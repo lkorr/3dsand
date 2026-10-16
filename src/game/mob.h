@@ -2338,7 +2338,10 @@ struct InfectSpec {
 // (Mob::CaptureWorn: the shells are still on the body and still burning, so
 // it is read live every call). Taking it copies the instance whole.
 struct LootPiece : ItemInstance {
-  enum class Kind : uint8_t { Worn, Held, Carried };
+  // Back (2026-10-15): the quiver on its back (EquipSlotId::Back), with every
+  // arrow in it -- no body of its own (drawn render-only), so it is taken,
+  // never shed.
+  enum class Kind : uint8_t { Worn, Held, Carried, Back };
   Kind kind = Kind::Worn;
   int equipSlot = -1;             // worn only
   // Which ItemCover entry the identity shell is (worn only), -1 otherwise.
@@ -2875,10 +2878,14 @@ class Mob {
   // rows' impulse -> hp rule. `fromWorld` should be a little in front of the
   // matter (the flight's last position, or the collider hit backed off): only
   // matter at or past it is in the channel. False when the handle is not one of
-  // this creature's slots; `out` says what happened otherwise.
+  // this creature's slots; `out` says what happened otherwise. `woundOut`
+  // (optional) takes the cells the channel removed, in the slot's
+  // authoritative lattice -- the walls a coated point drags its coat across
+  // (MobSystem::CoatOnContact, CoatHitKind::Pierce).
   bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
                   const Penetrator& pen, World& world,
-                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out,
+                  std::vector<IVec3>* woundOut = nullptr);
 
   // ---- WHAT DID IT: THE CAUSE IS AN ARGUMENT (W2-G, 2026-09-24) -------------
   //
@@ -3252,8 +3259,18 @@ class Mob {
   // `dirWorld` the way it was going; the art's point (ItemDef::ArrowSpec::tip)
   // is put there along that axis. Returns the slot, or -1 (no such limb, the
   // creature is at kMaxEmbeddedArrows, no art, physics refused).
+  //
+  // `inst` (optional, 2026-10-15): the arrow as an object -- its recorded
+  // lattice's COATS go onto the slot (ApplyLimbCoats), so a poisoned or bloody
+  // arrow stays so while it stands in the wound and comes back out so
+  // (PullArrowLattice).
   int EmbedArrow(const ItemDef& item, int hostLimb, Vec3 tipWorld,
-                 Vec3 dirWorld);
+                 Vec3 dirWorld, const ItemInstance* inst = nullptr);
+  // The arrow slot's lattice as its item records it (CaptureHeld's rule: only
+  // what differs from the authored arrow -- a clean whole one is nothing), for
+  // the instance that leaves the body when it is pulled. False for a slot that
+  // is not an arrow.
+  bool PullArrowLattice(int slot, WornDamage& out) const;
   bool IsArrowSlot(int slot) const {
     return slot >= baseLimbs_ && slot < (int)limbDefs_.size() &&
            limbDefs_[slot].tag == "arrow";
@@ -3337,6 +3354,11 @@ class Mob {
   // Where an item in this hand is held, world, as drawn: the hand's socket
   // point (the hilt centre's anchor), off the hand part's live transform.
   bool HandSocketWorld(Hand h, Vec3& out) const;
+  // ...ANY socket by its context ("back": where a quiver rides,
+  // game/quiver.h PresentQuiver): its point and its frame (the part's live
+  // rotation x the socket's own), world, as drawn. False when the rig
+  // publishes no such socket or its part is gone.
+  bool SocketWorldXf(const char* context, Vec3& pos, Quat& rot) const;
   // A running instance of `name` that is not blending out.
   bool ClipPlaying(const std::string& name) const;
   // A rig part's body corner as drawn (xf + the render offset), by name.
@@ -7324,7 +7346,8 @@ class MobSystem {
   // PierceAlongRay, which uses this.
   bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
                   const Penetrator& pen, World& world,
-                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out,
+                  std::vector<IVec3>* woundOut = nullptr);
   // ---- A MATERIAL, BY NAME, AT RUNTIME ------------------------------------
   //
   // Tuning cannot hold a material id: tuning.json is hot-reloaded on F5 and
@@ -7741,7 +7764,9 @@ class MobSystem {
   // and bite resolvers, for every creature-on-creature contact; no material is
   // special-cased -- what a transferred coat DOES afterwards is whatever that
   // material does as a body coat. See phys/coatcontact.h for the lattice half.
-  enum class CoatHitKind : uint8_t { Cut, Blunt, Bite };
+  // Pierce (2026-10-15): an arrow's point -- the coat goes on the CHANNEL's
+  // walls, as a cut's goes on its kerf's.
+  enum class CoatHitKind : uint8_t { Cut, Blunt, Bite, Pierce };
   struct CoatContact {
     uint64_t strikerId = 0;
     bool haft = false;         // the sweep was the held item's haft segment
@@ -7765,6 +7790,17 @@ class MobSystem {
     // same writers, on whatever lattice the matter has.
     uint64_t strikerBody = 0;
     uint64_t targetBody = 0;
+    // A BARE LATTICE AS THE STRIKER (2026-10-15, docs/PLAN_poison_arrows.md):
+    // an arrow in flight is neither a rig slot nor a body -- it is its
+    // ItemInstance's own lattice (game/itemcoat.h), and THAT is what wears its
+    // poison and takes the wound's blood. Replaces strikerId / strikerBody;
+    // `strikerScale` is its cells per world voxel, `strikerCell` the contact
+    // (the point) in those cells. No brick: nothing draws an arrow in flight's
+    // coat, and the lattice goes wherever the arrow ends up (an embed, the
+    // ground), which draws it from there.
+    std::vector<PrefabVoxel>* strikerLattice = nullptr;
+    float strikerScale = 1.0f;
+    Vec3 strikerCell{};
   };
   struct CoatContactResult {
     int strikerSlot = -1;      // which of the striker's slots touched
@@ -7919,7 +7955,12 @@ class MobSystem {
   // (Mob::RefId, "" for none), so an authored villager keeps its identity
   // through a save, a load, a park and an unpark. v10 and older load with no
   // ref -- which is what they were.
-  static constexpr uint32_t kSaveVersion = 11;
+  //
+  // 12 (2026-10-15, docs/PLAN_poison_arrows.md): A QUIVER'S ARROWS. Every
+  // ItemInstance ends with its held list (iteminstance.h kItemFmtQuiver), and
+  // the gear list carries the quiver on the creature's back
+  // (EquipSlotId::Back, Mob::CaptureGear). A v11 archer loads with no quiver.
+  static constexpr uint32_t kSaveVersion = 12;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;

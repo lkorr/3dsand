@@ -105,6 +105,14 @@ enum class ItemKind : uint8_t {
   // (MobSystem::FindShieldBlock) while it is up. Appended LAST so every kind
   // number before it -- and every range test above -- is unchanged.
   Shield,
+  // ---- worn on the BACK, and what the bow draws from (2026-10-15) ----
+  // A QUIVER (docs/PLAN_poison_arrows.md, game/quiver.h) holds ammunition as
+  // its own list of instances (ItemInstance::held), so every arrow in it keeps
+  // its own lattice -- its own coat -- and the quiver is still one slot. Worn
+  // in EquipSlotId::Back (not a fitted shell: drawn render-only on the
+  // `back` socket, game/quiver.cpp); the bow draws a random arrow out of the
+  // worn one and from nowhere else. Appended after Shield for Shield's reason.
+  Quiver,
 };
 
 // Is this kind WORN (a set of shells over the body) rather than merely carried?
@@ -131,13 +139,14 @@ inline const char* ItemKindName(ItemKind k) {
     case ItemKind::Key: return "key";
     case ItemKind::Ammo: return "ammo";
     case ItemKind::Shield: return "shield";
+    case ItemKind::Quiver: return "quiver";
     case ItemKind::None: break;
   }
   return "none";
 }
 
 inline ItemKind ItemKindFromName(const std::string& s) {
-  for (int i = 1; i <= (int)ItemKind::Shield; i++) {
+  for (int i = 1; i <= (int)ItemKind::Quiver; i++) {
     const ItemKind k = (ItemKind)i;
     if (s == ItemKindName(k)) return k;
   }
@@ -666,6 +675,16 @@ struct ItemDef {
     std::string clip = "shield_raise";
   } shield;
   bool IsShield() const { return shield.has && kind == ItemKind::Shield; }
+
+  // ---- A QUIVER (ItemKind::Quiver, 2026-10-15; game/quiver.h) ---------------
+  // What it holds and how many. `ammo` is the item id it takes ("arrow"), so a
+  // bolt case is a data row; `capacity` counts arrows, plain and coated alike.
+  struct QuiverSpec {
+    bool has = false;
+    int capacity = 0;
+    std::string ammo;
+  } quiver;
+  bool IsQuiver() const { return quiver.has && kind == ItemKind::Quiver; }
   // How many the stub starting kit hands out (main.cpp), as ONE stack.
   int startCount = 1;
 };

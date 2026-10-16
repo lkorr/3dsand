@@ -1585,7 +1585,7 @@ function flipFaces() {
   S.oldFaces = !S.oldFaces;
   render();
   toast(S.oldFaces ? 'showing the OLD faces (before 2026-10-15)'
-                   : 'showing the new fine faces');
+                   : 'showing the faces as their detail rows set them');
 }
 
 /** The old/fine toggle's button, for the tweak pane's header. */
@@ -1594,10 +1594,11 @@ function faceToggle() {
     class: 'oldface' + (S.oldFaces ? ' on' : ''),
     'data-nohist': true,
     title: 'Compare: flip EVERY preview on this page (this character, the ' +
-           'litter, the saved characters) between the new fine human face ' +
-           'and skin and the old face. Key: ` (backtick). A view only -- ' +
-           'saving always writes the new face. Other races are unchanged ' +
-           'either way.',
+           'litter, the saved characters) between the human face as its ' +
+           'detail rows set it (head tab: face detail) and the old face with ' +
+           'no skin detail at all. Key: ` (backtick). A view only -- saving ' +
+           'always writes the face the detail rows describe. Other races are ' +
+           'unchanged either way.',
     onclick: flipFaces,
   }, S.oldFaces ? 'faces: OLD' : 'faces: new');
 }
@@ -1666,7 +1667,7 @@ function tweakPane() {
       S.oldFaces ? el('div', { class: 'oldbanner' },
         'OLD FACES — every preview on the page is the human face as it was ' +
         'before 2026-10-15. Press ` or the button to flip back. Saving still ' +
-        'writes the new face.') : null,
+        'writes the face the detail rows describe.') : null,
       el('div', { class: 'prev' },
         el('div', { class: 'pcanv' }, big, side),
         el('div', {},
@@ -2390,6 +2391,10 @@ function geneRow(spec) {
       value: Math.min(v, hi),
       oninput: e => {
         gset(spec.path, Number(e.target.value));
+        // A NUMERIC STYLE ROW (the face detail master) sets the rows it
+        // stands for; the visible ones follow it as it drags.
+        if (spec.styled && mg.applyStyleRow(S.genome, spec.path, Number(e.target.value)))
+          syncRows(p => p.startsWith('face.detail'));
         // A slider drag must not rebuild the whole page (the pool alone is 30
         // bodies), so the preview and this row's readout update in place.
         readout.textContent = fmt(Number(e.target.value), spec);

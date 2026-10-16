@@ -160,6 +160,14 @@ struct ItemInstance {
   // its record of what it was taken with still equals `contents`, so any
   // pour, scoop or reaction since simply leaves it unused.
   std::shared_ptr<const alchemy::VesselLayout> layout;
+  // WHAT A QUIVER HOLDS (ItemKind::Quiver, game/quiver.h; 2026-10-15): its
+  // arrows, each an instance of its own, so a coated arrow keeps its lattice
+  // and its coat while the quiver stays ONE slot. Plain arrows merge into one
+  // counted entry (StacksWith), a coated one is an entry of count 1. ONE LEVEL
+  // DEEP: an entry never holds anything itself (every insert and every reader
+  // refuses it). Empty on everything that is not a loaded quiver. Persisted:
+  // PLYR v11, ITMS v10, MOBS v12, net protocol 4 (kItemFmtQuiver).
+  std::vector<ItemInstance> held;
 
   bool Empty() const { return name.empty() || count <= 0; }
   bool Filled() const { return !contents.Empty(); }
@@ -168,7 +176,9 @@ struct ItemInstance {
   void ClearFill() { contents = alchemy::Composition{}; }
   // A PRISTINE instance: nothing about it but its name and colour. Only these
   // merge into a stack — see StacksWith.
-  bool Plain() const { return contents.Empty() && damage.Empty() && !stoppered; }
+  bool Plain() const {
+    return contents.Empty() && damage.Empty() && !stoppered && held.empty();
+  }
   // DO TWO OF THESE MERGE INTO ONE STACK? Same item, same colour, and BOTH
   // plain. A filled vessel never stacks (a fill is per-object state: two
   // flasks of 40 eighths merged into one count-2 stack with ONE fill, and
@@ -205,6 +215,8 @@ inline void RemapItemInstance(ItemInstance& it, const MatRemap& r) {
     it.contents = c;
   }
   for (WornShellDamage& s : it.damage.shells) RemapPrefabVoxels(s.lattice, r);
+  // ...and every arrow in a quiver, whose coats are ids too.
+  for (ItemInstance& h : it.held) RemapItemInstance(h, r);
 }
 
 // ---- the byte shape, written once ------------------------------------------
@@ -255,10 +267,21 @@ inline bool ReadWornDamage(ByteReader& r, WornDamage& d,
 //   kItemFmtStopper -- that, then the stopper word (MOBS v10+, net 3+).
 // Callers pass their format's answer; there is no default, so no reader
 // guesses. (A `bool` still converts: true is kItemFmtMixed.)
-constexpr int kItemFmtLegacy = 0, kItemFmtMixed = 1, kItemFmtStopper = 2;
+//   kItemFmtQuiver  -- that, then a quiver's held list (MOBS v12+, net 4+,
+//                      ITMS v10+ via its own entry, refs container v2).
+constexpr int kItemFmtLegacy = 0, kItemFmtMixed = 1, kItemFmtStopper = 2,
+              kItemFmtQuiver = 3;
+// What a record written by THIS build carries (the net, the in-memory ones).
+constexpr int kItemFmtLatest = kItemFmtQuiver;
+// The most entries a quiver's held list may claim on read (a corrupt record,
+// refused before anything is sized on its word): far past any capacity.
+constexpr uint32_t kMaxQuiverEntries = 512;
 // The MOBS section's answer (game/mob.h MobSystem::kSaveVersion's history).
 inline int ItemFmtOfMobs(uint32_t version) {
-  return version >= 10 ? kItemFmtStopper : version >= 9 ? kItemFmtMixed : kItemFmtLegacy;
+  return version >= 12 ? kItemFmtQuiver
+         : version >= 10 ? kItemFmtStopper
+         : version >= 9  ? kItemFmtMixed
+                         : kItemFmtLegacy;
 }
 inline void WriteItemInstance(ByteWriter& w, const ItemInstance& it, int fmt) {
   w.Str(it.name);
@@ -271,6 +294,15 @@ inline void WriteItemInstance(ByteWriter& w, const ItemInstance& it, int fmt) {
   }
   WriteWornDamage(w, it.damage);
   if (fmt >= kItemFmtStopper) w.U32(it.stoppered ? 1u : 0u);
+  if (fmt >= kItemFmtQuiver) {
+    // One level deep: an entry's own held list is never written.
+    w.U32((uint32_t)it.held.size());
+    for (const ItemInstance& h : it.held) {
+      ItemInstance flat = h;
+      flat.held.clear();
+      WriteItemInstance(w, flat, fmt);
+    }
+  }
 }
 
 inline bool ReadItemInstance(ByteReader& r, ItemInstance& it, int fmt) {
@@ -292,6 +324,25 @@ inline bool ReadItemInstance(ByteReader& r, ItemInstance& it, int fmt) {
     uint32_t s = 0;
     r.U32(s);
     it.stoppered = s != 0;
+  }
+  it.held.clear();
+  if (ok && r.ok && fmt >= kItemFmtQuiver) {
+    uint32_t n = 0;
+    r.U32(n);
+    if (n > kMaxQuiverEntries) {
+      r.ok = false;
+      return false;
+    }
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+      ItemInstance h;
+      if (!ReadItemInstance(r, h, fmt)) break;
+      // One level deep: a nested entry claiming a list of its own is corrupt.
+      if (!h.held.empty()) {
+        r.ok = false;
+        break;
+      }
+      if (!h.Empty()) it.held.push_back(std::move(h));
+    }
   }
   return ok && r.ok;
 }

@@ -28,30 +28,30 @@
       "name": "hair",
       "parent": "head",
       "joint": "fixed",
-      "hp": 36,
+      "hp": 37,
       "severable": true,
       "vital": false,
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        26.5,
+        24.5,
         123,
-        7.5
+        3.5
       ]
     },
     {
       "name": "hair.2",
       "parent": "head",
       "joint": "fixed",
-      "hp": 6,
+      "hp": 4,
       "severable": true,
       "vital": false,
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        25.5,
-        118,
-        12.5
+        11.5,
+        117,
+        13.5
       ]
     }
   ],
@@ -233,7 +233,16 @@
       "earTilt": 0,
       "earLobe": 0.5,
       "earPointLen": 0.5,
-      "earTone": 0.6
+      "earTone": 0.6,
+      "detail": 0,
+      "detailShape": 0,
+      "detailEyes": 0,
+      "detailBrows": 0,
+      "detailMouth": 0,
+      "detailNose": 0,
+      "detailMarks": 0,
+      "detailEars": 0,
+      "detailBeard": 0
     },
     "hair": {
       "style": "crew",

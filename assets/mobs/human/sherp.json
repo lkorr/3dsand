@@ -12,14 +12,6 @@
             "keep": true
           }
         ]
-      },
-      "hair.2": {
-        "layers": [
-          {
-            "material": "hair_white",
-            "keep": true
-          }
-        ]
       }
     }
   },
@@ -135,30 +127,15 @@
       "name": "hair",
       "parent": "head",
       "joint": "fixed",
-      "hp": 26,
+      "hp": 28,
       "severable": true,
       "vital": false,
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        27.5,
-        117,
-        10.5
-      ]
-    },
-    {
-      "name": "hair.2",
-      "parent": "head",
-      "joint": "fixed",
-      "hp": 4,
-      "severable": true,
-      "vital": false,
-      "bloodless": true,
-      "tag": "hair",
-      "anchor": [
-        21.5,
+        26.5,
         116,
-        16.5
+        10.5
       ]
     }
   ],
@@ -340,7 +317,16 @@
       "earTilt": 0,
       "earLobe": 0.5,
       "earPointLen": 0.5,
-      "earTone": 0.6
+      "earTone": 0.6,
+      "detail": 0,
+      "detailShape": 0,
+      "detailEyes": 0,
+      "detailBrows": 0,
+      "detailMouth": 0,
+      "detailNose": 0,
+      "detailMarks": 0,
+      "detailEars": 0,
+      "detailBeard": 0
     },
     "hair": {
       "style": "swept",

@@ -96,7 +96,10 @@ enum class MsgType : uint16_t {
 // portions, iteminstance.h WriteContents) where they were one packed word.
 // 3 (2026-09-27): an item record ends with its vessel's stopper word
 // (iteminstance.h kItemFmtStopper).
-constexpr uint16_t kProtocolVersion = 3;
+// 4 (2026-10-15): an item record ends with a quiver's held list
+// (iteminstance.h kItemFmtQuiver), and a Pierce melee record carries the
+// arrow as an instance (meleehit.h v4).
+constexpr uint16_t kProtocolVersion = 4;
 
 // D, the lockstep delay, in ticks. Fixed rather than adaptive: §4 finding 5
 // takes "no deadlock" from a constant that both sides agree on before they

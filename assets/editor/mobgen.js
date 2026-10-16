@@ -409,17 +409,26 @@ export function detailColors(colors, g) {
   const skin = colors.skin;
   const op = path => (g ? toneQ(getPath(g, path) ?? 1) : 1);
   const mix = (to, path) => mixHex(skin, to, op(path));
+  // THE EYE'S AND THE EAR'S TONES AT THEIR DETAIL (FACE DETAIL, above
+  // headVoxFine): the whites, lashes and crease fade in from nothing and the
+  // bags from the old eye's full shade as the eyes' detail rises (eyeGenes),
+  // the ear's hollow from the rim's full shade as the ears' does. What the
+  // creator shows and what the game draws are this one number.
+  const face = g && g.face ? g.face : null;
+  const fe = face ? eyeGenes(face, faceDetail(g).eyes) : null;
+  const mixv = (to, v) => mixHex(skin, to, face ? toneQ(v) : 1);
+  const earTone = face ? 1 + ((face.earTone ?? 1) - 1) * faceDetail(g).ears : 1;
   return {
     [ART.FACE_SHADE]: colors.skinShade,
     [ART.FACE_LIGHT]: colors.skinLight,
-    [ART.EYE_WHITE]: mix(EYE_WHITE_HEX, 'face.whites'),
-    [ART.LASH]: mix(colors.lash || colors.hairShade, 'face.lashTone'),
+    [ART.EYE_WHITE]: mixv(EYE_WHITE_HEX, fe ? fe.whites : 1),
+    [ART.LASH]: mixv(colors.lash || colors.hairShade, fe ? fe.lashTone : 1),
     [ART.NOSTRIL]: nostrilHex(skin),
     [ART.TEETH]: EYE_WHITE_HEX,
     [ART.GLINT]: GLINT_HEX,
-    [ART.CREASE]: mix(colors.skinShade, 'face.creaseTone'),
-    [ART.BAGS]: mix(colors.skinShade, 'face.bagTone'),
-    [ART.EAR_IN]: mix(colors.skinShade, 'face.earTone'),
+    [ART.CREASE]: mixv(colors.skinShade, fe ? fe.creaseTone : 1),
+    [ART.BAGS]: mixv(colors.skinShade, fe ? fe.bagTone : 1),
+    [ART.EAR_IN]: mixv(colors.skinShade, earTone),
     [ART.COLLAR_L]: mix(colors.skinLight, 'body.skin.collarbones'),
     [ART.COLLAR_S]: mix(colors.skinShade, 'body.skin.collarbones'),
     [ART.CHEST]: mix(colors.skinShade, 'body.skin.chest'),
@@ -854,6 +863,21 @@ export function defaultGenome() {
       earLobe: 0.5,     // 0 attached .. 1 a long hanging lobe
       earPointLen: 0.5, // the elf point's length (with earPoint)
       earTone: 0.6,     // the hollow: the skin .. the shade
+      // ---- THE DETAIL ROWS (2026-10-15, owner ask: "the new faces are a little
+      // too freaky ... sliders that interpolate between the blocky 2x2x2 look
+      // and the new one"). Each is how far ONE feature has gone from the face
+      // as it was before the fine face (0, headVox's own cells, exactly) to the
+      // fine face as its rows describe it (1). Every default is 0: a genome
+      // written before these builds the old face it had. See FACE DETAIL.
+      detail: 0,        // the master row: the last value it set the others to
+      detailShape: 0,   // the skull and the cap: 2x2x2 steps .. rounded off
+      detailEyes: 0,
+      detailBrows: 0,
+      detailMouth: 0,
+      detailNose: 0,
+      detailMarks: 0,   // cheeks, freckles, lines, the scar, blush, the mottle
+      detailEars: 0,
+      detailBeard: 0,
     },
 
     /** HAIR IS A FUNCTION, not a texture: `back`/`front` are the z at or above
@@ -1125,7 +1149,21 @@ export function applyEyeStyle(genome, style) {
  *  style's own numbers go with the name. Returns whether `path` is one. */
 export function applyStyleRow(genome, path, value) {
   if (path === 'face.eyeStyle') { applyEyeStyle(genome, value); return true; }
+  if (path === 'face.detail') { applyFaceDetail(genome, value); return true; }
   return false;
+}
+
+/** THE DETAIL ROWS, one per feature (FACE DETAIL, above headVoxFine). */
+export const DETAIL_KEYS = ['detailShape', 'detailEyes', 'detailBrows',
+                            'detailMouth', 'detailNose', 'detailMarks',
+                            'detailEars', 'detailBeard'];
+
+/** The master detail row's pick: every feature's detail row to `v`. */
+export function applyFaceDetail(genome, v) {
+  const t = clamp(Number(v) || 0, 0, 1);
+  genome.face.detail = t;
+  for (const k of DETAIL_KEYS) genome.face[k] = t;
+  return genome;
 }
 
 /** Snap the beard genes to a named style (see applyHairStyle). */
@@ -1241,13 +1279,18 @@ export const GENE_GROUPS = [
   { key: 'face', title: 'head',
     note: 'The skull: jaw, cheekbones, crown and how far it sits behind the ' +
           'face. A face here is about twenty voxels across, so small moves ' +
-          'read large; the side view is where the skull shape shows.' },
+          'read large; the side view is where the skull shape shows. FACE ' +
+          'DETAIL, at the top: 0 is the blocky face from before the fine ' +
+          'face, cell for cell, 1 the fine face; every face tab has its own ' +
+          'detail row, and this one sets them all.' },
   { key: 'eyes', title: 'eyes',
-    note: 'A HUMAN\u2019s eyes are drawn at full resolution (12.5 mm cells) and ' +
-          'its sliders take half steps, a cell each; other races paint at ' +
-          'half that. Pick a style to set the rows below, then drag. The ' +
-          'opacity rows (whites, lashes, crease, under-eyes) fade a feature ' +
-          'toward the skin behind it, in tenths. Eyebrows are further down.' },
+    note: 'A HUMAN\u2019s eyes can be drawn at full resolution (12.5 mm cells), ' +
+          'its sliders taking half steps, a cell each; other races paint at ' +
+          'half that. DETAIL, at the top, is how much of that: 0 is the old ' +
+          'two-by-two block eye, 1 the eye exactly as the rows below set it. ' +
+          'Pick a style to set the rows, then drag. The opacity rows (whites, ' +
+          'lashes, crease, under-eyes) fade a feature toward the skin behind ' +
+          'it, in tenths. Eyebrows are further down.' },
   { key: 'brows', title: 'eyebrows', parent: 'eyes',
     note: 'Painted over the eyes in the hair colour (or the tone picked ' +
           'here). Every row below needs the eyebrows box ticked. A step is ' +
@@ -2175,6 +2218,46 @@ GENE_SPECS.push(
           'different scatter of the same amounts. Nothing else on the ' +
           'body reads it, and it reads nothing else.',
     min: 0, max: 999, step: 1, sigma: 0.15 },
+  // ---- THE DETAIL ROWS (2026-10-15): one per feature, at the TOP of its
+  // tab (`ui` below every other row's), and the master on the head tab. 0 is
+  // the old blocky face, 1 the fine one; see FACE DETAIL above headVoxFine.
+  { path: 'face.detail', label: 'face detail', group: 'face', race: 'human',
+    late: true, styled: true, ui: -2,
+    hint: 'Every detail row at once (head shape here, and the one at the top ' +
+          'of the eyes, eyebrows, mouth, face details, ears and facial hair ' +
+          'tabs). 0 is the face as it was before the fine face -- the blocky ' +
+          'one, cell for cell -- and 1 the fine face. Drag a row on its own ' +
+          'tab afterwards to mix them.',
+    min: 0, max: 1, step: 0.05, sigma: 0 },
+  ...[
+    ['detailShape', 'face', 'head shape detail',
+     'The skull and the hair cap: 0 the old 2x2x2 steps, 1 the same head ' +
+     'with its steps rounded off and a hairline drawn in half rows. Same ' +
+     'outline either way.'],
+    ['detailEyes', 'eyes', 'detail',
+     'How much of the fine eye the rows below draw: 0 is the old two-by-two ' +
+     'block eye, 1 the eye exactly as set; between, it narrows toward its ' +
+     'shape and the whites, lashes and crease fade in.'],
+    ['detailBrows', 'brows', 'detail',
+     'The brow from the old block bar (0) to the fine tapered brow (1).'],
+    ['detailMouth', 'mouth', 'detail',
+     'The old two-row mouth (0) to the fine line and lips (1): the corners ' +
+     'thin first, then the middle.'],
+    ['detailNose', 'details', 'nose detail',
+     'The old block nose (0) to the fine bridge, tip and nostrils (1).'],
+    ['detailMarks', 'details', 'marks detail',
+     'Cheeks, freckles, lines and the scar as the old blocks (0) or fine ' +
+     'marks (1); blush and the skin’s mottle on the face fade in with it.'],
+    ['detailEars', 'ears', 'detail',
+     'The old block ear (0) to the fine rim, hollow and lobe (1).'],
+    ['detailBeard', 'beard', 'detail',
+     'The beard in the old 2x2 blocks (0), or cut to single cells (1): ' +
+     'between, the edges and the stubble break up from blocks into ' +
+     'single hairs.'],
+  ].map(([k, group, label, hint]) => ({
+    path: 'face.' + k, label, group, race: 'human', late: true,
+    ui: k === 'detailShape' ? -1 : k === 'detailMarks' ? -0.5 : -1,
+    hint, min: 0, max: 1, step: 0.05, roll: 0.3, sigma: 0.15 })),
 );
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
@@ -4138,36 +4221,76 @@ function headVox(g, size, ctx) {
 }
 
 // =============================================================================
-// THE FINE HEAD (2026-10-15)
+// THE FINE HEAD (2026-10-15), AND HOW FAR IT GOES: FACE DETAIL
 //
 // A HUMAN's head is built ON THE SHIPPED LATTICE instead of on the authored
 // one and then doubled. Everything else on the figure is authored at 40 vox/m
-// and block-replicated to the 80 the engine draws (SKIN_UPSCALE), so a painted
-// cell is a 2x2x2 block -- an eye was a 25 mm square and a mouth a 25 mm bar --
-// while every race with a surface pass (goblin, demon, naga, the robots)
-// paints its face on the fine lattice. The owner saw it: goblins looked twice
-// as detailed as humans, and at the face they were.
+// and block-replicated to the 80 the engine draws (SKIN_UPSCALE), so a cell
+// headVox paints is a 2x2x2 block -- an eye a 25 mm square, a mouth a 25 mm
+// bar -- while every race with a surface pass (goblin, demon, naga, the
+// robots) paints its face on the fine lattice. Goblins looked twice as
+// detailed as humans, and at the face they were.
 //
-//  - THE SKULL, CAP, MANE AND KNOT are headVox's shape SAMPLED TWICE AS
-//    FINELY rather than replicated: every test is headVox's own expression
-//    evaluated at the centre of a shipped cell (`ac`), so the head keeps its
-//    size and proportions and loses its stair steps, and the hairline moves
-//    in half rows.
-//  - THE FACE is drawn at shipped resolution: an eye is a lash line over
-//    white-iris-white, a nose has a bridge, a tip and nostrils, a mouth has
-//    corners that turn and lips above and below it, an ear has a rim and a
-//    hollow, a brow tapers to its tail.
-//  - EVERY GENE KEEPS ITS AUTHORED-UNIT MEANING (eyeDx 2.5 is still 2.5
-//    authored cells), so a genome builds the face it always did, finer. The
-//    integer face genes take HALF steps on a human (`fineStep`), which is one
-//    shipped cell each.
+// FACE DETAIL. The first fine head (56a1f97) resampled the skull's ellipses
+// at the shipped lattice and drew a new face on it. The owner, the same day:
+// "the new faces are sculpted and shaped too differently and should follow
+// the same contours, and there should be sliders that interpolate between the
+// more blocky 2x2x2 look on the face and the new one ... the facial hair is
+// way too drastically different". Resampled finely, the same ellipses read as
+// an EGG beside the old head's fuller, flatter blocks; the beard, cut cell by
+// cell, was another beard. So the head is now a function of EIGHT DETAIL ROWS
+// (face.detailShape ... detailBeard; faceDetail), each 0..1:
+//
+//   0  is headVox's head CELL FOR CELL (test_mobgen §V holds it to
+//      upscaleCells(headVox) over every saved human and a hundred rolls),
+//      with the face's marks in the FACE_* slots (below);
+//   1  is the fine feature as its own rows describe it.
+//
+// Between, each feature moves the way its shape allows:
+//  - THE SKULL AND THE CAP (detailShape): the old blocks, ROUNDED OFF. The
+//    geometry is the old head's occupancy blended with its own blur and cut at
+//    a half -- a block's exposed corner goes first, a step fills in -- so the
+//    outline is the old one at every setting, never the resampled ellipse. The
+//    cap is headVox's hair function asked at a point that slides from the
+//    block's centre (0) to the cell's own (1): the hairline goes from whole
+//    rows to half rows.
+//  - THE BEARD (detailBeard): the same sliding point for its regions, the
+//    region lines sliding from headVox's rounded ones to the fine unrounded
+//    ones, and a hash that slides from the block's (all eight cells keep or
+//    drop together) to the cell's own -- the edge and the stubble break up
+//    from blocks into single hairs.
+//  - THE EYES (detailEyes): the fine eye with its rows slid from the `old`
+//    point (a two-row iris filling the eye; whites, lashes and crease at zero
+//    opacity) to the genome's (eyeGenes), so it narrows toward its shape while
+//    the whites, the lash line and the crease FADE in (detailColors reads the
+//    same numbers).
+//  - THE BROWS AND THE MOUTH: a band per column whose rows and ends slide from
+//    the old blocks' to the fine feature's; the mouth's corners thin first.
+//  - THE NOSE: the front of each column slides from the block nose's to the
+//    fine nose's.
+//  - THE EARS: the band, the rows and how far the ear stands off slide from
+//    the block ear's; the lobe and the curl arrive at a half, and the
+//    hollow's shade fades from the rim's to its own.
+//  - THE MARKS: cheeks, lines and the scar switch at a half; freckles slide
+//    like the beard; blush, and the skin pass's mottle, moles and soft seam on
+//    the head (humanSkinPass), fade in.
+//
+// THE MARKS ARE IN THE FACE_* SLOTS AT EVERY DETAIL. headVox paints them in
+// SKIN_SHADE / SKIN_LIGHT, which the Characters page draws as plain skin
+// (breed.js slotRGB flattens a family's shade onto its base), so on the page
+// the old face had no mouth line, freckle, eye bag or wrinkle the game drew.
+// FACE_SHADE / FACE_LIGHT are the same two colours under numbers the page
+// draws as themselves: the game sees nothing change, the page shows the old
+// face the way the game always did. The skull's own shading (its back half,
+// the ears) stays SKIN_SHADE: that is form, not a mark.
+//
+// THE HALF STEPS. headVox cannot draw half a block, so the old head is drawn
+// with every half-step row rounded (legacyFace); a half step appears as its
+// feature's detail rises.
 //
 // RACES KEEP headVox: their surface passes are written against its painted
-// face. `opts.face = 'legacy'` builds a human the old way too, which is what
-// the Characters page's old/fine toggle compares against.
-//
-// Paint uses the detail slots (ART.FACE_SHADE ...) wherever headVox used
-// SKIN_SHADE / SKIN_LIGHT on the face; see the ART note for why.
+// face. `opts.face = 'legacy'` builds a human the old way too (the Characters
+// page's old/fine toggle), half steps rounded.
 // =============================================================================
 
 /** Does this genome get the fine head and the skin pass? Humans only, unless
@@ -4183,6 +4306,93 @@ export function isFineFace(g, opts) {
 const FINE_SKIN = new Set([ART.SKIN_BASE, ART.SKIN_SHADE, ART.SKIN_LIGHT,
                            ART.FACE_SHADE, ART.FACE_LIGHT]);
 
+/** The face rows a human takes in half steps (GENE_SPECS `fineStep`). */
+const HALF_STEP_FACE = GENE_SPECS
+  .filter(s => s.fineStep && s.path.startsWith('face.'))
+  .map(s => s.path.slice('face.'.length));
+
+/** Half away from zero, so a mirrored pair of genes rounds the same way. */
+const roundSym = v => Math.sign(v) * Math.floor(Math.abs(v) + 0.5);
+
+/** The face rows AS THE OLD HEAD DRAWS THEM: every half step rounded to a
+ *  whole one (half a 2x2 block is what the fine face is for). */
+export function legacyFace(face) {
+  const o = { ...face };
+  for (const k of HALF_STEP_FACE)
+    if (typeof o[k] === 'number') o[k] = roundSym(o[k]);
+  return o;
+}
+
+/** Each feature's DETAIL, 0 the old blocky face .. 1 the fine one (FACE
+ *  DETAIL, above). */
+export function faceDetail(g) {
+  const f = (g && g.face) || {};
+  const v = k => clamp(Number(f[k]) || 0, 0, 1);
+  return { shape: v('detailShape'), eyes: v('detailEyes'), brows: v('detailBrows'),
+           mouth: v('detailMouth'), nose: v('detailNose'), marks: v('detailMarks'),
+           ears: v('detailEars'), beard: v('detailBeard') };
+}
+
+/** THE EYE'S ROWS AT ITS DETAIL `d`: slid from the old point -- a round eye
+ *  its iris fills, every tone at zero, nothing tilted -- to the genome's own.
+ *  detailColors reads the tones from here too, so what fades in as the detail
+ *  rises is the colour of the whites, the lashes and the crease. */
+export function eyeGenes(face, d) {
+  const L = legacyFace(face);
+  const lerp = (a, b) => a + (b - a) * d;
+  return {
+    ...face,
+    eyeRow: lerp(L.eyeRow, face.eyeRow), eyeCols: lerp(L.eyeCols, face.eyeCols),
+    eyeOpen: lerp(1, face.eyeOpen), eyeTilt: lerp(0, face.eyeTilt),
+    irisSize: lerp(1, face.irisSize), whites: lerp(0, face.whites),
+    glint: !!face.glint && d >= 0.5,
+    lashes: lerp(0, face.lashes), lashTone: lerp(0, face.lashTone),
+    lidCrease: lerp(0, face.lidCrease), creaseTone: lerp(0, face.creaseTone),
+    bagTone: lerp(1, face.bagTone),
+  };
+}
+
+/** How far the head shape's rounding reaches (blurBinomial's radius) and
+ *  where it is cut (a cell is head where its blur is at least this). Picked
+ *  by measurement on the saved cast (2026-10-15): radius 4 rounds a two-cell
+ *  stair into a one-cell slope without eating the mane or the topknot (2 and
+ *  1 smaller kept stray steps), and a cut a shade under a half keeps the old
+ *  head's VOLUME (brug 4928 cells -> 4926; at 0.5 it lost 3%, which read as a
+ *  smaller head) and its outline row for row: the same 16-cell face, 20 at
+ *  the ears, the square jaw, each corner a cell rounder. */
+const SHAPE_BLUR_R = 4;
+const SHAPE_CUT = 0.45;
+
+/** A separable binomial blur of a dense field, radius `r` (1: 1-2-1, 2:
+ *  1-4-6-4-1, ...). Outside the box is empty, except BELOW the floor, where the
+ *  field continues as its own bottom row: the neck runs on into the torso, and
+ *  rounding its stump off at the joint would open a seam there. */
+function blurBinomial(src, sx, sy, sz, r) {
+  const w = [1];                                   // the binomial row 2r
+  for (let k = 0; k < 2 * r; k++) w.push(w[k] * (2 * r - k) / (k + 1));
+  const n = w.reduce((a, b) => a + b, 0), h = (w.length - 1) >> 1;
+  const at = (X, Y, Z) => (Z * sy + Y) * sx + X;
+  let a = src, b = new Float32Array(src.length);
+  for (let axis = 0; axis < 3; axis++) {
+    for (let Z = 0; Z < sz; Z++)
+      for (let Y = 0; Y < sy; Y++)
+        for (let X = 0; X < sx; X++) {
+          let s = 0;
+          for (let k = -h; k <= h; k++) {
+            let x = X, y = Y, z = Z;
+            if (axis === 0) x += k; else if (axis === 1) y += k; else z += k;
+            if (z < 0) z = 0;                          // the neck runs on
+            if (x < 0 || y < 0 || x >= sx || y >= sy || z >= sz) continue;
+            s += a[at(x, y, z)] * w[k + h];
+          }
+          b[at(X, Y, Z)] = s / n;
+        }
+    const t = a === src ? new Float32Array(src.length) : a;
+    a = b; b = t;
+  }
+  return a;
+}
+
 /**
  * @param g       normalized genome
  * @param artSize the head's AUTHORED box (the limb table's); the cells come
@@ -4194,16 +4404,28 @@ function headVoxFine(g, artSize, ctx) {
   const S = SKIN_UPSCALE;
   const [ax, ay, az] = artSize;
   const sx = ax * S, sy = ay * S, sz = az * S;
-  // A shipped cell's CENTRE in authored units: the `x + 0.5` every headVox
-  // test is written in.
-  const ac = X => (X + 0.5) / S;
+  const D = faceDetail(g);
+  const f = g.face;                       // the genome's rows, half steps and all
+  const fl = legacyFace(f);               // ...as the old head draws them
+  const fe = eyeGenes(f, D.eyes);         // ...as the fine eye draws them
+  const lerp = (a, b, t) => a + (b - a) * t;
+  // Symmetric rounding: Math.round takes -0.5 to 0 but 0.5 to 1, which would
+  // make every mirrored left/right gene lopsided by a cell.
+  const sround = roundSym;
+  const rnd01 = (...v) => hashN(...v) / 4294967296;
   const cx = ax * 0.5, cy = ay * 0.5;
   const hcy = cy - g.head.skullBack * (ay / DEF.head.size[1]);
-  const eyeA = ctx.eyeZ - ctx.limbs.head.mn[2] + g.face.eyeRow;
-  if (!(eyeA >= 0 && eyeA < az))
-    throw new Error(`eye row ${eyeA} is outside the head model (0..${az - 1}); ` +
-                    `the head's scene z or its height moved without the eye ` +
-                    `metre contract following`);
+  // THE EYE ROW, twice: the old head's (whole rows) and the fine eye's (a
+  // half step once the eyes' detail is up). Every old-style feature sits on
+  // the first, every fine one on the second, so each keeps to the eyes it was
+  // drawn against.
+  const eyeBase = ctx.eyeZ - ctx.limbs.head.mn[2];
+  const eyeZ = eyeBase + fl.eyeRow, eyeA = eyeBase + fe.eyeRow;
+  for (const e of [eyeZ, eyeA])
+    if (!(e >= 0 && e < az))
+      throw new Error(`eye row ${e} is outside the head model (0..${az - 1}); ` +
+                      `the head's scene z or its height moved without the eye ` +
+                      `metre contract following`);
   const neckTop = Math.max(1, Math.round(2 * az / DEF.head.size[2]));
   const skullLo = neckTop + 1;
   const hm = g.head;
@@ -4213,15 +4435,7 @@ function headVoxFine(g, artSize, ctx) {
   const pry = scaleKnots([[0.00, 2.7], [0.18, 3.7], [0.45, 4.6], [0.75, 4.6],
                           [1.00, 2.9]], ay / DEF.head.size[1], mod);
   const neckR = 2.0 * (ax / DEF.head.size[0]);
-  // The profile past its last knot CONTINUES its last slope instead of
-  // holding: the fine top row sits a quarter row above headVox's, and
-  // holding the crown's radius there is a flat lid one cell rounder than it
-  // has any reason to be.
-  const profX = (u, pts) => {
-    if (u <= 1) return profile(u, pts);
-    const [u0, v0] = pts[pts.length - 2], [u1, v1] = pts[pts.length - 1];
-    return Math.max(0.6, v1 + (v1 - v0) / (u1 - u0) * (u - 1));
-  };
+  const hz = az / DEF.head.size[2], hy = ay / DEF.head.size[1];
 
   // ONE DENSE GRID, occupancy and paint together: the face below asks for the
   // front of a column a few thousand times, which a cell list answers in O(n).
@@ -4230,20 +4444,34 @@ function headVoxFine(g, artSize, ctx) {
   const inBox = (X, Y, Z) => X >= 0 && Y >= 0 && Z >= 0 &&
                              X < sx && Y < sy && Z < sz;
   const get = (X, Y, Z) => (inBox(X, Y, Z) ? col[at(X, Y, Z)] : 0);
-  const add = (X, Y, Z, c) => {
+  // THE ORDER THE CELLS COME OUT IN. hairMass grows its shells breadth first
+  // from the head's cells IN LIST ORDER (a cell two seeds reach belongs to
+  // the first), so a head that is headVox's cell for cell must also LIST them
+  // as upscaleCells(headVox) does: headVox's cells in the order it made them,
+  // each one's block in upscaleCells' order. `ord` is the making order -- an
+  // authored cell's for every cell of its block -- and the sort at the end
+  // does the rest. (Measured: the same cells in scan order moved 1..450 hair
+  // cells on 129 of 239 bodies.)
+  const ord = new Int32Array(sx * sy * sz).fill(-1);
+  let nextOrd = 1 << 22;                            // after every skull cell
+  const newBlock = () => nextOrd++;
+  const add = (X, Y, Z, c, o) => {
     if (!inBox(X, Y, Z) || col[at(X, Y, Z)]) return false;
     col[at(X, Y, Z)] = c;
+    ord[at(X, Y, Z)] = o ?? nextOrd++;
     return true;
   };
-  const inEllipse = (X, Y, rx, ry) => {
-    if (rx <= 0 || ry <= 0) return false;
-    const dx = (ac(X) - cx) / rx, dy = (ac(Y) - hcy) / ry;
-    return dx * dx + dy * dy <= 1.0;
-  };
-  // THE HEAD'S OWN FRAME for every hashed choice on it: across from the
+  // WHERE A SHIPPED CELL ASKS headVox's QUESTIONS, at detail t, in authored
+  // units: at 0 its authored cell's centre (all eight cells of a block ask the
+  // same question, so the answer is the block), at 1 its own centre (`sc`).
+  // `sr` is a ROW in headVox's own reckoning -- its tests compare the row
+  // index z, not z + 0.5 -- the row at 0, the fine row's bottom edge at 1.
+  const sc = (X, t) => lerp(Math.floor(X / S) + 0.5, (X + 0.5) / S, t);
+  const sr = (Z, t) => lerp(Math.floor(Z / S), Z / S, t);
+  // THE HEAD'S OWN FRAME for every fine hashed choice: across from the
   // midline, front to back from the skull's centre, up from the box floor.
-  // Keyed on the box corner, a head two cells wider shifted every cell's key
-  // and re-rolled every speckle on it (see GENE INDEPENDENCE).
+  // (headVox's own hashes are keyed on its box, and at detail 0 that is what
+  // is asked: the old head's speckle, to the cell.)
   const HX = sx >> 1, HY = Math.round(hcy * S);
   // WHAT THE HAIR MASS NEEDS TO KNOW, recorded as it is decided rather than
   // read back out of the paint afterwards (headMarks; hairMass): the cap, the
@@ -4251,242 +4479,407 @@ function headVoxFine(g, artSize, ctx) {
   const capK = new Set(), beardK = new Set();
   const sk0 = [1e9, 1e9, 1e9], sk1 = [-1e9, -1e9, -1e9];
 
-  // ---- the hair function, headVox's own, at shipped resolution ------------
-  const hz = az / DEF.head.size[2], hy = ay / DEF.head.size[1];
+  // ---- THE SKULL, THE MANE AND THE KNOT, as headVox builds them -----------
+  // On its own lattice: `A` says what each AUTHORED cell is (0 nothing, 1
+  // skull, 2 mane, 3 knot), by headVox's own tests in headVox's own order.
+  const A = new Uint8Array(ax * ay * az);
+  const ordA = new Int32Array(ax * ay * az).fill(-1);     // headVox's making order
+  let nA = 0;
+  const atA = (x, y, z) => (z * ay + y) * ax + x;
+  const getA = (x, y, z) => (x >= 0 && y >= 0 && z >= 0 && x < ax && y < ay &&
+                             z < az ? A[atA(x, y, z)] : 0);
+  for (let z = 0; z < az; z++) {
+    let rx, ry;
+    if (z <= neckTop) { rx = neckR; ry = neckR; }
+    else {
+      const u = (z - skullLo) / Math.max(az - 1 - skullLo, 1);
+      rx = profile(u, prx); ry = profile(u, pry);
+    }
+    for (let y = 0; y < ay; y++)
+      for (let x = 0; x < ax; x++)
+        if (ellipseMask(x, y, cx, hcy, rx, ry)) { A[atA(x, y, z)] = 1; ordA[atA(x, y, z)] = nA++; }
+  }
   const hBack = g.hair.back * hz, hFront = g.hair.front * hz;
-  const hairT = Y => clamp((ac(Y) - (hcy - 4.0 * hy)) / (8.0 * hy), 0.0, 1.0);
+  // A MANE: the skull's base ellipse continued down the nape, back half only,
+  // so every mane cell has skull or mane straight above it (headVox's note).
+  if (g.hair.length > 0 && hBack < az) {
+    const lz = Math.round(g.hair.length * hz);
+    const rx = profile(0.0, prx), ry = profile(0.0, pry);
+    for (let z = Math.max(0, skullLo - lz); z < skullLo; z++)
+      for (let y = 0; y < ay; y++)
+        for (let x = 0; x < ax; x++) {
+          if (!ellipseMask(x, y, cx, hcy, rx, ry)) continue;
+          if (y + 0.5 >= hcy - 1.0) continue;          // back half only
+          if (!A[atA(x, y, z)]) { A[atA(x, y, z)] = 2; ordA[atA(x, y, z)] = nA++; }
+        }
+  }
+  // A TOPKNOT: grown back off the back-most cell of each column near the
+  // crown (front is HIGH y in this frame, until the flip at the end).
+  if (g.hair.knot) {
+    const kd = Math.max(1, Math.round(2 * hy));
+    for (const x of [Math.floor(cx) - 1, Math.floor(cx)])
+      for (let z = az - Math.max(2, Math.round(3 * hz)); z < az; z++) {
+        let backY = -1;
+        for (let y = 0; y < ay; y++) if (getA(x, y, z)) { backY = y; break; }
+        if (backY <= 0) continue;
+        for (let d = 1; d <= kd && backY - d >= 0; d++)
+          if (x >= 0 && x < ax && !A[atA(x, backY - d, z)]) {
+            A[atA(x, backY - d, z)] = 3;
+            ordA[atA(x, backY - d, z)] = nA++;
+          }
+      }
+  }
+
+  // ---- HEAD SHAPE DETAIL: the same blocks, rounded off (D.shape) ----------
+  // B is the old head on this lattice, every authored cell a 2x2x2 block. At
+  // detail 1 a cell is head where most of its neighbourhood is (blur(B) >=
+  // 1/2): a block's exposed corner comes off and the step under it fills in,
+  // so the two-cell stair of the old outline becomes a one-cell slope ON THE
+  // SAME OUTLINE. Between, the two cut-offs slide linearly from "keep every
+  // old cell, fill none" (0, B exactly) to the half: an old cell goes once its
+  // blur is under t/2, an empty one fills once its blur is over 1 - t/2 -- the
+  // most exposed corners first, the deepest steps first, all the way along
+  // the slider. (A blend (1 - t) B + t blur(B) >= 1/2 moved nothing at all
+  // below t = 1/2.) A newly filled cell takes what most of the old head
+  // around it was (skull, mane or knot).
+  const ts = D.shape;
+  const region = new Uint8Array(sx * sy * sz);       // 0, or A's 1 / 2 / 3
+  for (let Z = 0; Z < sz; Z++)
+    for (let Y = 0; Y < sy; Y++)
+      for (let X = 0; X < sx; X++) {
+        const p = atA((X / S) | 0, (Y / S) | 0, (Z / S) | 0);
+        region[at(X, Y, Z)] = A[p];
+        ord[at(X, Y, Z)] = A[p] ? ordA[p] : (1 << 21) + at(X, Y, Z);
+      }
+  if (ts > 0) {
+    const ov = globalThis.SV_SHAPE || {};
+    const R = ov.r ?? SHAPE_BLUR_R, T = ov.T ?? SHAPE_CUT;
+    const B = new Float32Array(sx * sy * sz);
+    for (let i = 0; i < B.length; i++) B[i] = region[i] ? 1 : 0;
+    const Bf = blurBinomial(B, sx, sy, sz, R);
+    const was = region.slice();
+    // Every cell the full rounding changes, most urgent first: an old cell
+    // by how far under the cut its neighbourhood is (the most exposed corner
+    // first), an empty one by how far over (the deepest step first). Mirror
+    // cells tie and go together, so the head stays symmetric at every step.
+    const ch = [];
+    for (let Z = 0; Z < sz; Z++)
+      for (let Y = 0; Y < sy; Y++)
+        for (let X = 0; X < sx; X++) {
+          const i = at(X, Y, Z);
+          const u = B[i] ? T - Bf[i] : Bf[i] - T;
+          if (B[i] ? u > 0 : u > 1e-7)
+            ch.push([Math.round(u * 1e5), Math.min(X, sx - 1 - X), Y, Z, i]);
+        }
+    ch.sort((a, b) => b[0] - a[0] || a[3] - b[3] || a[2] - b[2] || a[1] - b[1]);
+    const n = ts >= 1 ? ch.length : Math.round(ts * ch.length);
+    for (let k = 0; k < ch.length; k++) {
+      // A tie group is taken whole once its first cell is in.
+      if (k >= n && !(k > 0 && ch[k][0] === ch[k - 1][0] && ch[k][1] === ch[k - 1][1] &&
+                      ch[k][2] === ch[k - 1][2] && ch[k][3] === ch[k - 1][3])) break;
+      const i = ch[k][4];
+      if (B[i]) { region[i] = 0; continue; }
+      // A filled step: the old head's commonest part about it.
+      const X = i % sx, Y = Math.floor(i / sx) % sy, Z = Math.floor(i / (sx * sy));
+      const c = [0, 0, 0, 0];
+      for (let dz = -1; dz <= 1; dz++)
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const x = X + dx, y = Y + dy, z = Z + dz;
+            if (inBox(x, y, z)) c[was[at(x, y, z)]]++;
+          }
+      region[i] = c[2] > c[1] && c[2] >= c[3] ? 2 : c[3] > c[1] ? 3 : 1;
+    }
+  }
+
+  // ---- THE CAP: headVox's hair function, asked where each cell asks -------
+  // At shape detail 0 every test below is headVox's own expression at its own
+  // cell (`sc`, `sr` at 0); at 1 the fine lattice's, so the hairline steps in
+  // half rows and the scalp speckle is a cell, not a block, across.
   const skullR = Math.max(...prx.map(k => k[1]));
   const bandHalf = g.hair.band * skullR;
-  const lineAt = (X, Y) => {
-    let line = hBack + (hFront - hBack) * hairT(Y);
+  const hairT = py => clamp((py - (hcy - 4.0 * hy)) / (8.0 * hy), 0.0, 1.0);
+  const lineAt = (px, py) => {
+    let line = hBack + (hFront - hBack) * hairT(py);
+    // THE PARTING tilts the line side to side, weighted toward the FRONT;
+    // THE BAND is how wide a strip across the skull grows hair at all
+    // (headVox's notes on both).
     if (g.hair.side)
-      line += g.hair.side * ((ac(X) - cx) / Math.max(bandHalf, 1)) * 3.0 * hz *
-              hairT(Y);
+      line += g.hair.side * ((px - cx) / Math.max(bandHalf, 1)) * 3.0 * hz * hairT(py);
     return line;
   };
-  // headVox asks "z >= line" of a row's BOTTOM edge; Z / S is the fine row's.
-  const isHair = (X, Y, Z) => {
-    if (Math.floor(Z / S) < skullLo) return false;
-    if (Math.abs(ac(X) - cx) > bandHalf) return false;
-    return Z / S >= lineAt(X, Y);
-  };
+  // SCALP SHOWING THROUGH (headVox's scalpShows): a hashed speckle whose
+  // density falls off with distance from the thin region. The hash is the
+  // block's at 0 and the cell's own at 1.
   const hg = g.hair;
   const thinCap = hg.hairlineSoft > 0 || hg.topThin > 0 || hg.sideThin > 0;
-  const scalpShows = (X, Y, Z) => {
-    const axd = Math.abs(ac(X) - cx) / Math.max(skullR, 1);
+  const scalpShows = (X, Y, Z, px, py, zc, zr) => {
+    const axd = Math.abs(px - cx) / Math.max(skullR, 1);
     let p = 0;
     if (hg.hairlineSoft > 0) {
-      const dz = ac(Z) - lineAt(X, Y);
+      const dz = zc - lineAt(px, py);
       p = Math.max(p, hg.hairlineSoft * 0.85 * clamp(1 - dz / (3.5 * hz), 0, 1));
-      if (Math.abs(ac(X) - cx) > bandHalf - 1.5)
-        p = Math.max(p, hg.hairlineSoft * 0.5);
+      if (Math.abs(px - cx) > bandHalf - 1.5) p = Math.max(p, hg.hairlineSoft * 0.5);
     }
     if (hg.topThin > 0) {
-      const u = clamp((ac(Z) - az * 0.62) / (az * 0.38), 0, 1);
+      const u = clamp((zc - az * 0.62) / (az * 0.38), 0, 1);
       p = Math.max(p, hg.topThin * 0.75 * u * (1 - 0.5 * clamp(axd, 0, 1)));
     }
     if (hg.sideThin > 0) {
-      const w = clamp((axd - 0.55) / 0.4, 0, 1) * (Z / S < az * 0.8 ? 1 : 0.4);
+      const w = clamp((axd - 0.55) / 0.4, 0, 1) * (zr < az * 0.8 ? 1 : 0.4);
       p = Math.max(p, hg.sideThin * 0.6 * w);
     }
-    return p > 0 && hashN(X - HX, Y - HY, Z, 71) / 4294967296 < p;
+    if (!(p > 0)) return false;
+    return lerp(rnd01((X / S) | 0, (Y / S) | 0, (Z / S) | 0, 71),
+                rnd01(X - HX, Y - HY, Z, 71), ts) < p;
   };
-
-  // ---- the skull ------------------------------------------------------------
-  for (let Z = 0; Z < sz; Z++) {
-    let rx, ry;
-    if (Math.floor(Z / S) <= neckTop) { rx = neckR; ry = neckR; }
-    else {
-      // headVox's u at THIS cell's height: its rows sit at z, these at
-      // z - 0.25 and z + 0.25, so the radius steps twice as often.
-      const u = (ac(Z) - 0.5 - skullLo) / Math.max(az - 1 - skullLo, 1);
-      rx = profX(u, prx); ry = profX(u, pry);
-    }
+  for (let Z = 0; Z < sz; Z++)
     for (let Y = 0; Y < sy; Y++)
       for (let X = 0; X < sx; X++) {
-        if (!inEllipse(X, Y, rx, ry)) continue;
-        const back = ac(Y) < hcy - 1.5;
-        let c;
-        if (isHair(X, Y, Z)) {
-          c = thinCap && scalpShows(X, Y, Z) ? ART.SKIN_LIGHT
-            : back ? ART.HAIR_SHADE : ART.HAIR;
-          capK.add(at(X, Y, Z));
-        } else c = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
-        col[at(X, Y, Z)] = c;
+        const i = at(X, Y, Z), r = region[i];
+        if (!r) continue;
+        if (r >= 2) { col[i] = ART.HAIR_SHADE; capK.add(i); continue; }
+        const px = sc(X, ts), py = sc(Y, ts), zc = sc(Z, ts), zr = sr(Z, ts);
+        const back = py < hcy - 1.5;
+        if (Math.floor(Z / S) >= skullLo && Math.abs(px - cx) <= bandHalf &&
+            zr >= lineAt(px, py)) {
+          col[i] = thinCap && scalpShows(X, Y, Z, px, py, zc, zr) ? ART.SKIN_LIGHT
+                 : back ? ART.HAIR_SHADE : ART.HAIR;
+          capK.add(i);
+        } else col[i] = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
         // The skull's extent over its upper three quarters, the frame the
         // hair mass is grown in -- the skull alone, before any ear or nose.
-        if (Z >= sz * 0.25) {
+        if (zr >= az * 0.25) {
           sk0[0] = Math.min(sk0[0], X); sk1[0] = Math.max(sk1[0], X);
           sk0[1] = Math.min(sk0[1], Y); sk1[1] = Math.max(sk1[1], Y);
           sk0[2] = Math.min(sk0[2], Z); sk1[2] = Math.max(sk1[2], Z);
         }
       }
-  }
-
-  // A MANE, headVox's: the skull's base ellipse continued down the nape, back
-  // half only. The same ellipse as the skull's lowest rows, so every mane cell
-  // has skull or mane straight above it -- connected by construction.
-  if (g.hair.length > 0 && hBack < az) {
-    const lz = g.hair.length * hz;
-    const rx = profile(0.0, prx), ry = profile(0.0, pry);
-    const Z0 = Math.max(0, Math.round((skullLo - lz) * S));
-    for (let Z = Z0; Z < skullLo * S; Z++)
-      for (let Y = 0; Y < sy; Y++)
-        for (let X = 0; X < sx; X++) {
-          if (!inEllipse(X, Y, rx, ry)) continue;
-          if (ac(Y) >= hcy - 1.0) continue;
-          if (add(X, Y, Z, ART.HAIR_SHADE)) capK.add(at(X, Y, Z));
-        }
-  }
-  // A TOPKNOT, headVox's: grown back off the back-most cell of each column
-  // near the crown (front is HIGH y in this frame, until the flip at the end).
-  if (g.hair.knot) {
-    const kd = Math.max(1, Math.round(2 * hy)) * S;
-    const x0 = (Math.floor(cx) - 1) * S, x1 = (Math.floor(cx) + 1) * S;
-    for (let X = x0; X < x1; X++)
-      for (let Z = sz - Math.max(2, Math.round(3 * hz)) * S; Z < sz; Z++) {
-        let backY = -1;
-        for (let Y = 0; Y < sy; Y++) if (get(X, Y, Z)) { backY = Y; break; }
-        if (backY <= 0) continue;
-        for (let d = 1; d <= kd && backY - d >= 0; d++)
-          if (add(X, backY - d, Z, ART.HAIR_SHADE)) capK.add(at(X, backY - d, Z));
-      }
-  }
-
-  const f = g.face;
-  const CX = sx / 2;                 // the midline, between columns CX-1 and CX
-  const mirror = X => sx - 1 - X;
-  const Ze = Math.round(S * eyeA);   // the eye's lower row: headVox's eye row's bottom
-  const sround = v => Math.sign(v) * Math.floor(Math.abs(v) + 0.5);
-  const rnd01 = (...v) => hashN(...v) / 4294967296;
-  const keyOf = (X, Y, Z) => at(X, Y, Z);
-  const earSet = new Set(), noseSet = new Set();
-
-  // ---- EARS: a rim and a hollow -------------------------------------------
-  // headVox's ear is one cell proud of the widest filled column over a band
-  // one authored cell deep. Here it is the same placement, a shipped cell
-  // deeper and in half rows: the rim (top, back edge, lobe) in the skin, the
-  // bowl inside it shaded, a lobe that narrows at the bottom and a helix that
-  // curls back at the top. Placed per (Y, Z) against the skull's own outermost
-  // cell, so a narrow skull's ear still touches it.
-  const earYA = pyRound(hcy) - 1;
-  // THE BAND, front to back: 2..4 cells (earWidth; 3, headVox's cell and one
-  // in front, at the default), set back or forward (earBack, whole cells;
-  // back is LOW y in this frame).
-  const earCells = 2 + Math.round(2 * f.earWidth);
-  const eY0 = earYA * S - 1 - Math.round(S * f.earBack);
-  const eY1 = eY0 + earCells - 1;                           // back .. front
-  const earTop = Math.floor(S * (eyeA + 1)) - 1 + Math.round(S * f.earHeight);
-  const earH = Math.max(2, Math.round(S * (1 + f.earSize)));
-  const earBot = earTop - earH + 1;
-  // THE TILT leans the top half back (+) or forward (-) a cell.
-  const eTilt = f.earTilt >= 0.35 ? 1 : f.earTilt <= -0.35 ? -1 : 0;
-  // THE LOBE: attached (the bottom row is its front cell only), as drawn
-  // (the middle of the band), or hanging a row lower.
-  const lobeHang = f.earLobe >= 0.75;
-  const zLow = earBot - (lobeHang ? 1 : 0);
-  const stickOut = f.earOut;
-  const earTips = [[], []];                                 // per side: [X, Y, Z]
-  for (let Z = zLow; Z <= earTop; Z++) {
-    if (Z < 0 || Z >= sz) continue;
-    const sh = eTilt && Z > earBot + earH / 2 ? -eTilt : 0;
-    const yLo = eY0 + sh, yHi = eY1 + sh;
-    const lobeRow = Z === zLow && earH >= 3;
-    for (let Y = Math.max(0, yLo); Y <= Math.min(sy - 1, yHi); Y++) {
-      // The lobe is the middle of the band (or its front, attached); the
-      // top row curls back.
-      if (lobeRow) {
-        if (f.earLobe < 0.25 && !lobeHang) { if (Y !== yHi) continue; }
-        else if (Y === yLo || (lobeHang && Y === yHi && earCells >= 3)) continue;
-      }
-      if (Z === earTop && earH >= 3 && Y === yHi) continue;
-      let lo = -1, hi = -1;
-      for (let X = 0; X < sx; X++) if (get(X, Y, Z)) { if (lo < 0) lo = X; hi = X; }
-      if (lo < 0) continue;
-      const rim = Z === earTop || Z === zLow || Y === yLo || Y === yHi;
-      const c = rim ? ART.SKIN_SHADE : ART.EAR_IN;
-      for (const [X, side] of [[lo - 1, 0], [hi + 1, 1]]) {
-        if (!add(X, Y, Z, c)) continue;
-        earSet.add(keyOf(X, Y, Z));
-        if (Z === earTop) earTips[side].push([X, Y, Z]);
-        // STICK-OUT: from 0.4 the back rim stands a second cell out, from
-        // 0.8 all of the ear but its front column.
-        const mid = Z > zLow && Z < earTop;
-        if (mid && ((stickOut >= 0.4 && Y === yLo) || (stickOut >= 0.8 && Y < yHi))) {
-          const X2 = side === 0 ? X - 1 : X + 1;
-          if (add(X2, Y, Z, rim ? ART.SKIN_SHADE : ART.EAR_IN))
-            earSet.add(keyOf(X2, Y, Z));
-        }
-      }
-    }
-  }
-  // AN ELF POINT: up off the back of each ear's top, 2..6 cells
-  // (earPointLen), sweeping back a cell every third.
-  if (f.earPoint) {
-    const n = 2 + Math.round(4 * f.earPointLen);
-    for (const tips of earTips) {
-      if (!tips.length) continue;
-      const [X, Y0, Z0] = tips.reduce((a, b) => (b[1] < a[1] ? b : a));
-      let Y = Y0;
-      for (let d = 1; d <= n; d++) {
-        if (d % 3 === 0 && Y - 1 >= 0) {
-          if (!add(X, Y - 1, Z0 + d - 1, ART.SKIN_SHADE)) break;
-          earSet.add(keyOf(X, Y - 1, Z0 + d - 1));
-          Y -= 1;
-        }
-        if (!add(X, Y, Z0 + d, ART.SKIN_SHADE)) break;
-        earSet.add(keyOf(X, Y, Z0 + d));
-      }
-    }
-  }
 
   // ---- the face's paint helpers --------------------------------------------
+  const CX = sx / 2;                 // the midline, between columns CX-1 and CX
+  const mirror = X => sx - 1 - X;
+  const keyOf = (X, Y, Z) => at(X, Y, Z);
+  const earSet = new Set(), noseSet = new Set();
   // The FRONTMOST filled cell of column (X, Z) -- front is HIGH y here.
   const frontY = (X, Z) => {
     if (X < 0 || X >= sx || Z < 0 || Z >= sz) return -1;
     for (let Y = sy - 1; Y >= 0; Y--) if (col[at(X, Y, Z)]) return Y;
     return -1;
   };
-  // Paint the front of (X, Z). `skinOnly` leaves hair, eyes and beard alone.
-  const paintAt = (X, Z, c, skinOnly) => {
+  // Paint the front of (X, Z), `deep` cells of it (an OLD-style mark is a
+  // whole authored cell, so two). `skinOnly` leaves hair, eyes and beard
+  // alone: it asks the front cell, and a cell it does not paint stops it.
+  const paintAt = (X, Z, c, skinOnly, deep = 1) => {
     const Y = frontY(X, Z);
     if (Y < 0) return false;
-    const k = at(X, Y, Z);
-    if (skinOnly && !FINE_SKIN.has(col[k])) return false;
-    col[k] = c;
-    return true;
-  };
-  // Stand a cell one proud of the front of (X, Z).
-  const proud = (X, Z, c) => {
-    const Y = frontY(X, Z);
-    if (Y < 0 || Y + 1 >= sy || col[at(X, Y + 1, Z)]) return false;
-    col[at(X, Y + 1, Z)] = c;
-    noseSet.add(at(X, Y + 1, Z));
+    if (skinOnly && !FINE_SKIN.has(col[at(X, Y, Z)])) return false;
+    for (let k = 0; k < deep && Y - k >= 0 && col[at(X, Y - k, Z)]; k++)
+      col[at(X, Y - k, Z)] = c;
     return true;
   };
   // Both sides at once: `fn(X)` for the LEFT feature and its mirror.
   const both = (X, fn) => { fn(X); fn(mirror(X)); };
+  // THE OLD HEAD'S OWN PAINT, on this lattice: one AUTHORED cell (x, z) is a
+  // block of S x S columns, each painted S deep -- at shape detail 0 exactly
+  // the 2x2x2 block headVox's paintAt repainted. Bounds are the authored box.
+  const paintL = (x, z, c, skinOnly) => {
+    if (x < 0 || x >= ax || z < 0 || z >= az) return false;
+    let any = false;
+    for (let dz = 0; dz < S; dz++)
+      for (let dx = 0; dx < S; dx++)
+        if (paintAt(S * x + dx, S * z + dz, c, skinOnly, S)) any = true;
+    return any;
+  };
+  // ...and headVox's `proud`: an authored cell (S x S x S here) one proud of
+  // the front, where the box has room. Returns whether it stood.
+  const proudL = (x, z, c, set) => {
+    if (x < 0 || x >= ax || z < 0 || z >= az) return false;
+    let any = false;
+    const o = newBlock();
+    for (let dz = 0; dz < S; dz++)
+      for (let dx = 0; dx < S; dx++) {
+        const X = S * x + dx, Z = S * z + dz, Y = frontY(X, Z);
+        if (Y < 0 || Y + S >= sy) continue;
+        for (let k = 1; k <= S; k++)
+          if (add(X, Y + k, Z, c, o)) { set.add(at(X, Y + k, Z)); any = true; }
+      }
+    return any;
+  };
+
+  // ---- THE EARS (D.ears) ----------------------------------------------------
+  // headVox's ear is an authored cell proud of the widest filled column at the
+  // ear row, one to three rows tall, all in the shade; the fine ear is a rim
+  // round a shaded hollow, a cell proud, its band, height, lobe and curl its
+  // own rows. Between: the band, the rows and the stand-off slide from the
+  // block's to the fine ear's, the lobe and the curl arrive at a half, and
+  // the hollow's shade slides from the rim's (detailColors).
+  const de = D.ears;
+  const earYA = pyRound(hcy) - 1;                 // headVox's earY
+  // headVox's rows and band, on this lattice.
+  const earRowsL = fl.earSize <= 0 ? [eyeZ]
+                 : fl.earSize >= 2 ? [eyeZ - 2, eyeZ - 1, eyeZ] : [eyeZ - 1, eyeZ];
+  // The fine ear's (eyeA: the eye row the fine eye is drawn at).
+  const earCells = 2 + Math.round(2 * f.earWidth);
+  const eY0F = earYA * S - 1 - Math.round(S * f.earBack);
+  const eY1F = eY0F + earCells - 1;                         // back .. front
+  const earTopF = Math.floor(S * (eyeA + 1)) - 1 + Math.round(S * f.earHeight);
+  const earHF = Math.max(2, Math.round(S * (1 + f.earSize)));
+  const earBotF = earTopF - earHF + 1;
+  const lobeHang = f.earLobe >= 0.75 && de >= 0.5;
+  const zLowF = earBotF - (lobeHang ? 1 : 0);
+  const earTips = [[], []];                                 // per side: [X, Y, Z]
+  if (de <= 0) {
+    // THE OLD EAR, cell for cell: per shipped row of each authored ear row, an
+    // authored cell's worth (S) out from the widest filled column there.
+    const earTopL = [];
+    for (const z of earRowsL) {
+      if (z < 0) continue;
+      const oL = newBlock(), oR = newBlock();
+      for (let dz = 0; dz < S; dz++)
+        for (let dy = 0; dy < S; dy++) {
+          const Y = S * earYA + dy, Z = S * z + dz;
+          if (Y < 0 || Y >= sy || Z >= sz) continue;
+          let lo = -1, hi = -1;
+          for (let X = 0; X < sx; X++) if (get(X, Y, Z)) { if (lo < 0) lo = X; hi = X; }
+          if (lo < 0) continue;                  // no skull on this row: no ears
+          if (lo - S >= 0)
+            for (let k = 1; k <= S; k++)
+              if (add(lo - k, Y, Z, ART.SKIN_SHADE, oL)) earSet.add(at(lo - k, Y, Z));
+          if (hi + S < sx)
+            for (let k = 1; k <= S; k++)
+              if (add(hi + k, Y, Z, ART.SKIN_SHADE, oR)) earSet.add(at(hi + k, Y, Z));
+          if (lo - S >= 0) earTopL[0] = Z;
+          if (hi + S < sx) earTopL[1] = Z;
+        }
+    }
+    // AN ELF POINT: two authored cells straight up off the top of each ear,
+    // only where the skull left the space empty.
+    if (f.earPoint) {
+      const oP = [[newBlock(), newBlock()], [newBlock(), newBlock()]];
+      for (const k of [...earSet]) {
+        const X = k % sx, Y = Math.floor(k / sx) % sy, Z = Math.floor(k / (sx * sy));
+        const side = X < CX ? 0 : 1;
+        if (earTopL[side] === undefined || Z !== earTopL[side]) continue;
+        for (let dz = 1; dz <= 2 * S; dz++) {
+          if (!add(X, Y, Z + dz, ART.SKIN_SHADE, oP[side][dz > S ? 1 : 0])) break;
+          earSet.add(at(X, Y, Z + dz));
+        }
+      }
+    }
+  } else {
+    // THE FINE EAR, its band, rows and stand-off slid from the old one's.
+    const eY0 = Math.round(lerp(S * earYA, eY0F, de));
+    const eY1 = Math.round(lerp(S * earYA + S - 1, eY1F, de));
+    const zLo = Math.round(lerp(S * Math.min(...earRowsL), zLowF, de));
+    const earTop = Math.round(lerp(S * Math.max(...earRowsL) + S - 1, earTopF, de));
+    const fine = de >= 0.5;                       // the lobe, the curl, the tilt
+    const earH = earTop - zLo + 1 - (lobeHang ? 1 : 0);
+    const earBot = earTop - earH + 1;
+    const eTilt = !fine ? 0 : f.earTilt >= 0.35 ? 1 : f.earTilt <= -0.35 ? -1 : 0;
+    // How far out: an authored cell's worth at 0, one cell at 1 -- and the
+    // fine ear's stick-out (from 0.4 its back rim stands a second cell out,
+    // from 0.8 all of the ear but its front column).
+    const outAt = (Y, yLo, yHi, mid) => {
+      const so = mid && ((f.earOut >= 0.4 && Y === yLo) ||
+                         (f.earOut >= 0.8 && Y < yHi)) ? 2 : 1;
+      return Math.max(1, Math.round(lerp(S, so, de)));
+    };
+    for (let Z = zLo; Z <= earTop; Z++) {
+      if (Z < 0 || Z >= sz) continue;
+      const sh = eTilt && Z > earBot + earH / 2 ? -eTilt : 0;
+      const yLo = eY0 + sh, yHi = eY1 + sh;
+      const lobeRow = fine && Z === zLo && earH >= 3;
+      for (let Y = Math.max(0, yLo); Y <= Math.min(sy - 1, yHi); Y++) {
+        // The lobe is the middle of the band (or its front, attached); the
+        // top row curls back.
+        if (lobeRow) {
+          if (f.earLobe < 0.25 && !lobeHang) { if (Y !== yHi) continue; }
+          else if (Y === yLo || (lobeHang && Y === yHi && eY1 - eY0 >= 2)) continue;
+        }
+        if (fine && Z === earTop && earH >= 3 && Y === yHi) continue;
+        let lo = -1, hi = -1;
+        for (let X = 0; X < sx; X++) if (get(X, Y, Z)) { if (lo < 0) lo = X; hi = X; }
+        if (lo < 0) continue;
+        const rim = Z === earTop || Z === zLo || Y === yLo || Y === yHi;
+        const c = rim ? ART.SKIN_SHADE : ART.EAR_IN;
+        const out = outAt(Y, yLo, yHi, Z > zLo && Z < earTop);
+        for (const [X0, side, dir] of [[lo - 1, 0, -1], [hi + 1, 1, 1]])
+          for (let k = 0; k < out; k++) {
+            const X = X0 + dir * k;
+            if (!add(X, Y, Z, c)) break;
+            earSet.add(keyOf(X, Y, Z));
+            if (Z === earTop) earTips[side].push([X, Y, Z]);
+          }
+      }
+    }
+    // AN ELF POINT: up off the back of each ear's top, 2..6 cells
+    // (earPointLen), sweeping back a cell every third -- from an authored
+    // pair of rows at 0.
+    if (f.earPoint) {
+      const n = Math.round(lerp(2 * S, 2 + Math.round(4 * f.earPointLen), de));
+      for (const tips of earTips) {
+        if (!tips.length) continue;
+        const pts = fine ? [tips.reduce((a, b) => (b[1] < a[1] ? b : a))] : tips;
+        for (const [X, Y0, Z0] of pts) {
+          let Y = Y0;
+          for (let d = 1; d <= n; d++) {
+            if (fine && d % 3 === 0 && Y - 1 >= 0) {
+              if (!add(X, Y - 1, Z0 + d - 1, ART.SKIN_SHADE)) break;
+              earSet.add(keyOf(X, Y - 1, Z0 + d - 1));
+              Y -= 1;
+            }
+            if (!add(X, Y, Z0 + d, ART.SKIN_SHADE)) break;
+            earSet.add(keyOf(X, Y, Z0 + d));
+          }
+        }
+      }
+    }
+  }
 
   // ---- THE EYES' columns (painted later, placed now: everything keys off them)
-  // The eye's WIDTH comes from the size gene (3, 4, 5 cells), plus a white at
-  // the outer corner for `eyeWhites` (to five); the IRIS is a share of the
-  // size's width (irisSize), centred on headVox's eye centre cx -+ eyeDx; the
-  // whites split round it, one inside, the rest out. Computed for the LEFT
-  // eye (low X) and mirrored, so the face is symmetric to the cell.
+  // THE OLD EYE: `eyeCols` authored columns from the one the eye's centre
+  // falls in, inward (headVox; its right eye is not quite the left's mirror,
+  // and at detail 0 it is drawn as headVox drew it).
   const eyeDxA = f.eyeDx * (ax / DEF.head.size[0]);
-  const Wbase = f.eyeCols >= 2 ? 5 : f.eyeCols >= 1.5 ? 4 : 3;
+  const eyeColsL = new Set();
+  for (let k = 0; k < fl.eyeCols; k++) {
+    eyeColsL.add(Math.trunc(cx - eyeDxA) + k);
+    eyeColsL.add(Math.trunc(cx + eyeDxA) - k);
+  }
+  // Per side: dir is the way OUT (toward the ear); outer/inner are the eye's
+  // outermost and innermost columns.
+  const eyeSides = [-1, 1].map(dir => {
+    const E = [...eyeColsL].filter(c => (dir < 0 ? c < cx : c >= cx));
+    if (!E.length) return null;
+    const outer = dir < 0 ? Math.min(...E) : Math.max(...E);
+    const inner = dir < 0 ? Math.max(...E) : Math.min(...E);
+    return { dir, outer, inner, E };
+  }).filter(Boolean);
+  // THE FINE EYE, drawn with its rows at the eyes' detail (eyeGenes). The
+  // eye's WIDTH comes from the size gene (3, 4, 5 cells), plus a white at the
+  // outer corner for `eyeWhites` (to five); the IRIS is a share of the
+  // size's width (irisSize); the whites split round it, one inside, the rest
+  // out. Computed for the LEFT eye (low X) and mirrored, so the face is
+  // symmetric to the cell.
+  const Ze = Math.round(S * eyeA);   // the eye's lower row
+  const Wbase = fe.eyeCols >= 2 ? 5 : fe.eyeCols >= 1.5 ? 4 : 3;
   const W = Math.min(5, Wbase + (f.eyeWhites ? 1 : 0));
-  const iw = clamp(Math.round(Wbase * (0.2 + 0.6 * f.irisSize)), 1, W);
+  const iw = clamp(Math.round(Wbase * (0.2 + 0.6 * fe.irisSize)), 1, W);
   const wIn = Math.min(1, W - iw), wOut = W - iw - wIn;
-  let i0 = Math.round(S * (cx - eyeDxA) - iw / 2);
+  // WHERE: the fine iris is centred on headVox's eye centre cx -+ eyeDx; the
+  // old one ran inward from the authored column that centre falls in. Slid
+  // between, so the old point's iris is the old eye's columns.
+  let i0 = Math.round(lerp(S * Math.trunc(cx - eyeDxA), S * (cx - eyeDxA) - iw / 2,
+                           D.eyes));
   // Keep the inner corner clear of the midline by a cell (the bridge of the
   // nose), and the outer corner inside the box.
   i0 -= Math.max(0, (i0 + iw + wIn - 1) - (CX - 2));
   i0 += Math.max(0, wOut - i0);
   const eOut = i0 - wOut, eIn = i0 + iw + wIn - 1;         // outer, inner columns
   const isIris = X => X >= i0 && X < i0 + iw;
-  const eyeRows = f.eyeOpen >= 0.7 ? 2 : 1;
-  const tilt = f.eyeTilt >= 0.35 ? 1 : f.eyeTilt <= -0.35 ? -1 : 0;
+  const eyeRows = fe.eyeOpen >= 0.7 ? 2 : 1;
+  const tilt = fe.eyeTilt >= 0.35 ? 1 : fe.eyeTilt <= -0.35 ? -1 : 0;
   const dzOf = X => (X === eOut ? tilt : 0);                // the outer corner tilts
   // A round eye's END columns stay one row: the corners of a 2-row eye are
   // skin. Only a WHITE corner: an iris that reaches the corner keeps its rows.
@@ -4495,111 +4888,218 @@ function headVoxFine(g, artSize, ctx) {
   const lashRow = X => Ze + rowsOf(X) + dzOf(X);
   const lashTop = Ze + eyeRows + Math.max(0, tilt);
 
-  // ---- the mouth's row and columns (painted later) --------------------------
-  const mzA = eyeA - f.mouthDrop;                     // headVox's mouth row
+  // ---- the mouth's rows and columns (painted later) -------------------------
+  // The OLD mouth: `mouthWidth` authored cells on the row `mouthDrop` under
+  // the old eye row. The FINE one: a line `2 * mouthWidth` cells long on the
+  // upper of that row's two shipped rows, under the fine eye row.
+  const mz = eyeZ - fl.mouthDrop;
+  const mw = fl.mouthWidth;
+  const mcolsL = [];
+  for (let k = 0; k < mw; k++)
+    mcolsL.push(Math.trunc(cx) - 1 + k - ((mw - 2) >> 1) + fl.mouthShift);
+  const curveUp = Math.sign(f.mouthCurve);
+  const moffL = mcolsL.map((_, n) => {
+    const t = mw > 1 ? n / (mw - 1) : 0.5;
+    let off = mw > 1 ? sround(Math.abs(f.mouthSkew) *
+                              (f.mouthSkew > 0 ? t : 1 - t)) : 0;
+    if (Math.abs(f.mouthCurve) >= 0.7 && mw >= 3 && (n === 0 || n === mw - 1))
+      off += curveUp;
+    return off;
+  });
+  const mzA = eyeA - f.mouthDrop;                     // headVox's mouth row, fine
   const Zm = Math.round(S * mzA) + 1;                 // the line: its upper half
   const MC = CX + Math.round(S * f.mouthShift);       // between MC-1 and MC
   const mHalf = Math.max(1, Math.floor(f.mouthWidth + 1e-9));
   const softCorners = f.mouthWidth - mHalf >= 0.5 - 1e-9;
 
-  // ---- THE NOSE: a bridge, a tip and nostrils -------------------------------
-  // Rows count down from just under the eye line, headVox's band; the nose
-  // stops two rows above the mouth line so the upper lip has a row of its own.
-  // The room is there: headVox's face sits one AUTHORED cell short of the
-  // box's front, which is two shipped cells -- a bridge one cell proud and a
-  // tip two.
+  // ---- THE NOSE (D.nose) ------------------------------------------------------
+  // THE OLD NOSE: `nose` authored rows under the eye row, `2 * noseWidth`
+  // authored columns across, one authored cell proud, its lowest row the lit
+  // tip. THE FINE NOSE: a bridge, a tip and nostrils on a STRAIGHT PROFILE --
+  // every cell filled out to a fixed depth, one past the face at the eye row
+  // (its most forward point) for the bridge and the wings, two for a bulb --
+  // rather than "one proud of whatever is there": the face falls away below
+  // the eyes, so a nose that followed it would be a ridge of bumps. It stops
+  // two rows above the mouth line so the upper lip has a row of its own.
+  // BETWEEN, each column's FRONT slides from the old nose's to the fine one's.
+  const dn = D.nose;
+  const noseRowsL = Math.min(fl.nose, fl.mouthDrop - 1);
+  const noseColsL = [];
+  for (let k = 0; k < 2 * fl.noseWidth; k++)
+    noseColsL.push(Math.trunc(cx) - fl.noseWidth + k);
   const nL = Math.max(0, Math.min(Math.round(S * f.nose), Ze - Zm - 2));
   const tipHalf = f.noseWidth >= 2 ? 2 : 1;             // cells each side of CX
   const tipLow = Ze - nL;                               // the tip's lowest row
   const tipRows = nL >= 2 ? 2 : nL;
-  if (nL > 0) {
-    // A STRAIGHT PROFILE. Every nose cell is filled out to a fixed depth --
-    // one past the face at the eye row (its most forward point) for the
-    // bridge and the wings, two for a bulb -- rather than "one proud of
-    // whatever is there": the face falls away below the eyes, so a nose that
-    // followed it would be a ridge of bumps; one that holds its line projects
-    // further the lower it gets, which is what a nose does.
-    const yRef = Math.max(frontY(CX - 1, Ze), frontY(CX, Ze));
-    const yMax = sy - 1;
-    const fill = (X, Z, Yt) => {
-      const y0 = frontY(X, Z);
-      if (y0 < 0) return;
-      for (let Y = y0 + 1; Y <= Math.min(Yt, yMax); Y++)
-        if (add(X, Y, Z, ART.SKIN_BASE)) noseSet.add(at(X, Y, Z));
+  if (dn <= 0) {
+    for (let r = 1; r <= noseRowsL; r++)
+      for (const x of noseColsL)
+        proudL(x, eyeZ - r, r === noseRowsL ? ART.FACE_LIGHT : ART.SKIN_BASE, noseSet);
+  } else {
+    // Each nose's front per column, against the face as it stands now.
+    const front = new Map();                     // X*4096+Z -> [old, fine]
+    const want = (X, Z, i, Y) => {
+      const k = X * 4096 + Z;
+      if (!front.has(k)) front.set(k, [null, null]);
+      const v = front.get(k);
+      v[i] = v[i] === null ? Y : Math.max(v[i], Y);
     };
-    // The bridge, two cells wide, from between the eyes (or, on a lower
-    // bridge, from under them) down to the tip.
-    if (f.noseBridge >= 0.3) {
-      const zTop = f.noseBridge >= 0.7 ? Ze + 1 : Ze - 1;
-      for (let Z = tipLow + tipRows; Z <= zTop; Z++)
-        both(CX - 1, X => fill(X, Z, yRef + 1));
+    for (let r = 1; r <= noseRowsL; r++)
+      for (const x of noseColsL)
+        for (let dz = 0; dz < S; dz++)
+          for (let dx = 0; dx < S; dx++) {
+            const X = S * x + dx, Z = S * (eyeZ - r) + dz, Y = frontY(X, Z);
+            if (Y >= 0 && Y + S < sy) want(X, Z, 0, Y + S);
+          }
+    if (nL > 0) {
+      const yRef = Math.max(frontY(CX - 1, Ze), frontY(CX, Ze));
+      // The bridge, two cells wide, from between the eyes (or, on a lower
+      // bridge, from under them) down to the tip.
+      if (f.noseBridge >= 0.3) {
+        const zTop = f.noseBridge >= 0.7 ? Ze + 1 : Ze - 1;
+        for (let Z = tipLow + tipRows; Z <= zTop; Z++)
+          both(CX - 1, X => want(X, Z, 1, yRef + 1));
+      }
+      // The tip: two rows, wider at the bottom on a broad nose (the wings),
+      // and a second cell out at its centre -- the bulb -- unless it is flat.
+      const bulb = f.noseBulb >= 0.4 && tipRows >= 2;
+      for (let r = 0; r < tipRows; r++) {
+        const Z = tipLow + r;
+        const half = r === 0 && (f.noseWidth >= 1.5 || f.noseBulb >= 0.8)
+          ? Math.max(tipHalf, 2) : tipHalf;
+        for (let k = 1; k <= half; k++)
+          both(CX - k, X => want(X, Z, 1, yRef + (bulb && r === 1 && k === 1 ? 2 : 1)));
+      }
     }
-    // The tip: two rows, wider at the bottom on a broad nose (the wings), and
-    // a second cell out at its centre -- the bulb -- unless it is flat.
-    const bulb = f.noseBulb >= 0.4 && tipRows >= 2;
-    for (let r = 0; r < tipRows; r++) {
-      const Z = tipLow + r;
-      const half = r === 0 && (f.noseWidth >= 1.5 || f.noseBulb >= 0.8)
-        ? Math.max(tipHalf, 2) : tipHalf;
-      for (let k = 1; k <= half; k++)
-        both(CX - k, X => fill(X, Z, yRef + (bulb && r === 1 && k === 1 ? 2 : 1)));
+    const litZ0 = S * (eyeZ - noseRowsL), litZ1 = litZ0 + S - 1;
+    for (const [k, [yo, yf]] of front) {
+      const X = Math.floor(k / 4096), Z = k % 4096;
+      const base = frontY(X, Z);
+      if (base < 0) continue;
+      const yt = Math.min(sy - 1, Math.round(lerp(yo ?? base, yf ?? base, dn)));
+      // Below a half the old tip's row is still lit, as the old nose's was.
+      const c = dn < 0.5 && noseRowsL > 0 && Z >= litZ0 && Z <= litZ1
+        ? ART.FACE_LIGHT : ART.SKIN_BASE;
+      for (let Y = base + 1; Y <= yt; Y++) if (add(X, Y, Z, c)) noseSet.add(at(X, Y, Z));
     }
   }
 
   // ---- eyebrow cells: computed now (the ridge is geometry), painted last ----
-  const browCells = [];                                 // [X, Z]
-  // Two rows a step -- headVox's own thickness, so every half step is a row --
-  // with the tail a row thinner (below).
+  // THE OLD BROW: whole authored rows over the eye, outer end to inner end;
+  // THE FINE BROW: two rows a step with a tail a row thinner, a shipped row
+  // lower than headVox's (there, it sits on the hairline of most stock styles
+  // and is painted into the cap). BETWEEN, per column, its rows and its two
+  // ends slide from the old brow's to the fine one's (D.brows).
+  const db = D.brows;
+  const browCells = [];                                 // [X, Z, lowestRow]
   const browTR = Math.max(1, Math.round(S * f.browThick));
-  // A shipped row lower than headVox's brow (eye row + 2 authored): there, it
-  // sits on the hairline of most stock styles and is painted into the cap.
-  // The fine eye is one row plus its lashes, so one row of gap (the crease's)
-  // is enough above it.
-  const browZ0 = Math.max(lashTop + 1 + (f.lidCrease >= 0.2 ? 1 : 0),
+  const browZ0 = Math.max(lashTop + 1 + (fe.lidCrease >= 0.2 ? 1 : 0),
                           Ze + Math.round(S * (1.5 + f.browHeight)));
-  if (f.brow) {
-    // Outer end to inner end. The inner reach is not clamped at the eye: three
-    // cells of it meets its mirror at the midline, the unibrow.
+  // The old brow, per side, as [authored column, its bottom row, its rows].
+  const oldBrow = s => {
+    const base = eyeZ + 2 + fl.browHeight;
+    // Outer to inner. The inner reach is NOT clamped at the midline: brows
+    // meeting in the middle is the unibrow the slider promises.
+    const cols = [];
+    for (let c = s.outer + s.dir * fl.browOuter; ; c -= s.dir) {
+      cols.push(c);
+      if (c === s.inner - s.dir * fl.browInner) break;
+    }
+    return cols.map((x, n) => {
+      const t = cols.length > 1 ? n / (cols.length - 1) : 0.5;
+      const off = sround(f.browTilt * t * 1.5) +
+                  sround(f.browArch * (1 - Math.abs(2 * t - 1)) * 1.5);
+      const z0 = Math.min(az - 1, Math.max(eyeZ + 1, base + off));
+      return [x, z0, Math.min(fl.browThick, az - z0)];
+    });
+  };
+  if (f.brow && db <= 0) {
+    for (const s of eyeSides)
+      for (const [x, z0, n] of oldBrow(s))
+        for (let r = 0; r < n; r++) browCells.push([x, z0 + r, r === 0, true]);
+    if (f.browProud)
+      for (const [x, z, low] of browCells) if (low) proudL(x, z, ART.SKIN_BASE, noseSet);
+  } else if (f.brow) {
+    // The left brow, both ways, as bands over shipped columns.
+    const sL = eyeSides.find(s => s.dir < 0);
+    const bandL = new Map();
+    if (sL)
+      for (const [x, z0, n] of oldBrow(sL))
+        for (let dx = 0; dx < S; dx++)
+          bandL.set(S * x + dx, [S * z0, Math.min(sz - 1, S * (z0 + n) - 1)]);
     const xOut = eOut - Math.round(S * f.browOuter);
     const xIn = Math.min(CX - 1, eIn + Math.round(S * f.browInner) - 1);
-    const n = xIn - xOut + 1;
+    const nF = xIn - xOut + 1;
+    const bandF = new Map();
     for (let X = xOut; X <= xIn; X++) {
-      const t = n > 1 ? (X - xOut) / (n - 1) : 0.5;           // 0 outer .. 1 inner
+      const t = nF > 1 ? (X - xOut) / (nF - 1) : 0.5;           // 0 outer .. 1 inner
       const off = sround(f.browTilt * t * 2.5) +
                   sround(f.browArch * (1 - Math.abs(2 * t - 1)) * 2.5);
       const z0 = Math.min(sz - 1, Math.max(lashTop + 1, browZ0 + off));
       // The TAIL tapers: the outer third is a row thinner.
       const rows = t < 0.3 ? Math.max(1, browTR - 1) : browTR;
-      for (let r = 0; r < rows; r++)
-        if (z0 + r < sz) both(X, XX => browCells.push([XX, z0 + r, r === 0]));
+      bandF.set(X, [z0, Math.min(sz - 1, z0 + rows - 1)]);
     }
-    if (f.browProud)
-      for (const [X, Z, low] of browCells) if (low) proud(X, Z, ART.SKIN_BASE);
+    const ksL = [...bandL.keys()], aL = Math.min(...ksL), bL = Math.max(...ksL);
+    const haveL = ksL.length > 0;
+    const xa = Math.round(haveL ? lerp(aL, xOut, db) : xOut);
+    const xb = Math.round(haveL ? lerp(bL, xIn, db) : xIn);
+    for (let X = xa; X <= xb; X++) {
+      const u = xb > xa ? (X - xa) / (xb - xa) : 0.5;
+      const F = bandF.get(Math.round(lerp(xOut, xIn, u)));
+      const O = haveL ? bandL.get(Math.round(lerp(aL, bL, u))) : F;
+      const bot = Math.round(lerp(O[0], F[0], db)), top = Math.round(lerp(O[1], F[1], db));
+      for (let Z = bot; Z <= top; Z++) both(X, XX => browCells.push([XX, Z, Z === bot, false]));
+    }
+    // THE RIDGE: an authored cell proud at 0, one cell at 1.
+    if (f.browProud) {
+      const depth = Math.max(1, Math.round(lerp(S, 1, db)));
+      for (const [X, Z, low] of browCells) {
+        if (!low) continue;
+        const Y = frontY(X, Z);
+        if (Y < 0) continue;
+        for (let k = 1; k <= depth; k++) if (add(X, Y + k, Z, ART.SKIN_BASE)) noseSet.add(at(X, Y + k, Z));
+      }
+    }
   }
   const browTop = browCells.length
-    ? Math.max(...browCells.map(c => c[1])) : browZ0 + browTR - 1;
+    ? Math.max(...browCells.map(c => (c[3] ? S * c[1] + S - 1 : c[1])))
+    : browZ0 + browTR - 1;
 
   // ---- skin marks: painted first, so beard, eyes, mouth and brows lie over --
+  // (D.marks: the old blocks below a half, the fine marks from it; the
+  // freckles slide like the beard, the blush fades in.)
+  const dm = D.marks, oldMarks = dm < 0.5;
   const shade = (X, Z) => paintAt(X, Z, ART.FACE_SHADE, true);
   const light = (X, Z) => paintAt(X, Z, ART.FACE_LIGHT, true);
-  // CHEEKS: a soft patch under the outer eye, lit (cheekbones) or shaded
-  // (hollows, set a row lower).
+  const shadeL = (x, z) => paintL(x, z, ART.FACE_SHADE, true);
+  const lightL = (x, z) => paintL(x, z, ART.FACE_LIGHT, true);
+  // CHEEKS: lit (cheekbones) or shaded (hollows, set a row lower) -- two
+  // authored columns under the outer eye, or a soft patch there.
   if (Math.abs(f.cheeks) >= 0.25) {
     const big = Math.abs(f.cheeks) >= 0.6;
-    const rx = big ? 2.2 : 1.5, rz = big ? 1.6 : 1.0;
-    const pcx = eOut + 1.5, pcz = Ze - (f.cheeks > 0 ? 2.5 : 3.5);
-    for (let Z = Math.floor(pcz - rz); Z <= Math.ceil(pcz + rz); Z++)
-      for (let X = Math.floor(pcx - rx); X <= Math.ceil(pcx + rx); X++) {
-        const ex = (X + 0.5 - pcx) / rx, ez = (Z + 0.5 - pcz) / rz;
-        if (ex * ex + ez * ez > 1) continue;
-        both(X, XX => (f.cheeks > 0 ? light : shade)(XX, Z));
-      }
+    if (oldMarks) {
+      const rows = f.cheeks > 0 ? [eyeZ - 1, eyeZ - 2] : [eyeZ - 2, eyeZ - 3];
+      for (const s of eyeSides)
+        for (const x of [s.outer, s.outer + s.dir])
+          for (const z of big ? rows : [rows[0]])
+            (f.cheeks > 0 ? lightL : shadeL)(x, z);
+    } else {
+      const rx = big ? 2.2 : 1.5, rz = big ? 1.6 : 1.0;
+      const pcx = eOut + 1.5, pcz = Ze - (f.cheeks > 0 ? 2.5 : 3.5);
+      for (let Z = Math.floor(pcz - rz); Z <= Math.ceil(pcz + rz); Z++)
+        for (let X = Math.floor(pcx - rx); X <= Math.ceil(pcx + rx); X++) {
+          const ex = (X + 0.5 - pcx) / rx, ez = (Z + 0.5 - pcz) / rz;
+          if (ex * ex + ez * ez > 1) continue;
+          both(X, XX => (f.cheeks > 0 ? light : shade)(XX, Z));
+        }
+    }
   }
-  // BLUSH (body.skin.blush): the lip colour, dithered over the same cheek
-  // patch, thinning to its rim; strong enough, it reaches the tip of the nose.
-  // The dither is keyed to the patch (the outer eye corner, the eye row), so
-  // it rides with the eyes instead of re-rolling when they move.
-  const blush = g.body.skin.blush;
+  // BLUSH (body.skin.blush, the fine face's): the lip colour, dithered over
+  // the cheek patch, thinning to its rim; strong enough, it reaches the tip
+  // of the nose. Faded in with the marks' detail. The dither is keyed to the
+  // patch (the outer eye corner, the eye row), so it rides with the eyes.
+  const blush = g.body.skin.blush * dm;
   if (blush >= 0.1) {
     const rx = 2.4, rz = 1.7, pcx = eOut + 1.5, pcz = Ze - 2.5;
     for (let Z = Math.floor(pcz - rz); Z <= Math.ceil(pcz + rz); Z++)
@@ -4612,106 +5112,163 @@ function headVoxFine(g, artSize, ctx) {
         both(X, XX => paintAt(XX, Z, ART.LIP, true));
       }
   }
-  // FRECKLES: single cells now, across the nose and the cheeks. WHICH cells is
-  // the skin's dice (body.skin.pattern, as on the body), keyed off the midline
-  // and the eye row: the band follows the eyes up and down and keeps its spots.
-  if (f.freckles > 0)
-    for (let Z = Ze - 5; Z <= Ze - 1; Z++)
-      for (let X = 0; X < sx; X++)
-        if (Math.abs(X + 0.5 - CX) < 7.5 &&
-            rnd01(g.body.skin.pattern | 0, X - HX, Z - Ze, 151) <
-              f.freckles * 0.3) shade(X, Z);
-  // THE NOSE'S OWN SHADING: nostrils under the tip's outer cells, the crease
-  // of each wing beside it, a highlight on the bulb. A face with no nose
-  // still gets two nostrils, where a nose would end. All in the NOSTRIL tone,
-  // not the skin's shade (ART.NOSTRIL).
-  const nostril = (X, Z) => paintAt(X, Z, ART.NOSTRIL, true);
-  if (nL > 0) {
-    const lowHalf = f.noseWidth >= 1.5 || f.noseBulb >= 0.8
-      ? Math.max(tipHalf, 2) : tipHalf;
-    both(CX - lowHalf, X => nostril(X, tipLow));
-    both(CX - lowHalf - 1, X => nostril(X, tipLow));
-    if (f.nose >= 1 && tipRows >= 2)
-      both(CX - 1, X => paintAt(X, tipLow + 1, ART.FACE_LIGHT, true));
+  // FRECKLES: headVox's speckle of authored cells over two rows across the
+  // nose and cheeks (0), sliding to single cells over five shipped rows (1).
+  // WHICH cells: headVox's own hash of its cell at 0, the skin's dice
+  // (body.skin.pattern) keyed off the midline and the eye row at 1, so the
+  // band follows the eyes up and down and keeps its spots.
+  if (f.freckles > 0) {
+    const zLo = Math.round(lerp(S * (eyeZ - 2), Ze - 5, dm));
+    const zHi = Math.round(lerp(S * (eyeZ - 1) + S - 1, Ze - 1, dm));
+    const reach = lerp(3.6, 7.5 / S, dm), rate = f.freckles * lerp(0.55, 0.3, dm);
+    for (let Z = zLo; Z <= zHi; Z++)
+      for (let X = 0; X < sx; X++) {
+        if (!(Math.abs(sc(X, dm) - cx) < reach)) continue;
+        const r = lerp(rnd01((X / S) | 0, (Z / S) | 0, 151),
+                       rnd01(g.body.skin.pattern | 0, X - HX, Z - Ze, 151), dm);
+        if (r < rate) paintAt(X, Z, ART.FACE_SHADE, true, dm > 0 ? 1 : S);
+      }
+  }
+  // THE NOSE'S OWN SHADING (D.nose). Old: a shade beside the tip. Fine:
+  // nostrils under the tip's outer cells, the crease of each wing beside it, a
+  // highlight on the bulb, all in the NOSTRIL tone (ART.NOSTRIL); a face with
+  // no nose still gets two nostrils where a nose would end.
+  if (dn < 0.5) {
+    if (noseRowsL > 0) {
+      shadeL(noseColsL[0] - 1, eyeZ - noseRowsL);
+      shadeL(noseColsL[noseColsL.length - 1] + 1, eyeZ - noseRowsL);
+    }
   } else {
-    both(CX - 2, X => nostril(X, Zm + 3));
+    const nostril = (X, Z) => paintAt(X, Z, ART.NOSTRIL, true);
+    if (nL > 0) {
+      const lowHalf = f.noseWidth >= 1.5 || f.noseBulb >= 0.8
+        ? Math.max(tipHalf, 2) : tipHalf;
+      both(CX - lowHalf, X => nostril(X, tipLow));
+      both(CX - lowHalf - 1, X => nostril(X, tipLow));
+      if (f.nose >= 1 && tipRows >= 2)
+        both(CX - 1, X => paintAt(X, tipLow + 1, ART.FACE_LIGHT, true));
+    } else {
+      both(CX - 2, X => nostril(X, Zm + 3));
+    }
   }
   // AGE LINES, in steps: crow's feet, then the forehead, then (with the
   // mouth, below) the lines from the nose to its corners.
-  if (f.wrinkles >= 0.2)
-    both(eOut - 2, X => { shade(X, Ze + 1 + tilt); shade(X, Ze - 1 + tilt); });
-  if (f.wrinkles >= 0.35)
-    both(eOut - 3, X => { shade(X, Ze + 2 + tilt); shade(X, Ze - 2 + tilt); });
-  if (f.wrinkles >= 0.45)
-    for (const Zf of f.wrinkles >= 0.8 ? [browTop + 2, browTop + 4] : [browTop + 2])
-      for (let X = 0; X < sx; X++) {
-        const dx = Math.abs(X + 0.5 - CX);
-        if (dx < 4.5 && !(dx > 2 && dx < 3)) shade(X, Zf);
-      }
-  // A SCAR: a pale slash down through one brow and eye, one cell wide.
+  if (oldMarks) {
+    if (f.wrinkles >= 0.2)                      // crow's feet
+      for (const s of eyeSides)
+        shadeL(s.outer + s.dir * (f.eyeWhites ? 2 : 1), eyeZ - 1);
+    if (f.wrinkles >= 0.45)                     // a forehead line
+      for (let x = Math.trunc(cx) - 2; x <= Math.trunc(cx) + 1; x++)
+        shadeL(x, eyeZ + 3 + Math.max(0, fl.browHeight) +
+                  (f.brow ? fl.browThick - 1 : 0));
+  } else {
+    if (f.wrinkles >= 0.2)
+      both(eOut - 2, X => { shade(X, Ze + 1 + tilt); shade(X, Ze - 1 + tilt); });
+    if (f.wrinkles >= 0.35)
+      both(eOut - 3, X => { shade(X, Ze + 2 + tilt); shade(X, Ze - 2 + tilt); });
+    if (f.wrinkles >= 0.45)
+      for (const Zf of f.wrinkles >= 0.8 ? [browTop + 2, browTop + 4] : [browTop + 2])
+        for (let X = 0; X < sx; X++) {
+          const dx = Math.abs(X + 0.5 - CX);
+          if (dx < 4.5 && !(dx > 2 && dx < 3)) shade(X, Zf);
+        }
+  }
+  // A SCAR: a pale slash down through one brow and eye -- through hair too (a
+  // scar is a bald line in a brow or a cap). The eye it crosses is painted
+  // after it, so the eye survives. Its cells keep the brow off them.
   const scarKeys = new Set();
   if (f.scar !== 0) {
-    const n = Math.max(4, Math.round(Math.abs(f.scar) * 12));
-    const right = f.scar > 0;
-    const zS = browTop + 1;
-    for (let i = 0; i < n; i++) {
-      // Through hair too: a scar is a bald line in a brow or a cap. The eye
-      // it crosses is painted after it, so the eye survives.
-      const XL = eIn - Math.floor(i / 2), Z = zS - i;
-      const X = right ? mirror(XL) : XL;
-      if (paintAt(X, Z, ART.FACE_LIGHT)) scarKeys.add(X * 4096 + Z);
+    if (oldMarks) {
+      const s = eyeSides.find(e => e.dir === Math.sign(f.scar));
+      if (s) {
+        const n = Math.max(2, Math.round(Math.abs(f.scar) * 6));
+        const z0 = eyeZ + 2 + (n >= 4 ? 1 : 0);
+        for (let i = 0; i < n; i++) {
+          const x = s.inner + s.dir * (Math.floor(i / 2) - 1), z = z0 - i;
+          if (paintL(x, z, ART.FACE_LIGHT, false))
+            for (let dz = 0; dz < S; dz++)
+              for (let dx = 0; dx < S; dx++) scarKeys.add((S * x + dx) * 4096 + S * z + dz);
+        }
+      }
+    } else {
+      const n = Math.max(4, Math.round(Math.abs(f.scar) * 12));
+      const right = f.scar > 0;
+      const zS = browTop + 1;
+      for (let i = 0; i < n; i++) {
+        const XL = eIn - Math.floor(i / 2), Z = zS - i;
+        const X = right ? mirror(XL) : XL;
+        if (paintAt(X, Z, ART.FACE_LIGHT)) scarKeys.add(X * 4096 + Z);
+      }
     }
   }
 
-  // ---- THE BEARD: headVox's regions, read at shipped resolution ------------
-  // Every threshold is headVox's own number, unrounded: a row test `z <= T`
-  // becomes `Z/S < T + 1` (the fine row's bottom edge), which agrees with
-  // headVox on every whole T and moves in half rows between them. The edge
-  // band is one shipped cell, and the density test is per shipped cell -- a
-  // stubble grain at last (headVox's note on why its stubble read as blotches).
+  // ---- THE BEARD (D.beard): headVox's regions, asked where each cell asks ---
+  // Paint on the lower face in the hair shade, laid down before the mouth is
+  // repainted over it (so a moustache never swallows the mouth). The amount is
+  // its REACH, not its density: a moustache and goatee, then the jaw, then
+  // the cheeks up to the ears. Solid, with a broken outer edge. REGIONS
+  // (2026-09-25): the CENTRE strip is the moustache at and above the mouth row
+  // and the chin below it, each with its own width; the SIDES (past 2.2 cells
+  // out) are the jaw up to `jawTop` and the cheeks up to `cheekTop`.
+  //
+  // At detail 0 every test is headVox's at its authored cell, its rows the
+  // rounded ones, its edge an authored cell deep and its two hashes the
+  // block's: the old beard, block for block. At 1 the same tests at each
+  // shipped cell, the rows unrounded (they move in half rows), the edge one
+  // cell deep and the hashes the cell's own: stubble and a ragged edge in
+  // single hairs. Between, the point each cell asks at, the row lines and the
+  // hashes all slide -- a block breaks up as the detail rises.
+  const dbd = D.beard;
   const beardTone = f.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
   const NOT_BEARD = new Set([ART.EYE, ART.EYE_WHITE, ART.LASH, ART.GLINT,
                              ART.NOSTRIL]);
+  const jawLift = lerp(fl.beardJaw, f.beardJaw, dbd);
   if (f.beard > 0) {
     const bd = f.beard;
-    const topZ = eyeA - 2;
+    const topZ = lerp(eyeZ, eyeA, dbd) - 2;
     const reach = 1.5 + bd * (ax * 0.5) * (1 + f.beardWidth * 0.6);
-    const jawTop = skullLo + 1 + bd * 3 + f.beardJaw;
+    const jawTop = skullLo + 1 + lerp(Math.round(bd * 3), bd * 3, dbd) + jawLift;
     const auto = bd >= 0.75 ? 1 : 0;
     const cheekF = f.beardCheek >= 0 ? Math.max(auto, f.beardCheek)
                                      : auto * (1 + f.beardCheek);
     const cheekTop = jawTop + (topZ - jawTop) * cheekF;
+    // headVox's `z <= cheekTop` on whole rows, the fine `zE < cheekTop + 1`.
+    const cheekLine = lerp(Math.floor(cheekTop) + 1, cheekTop + 1, dbd);
     const lipHalf = f.beardLip >= 0 ? 2.2 + f.beardLip * 2 : 2.2 * (1 + f.beardLip);
     const chinHalf = f.beardChin >= 0 ? 2.2 + f.beardChin * 1.5
                                       : 2.2 * (1 + f.beardChin);
     const lipW = f.beardLip > 0 ? Math.max(reach, lipHalf) : Math.min(reach, lipHalf);
     const chinW = f.beardChin > 0 ? Math.max(reach, chinHalf) : Math.min(reach, chinHalf);
-    const mouthHalf = f.mouthWidth / 2;
+    const mouthHalf = lerp(fl.mouthWidth, f.mouthWidth, dbd) / 2;
+    const mouthRow = lerp(mz, mzA, dbd);
     const droop = f.beardLip >= 0.75;
     const keep = 1 - f.beardRagged;
+    const edgeIn = lerp(1, 0.5, dbd);              // how deep the ragged edge is
     for (let Z = 0; Z < sz; Z++) {
-      const zE = Z / S;
-      if (zE >= topZ + 1 || Math.floor(zE) < skullLo) continue;
-      const jawRow = zE < jawTop + 1;
-      const lipRow = zE >= mzA;
+      const zr = sr(Z, dbd);
+      if (zr >= topZ + 1 || Math.floor(Z / S) < skullLo) continue;
+      const jawRow = zr < jawTop + 1;
+      const lipRow = zr >= mouthRow;
       const cW = lipRow ? lipW : chinW;
       for (let Y = 0; Y < sy; Y++) {
-        if (ac(Y) < hcy - 0.5) continue;                 // the back of the head
+        if (sc(Y, dbd) < hcy - 0.5) continue;           // the back of the head
         for (let X = 0; X < sx; X++) {
           const k = at(X, Y, Z);
           const c = col[k];
           if (!c || NOT_BEARD.has(c) || noseSet.has(k) || earSet.has(k)) continue;
-          const dx = Math.abs(ac(X) - cx);
+          const dx = Math.abs(sc(X, dbd) - cx);
           const centre = dx <= cW;
-          const side = dx > 2.2 && dx <= reach && (jawRow || zE < cheekTop + 1);
+          const side = dx > 2.2 && dx <= reach && (jawRow || zr < cheekLine);
           const hang = droop && !lipRow && dx > mouthHalf && dx <= lipW;
           if (!centre && !side && !hang) continue;
-          let edge = dx > reach - 0.5 || (!jawRow && dx > 1.2);
+          let edge = dx > reach - edgeIn || (!jawRow && dx > 1.2);
           if (centre && !side && (lipRow ? f.beardLip : f.beardChin) !== 0 &&
-              dx > cW - 0.5) edge = true;
+              dx > cW - edgeIn) edge = true;
+          const x = (X / S) | 0, y = (Y / S) | 0, z = (Z / S) | 0;
           if (f.beardDensity < 1 &&
-              rnd01(X - HX, Y - HY, Z, 131) >= f.beardDensity) continue;
-          if (!edge || hashN(X - HX, Y - HY, Z, 97) / 4294967296 < keep) {
+              lerp(rnd01(x, y, z, 131), rnd01(X - HX, Y - HY, Z, 131), dbd) >=
+                f.beardDensity) continue;
+          if (!edge || lerp(rnd01(x, y, z, 97), rnd01(X - HX, Y - HY, Z, 97), dbd) < keep) {
             col[k] = beardTone;
             beardK.add(k);
           }
@@ -4720,156 +5277,284 @@ function headVoxFine(g, artSize, ctx) {
     }
   }
   // SIDEBURNS: the outermost authored cell's worth of face in front of the
-  // ear, from the hairline down. Independent of `beard`.
+  // ear, from the hairline down toward the jaw. Independent of `beard`, so
+  // they exist on a clean-shaven face. The same sliding as the beard's.
   if (f.beardSide > 0) {
-    const zTop = eyeA + 1;
-    const zBot = zTop - f.beardSide * (zTop - skullLo);
-    const yLo = earYA * S, yHi = (earYA + 3) * S - 1;
-    for (let Z = Math.floor(zBot * S); Z < (zTop + 1) * S && Z < sz; Z++) {
-      if (Z < 0 || Z / S < zBot) continue;
+    const zTopL = eyeZ + 1, zTopF = eyeA + 1;
+    const zBot = lerp(Math.round(zTopL - f.beardSide * (zTopL - skullLo)),
+                      zTopF - f.beardSide * (zTopF - skullLo), dbd);
+    const zTop = lerp(zTopL, zTopF, dbd);
+    const yLo = earYA * S, yHi = Math.min(sy - 1, (earYA + 3) * S - 1);
+    for (let Z = 0; Z < sz; Z++) {
+      const zr = sr(Z, dbd);
+      if (zr < zBot || zr >= zTop + 1) continue;
       let maxDx = -1;
-      for (let Y = yLo; Y <= Math.min(yHi, sy - 1); Y++)
+      for (let Y = yLo; Y <= yHi; Y++)
         for (let X = 0; X < sx; X++) {
           const k = at(X, Y, Z);
-          if (col[k] && !earSet.has(k)) maxDx = Math.max(maxDx, Math.abs(ac(X) - cx));
+          if (col[k] && !earSet.has(k)) maxDx = Math.max(maxDx, Math.abs(sc(X, dbd) - cx));
         }
       if (maxDx < 0) continue;
-      for (let Y = yLo; Y <= Math.min(yHi, sy - 1); Y++)
+      for (let Y = yLo; Y <= yHi; Y++)
         for (let X = 0; X < sx; X++) {
           const k = at(X, Y, Z);
           if (!FINE_SKIN.has(col[k]) || earSet.has(k)) continue;
-          if (Math.abs(ac(X) - cx) < maxDx - 1) continue;
+          if (Math.abs(sc(X, dbd) - cx) < maxDx - 1) continue;
           if (f.beardDensity < 1 &&
-              rnd01(X - HX, Y - HY, Z, 131) >= f.beardDensity) continue;
+              lerp(rnd01((X / S) | 0, (Y / S) | 0, (Z / S) | 0, 131),
+                   rnd01(X - HX, Y - HY, Z, 131), dbd) >= f.beardDensity) continue;
           col[k] = beardTone;
           beardK.add(k);
         }
     }
   }
 
-  // ---- THE EYES --------------------------------------------------------------
+  // ---- THE EYES (D.eyes) --------------------------------------------------------
   // Repaints of the frontmost cell, so an eye can neither float nor sink.
-  // The whites at opacity 0 are not painted at all: the skin is what shows.
-  const whitesOn = toneQ(f.whites) > 0;
-  // The eyes' extent, for headMarks: where they are, painted or not, so the
-  // hair is told the same eyes whatever their whites, lashes or iris are set to.
+  // `eyeK` and `eyeXZ` are what the hair mass is told: where the eyes are,
+  // painted or not, so the hair sees the same eyes whatever their whites,
+  // lashes or iris are set to.
   const eyeXZ = [], eyeK = new Set();
-  const markEye = (X, Z) => {
+  const markEye = (X, Z, deep = 1) => {
     const Y = frontY(X, Z);
-    if (Y >= 0) eyeK.add(at(X, Y, Z));
+    for (let k = 0; k < deep && Y - k >= 0 && col[at(X, Y - k, Z)]; k++)
+      eyeK.add(at(X, Y - k, Z));
   };
-  for (let X = eOut; X <= eIn; X++) {
-    const iris = isIris(X);
-    for (let r = 0; r < rowsOf(X); r++)
-      both(X, XX => { eyeXZ.push([XX, Ze + r + dzOf(X)]); markEye(XX, Ze + r + dzOf(X)); });
-    if (!iris && !whitesOn) continue;
-    for (let r = 0; r < rowsOf(X); r++)
-      both(X, XX => paintAt(XX, Ze + r + dzOf(X), iris ? ART.EYE : ART.EYE_WHITE));
-  }
-  // A GLINT: the top outer cell of a two-row iris.
-  if (f.glint && eyeRows === 2)
-    both(i0, X => paintAt(X, Ze + 1 + dzOf(i0), ART.GLINT));
-  // THE LASH LINE, over the eye; light lashes stop short of the inner corner.
-  // Heavy ones flick out past the outer corner and line its underside. Its
-  // row is the eye's (headMarks) whether or not it is drawn.
-  for (let X = eOut; X <= eIn; X++) both(X, XX => markEye(XX, lashRow(X)));
-  if (f.lashes >= 0.15 && toneQ(f.lashTone) > 0) {
-    // LASH LENGTH: how much of the eye the line covers, from the outer corner.
-    const xEnd = eOut + Math.max(1, Math.round((eIn - eOut + 1) * f.lashSpan)) - 1;
-    for (let X = eOut; X <= xEnd; X++) both(X, XX => paintAt(XX, lashRow(X), ART.LASH));
-    if (f.lashes >= 0.7)
-      both(eOut - 1, X => paintAt(X, lashRow(eOut) + (tilt >= 0 ? 1 : 0), ART.LASH, true));
-    if (f.lashes >= 0.85)
-      both(eOut, X => paintAt(X, Ze - 1 + tilt, ART.LASH, true));
-  }
-  // THE LID CREASE: a shaded line a row over the lashes (deep-set, hooded).
-  if (f.lidCrease >= 0.2 && toneQ(f.creaseTone) > 0)
-    for (let X = eOut - (f.lidCrease >= 0.6 ? 1 : 0); X < eIn; X++)
-      both(X, XX => paintAt(XX, lashRow(X) + 1, ART.CREASE, true));
-  // UNDER THE EYES: shade under the iris and the outer white; past halfway a
-  // second row and the outer corner.
-  const bag = (X, Z) => paintAt(X, Z, ART.BAGS, true);
-  if (f.eyeBags > 0.2 && toneQ(f.bagTone) > 0) {
-    for (let X = eOut; X < i0 + iw; X++) {
-      both(X, XX => bag(XX, Ze - 1 + dzOf(X)));
-      if (f.eyeBags > 0.6) both(X, XX => bag(XX, Ze - 2 + dzOf(X)));
+  if (D.eyes <= 0) {
+    // THE OLD EYE: each authored eye column's front cell at the eye row, the
+    // whites a lit cell outward of each pupil, the bags a shade under it.
+    for (const x of eyeColsL)
+      for (let dz = 0; dz < S; dz++)
+        for (let dx = 0; dx < S; dx++) {
+          eyeXZ.push([S * x + dx, S * eyeZ + dz]);
+          markEye(S * x + dx, S * eyeZ + dz, S);
+        }
+    for (const x of eyeColsL) paintL(x, eyeZ, ART.EYE, false);
+    if (f.eyeWhites)
+      for (const s of eyeSides) lightL(s.outer + s.dir, eyeZ);
+    if (f.eyeBags > 0.2)
+      for (const s of eyeSides) {
+        for (const x of s.E) shadeL(x, eyeZ - 1);
+        if (f.eyeBags > 0.6) shadeL(s.outer + s.dir, eyeZ - 1);
+      }
+  } else {
+    // The whites at opacity 0 are not painted at all: the skin is what shows.
+    const whitesOn = toneQ(fe.whites) > 0;
+    for (let X = eOut; X <= eIn; X++) {
+      const iris = isIris(X);
+      for (let r = 0; r < rowsOf(X); r++)
+        both(X, XX => { eyeXZ.push([XX, Ze + r + dzOf(X)]); markEye(XX, Ze + r + dzOf(X)); });
+      if (!iris && !whitesOn) continue;
+      for (let r = 0; r < rowsOf(X); r++)
+        both(X, XX => paintAt(XX, Ze + r + dzOf(X), iris ? ART.EYE : ART.EYE_WHITE));
     }
-    if (f.eyeBags > 0.6) both(eOut - 1, X => bag(X, Ze - 1));
+    // A GLINT: the top outer cell of a two-row iris.
+    if (fe.glint && eyeRows === 2)
+      both(i0, X => paintAt(X, Ze + 1 + dzOf(i0), ART.GLINT));
+    // THE LASH LINE, over the eye; light lashes stop short of the inner
+    // corner. Heavy ones flick out past the outer corner and line its
+    // underside. Its row is the eye's (headMarks) whether or not it is drawn.
+    for (let X = eOut; X <= eIn; X++) both(X, XX => markEye(XX, lashRow(X)));
+    if (fe.lashes >= 0.15 && toneQ(fe.lashTone) > 0) {
+      // LASH LENGTH: how much of the eye the line covers, from the outer corner.
+      const xEnd = eOut + Math.max(1, Math.round((eIn - eOut + 1) * fe.lashSpan)) - 1;
+      for (let X = eOut; X <= xEnd; X++) both(X, XX => paintAt(XX, lashRow(X), ART.LASH));
+      if (fe.lashes >= 0.7)
+        both(eOut - 1, X => paintAt(X, lashRow(eOut) + (tilt >= 0 ? 1 : 0), ART.LASH, true));
+      if (fe.lashes >= 0.85)
+        both(eOut, X => paintAt(X, Ze - 1 + tilt, ART.LASH, true));
+    }
+    // THE LID CREASE: a shaded line a row over the lashes (deep-set, hooded).
+    if (fe.lidCrease >= 0.2 && toneQ(fe.creaseTone) > 0)
+      for (let X = eOut - (fe.lidCrease >= 0.6 ? 1 : 0); X < eIn; X++)
+        both(X, XX => paintAt(XX, lashRow(X) + 1, ART.CREASE, true));
+    // UNDER THE EYES: shade under the iris and the outer white -- two rows
+    // while the eye is still mostly the old one, as the old bags were -- and
+    // past halfway the outer corner.
+    const bag = (X, Z) => paintAt(X, Z, ART.BAGS, true);
+    if (fe.eyeBags > 0.2 && toneQ(fe.bagTone) > 0) {
+      const two = fe.eyeBags > 0.6 || D.eyes < 0.5;
+      for (let X = eOut; X < i0 + iw; X++) {
+        both(X, XX => bag(XX, Ze - 1 + dzOf(X)));
+        if (two) both(X, XX => bag(XX, Ze - 2 + dzOf(X)));
+      }
+      if (fe.eyeBags > 0.6) both(eOut - 1, X => bag(X, Ze - 1));
+    }
   }
 
-  // ---- THE MOUTH ---------------------------------------------------------------
-  // A line `2 * mouthWidth` cells long, centred on MC. Its shape is a curve, not
-  // a corner cell: a smile lifts the ends by up to two rows along a parabola
-  // and a smirk tilts the whole line. A half step of width is a pair of soft
-  // corners in the shade rather than an off-centre cell.
+  // ---- THE MOUTH (D.mouth) ------------------------------------------------------
+  // OLD: `mouthWidth` authored cells on the mouth row, a curve as its two end
+  // cells stepping a row, open rows under it, lips a row above and below.
+  // FINE: a line `2 * mouthWidth` cells long whose shape is a curve, not a
+  // corner cell -- a smile lifts the ends by up to two rows along a parabola,
+  // a smirk tilts the whole line -- an open mouth with teeth, lips that fill
+  // from the middle. BETWEEN, the line's two ends and each column's row slide
+  // from the old mouth's to the fine one's, and its second row thins away
+  // from the corners in (`thick`); the open rows and the lips' rows slide too.
+  const dmo = D.mouth;
   const mtone = f.lipLine ? ART.LIP : f.mouthTone === 'dark' ? ART.EYE : ART.FACE_SHADE;
   const lipCol = f.lipTone === 'colour' ? ART.LIP
                : f.lipTone === 'shade' ? ART.FACE_SHADE : ART.FACE_LIGHT;
-  const openRows = Math.round(S * f.mouthOpen);
-  const mcols = [];
-  for (let X = MC - mHalf; X < MC + mHalf; X++) mcols.push(X);
-  const offOf = X => {
-    const s = (X + 0.5 - MC) / mHalf;                  // -1 .. 1 along the line
-    const t = (s + 1) / 2;
-    return sround(f.mouthCurve * 1.6 * s * s) +
-           sround(Math.abs(f.mouthSkew) * 2 * (f.mouthSkew > 0 ? t : 1 - t));
-  };
-  const moff = mcols.map(offOf);
-  mcols.forEach((X, n) => paintAt(X, Zm + moff[n], mtone));
-  const ends = [[mcols[0] - 1, moff[0]], [mcols[mcols.length - 1] + 1, moff[moff.length - 1]]];
-  if (Math.abs(f.mouthCurve) >= 0.3)
-    for (const [X, o] of ends) paintAt(X, Zm + o + Math.sign(f.mouthCurve), mtone);
-  else if (softCorners)
-    for (const [X, o] of ends) paintAt(X, Zm + o, ART.FACE_SHADE, true);
-  // OPEN: dark rows under the line, the upper teeth in the first of two.
-  for (let r = 1; r <= openRows; r++)
-    mcols.forEach((X, n) => paintAt(X, Zm + moff[n] - r,
-      r === 1 && openRows >= 2 && Math.abs(X + 0.5 - MC) < mHalf - 0.5
-        ? ART.TEETH : ART.EYE));
-  // LIPS: the lower lip from half a step (its middle), the upper from one and
-  // a half (a cupid's bow, the cells either side of the middle), both full
-  // at two and the lower lip a row deeper. Hidden under a moustache.
-  const L = f.lips;
-  const lowZ = Zm + Math.min(...moff) - openRows - 1;
-  const upZ = Zm + Math.max(...moff) + 1;
-  for (const X of mcols) {
-    const d = Math.abs(X + 0.5 - MC) / mHalf;           // 0 middle .. ~1 end
-    if (L >= 1 || (L >= 0.5 && d < 0.6)) paintAt(X, lowZ, lipCol, true);
-    if (L >= 2 && d < 0.6) paintAt(X, lowZ - 1, lipCol, true);
-    // The bow is the middle of the upper lip; at two it runs to the corners.
-    if ((L >= 2 && d < 1) || (L >= 1.5 && d < 0.6)) paintAt(X, upZ, lipCol, true);
+  // Where the mouth's two ends are, for the age lines (marks).
+  let mouthL = null, mouthR = null;
+  if (dmo <= 0) {
+    mcolsL.forEach((x, n) => paintL(x, mz + moffL[n], mtone, false));
+    if (Math.abs(f.mouthCurve) >= 0.3) {
+      paintL(mcolsL[0] - 1, mz + moffL[0] + curveUp, mtone, false);
+      paintL(mcolsL[mw - 1] + 1, mz + moffL[mw - 1] + curveUp, mtone, false);
+    }
+    for (let r = 1; r <= fl.mouthOpen; r++)
+      mcolsL.forEach((x, n) => paintL(x, mz + moffL[n] - r, ART.EYE, false));
+    if (fl.lips >= 1)
+      for (const x of mcolsL) paintL(x, mz + Math.min(...moffL) - fl.mouthOpen - 1, lipCol, true);
+    if (fl.lips >= 2)
+      for (const x of mcolsL) paintL(x, mz + Math.max(...moffL) + 1, lipCol, true);
+    mouthL = [S * mcolsL[0], S * (mz + moffL[0]) + S - 1];
+    mouthR = [S * mcolsL[mw - 1] + S - 1, S * (mz + moffL[mw - 1]) + S - 1];
+  } else {
+    const deep = dmo < 0.5 ? S : 1;
+    const offF = X => {
+      const s = (X + 0.5 - MC) / mHalf;                // -1 .. 1 along the line
+      const t = (s + 1) / 2;
+      return sround(f.mouthCurve * 1.6 * s * s) +
+             sround(Math.abs(f.mouthSkew) * 2 * (f.mouthSkew > 0 ? t : 1 - t));
+    };
+    const aL = S * mcolsL[0], bL = S * mcolsL[mw - 1] + S - 1;
+    const aF = MC - mHalf, bF = MC + mHalf - 1;
+    const topL = X => S * (mz + moffL[clamp(Math.floor(X / S) - mcolsL[0], 0, mw - 1)]) + S - 1;
+    const xa = Math.round(lerp(aL, aF, dmo)), xb = Math.round(lerp(bL, bF, dmo));
+    // How far the thinning has come in from the corners (none until 0.15).
+    const thin = clamp((dmo - 0.15) / 0.75, 0, 1);
+    const line = [];                                  // [X, top row, thick, u]
+    for (let X = xa; X <= xb; X++) {
+      const u = xb > xa ? (X - xa) / (xb - xa) : 0.5;
+      const top = Math.round(lerp(topL(Math.round(lerp(aL, bL, u))),
+                                  Zm + offF(Math.round(lerp(aF, bF, u))), dmo));
+      line.push([X, top, thin <= 0 || Math.abs(2 * u - 1) < 1 - thin, u]);
+    }
+    for (const [X, top, thick] of line) {
+      paintAt(X, top, mtone, false, deep);
+      if (thick) paintAt(X, top - 1, mtone, false, deep);
+    }
+    const [lx, ltop] = line[0], [rx, rtop] = line[line.length - 1];
+    mouthL = [lx, ltop]; mouthR = [rx, rtop];
+    if (Math.abs(f.mouthCurve) >= 0.3) {
+      if (dmo < 0.5)                    // the old corner: a block a block's step on
+        for (const [X0, top, dir] of [[lx, ltop, -1], [rx, rtop, 1]])
+          for (let k = 1; k <= S; k++)
+            for (let r = 0; r < S; r++)
+              paintAt(X0 + dir * k, top + curveUp * S - r, mtone, false, deep);
+      else
+        for (const [X0, top, dir] of [[lx, ltop, -1], [rx, rtop, 1]])
+          paintAt(X0 + dir, top + curveUp, mtone);
+    } else if (softCorners && dmo >= 0.5) {
+      paintAt(lx - 1, ltop, ART.FACE_SHADE, true);
+      paintAt(rx + 1, rtop, ART.FACE_SHADE, true);
+    }
+    // OPEN: dark rows under the line (its lower row where it is thick), the
+    // upper teeth in the first of two once the mouth is the fine one.
+    const openF = Math.round(S * f.mouthOpen);
+    const openN = Math.round(lerp(S * fl.mouthOpen, openF, dmo));
+    for (const [X, top, thick] of line)
+      for (let r = 1; r <= openN; r++)
+        paintAt(X, top - (thick ? 1 : 0) - r,
+                dmo >= 0.5 && r === 1 && openF >= 2 &&
+                Math.abs(X + 0.5 - MC) < mHalf - 0.5 ? ART.TEETH : ART.EYE,
+                false, deep);
+    // LIPS. Old: the lower lip a whole row of blocks under the open rows, the
+    // upper over the line, from 1 and 2. Fine: the lower lip from half a step
+    // (its middle), the upper from one and a half (a cupid's bow), both full
+    // at two and the lower lip a row deeper. Each column's lip rows slide
+    // between the two, under the moustache all the same (skin only).
+    const L = f.lips;
+    const lowOld = S * (mz + Math.min(...moffL) - fl.mouthOpen) - 1;  // top row of the old lower lip
+    const upOld = S * (mz + Math.max(...moffL) + 1);                  // bottom row of the old upper lip
+    const lowFine = Zm + Math.min(...line.map(c => offF(Math.round(lerp(aF, bF, c[3]))))) -
+                    openF - 1;
+    const upFine = Zm + Math.max(...line.map(c => offF(Math.round(lerp(aF, bF, c[3]))))) + 1;
+    for (const [X, , , u] of line) {
+      const d = Math.abs(lerp(aF, bF, u) + 0.5 - MC) / mHalf;     // 0 middle .. ~1 end
+      const lowN = Math.round(lerp(fl.lips >= 1 ? S : 0,
+        (L >= 1 || (L >= 0.5 && d < 0.6) ? 1 : 0) + (L >= 2 && d < 0.6 ? 1 : 0), dmo));
+      const upN = Math.round(lerp(fl.lips >= 2 ? S : 0,
+        (L >= 2 && d < 1) || (L >= 1.5 && d < 0.6) ? 1 : 0, dmo));
+      const lowTop = Math.round(lerp(lowOld, lowFine, dmo));
+      const upBot = Math.round(lerp(upOld, upFine, dmo));
+      for (let r = 0; r < lowN; r++) paintAt(X, lowTop - r, lipCol, true, deep);
+      for (let r = 0; r < upN; r++) paintAt(X, upBot + r, lipCol, true, deep);
+    }
   }
-  // NOSE-TO-MOUTH lines, the last step of the age lines.
+  // NOSE-TO-MOUTH lines, the last step of the age lines (D.marks): beside the
+  // mouth's two ends as it is drawn, an authored cell a row up (old), or three
+  // cells running up and out (fine).
   if (f.wrinkles >= 0.7) {
-    const [lx] = ends[0], [rx] = ends[1];
-    shade(lx, Zm + 1); shade(lx, Zm + 2); shade(lx - 1, Zm + 3);
-    shade(rx, Zm + 1); shade(rx, Zm + 2); shade(rx + 1, Zm + 3);
+    if (oldMarks) {
+      shadeL(Math.floor(mouthL[0] / S) - 1, Math.floor(mouthL[1] / S) + 1);
+      shadeL(Math.floor(mouthR[0] / S) + 1, Math.floor(mouthR[1] / S) + 1);
+    } else {
+      const lx = mouthL[0] - 1, rx = mouthR[0] + 1;
+      const zb = Math.round(lerp(S * mz + 1, Zm, dmo));
+      shade(lx, zb + 1); shade(lx, zb + 2); shade(lx - 1, zb + 3);
+      shade(rx, zb + 1); shade(rx, zb + 2); shade(rx + 1, zb + 3);
+    }
   }
 
   // ---- BROWS, last: over the hair cap and any mark except the scar ---------
   if (browCells.length) {
     const tone = { hair: ART.HAIR, dark: ART.EYE, light: ART.FACE_LIGHT }[
       f.browTone] ?? ART.HAIR_SHADE;
-    for (const [X, Z] of browCells) {
-      if (scarKeys.has(X * 4096 + Z)) continue;
-      // Which cells go bare is keyed to the brow's own eye (its outer corner,
-      // the eye row) and side, so the brow keeps its gaps as the eyes move.
-      const right = X >= CX ? 1 : 0;
-      if (f.browSparse > 0 &&
-          rnd01(right, (right ? mirror(X) : X) - eOut, Z - Ze, 163) < f.browSparse)
+    for (const [X0, Z0, , authored] of browCells) {
+      // The old brow's cells are authored (its paint is the block, its bare
+      // cells headVox's own hash of the block); the slid brow's are shipped,
+      // its bare cells keyed to the brow's own eye (its outer corner, the eye
+      // row) and side, so the brow keeps its gaps as the eyes move.
+      if (authored) {
+        let scarred = false;
+        for (let dz = 0; dz < S; dz++)
+          for (let dx = 0; dx < S; dx++)
+            if (scarKeys.has((S * X0 + dx) * 4096 + S * Z0 + dz)) scarred = true;
+        if (scarred) continue;
+        if (f.browSparse > 0 && rnd01(X0, Z0, 163) < f.browSparse) continue;
+        paintL(X0, Z0, tone, false);
         continue;
-      paintAt(X, Z, tone);
+      }
+      if (scarKeys.has(X0 * 4096 + Z0)) continue;
+      const right = X0 >= CX ? 1 : 0;
+      if (f.browSparse > 0 &&
+          lerp(rnd01((X0 / S) | 0, (Z0 / S) | 0, 163),
+               rnd01(right, (right ? mirror(X0) : X0) - eOut, Z0 - Ze, 163), db) <
+            f.browSparse)
+        continue;
+      paintAt(X0, Z0, tone, false, db < 0.5 ? S : 1);
     }
   }
 
-  // Out: cell list, then the flip every builder ends with (front LOW y).
-  const out = [];
+  // Out: cell list IN THE MAKING ORDER (`ord`; a block's cells in
+  // upscaleCells' order, dz, then dy as flipped, then dx), then the flip
+  // every builder ends with (front LOW y).
+  // One number per cell -- (making order, place in its block) and the cell's
+  // own index under it -- so the sort is a typed array's numeric one (an
+  // array of pairs and a comparator was most of this function's time).
+  // Exact: the largest key is ~2^25 * 2^15, far inside a double's 2^53.
+  const CELLS = sx * sy * sz;
+  let n = 0;
+  for (let i = 0; i < CELLS; i++) if (col[i]) n++;
+  const sortKey = new Float64Array(n);
+  let j = 0;
   for (let Z = 0; Z < sz; Z++)
     for (let Y = 0; Y < sy; Y++)
       for (let X = 0; X < sx; X++) {
-        const c = col[at(X, Y, Z)];
-        if (c) out.push([X, Y, Z, c]);
+        const i = at(X, Y, Z);
+        if (!col[i]) continue;
+        const sub = ((Z % S) * S + (S - 1 - (Y % S))) * S + (X % S);
+        sortKey[j++] = (ord[i] * S * S * S + sub) * CELLS + i;
       }
+  sortKey.sort();
+  const out = new Array(n);
+  for (let k = 0; k < n; k++) {
+    const i = sortKey[k] % CELLS;
+    out[k] = [i % sx, Math.floor(i / sx) % sy, Math.floor(i / (sx * sy)), col[i]];
+  }
   // ...and the same flip for what the hair mass is told (headMarks).
   if (ctx.marks) {
     const flip = k => {
@@ -4877,16 +5562,22 @@ function headVoxFine(g, artSize, ctx) {
       return X + sx * ((sy - 1 - Y) + sy * Z);
     };
     const keys = s => new Set([...s].map(flip));
+    // THE EYE ROWS: the old eye's two shipped rows, or the fine eye's from its
+    // lower row to its top (one row for an almond, two for a round eye).
+    const oldEye = D.eyes <= 0;
     ctx.marks.head = {
       size: [sx, sy, sz],
       // The cap is scalp wherever an eye is not drawn over it (a low fringe
       // reaches the eye row): hair never roots on an eye.
       scalp: keys([...capK].filter(k => !eyeK.has(k))), beard: keys(beardK),
       features: keys(new Set([...earSet, ...noseSet])),
-      eyeCells: keys(eyeK), eyes: eyeXZ, eyeLo: Ze, eyeHi: Ze,
+      eyeCells: keys(eyeK), eyes: eyeXZ,
+      eyeLo: oldEye ? S * eyeZ : Ze,
+      eyeHi: oldEye ? S * eyeZ + S - 1 : Ze + eyeRows - 1,
       // The eye line before the eye-height slider moves it (the eye metre
       // contract's row): what the short hair layer's reach is measured from.
-      eyeBaseHi: Math.round(S * (eyeA - g.face.eyeRow)),
+      // The old eye's top row, sliding to the fine eye's lower one.
+      eyeBaseHi: S * eyeBase + Math.round((S - 1) * (1 - D.eyes)),
       skull: { c0: [sk0[0], sy - 1 - sk1[1], sk0[2]],
                c1: [sk1[0], sy - 1 - sk0[1], sk1[2]] },
     };
@@ -4977,15 +5668,20 @@ function humanSkinPass(g, cells, size, info) {
   // no palette cost), anything else paints its own toned slot, whose colour
   // detailColors mixes from the skin toward the feature's full tone.
   const on = k => toneQ(sk[k]) > 0;
+  // ON THE HEAD the seam, the moles and the mottle are the face's marks too,
+  // and fade in with their detail (FACE DETAIL): at 0 the head is the old
+  // head, cell for cell.
+  const headK = role === 'head' ? faceDetail(g).marks : 1;
 
   // ---- THE SEAM: a checker band where shadeBack's dark half begins ----------
   // softEdge is the share of the checker's cells that are laid.
-  if (sk.softEdge > 0)
+  const softEdge = sk.softEdge * headK;
+  if (softEdge > 0)
     for (const v of cells) {
       if (v[3] !== ART.SKIN_BASE || ((v[0] + v[2]) & 1)) continue;
       const b = get(v[0], v[1] + 1, v[2]);
       if (b && b[3] === ART.SKIN_SHADE && exposed(v[0], v[1], v[2]) &&
-          (sk.softEdge >= 1 || rnd(v[0], v[1], v[2], 0x5e) < sk.softEdge))
+          (softEdge >= 1 || rnd(v[0], v[1], v[2], 0x5e) < softEdge))
         v[3] = ART.SKIN_SHADE;
     }
 
@@ -5091,8 +5787,8 @@ function humanSkinPass(g, cells, size, info) {
   // them claims bare skin (SKIN_BASE) only. The mottle used to go first, and
   // then raising the texture took moles away: a mole could only land on a
   // cell the mottle had not already taken.
-  if (sk.moles > 0) {
-    const rate = sk.moles * (role === 'head' ? 0.004 : 0.0012);
+  if (sk.moles * headK > 0) {
+    const rate = sk.moles * headK * (role === 'head' ? 0.004 : 0.0012);
     for (const v of cells)
       if (v[3] === ART.SKIN_BASE && exposed(v[0], v[1], v[2]) &&
           rnd(v[0], v[1], v[2], 0x30) < rate) v[3] = ART.MOLE;
@@ -5108,8 +5804,8 @@ function humanSkinPass(g, cells, size, info) {
     }
 
   // TEXTURE: a fine mottle, in patches.
-  if (sk.texture > 0) {
-    const rate = sk.texture * (role === 'head' ? 0.05 : 0.09);
+  if (sk.texture * headK > 0) {
+    const rate = sk.texture * headK * (role === 'head' ? 0.05 : 0.09);
     for (const v of cells) {
       if (v[3] !== ART.SKIN_BASE || !exposed(v[0], v[1], v[2])) continue;
       const patch = vnoise(seed, v[0] - ox, v[1] - oy, oz - v[2], 4);
@@ -6975,6 +7671,12 @@ function scaleClipPositions(clips, factor) {
  */
 export function generateMob(genome, seed = 0, opts = {}) {
   const g = normalizeGenome(genome);
+  // THE OLD FACE ON A HUMAN (the Characters page's old/fine toggle) is
+  // headVox's, which draws whole authored cells: its half steps rounded, as
+  // the fine head's own old branches round them (legacyFace). Unrounded, a
+  // half-step brow reach never met its end column and looped forever.
+  if (opts.face === 'legacy' && (g.body.race || 'human') === 'human')
+    g.face = legacyFace(g.face);
   const name = opts.name || g.name || 'untitled';
   const table = limbTable(g);
   const L = table.limbs;

@@ -248,7 +248,10 @@ void Overlay::DrawHUD(const UIState& s) {
   const float bowPx = 2.0f;                 // the bow's pixel
   const float bowGlyphW = 13 * bowPx;       // string pulled 6 + stave bow 4 + head 3
   char bowCount[16];
-  std::snprintf(bowCount, sizeof bowCount, "x%d", std::max(0, s.arrowsLeft));
+  if (s.bowNoQuiver)
+    std::snprintf(bowCount, sizeof bowCount, "no quiver");
+  else
+    std::snprintf(bowCount, sizeof bowCount, "x%d", std::max(0, s.arrowsLeft));
   const ImVec2 bowCs = ImGui::CalcTextSize(bowCount);
   const float bowInner = bowGlyphW + 8.0f + bowCs.x;
   const float barsRight =

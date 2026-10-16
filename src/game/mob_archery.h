@@ -45,7 +45,9 @@
 // profile with a `ranged` block: a creature not holding a bow is handed the
 // profile's `bow` in its right fist (what that fist held goes to the sheath, a
 // sidearm, else the bag; the left fist is emptied into the bag -- it is the
-// string hand), and arrows are added to its pack up to `quiver`. Anything
+// string hand), a QUIVER goes on its back (the first in the library that takes
+// the bow's arrows; game/quiver.h -- the bow draws from nothing else) and
+// arrows are loaded into it up to `quiver` (and its capacity). Anything
 // else: untouched. Called at SPAWN only -- a loaded creature's kit is the
 // save's truth and is never restocked.
 //
@@ -61,7 +63,9 @@
 // Nothing asked and nothing drawn = nothing runs.
 //
 // NOT SAVED: a draw in progress (a loaded archer starts with the string
-// slack). The arrows in its kit are the kit's, saved with it.
+// slack). The arrows in its quiver are the kit's, saved with it (the quiver
+// rides the gear list, Mob::CaptureGear). Each shot is a RANDOM arrow of the
+// quiver (rng::Hash3 on mob id and tick), coat and all.
 
 #include <cstdint>
 #include <span>

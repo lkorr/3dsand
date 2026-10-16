@@ -2246,7 +2246,11 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
   const shapeOf = p => p.cells.map(c => c.slice(0, 3).join(',')).sort().join(';');
   const paintOf = p => p.cells.map(c => c.join(',')).sort().join(';');
   const def = mg.defaultGenome();
-  const fine = mg.generateMob(def, 0, opts), old = mg.generateMob(def, 0, { ...opts, face: 'legacy' });
+  // THE FINE FACE IS DETAIL 1 (FACE DETAIL in mobgen.js): every detail row
+  // defaults to 0, the old face, so what this section asks of the fine face
+  // it asks of a genome turned all the way up. Section V holds detail 0.
+  const FINE = src => mg.applyFaceDetail(mg.normalizeGenome(src), 1);
+  const fine = mg.generateMob(FINE(def), 0, opts), old = mg.generateMob(def, 0, { ...opts, face: 'legacy' });
   const F = partsOf(fine), O = partsOf(old);
 
   // 1. Both build sound, and the head keeps its BOX (every helm is fit to it).
@@ -2294,7 +2298,7 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
   // AN OPACITY MOVES A COLOUR, NOT A CELL: the same cells in the same slots,
   // the slot's colour mixed toward the skin -- in tenths, ends exact.
   const tone = (path, v) => {
-    const g = mg.normalizeGenome({}); mg.setPath(g, path, v); return mg.normalizeGenome(g);
+    const g = FINE({}); mg.setPath(g, path, v); return mg.normalizeGenome(g);
   };
   for (const [path, slot] of [['body.skin.collarbones', A.COLLAR_L],
                               ['body.skin.nails', A.NAIL_T], ['face.lashTone', A.LASH],
@@ -2315,7 +2319,7 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
 
   // 3. THE FINE FACE IS SYMMETRIC in shape on a symmetric genome: every lever
   //    that is not a side (the parting, the smirk, the offset, the scar) high.
-  const sym = mg.normalizeGenome({ face: { brow: true, browProud: true, nose: 2.5,
+  const sym = FINE({ face: { brow: true, browProud: true, nose: 2.5,
     noseWidth: 2, noseBridge: 1, noseBulb: 1, earSize: 2, earPoint: true,
     eyeCols: 2, eyeWhites: true, eyeOpen: 1, eyeTilt: 1, lashes: 1, lips: 2 } });
   const H = partsOf(mg.generateMob(sym, 0, opts)).head;
@@ -2343,7 +2347,7 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
     ['face.mouthShift', 0.5], ['body.skin.blush', 0.6], ['body.skin.moles', 1],
   ];
   for (const [path, v] of LEVERS) {
-    const base = mg.normalizeGenome({ face: path.startsWith('face.brow') ? browOn : {} });
+    const base = FINE({ face: path.startsWith('face.brow') ? browOn : {} });
     const g = mg.normalizeGenome(base);
     mg.setPath(g, path, v);
     const n = mg.normalizeGenome(g);
@@ -2353,7 +2357,7 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
   }
   // A low mouth, so the nose has rows to grow into: it stops two rows above the
   // mouth line, and at the default mouth anything past 1.5 is that stop.
-  const nosed = mg.normalizeGenome({ face: { nose: 2, mouthDrop: 4.5 } });
+  const nosed = FINE({ face: { nose: 2, mouthDrop: 4.5 } });
   for (const [path, v] of [['face.nose', 1.5], ['face.noseWidth', 1.5],
                            ['face.noseBridge', 0.9], ['face.noseBridge', 0.1],
                            ['face.noseBulb', 0.9]]) {
@@ -2361,13 +2365,13 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
     mg.setPath(g, path, v);
     ok(head(mg.normalizeGenome(g)) !== head(nosed), `fine lever ${path} = ${v} moves a cell`);
   }
-  ok(head(mg.normalizeGenome({ body: { skin: { texture: 0.8 } } })) !== head(mg.defaultGenome()),
+  ok(head(FINE({ body: { skin: { texture: 0.8 } } })) !== head(FINE({})),
      'skin texture reaches the face');
-  const round = mg.normalizeGenome({ face: { eyeOpen: 1 } });
-  ok(head(mg.normalizeGenome({ face: { eyeOpen: 1, glint: true } })) !== head(round),
+  const round = FINE({ face: { eyeOpen: 1 } });
+  ok(head(FINE({ face: { eyeOpen: 1, glint: true } })) !== head(round),
      'fine lever face.glint moves a cell (on a two-row eye)');
-  const pointed = mg.normalizeGenome({ face: { earPoint: true } });
-  ok(head(mg.normalizeGenome({ face: { earPoint: true, earPointLen: 1 } })) !== head(pointed),
+  const pointed = FINE({ face: { earPoint: true } });
+  ok(head(FINE({ face: { earPoint: true, earPointLen: 1 } })) !== head(pointed),
      'fine lever face.earPointLen moves a cell');
 
   // THE OLD EYE IS A SETTING: the `old` style draws the legacy head's eye,
@@ -2384,7 +2388,7 @@ const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
   for (const cols of [1, 2]) {
     const base = mg.normalizeGenome({ face: { eyeCols: cols } });
     const legacyEye = eyeCells(mg.generateMob(base, 0, { ...opts, face: 'legacy' }));
-    const o = mg.normalizeGenome(base);
+    const o = FINE(base);                     // the style, at full detail
     mg.applyEyeStyle(o, 'old');
     const oldStyle = eyeCells(mg.generateMob(mg.normalizeGenome(o), 0, opts));
     if (cols === 1)
@@ -2726,6 +2730,168 @@ section('U. every slider moves only what it is for (gene independence)');
     ok(grown.size > painted.size + 50, 'the beard\u2019s own volume does',
        `${painted.size} -> ${grown.size}`);
   }
+}
+
+// =============================================================================
+// V. face detail
+// =============================================================================
+
+section('V. face detail: 0 is the old head cell for cell, and each feature its own slider');
+{
+  // THE OWNER'S ASK (2026-10-15): "the new faces are sculpted and shaped too
+  // differently and should follow the same contours, and there should be
+  // sliders that interpolate between the more blocky 2x2x2 look on the face
+  // and the new one ... the facial hair is way too drastically different".
+  // So a human's head is a function of eight detail rows (mobgen.js FACE
+  // DETAIL), every default 0. What must hold:
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  const A = mg.ART;
+  const partsOf = b => Object.fromEntries(b.parts.map(p => [p.name, p]));
+  // headVox paints the face's marks in SKIN_SHADE / SKIN_LIGHT; at every
+  // detail the fine head paints those two colours as FACE_SHADE / FACE_LIGHT,
+  // so the Characters page draws them (FACE DETAIL, "the marks").
+  const AS_OLD = { [A.FACE_SHADE]: A.SKIN_SHADE, [A.FACE_LIGHT]: A.SKIN_LIGHT };
+  // IN LIST ORDER: hairMass grows its shells from the head's cells in order.
+  const sig = (p, asOld) => p.cells.map(([x, y, z, c]) =>
+    `${x},${y},${z},${asOld ? (AS_OLD[c] ?? c) : c}`).join(';');
+  const at = (src, d) => mg.applyFaceDetail(mg.normalizeGenome(src), d);
+
+  // 1. AT 0 THE HEAD IS headVox's -- every cell, its paint and its ORDER --
+  //    and so is all the hair the head's marks grow, on every saved human (half
+  //    steps rounded, as the old head draws them), the presets and 60 rolls.
+  //    The same builds the Characters page's old-face toggle, which used to
+  //    loop forever on a half-step brow reach (maren).
+  const cast = [['default', mg.defaultGenome()],
+                ...mg.PRESET_ORDER.map(k => ['preset ' + k, mg.presetGenome(k)])];
+  for (const dir of ['human', 'pool'])
+    for (const n of fs.readdirSync(path.join(ROOT, 'assets/mobs', dir)).sort()) {
+      if (!n.endsWith('.json')) continue;
+      const j = readJson(path.join(ROOT, 'assets/mobs', dir, n));
+      if (j.genome && (j.genome.body?.race ?? 'human') === 'human') cast.push([n, j.genome]);
+    }
+  for (let k = 1; k <= 60; k++) cast.push(['roll ' + k, mg.randomGenome(mg.makeRng(9100 + k))]);
+  const bad = [];
+  for (const [nm, src] of cast) {
+    const g = at(src, 0);
+    let F, O;
+    try {
+      F = partsOf(mg.generateMob(g, 0, opts));
+      O = partsOf(mg.generateMob(g, 0, { ...opts, face: 'legacy' }));
+    } catch (e) { bad.push(`${nm} (${e.message})`); continue; }
+    const hair = [...new Set([...Object.keys(F), ...Object.keys(O)])]
+      .filter(k => (F[k] || O[k]).hair);
+    if (sig(F.head, true) !== sig(O.head) ||
+        !hair.every(k => F[k] && O[k] && F[k].mn.join() === O[k].mn.join() &&
+                         sig(F[k]) === sig(O[k])))
+      bad.push(nm);
+  }
+  ok(!bad.length, `detail 0 is the old head and its hair, cell for cell, on ` +
+                  `${cast.length - bad.length}/${cast.length} bodies`, bad.slice(0, 6).join(', '));
+
+  // 2. EACH ROW REACHES ITS FEATURE AND STOPS AT THE NECK: on a face with every
+  //    feature on, each row alone at 1 changes the head, and no part below it.
+  const rich = mg.applySex(mg.presetGenome('human'), 'male');
+  mg.applyBeardStyle(rich, 'stubble');
+  Object.assign(rich.face, { brow: true, browProud: true, nose: 2, noseWidth: 1.5,
+    lips: 1, mouthCurve: 0.5, cheeks: 0.6, freckles: 0.6, wrinkles: 0.8, scar: 0.5,
+    earPoint: true, eyeBags: 0.7 });
+  rich.body.skin.blush = 0.5;
+  const R0 = partsOf(mg.generateMob(at(rich, 0), 0, opts));
+  const below = Object.keys(R0).filter(n => n !== 'head' && !R0[n].hair);
+  for (const k of mg.DETAIL_KEYS) {
+    const g = at(rich, 0);
+    g.face[k] = 1;
+    const P = partsOf(mg.generateMob(mg.normalizeGenome(g), 0, opts));
+    ok(sig(P.head) !== sig(R0.head), `face.${k} at 1 changes the head`);
+    ok(below.every(n => sig(P[n]) === sig(R0[n])), `face.${k} changes nothing below the neck`);
+  }
+
+  // 3. THE MASTER ROW is a style row (no roll, mutate or cross draws it) that
+  //    sets all eight; every row starts at the old face.
+  const m = mg.normalizeGenome({});
+  ok(mg.applyStyleRow(m, 'face.detail', 0.6) &&
+     mg.DETAIL_KEYS.every(k => m.face[k] === 0.6) && m.face.detail === 0.6,
+     'the face detail row sets every feature’s detail');
+  ok(mg.GENE_SPECS.find(sp => sp.path === 'face.detail').styled,
+     'the face detail row is a style row');
+  ok(mg.DETAIL_KEYS.every(k => mg.normalizeGenome({}).face[k] === 0),
+     'every detail row defaults to 0, the old face');
+
+  // 4. THE HEAD SHAPE KEEPS THE OLD OUTLINE. Rounded all the way, the head's
+  //    silhouette is the old head's row for row, front and side, to a cell
+  //    each side (its flat lid to two), and its volume to 3%: the same head with its stair steps
+  //    sanded off. (The resampled ellipse this replaced was two cells wider
+  //    through the cheeks with a tapering crown and jaw -- the "egg".)
+  const rows = p => {
+    const r = new Map();
+    for (const [x, y, z] of p.cells) {
+      const v = r.get(z) || [1e9, -1e9, 1e9, -1e9];
+      v[0] = Math.min(v[0], x); v[1] = Math.max(v[1], x);
+      v[2] = Math.min(v[2], y); v[3] = Math.max(v[3], y);
+      r.set(z, v);
+    }
+    return r;
+  };
+  for (const [nm, src] of cast.slice(0, 12)) {
+    const H0 = partsOf(mg.generateMob(at(src, 0), 0, opts)).head;
+    const g1 = at(src, 0);
+    g1.face.detailShape = 1;
+    const H1 = partsOf(mg.generateMob(mg.normalizeGenome(g1), 0, opts)).head;
+    const r0 = rows(H0), r1 = rows(H1);
+    // (The crown's top row is the old head's flat lid; rounded, its corners
+    // come in two cells, which is the rounding.)
+    const lid = Math.max(...r0.keys());
+    let worst = 0;
+    for (const [z, v0] of r0) {
+      const v1 = r1.get(z);
+      const d = v1 ? Math.max(...v0.map((e, i) => Math.abs(e - v1[i]))) : 99;
+      worst = Math.max(worst, z === lid ? Math.max(0, d - 1) : d);
+    }
+    const vol = H1.cells.length / H0.cells.length;
+    ok(worst <= 1 && vol > 0.97 && vol < 1.03,
+       `${nm}: the rounded head is the old head’s outline and volume`,
+       `worst row edge ${worst}, volume x${vol.toFixed(3)}`);
+  }
+
+  // 5. ...AND THE ROUNDING RUNS ALL THE WAY ALONG ITS SLIDER (it once moved
+  //    nothing below a half), the head a mirror at every step.
+  {
+    const H = d => {
+      const g = at({}, 0);
+      g.face.detailShape = d;
+      return partsOf(mg.generateMob(mg.normalizeGenome(g), 0, opts)).head;
+    };
+    const set0 = new Set(H(0).cells.map(c => c.slice(0, 3).join(',')));
+    const moved = h => {
+      const s1 = new Set(h.cells.map(c => c.slice(0, 3).join(',')));
+      let n = 0;
+      for (const k of s1) if (!set0.has(k)) n++;
+      for (const k of set0) if (!s1.has(k)) n++;
+      return n;
+    };
+    const steps = [0.25, 0.5, 0.75, 1].map(d => moved(H(d)));
+    ok(steps[0] > 0 && steps[0] < steps[1] && steps[1] < steps[2] && steps[2] < steps[3] &&
+       steps[1] > steps[3] * 0.3 && steps[1] < steps[3] * 0.7,
+       'the head shape rounds a share at a time along its slider', steps.join(' / '));
+    for (const d of [0.25, 0.5, 0.75]) {
+      const h = H(d), sx = h.size[0];
+      const cs = new Set(h.cells.map(c => c.slice(0, 3).join(',')));
+      ok(h.cells.every(([x, y, z]) => cs.has(`${sx - 1 - x},${y},${z}`)),
+         `the head is a mirror at shape detail ${d}`);
+    }
+  }
+
+  // 6. THE TONES ARE THE DETAIL'S TOO: at eye detail 0 the whites, the lash
+  //    line and the crease are the skin and the bags the old full shade; at 1
+  //    each is its own colour. The ear's hollow is the rim's shade at 0.
+  const t0 = at({}, 0), t1 = at({}, 1);
+  const c0 = mg.detailColors(t0.colors, t0), c1 = mg.detailColors(t1.colors, t1);
+  ok(c0[A.EYE_WHITE] === t0.colors.skin && c0[A.LASH] === t0.colors.skin &&
+     c0[A.CREASE] === t0.colors.skin && c0[A.BAGS] === t0.colors.skinShade &&
+     c0[A.EAR_IN] === t0.colors.skinShade,
+     'at detail 0 the fine tones are the old face’s');
+  ok(c1[A.EYE_WHITE] !== t1.colors.skin && c1[A.LASH] !== t1.colors.skin,
+     'at detail 1 the whites and lashes are their own colours');
 }
 
 // =============================================================================

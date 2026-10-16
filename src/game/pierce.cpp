@@ -23,8 +23,10 @@
 
 bool Mob::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
                      const Penetrator& pen, World& world,
-                     std::vector<ParticleSpawn>& spawns, PierceResult& out) {
+                     std::vector<ParticleSpawn>& spawns, PierceResult& out,
+                     std::vector<IVec3>* woundOut) {
   out = PierceResult{};
+  if (woundOut) woundOut->clear();
   if (!def_ || !phys_ || sys_ == nullptr) return false;
   int li = -1;
   for (size_t i = 0; i < limbs_.size(); i++)
@@ -207,6 +209,7 @@ bool Mob::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
       },
       /*spall=*/nullptr, &rep, &box);
   out.carved = (uint32_t)rep.cells.size();
+  if (woundOut) *woundOut = rep.cells;
   out.hpCharged = lostAll() - lost0;
   out.killed = wasAlive && !alive_;
   // SEVERED OR DEAD-AND-RELEASED: nothing below may touch the slot (the
@@ -241,7 +244,7 @@ bool Mob::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
 bool MobSystem::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
                            const Penetrator& pen, World& world,
                            std::vector<ParticleSpawn>& spawns,
-                           PierceResult& out) {
+                           PierceResult& out, std::vector<IVec3>* woundOut) {
   // Every creature, the avatar included (FindOwner's walk, CutLimb's reason).
   int li = -1;
   Mob* m = FindOwner(bodyHandle, &li);
@@ -250,7 +253,7 @@ bool MobSystem::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
     return false;
   }
   return m->PierceLimb(bodyHandle, fromWorld, dirWorld, pen, world, spawns,
-                       out);
+                       out, woundOut);
 }
 
 PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris,
@@ -259,7 +262,8 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
                             const Penetrator& pen,
                             const std::vector<uint64_t>& ignore,
                             const std::string& embedItem,
-                            uint64_t shooterActor, Vec3 shooterAt) {
+                            uint64_t shooterActor, Vec3 shooterAt,
+                            const PierceCoat* coat) {
   PierceFlight f;
   f.speedMps = pen.speedMps;
   const float dl = dirWorld.len();
@@ -335,6 +339,7 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
       wire.c.pierce = cur;
       wire.slot = slot;
       wire.embedItem = embedItem;
+      if (coat != nullptr && coat->item != nullptr) wire.embedInst = *coat->item;
       return wire;
     };
     std::vector<ParticleSpawn> ghostGore;
@@ -354,7 +359,31 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
           sneak = mobs.SneakAttackMul(*m, shooterActor, true);
           hitPen.hp *= sneak;
         }
-        mobs.PierceLimb(body, origin, d, hitPen, world, spawns, h.r);
+        // Who is struck, named BEFORE the channel's carve (a sever renumbers).
+        const uint64_t coatMob = m->Id();
+        const int coatSlot = li;
+        const std::string coatSlotName = m->SlotName(li);
+        std::vector<IVec3> wound;
+        mobs.PierceLimb(body, origin, d, hitPen, world, spawns, h.r,
+                        coat != nullptr && coat->lattice != nullptr ? &wound : nullptr);
+        // THE POINT TRADES COATS WITH THE CHANNEL (PierceCoat): only a channel
+        // that got in and took something has walls to trade with.
+        if (coat != nullptr && coat->lattice != nullptr && h.r.hit &&
+            !h.r.missed && !wound.empty()) {
+          MobSystem::CoatContact cc;
+          cc.strikerLattice = coat->lattice;
+          cc.strikerScale = coat->scale;
+          cc.strikerCell = coat->tipCell;
+          cc.radius = coat->headVox;
+          cc.targetId = coatMob;
+          cc.targetSlot = coatSlot;
+          cc.targetSlotName = coatSlotName;
+          cc.at = h.r.stopWorld;
+          cc.kind = MobSystem::CoatHitKind::Pierce;
+          cc.power = 1.0f;
+          cc.woundCells = &wound;
+          mobs.CoatOnContact(cc);
+        }
         if (shooterActor != 0 && h.r.hit && !h.r.missed) {
           if (sneak > 1.0f) {
             MobSystem::SneakEvent ev;

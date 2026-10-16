@@ -90,6 +90,8 @@ const char* ItemIcon(const std::string& kind) {
   if (kind == "armor_belt") return "slot_belt";
   if (kind == "trinket") return "slot_trinket";
   if (kind == "container") return "item_container";
+  // A quiver borrows the Back slot's engraving (equipment.h), as worn pieces do.
+  if (kind == "quiver") return "slot_sheath";
   return "item_unknown";
 }
 
@@ -2527,7 +2529,7 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
   if (T.frozen && !T.coats.empty()) {
     // Said where it matters: a coat put on a blade in the pack waits there.
     dl->AddText(ImVec2(colX, y), Fade(ui::ColGoldPale(), 0.75f),
-                FitText("won't dry until drawn", colW).c_str());
+                FitText(T.quiver ? "won't dry in the quiver" : "won't dry until drawn", colW).c_str());
     y += lineH + 2;
   }
   y += 10;
@@ -2596,6 +2598,36 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
     const ImVec2 ts = ImGui::CalcTextSize(b);
     dl->AddText(ImVec2(colX + (colW - ts.x) * 0.5f, y + 8), ui::ColParch(), b);
     y += 50;
+  }
+  // A QUIVER: BRUSH ONE, COPY TO N (itemstage::ApplyCopy). The arrow shown is
+  // the pattern; what it wears of the chosen flask's matter goes onto N more.
+  if (T.quiver && T.arrows > 1) {
+    dl->AddText(ImVec2(colX, y), ui::ColGold(), "COPY TO ARROWS");
+    y += lineH + 6;
+    const float bw = 40.0f;
+    const int most = std::max(1, T.arrows - 1);
+    T.copyN = std::clamp(T.copyN, 1, most);
+    if (ui::Button("##stagecopyless", ImVec2(colX, y), "-", false, bw))
+      T.copyN = std::max(1, T.copyN - (ImGui::GetIO().KeyShift ? 5 : 1));
+    rec("##stagecopyless");
+    if (ui::Button("##stagecopymore", ImVec2(colX + colW - bw, y), "+", false, bw))
+      T.copyN = std::min(most, T.copyN + (ImGui::GetIO().KeyShift ? 5 : 1));
+    rec("##stagecopymore");
+    char b[48];
+    std::snprintf(b, sizeof b, T.copyN >= most ? "all %d others" : "%d more", T.copyN);
+    const ImVec2 ts = ImGui::CalcTextSize(b);
+    dl->AddText(ImVec2(colX + (colW - ts.x) * 0.5f, y + 8), ui::ColParch(), b);
+    y += 48;
+    const bool go = ui::Button("##stagecopy", ImVec2(colX, y), "apply", false, colW);
+    rec("##stagecopy");
+    if (go && hasBrush) T.wantCopy = true;
+    if (ImGui::IsItemHovered())
+      Tip(hasBrush ? "Coat that many more arrows in this quiver the way this one is "
+                     "coated with the chosen flask's matter. It costs what brushing "
+                     "them by hand would."
+                   : "Choose a filled flask on the FLASKS row, brush this arrow, then "
+                     "copy its coat onto the rest.");
+    y += 48;
   }
   // WHAT IT WEARS, heaviest coverage first (the per-limb ledger's shape).
   dl->AddText(ImVec2(colX, y), ui::ColGold(), "COATS");
@@ -4983,6 +5015,25 @@ void DrawInventoryScreen(UIState& s) {
                      Fade(ui::ColParch(), 0.8f), tag);
       ImGui::PopFont();
       ui::KeyBadge(dl, ImVec2(sx + 2, sy + 2), side ? "Q" : "E");
+    }
+    // THE BACK (game/quiver.h): the quiver the bow draws from, under the
+    // right column's armour. A real kit slot, so a drag in or out is the move
+    // Q / E make on a quiver in the hotbar.
+    {
+      const int idx = s.backEquipSlot < (int)s.equipDefs.size() ? s.backEquipSlot : -1;
+      if (idx >= 0) {
+        const float sy = portY + 4 * (kSlot + kSlotGap) + 6;
+        const UIState::EquipSlotUI& d = s.equipDefs[idx];
+        ItemSlot(s, "eqback", ImVec2(colR, sy), SlotOr(s.equipSlots, idx),
+                 KitRef{KitSpace::Equip, idx}, d.icon.c_str(), d.acceptsAnything,
+                 d.why.c_str(), false, &d.accepts);
+        ImGui::PushFont(ui::FontSmall());
+        const char* tag = "back";
+        const ImVec2 ts = ImGui::CalcTextSize(tag);
+        ui::ShadowText(dl, ImVec2(std::floor(colR + (kSlot - ts.x) * 0.5f), sy + kSlot + 2),
+                       Fade(ui::ColParch(), 0.8f), tag);
+        ImGui::PopFont();
+      }
     }
     y = portY + kPortraitH + 16;
 

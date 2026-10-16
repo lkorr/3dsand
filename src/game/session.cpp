@@ -23,6 +23,7 @@
 #include "game/dye.h"
 #include "game/itemcoat.h"
 #include "game/pierce.h"   // SpellMatterStrike: a spell flight's matter meets a body
+#include "game/quiver.h"   // the bow draws from the quiver on the back
 #include "game/persist.h"
 #include "game/strokes.h"
 #include "game/worlditems.h"
@@ -2420,10 +2421,16 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             }
             const uint32_t aseed =
                 rng::Hash3(0xA770B0u, tick, (uint32_t)s.index);
+            // WHICH ARROW (game/quiver.h): a random one out of the quiver on
+            // the back, keyed on the shot's own stateless hash -- so a replay
+            // or a peer looses the same arrow, coat and all.
+            const uint32_t pick = rng::Hash3(0xA770B2u, tick, (uint32_t)s.index);
+            const ItemInstance nocked = KitPeekAmmo(kit, ammo->name, pick);
             if (w.arrows.Launch(*ammo, from, dir, speed, player.vel, aseed,
                                 std::move(ignore),
-                                ai::kPlayerActorBase + (uint64_t)s.index)) {
-              KitTakeAmmo(kit, ammo->name);
+                                ai::kPlayerActorBase + (uint64_t)s.index,
+                                &nocked)) {
+              KitTakeAmmo(kit, ammo->name, pick);
               have--;
             } else {
               ui.kitMessage = "too many arrows in the air";
@@ -2437,6 +2444,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                          : 0.0f;
         ui.bowMinDraw = bowDef ? bowDef->bow.minDraw : 0.0f;
         ui.arrowsLeft = bowDef ? std::max(0, have) : -1;
+        // No quiver on the back: the bow cannot draw at all (game/quiver.h).
+        ui.bowNoQuiver = bowDef != nullptr && KitWornQuiver(kit, items) == nullptr;
       }
       // WHICH VESSEL ACTS THIS TICK: the one whose hand's button is down
       // (the right's first), else the last-used hand's, else the only one.
@@ -4475,6 +4484,24 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               ui.kitMessage = r.refused;
               ui.kitMessageAge = 0.0f;
             }
+          }
+          // BRUSH ONE, COPY TO N (a quiver on the stage): one tick, one order.
+          if (s.itemStageCopy.active) {
+            const itemstage::CopyResult cr =
+                itemstage::ApplyCopy(kit, items, mats, s.itemStageCopy);
+            s.itemStageCopy = itemstage::CopyOrder{};
+            if (cr.refused) {
+              ui.kitMessage = cr.refused;
+            } else if (cr.done == 0) {
+              ui.kitMessage = "every arrow in it wears that already";
+            } else {
+              const std::string what =
+                  cr.mat < mats.size() ? mats[cr.mat].name : std::string("it");
+              ui.kitMessage = "you coat " + std::to_string(cr.done) +
+                              (cr.done == 1 ? " more arrow" : " more arrows") + " with " +
+                              what + " (" + std::to_string(cr.spent) + "/8 of a cell)";
+            }
+            ui.kitMessageAge = 0.0f;
           }
         }
         // ---- SPELLS IN HAND (caster.h PlayerCaster::hand) ------------------

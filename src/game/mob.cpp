@@ -29935,6 +29935,14 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
     piece.contents = hh.contents;
     out.push_back(std::move(piece));
   }
+  // The quiver on its back (and every arrow in it), before the pack.
+  if (const ItemStack& q = kit_.equip.At((int)EquipSlotId::Back); !q.Empty()) {
+    LootPiece piece;
+    static_cast<ItemInstance&>(piece) = q;
+    piece.kind = LootPiece::Kind::Back;
+    piece.equipSlot = (int)EquipSlotId::Back;
+    out.push_back(std::move(piece));
+  }
   // The pack last, so the worn and held entries keep the indices the loot
   // panel has always given them and a pack item is simply further down.
   // Whole instances (W2-M): a looted flask holds what it held.
@@ -29964,6 +29972,10 @@ bool Mob::TakeLootPiece(int index, LootPiece* out, int count) {
     case LootPiece::Kind::Held:
       // unequip: the borrowed slot leaves with the item
       EquipItem(nullptr, piece.hand);
+      break;
+    case LootPiece::Kind::Back:
+      // No body to take out of the world: the kit slot is the whole of it.
+      kit_.equip.slots[(int)EquipSlotId::Back] = ItemStack{};
       break;
     case LootPiece::Kind::Carried: {
       // The carried entries are the tail of the list, in pack order.
@@ -31801,6 +31813,16 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
   std::stable_sort(bySlot.begin(), bySlot.end(),
                    [](const auto& a, const auto& b) { return a.first < b.first; });
   for (auto& e : bySlot) out.push_back(std::move(e.second));
+  // THE QUIVER ON ITS BACK (game/quiver.h), last: it has no rig slot to sort
+  // by. The whole instance, every arrow in it, so a saved, announced or
+  // handed-off archer keeps what it would shoot (MobSystem::ApplyWireGear).
+  if (const ItemStack& q = kit_.equip.At((int)EquipSlotId::Back); !q.Empty()) {
+    ::net::WireGear g;
+    static_cast<ItemInstance&>(g) = q;
+    g.equipSlot = (int)EquipSlotId::Back;
+    g.held = 0;
+    out.push_back(std::move(g));
+  }
 }
 
 bool MobSystem::SavesAsRecord(const Mob& m) const {
@@ -33141,6 +33163,7 @@ bool MobSystem::RedressFromWire(Mob& m,
   for (int es : slots) m.UnwearItem(es);
   for (int hk = 0; hk < kHands; hk++)
     if (!m.held_[hk].item.empty()) m.EquipItem(nullptr, HandAt(hk));
+  m.KitMut().equip.slots[(int)EquipSlotId::Back] = ItemStack{};
   ApplyWireGear(m, gear);
   instancesDirty_ = true;
   return true;
@@ -33154,6 +33177,10 @@ void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) 
     if (g.held) {
       const Hand h = g.held == 2u ? Hand::Left : Hand::Right;
       if (m.EquipItem(item, h)) m.SetHeldContents(g.contents, h);
+    } else if (g.equipSlot == (int)EquipSlotId::Back) {
+      // A quiver is a kit slot, not a shell: the instance, arrows and all.
+      if (item->IsQuiver())
+        m.KitMut().equip.slots[(int)EquipSlotId::Back] = static_cast<const ItemInstance&>(g);
     } else
       m.WearItem(item, g.equipSlot, g.damage.Empty() ? nullptr : &g.damage,
                  g.dye);
@@ -34376,7 +34403,7 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
 //     hit on a held item embeds nowhere. Base hosts are what keep `wornHost`
 //     stable across RemoveAppendedSlots (MobLimb::wornHost's last note).
 int Mob::EmbedArrow(const ItemDef& item, int hostLimb, Vec3 tipWorld,
-                    Vec3 dirWorld) {
+                    Vec3 dirWorld, const ItemInstance* inst) {
   if (!phys_ || !item.IsAmmo() || item.voxels.empty()) return -1;
   if (hostLimb < 0 || hostLimb >= (int)limbs_.size()) return -1;
   int host = hostLimb;
@@ -34473,8 +34500,30 @@ int Mob::EmbedArrow(const ItemDef& item, int hostLimb, Vec3 tipWorld,
   phys_->SetBodyRole(p.body, LimbRole((size_t)slot), CollisionOwner());
   anim_.partAlive.resize(skel_.parts.size(), 1);
   anim_.springs.resize(skel_.parts.size(), SpringState{});
+  p.voxelsAtSpawn = (uint32_t)p.voxels.size();
+  // THE ARROW KEEPS ITS COAT IN THE WOUND (2026-10-15): the instance's
+  // recorded coats, voxel for voxel (the same art in the same order).
+  if (inst != nullptr && !inst->damage.shells.empty() &&
+      !inst->damage.shells[0].lattice.empty())
+    ApplyLimbCoats(slot, inst->damage.shells[0].lattice);
   MarkInstancesDirty();
   return slot;
+}
+
+bool Mob::PullArrowLattice(int slot, WornDamage& out) const {
+  out.Clear();
+  if (!IsArrowSlot(slot)) return false;
+  const MobLimb& L = limbs_[(size_t)slot];
+  bool coated = false;
+  for (const DebrisVoxel& v : L.voxels)
+    if (v.stain) { coated = true; break; }
+  if (!coated && (uint32_t)L.voxels.size() == L.voxelsAtSpawn) return true;
+  WornShellDamage d;
+  d.atSpawn = L.voxelsAtSpawn;
+  d.live = (uint32_t)L.voxels.size();
+  LatticeOfSlot(slot, d.lattice);
+  out.shells.push_back(std::move(d));
+  return true;
 }
 
 std::string Mob::ArrowItemOf(int slot) const {

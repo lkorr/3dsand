@@ -1028,6 +1028,11 @@ const char* const kOrder[] = {
     // and burning out at the shipped rates; plus a venom mace / fist on skin
     // and into an open pit. Regenerates the ground on the way out.
     "venom-blade",
+    // ...and the same venom on an ARROW (docs/PLAN_poison_arrows.md): a quiver,
+    // one arrow brushed and copied to the rest on the stage, a shot into a
+    // fresh human that seeds the wound, the arrow pulled back into a quiver,
+    // and the shot replayed. Fresh spawns; regenerates the ground on the way out.
+    "poison-arrow",
     // ...and the item STAGE coats the same lattices from a flask: its CPU
     // picture, its pick, a stroke on an item in the pack and one in the fist
     // (DESIGN.md §8b "The item stage"). Regenerates the ground like
