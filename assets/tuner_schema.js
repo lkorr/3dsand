@@ -142,6 +142,9 @@ const TUNING_SCHEMA = [
       {k:'grabCarrySpeed', n:'carry speed cap', d:'Top speed a held body may be moved at, before the weight curve scales it down. THIS is where weight is felt: a heavy thing simply cannot keep up with the crosshair, so it lags when you turn and catches up when you stop.', step:0.5, u:'m/s'},
       {k:'grabBreakDistance', n:'grab break distance', d:'How far the body may fall behind the carry point before the grab lets go. What drops a crate caught on a doorframe instead of dragging it through the frame on the next servo step.', step:0.1, u:'m'},
       {k:'grabSpinDamp', n:'carry spin damping', d:'Per-tick multiplier on a held body\'s spin. 1 keeps whatever tumble it had — and it windmills, because nothing it touches can slow it while the servo owns its linear velocity. 0 welds it to one orientation.', step:0.01},
+      {k:'pickConeDeg', n:'pick cone', d:'How far off the reticle a thing on the floor may be and still be what G picks up — the angle to its nearest point, not a pixel-perfect ray. The best by angle wins, the nearer breaks a near-tie, and never through rock or another body. 0 = only what the centre ray touches.', step:0.5, u:'deg'},
+      {k:'pickConeSmallDeg', n:'pick cone (thin things)', d:'The same cone for a THIN thing — an arrow stuck in the ground or a body, a blade lying flat — which is a few pixels wide from eye height and would otherwise still be a pixel hunt.', step:0.5, u:'deg'},
+      {k:'pickSmallSize', n:'thin-thing size', d:'What counts as thin for the wider cone: the middle extent of its bounding box (an arrow lying flat is long in one axis and a voxel or two in the other two).', step:0.25, u:'vox'},
     ],
   },
 

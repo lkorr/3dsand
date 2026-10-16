@@ -1068,6 +1068,11 @@ const char* const kOrder[] = {
     // pull-out, the flat damage, a volley twice, the draw/release input path.
     // Fresh spawns on pristine ground; regenerates it on the way out.
     "arrow",
+    // ...and G's PICK of an item or an arrow under the reticle (game/
+    // lookpick.h): a cone, line of sight, the nearer-the-reticle rule. One
+    // fresh spawn on pristine ground, kinematic items, never ticks; resets
+    // the creatures and debris on the way out and edits no terrain.
+    "look-pick",
     // ...and NPC ARCHERS (docs/PLAN_projectiles.md E): an `archer` draws,
     // looses and gets into a dummy, backs off from one too close, stops at 0
     // arrows and draws its sidearm, and replays bit for bit. Every scene
