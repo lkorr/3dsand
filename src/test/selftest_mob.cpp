@@ -12479,10 +12479,17 @@ Status GateMobSaveDelta(Ctx& c, std::string& detail) {
 // LEAVES NOTHING: resets mobs and debris, removes the park function, puts the
 // id counter back, clears the store, deletes its save dir and regenerates the
 // world at its home window.
+//
+// THE SWITCH (docs/PLAN_distant_npcs.md D3): arms A-F are the PARK path, so
+// they run with `distant.enabled` PINNED OFF (DistantSwitchScope) -- the
+// default is on since the flip, and the far teleport here (~90 m) is inside
+// the distant radius, so with it on these creatures would demote instead.
+// Arm G turns it on and is the demote path's half of this gate.
 Status GateMobPark(Ctx& c, std::string& detail) {
   namespace fs = std::filesystem;
   const char* kPath = "selftest_mobpark.svd";
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  DistantSwitchScope tierOff(false);
   EntityParking parking;
   auto restore = [&]() {
     c.debris.Reset();
@@ -12925,8 +12932,9 @@ Status GateMobPark(Ctx& c, std::string& detail) {
 
   // ======== G: THE DISTANT TIER'S SWITCH ON (docs/PLAN_distant_npcs.md D0) ===
   //
-  // Everything above ran with `distant.enabled` false -- the shipped default
-  // until D3 -- so it is the old park path, unchanged. With the switch on,
+  // Everything above ran with `distant.enabled` PINNED false (the shipped
+  // default is on since D3), so it is the old park path, unchanged. With the
+  // switch on,
   // the SAME teleport (the creatures are ~90 m from the new window's centre,
   // inside the 128 m radius) DEMOTES instead: nothing parks, the tier holds
   // them, and the same by-hand Unpark brings them back under THEIR OWN ids.
@@ -13867,8 +13875,15 @@ Status GateDistantRoundtrip(Ctx& c, std::string& detail) {
 //      booking the record carried stands B up as the turned def.
 // LEAVES NOTHING: resets mobs, debris and risings, removes the park function,
 // puts the id counter back, clears the store and regenerates the world.
+//
+// THE SWITCH (docs/PLAN_distant_npcs.md D3): P is the corpse's PARK path (the
+// MOBS v6 record in its bucket, the rising it carries), so the gate runs with
+// `distant.enabled` PINNED OFF; with it on (the default since the flip) the
+// teleport is inside the distant radius and the corpses would demote as dead
+// distant creatures instead -- the round trip `distant-roundtrip` holds.
 Status GateCorpseSave(Ctx& c, std::string& detail) {
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  DistantSwitchScope tierOff(false);
   EntityParking parking;
   auto restore = [&]() {
     c.debris.Reset();

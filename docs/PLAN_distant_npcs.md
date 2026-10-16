@@ -1,6 +1,8 @@
 # PLAN: distant NPCs — creatures that keep living past the residency window
 
-Status: **PLANNED 2026-10-13. AUDITED AND AMENDED 2026-10-15** (§7 lists the
+Status: **D0-D3 DONE on `distant-npcs` (2026-10-15): the tier is ON by
+default; D5+D6, D8, D9 next (§6 D3 has what each must know).**
+PLANNED 2026-10-13. AUDITED AND AMENDED 2026-10-15 (§7 lists the
 twelve corrections; they are written into the sections below, so the body is
 the truth and §7 is the changelog). Owner decisions §5 are RESOLVED. Execution
 order and waves: §3. Owner request: "increase the range at which NPCs can
@@ -1535,6 +1537,168 @@ tick, ~half of it).
 and pierce bleeding are flat (no spread, no sever). Severs are lost on a
 retire / save. Statues keep severed limbs. Infection (zombie rot, venom) is
 not modelled at distance.
+
+### D3 (branch `dnpc-d3`): the edge, and the flip
+
+**What landed.** `distant.enabled` is ON by default (tuning row, `tuning.json`,
+schema text, `tuning_params.js` regenerated). The edge (§2.7), all in the tick:
+
+- **The shared band.** `MobSystem::PublishDistantBand` (distant.cpp) builds the
+  near tier's view of the distant creatures within `kDistantEdgeBandVox` (192,
+  moved to distant.h) of the window BOX -- 0 inside it, so one held at the
+  promotion line is in -- from the tier's tick-start state, BEFORE `TickDistant`
+  steps; PreTick appends it to `actors_` AFTER `TickDistant` (which must read
+  the near creatures only). At most `kDistantBandMax` (128), nearest first,
+  ties by id, then id order; membership cached against the tier's new MOVE
+  GENERATION (`DistantMobs::MoveGen`, bumped by Insert / Erase / Take / Clear /
+  Relocate and a death) and the window, so a still tier costs a walk of the
+  members. The snapshot is ONE function now (`FillDistantSnap` /
+  `DistantActorOf`), used by the distant lists and the published band alike.
+  The other direction is D1's band, unchanged, plus the witness:
+  `Stats::playerActorsSeen` counts (and drops) a player-band id at the point a
+  distant actor list is built.
+- **Near hits distant.** `NpcStroke::edgeQueued` + a hook at the top of
+  `StepStroke`: a stroke whose target is not a near creature but a living
+  distant one queues `QueueEdgeBlow` at its FIRST CUTTING TICK (the blade still
+  sweeps for real). The queue (`NearEdgeBlow`: the attacker's kit at the cut,
+  `BuildDistantKit(..., withBody = false)`, the stroke's style matched by form
+  or base or name) is drained at the top of the next impact pass in
+  (attacker id, tick) order and rolled with `ResolveStrike` against the
+  defender's tick-start state; hits join the distant blows' apply.
+- **Distant hits near.** In the impact pass, a swing whose target is a near
+  creature of the band is rolled against that creature's LIVE body -- kit +
+  base-limb hp read once per defender per tick, before anything applies
+  (`absorbRuined`, as near) -- and a hit goes through `ApplyEdgeBlow`
+  (melee.h/.cpp): contact = a ray from 24 voxels out on the attacker's side at
+  THAT limb's collider, stepping past anything else on the line (8 casts
+  max; the limb centre if none reaches it); the sweep's `WornShellAlong`
+  cover retarget (cloth passed by an edge); `BuildStrikeParts` (a "thrust"
+  style is a stab along the travel, any other swing a cut across it; the
+  held item's edge length / half width / heft / carve bonus, a natural
+  weapon's fist floor) + `ResolveOnCreature`; a `StrikeEvent` for the audio.
+  No coat exchange (no attacker lattice). Applied after the distant blows,
+  in attacker-id order. `TickDistant` gained `spawns` (null in a CPU arm:
+  rolled, counted `edgeFarUnapplied`).
+- **Arrows both ways.** `ArrowFlight` carries an `ArrowShot` (shooter,
+  target) and its loose point; the NPC archers fill it. *Out*: a flight that
+  leaves the window (mid-step, or the window moved off it) at a living distant
+  creature is handed over (`QueueEdgeArrowOut`, an `ArrowEvent::PastEdge`) and
+  rolled at the next impact pass by `ResolveArrow` over the whole shot's
+  distance, landing after the flight time left (exit -> target at its exit
+  speed). A near archer's draw tracks a distant target through
+  `MobSystem::EdgeActor` (the published entry). *In*: a distant archer's loose
+  at a near creature of the band is a REAL flight -- aimed as `mob_archery`
+  aims (shoulder, aimRaise, `LeadPoint`, `ArrowHoldover`, the profile's spread
+  x the brain's aim tune on `kSaltDistantArrow`), flown by
+  `ArrowStepOutside` (arrows.cpp: ArrowFlights' own integrator, half-voxel
+  samples, DistantGround as the ground), queued at the first in-window sample
+  (`TakeEdgeArrowsIn`) and injected by `MobArcheryTick` with
+  `ArrowFlights::Inject` at that exact fixed-point state. *Converted*: an
+  abstract arrow whose target is a living NEAR creature (promoted mid-flight;
+  D2b's `arrowsLost`) becomes an inbound flight from its arc's state that
+  tick. Inbound arrows are drawn at their real state.
+- **The thrash bound.** `kDistantMaxFlips` (4) per `kDistantFlipWindowTicks`
+  (600), constexpr in distant.h. Demotion cannot wait, so Unpark's promotion
+  pass gets a fourth wait (`DistantFlipBudgetOk`: fewer than max - 1 flips in
+  the window, room kept for the demotion after; `Stats::flipWaits`); a waiting
+  creature is held at the line. Flips are logged per id in
+  `MobSystem::tierFlips_` (the last four ticks; trimmed; cleared by Reset);
+  `PromoteDistant` takes the tick.
+- **Gates.** `distant-edge` (new, `selftest_distant_calib.cpp`, kOrder after
+  `distant-calibrate`); `DistantSwitchScope` (support.h) pins the switch for a
+  scope. Per-gate decisions below. `last_run.json`'s `distant` block gains the
+  edge counters.
+
+**The flip, gate by gate** (every gate that binds a park function; the rest
+cannot demote anyone -- the demote branch is inside `if (parkFn_)`):
+
+| Gate | Decision | Why |
+|---|---|---|
+| `mob-park` | arms A-F PINNED OFF; G (switch on) unchanged | A-F are the park path (record bytes in the bucket, unpark budget/cap/ground); the ~90 m teleport is inside the radius, so with the tier on they would demote |
+| `corpse-save` | PINNED OFF | P is the corpse's MOBS v6 record and its rising through park/unpark; the distant corpse round trip is `distant-roundtrip`'s |
+| `npc-catchup` | PINNED OFF | the PARKED record's schedule catch-up (D5's note: "catch-up remains the path for a record that was never distant"); distant villagers walking schedules is `distant-schedule` (D5) |
+| `refs-npc-identity` | A-E pinned off; NEW arm C2 with the switch ON | C keeps the park-path claim; C2: the villager demotes (distant, nothing parked), the ref goes dormant, and on return the ref does not spawn a duplicate and the PROMOTION brings back the same mob id |
+| `item-park` | sees the tier (unpinned) | its claims are ground items (ITMS); the headless corpse now demotes instead of parking, which it does not assert on |
+| `distant-*` | unchanged | each sets the tier explicitly |
+| `dungeon-entities`, `demon-contract`, `demon-malice`, `mob-handoff` | unchanged, by construction | none binds a park function, so nothing they spawn can become distant; their `MobAt` counts and `!IsAlive`-as-gone still mean what they meant. A future arm that binds parking must count with `LocateCreature` / `LocateByRef` |
+
+**Deviations.**
+1. **A near creature does not walk out of the window.** Measured: a duelist
+   on a Goto 40 voxels past the -Z face stopped with its centre one voxel
+   outside -- the near drive refuses steps onto ground it cannot sense (the
+   fetch cache has nothing past the face). So near -> distant happens when the
+   WINDOW moves (or a body is thrown), not by walking; a near/distant pair
+   meets across the face and stays split. §2.7's "a near creature chasing a
+   distant one out of the window simply becomes distant" holds only for a
+   window move. `distant-edge` T drives the outward crossing through the park
+   rule's own door (`DemoteForTest`) for that reason.
+2. **The near band is published, not shared in place**: the plan said
+   "PreTick's actor list gets the distant creatures appended"; they are
+   appended AFTER TickDistant so the distant tick cannot read the tier back
+   out of the near list, and built BEFORE it so both read tick-start state.
+3. **Near hits distant lands a tick late**: queued during tick T's near
+   loop, rolled at T+1's impact pass (the distant tick runs before the near
+   loop). Deterministic; the roll keys on the stroke's own cut tick.
+4. **Distant hits near is priced by the near model**: the roll decides hit,
+   limb and size; the size enters as the sweep's power = (roll hp / shell
+   factor) / strike total, clamped 0.15..1. Measured in the gate: the roll
+   said 120.5 hp over 7 hits, the near door charged 112.6. The roll's `sever`
+   is ignored for a near body (its lattice decides). A `Blocked` outcome does
+   nothing to the near defender (no item wear, no flinch).
+5. **Inbound arrows are aimed, not rolled**: the near tier's physics is the
+   higher fidelity, so the distant archer's shot is a near archer's shot (aim,
+   lead, holdover, spread) and the table's hit rate is not used. One
+   documented skew: the injected flight steps a full tick from the boundary
+   sample on the tick it enters (< 1 tick of extra travel).
+6. **The thrash bound is a constexpr, not a tuning row** (an engine bound like
+   `kUnparkMarginChunks`); `distantMaxFlips` in baseline.json is the gate's
+   claim about it.
+7. **Fixture finding (not fixed)**: a standing dummy's body box centre
+   (`MobBodyBox`, what archers aim at -- `BoxCentre`, the actor list's centre)
+   sat 1.3 voxels off its pelvis; a ray through the box middle along +x met no
+   collider. `distant-edge` C aims at the root limb's centre.
+
+**Measured** (`--verify distant-edge, distant-fight, distant-calibrate,
+distant-walk, distant-sleep, distant-roundtrip, distant-look, mob-park,
+mob-save-delta, mob-handoff, npc-catchup, refs-npc-identity, dungeon-entities,
+demon-contract, demon-malice, mob-cap64-twice, corpse-save, item-park, archer,
+arrow, duel, npc-strike`: all 22 PASS, 102.7 s; `distant-edge` 15.5 s alone
+after its last fixture change). `distant-edge`, both runs identical (digest
+3ab6af95ccb29304):
+M: 15 near strokes queued at distant, 13 hit (distant hp 1,107 -> 81); 35
+distant swings at near creatures, 7 hit, 7 applied through the door (0 ray
+misses, 0 covered), near hp 1,107 -> 823, 6 limbs carved, 107.7 Blade hp,
+310.7 voxels of blood. A: 6 inbound looses, all injected, 7 PierceAlongRay
+hits on the near dummy, 0 grounded. C: 1 converted, 2 hits. B: 4 flights
+handed out, 4 resolved, the distant dummy killed. T: 7 flips (ticks 5, 69, 84,
+605, 620, 684, 699), at most 4 in 600, 610 flip-wait ticks. P: 0 player ids in
+any distant list over the whole verify run, the zombie awake and on its
+dummy all 900 ticks. `distant-fight` C unchanged: 668 us/tick for 128 engaged.
+
+**For D5+D6.** Promotion still passes `catchUp = true`; turn it off for a
+creature that walked (`movedWhileDistant`). Activation (parked -> distant) is
+not a tier flip in `tierFlips_` -- decide whether it should be. `npc-catchup`
+pins the switch off; `refs-npc-identity` C2 is the identity template for a
+distant villager. Saves still drop bleed, burn and distant severs.
+**For D8.** An overflow swap's promotion goes through Unpark, so the flip
+bound applies to it -- keep it, or a full cap thrashes. In-window distant
+creatures are published to the near band (box distance 0) and keep the
+never-a-player rule (it is enforced where the list is built, not by
+geometry). Near creatures do not walk out (deviation 1), so overflow
+demotions inside the window are the only near -> distant path besides the
+window.
+**For D9.** `ArrowShot` is the hook: the player's bow (session.cpp phase G)
+launches with it empty, so its flights still expire at the face.
+`QueueEdgeArrowOut` needs a TARGET id (the roll is per defender) -- D9 must
+pick one (e.g. the distant creature nearest the flight's line at the exit)
+and a miss must land on DistantGround.
+
+**Open.** Near casters can pick a distant target from the band and their casts
+are refused (no abstract spell hit). The player's own melee cannot reach a
+statue. A distant `Blocked` on a near shield does no item wear. The published
+band's cost was not measured on its own (a walk of at most 128 members a
+tick, the tier only when somebody moved). Ghosts (MP) are in the near band
+but a distant blow on one is counted as no target (owned elsewhere) -- D7.
 
 ## 7. Audit 2026-10-15: what changed and why
 

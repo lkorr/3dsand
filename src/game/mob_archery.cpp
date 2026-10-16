@@ -149,7 +149,17 @@ void EndDraw(Mob* m, const MobDraw& d) {
 bool TrackTarget(TickAuthorityCtx& w, std::span<SessionTick> players, MobDraw& d) {
   Vec3 at{};
   float height = 0.0f;
-  const bool live = MobTargetNow(w, players, d.targetId, at, &height);
+  bool live = MobTargetNow(w, players, d.targetId, at, &height);
+  // A DISTANT TARGET (docs/PLAN_distant_npcs.md section 2.7, D3): a creature
+  // past the window in the edge band, as the near tier sees it this tick --
+  // the tick-start entry the distant tier published (MobSystem::EdgeActor).
+  // The arrow flies out of the window at it and the tier lands it.
+  if (!live)
+    if (const ai::Actor* ea = w.mobs.EdgeActor(d.targetId)) {
+      at = ea->centre;
+      height = ea->height;
+      live = true;
+    }
   if (live) {
     d.targetPoint = at;
     d.targetHeight = height;
@@ -284,7 +294,12 @@ bool StepDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWor
   m->AppendLiveLimbBodies(ignore);
   const uint32_t seed = rng::Hash3(kSaltSeed, tick, (uint32_t)d.mobId);
   EndDraw(m, d);
-  if (!w.arrows.Launch(*ammo, s.from, s.dir, speed, Vec3{}, seed, std::move(ignore))) {
+  // WHO AT WHOM rides the flight (game/arrows.h ArrowShot): if it leaves the
+  // window at a creature that is distant by then, that tier lands it (D3).
+  ArrowShot shot;
+  shot.shooter = d.mobId;
+  shot.target = d.targetId;
+  if (!w.arrows.Launch(*ammo, s.from, s.dir, speed, Vec3{}, seed, std::move(ignore), shot)) {
     ev.kind = ArcheryEvent::Kind::Abort;
     ev.why = "too many arrows in the air";
     a.stats.aborted++;
@@ -322,6 +337,24 @@ bool StepDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWor
 
 void MobArcheryTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick) {
   MobArcheryWorld& a = w.archers;
+  // ---- THE DISTANT ARCHERS' ARROWS COME IN (docs/PLAN_distant_npcs.md 2.7) ---
+  // An arrow a distant archer loosed at a near creature was flown, for real,
+  // by the distant tier (TickDistant, inside this tick's mobs.PreTick) up to
+  // the window's boundary; here it becomes an ordinary flight at exactly that
+  // state, stepped in phase K with every other arrow -- it hits or misses
+  // physically, through PierceAlongRay, as a near archer's does. In the order
+  // the tier queued them. Before the rule-2 return below: these are not
+  // requests.
+  for (const DistantArrowIn& in : w.mobs.TakeEdgeArrowsIn()) {
+    const ItemDef* ammo = w.items.Named(in.ammo);
+    ArrowShot shot;
+    shot.shooter = in.shooter;
+    shot.target = in.target;
+    if (ammo != nullptr &&
+        w.arrows.Inject(*ammo, SpellFxVec{in.pos[0], in.pos[1], in.pos[2]},
+                        SpellFxVec{in.vel[0], in.vel[1], in.vel[2]}, in.seed, shot))
+      w.mobs.DistantMut().Note(&DistantMobs::Stats::edgeArrowsInjected);
+  }
   // RULE 2: nothing asked and nothing drawn = nothing to do.
   if (w.mobs.ShootRequests().empty() && a.draws.empty()) return;
   // ---- this tick's requests, in the order MobSystem issued them ----------------

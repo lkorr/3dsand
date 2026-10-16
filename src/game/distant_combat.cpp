@@ -681,7 +681,7 @@ std::vector<float> ShellHardnessOfLimbs(const Mob& m) {
   return out;
 }
 
-DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items) {
+DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items, bool withBody) {
   DistantKit k;
   const MobDef* def = m.Def();
   const MobSystem* sys = m.Sys();
@@ -769,6 +769,7 @@ DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items) {
   }
 
   // ---- THE BODY: roles, vitals, and what is worn over each limb --------------
+  if (!withBody) return k;
   const int base = m.AppendedBase();
   k.limbs.resize((size_t)std::max(0, base));
   for (int i = 0; i < base; i++) {

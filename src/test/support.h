@@ -490,4 +490,24 @@ struct IdCounterScope {
   IdCounterScope& operator=(const IdCounterScope&) = delete;
 };
 
+// THE DISTANT TIER'S SWITCH, HELD for a scope (docs/PLAN_distant_npcs.md D3).
+// `distant.enabled` has been ON by default since the flip, so a creature that
+// leaves the window within the radius DEMOTES instead of parking. A gate whose
+// claim is about the PARK path itself (the record in its bucket, the unpark,
+// the catch-up placer) pins it OFF for the arms that test that path -- the
+// path still exists with the switch on (past the radius, a full tier, a
+// retire), so this reaches it rather than hiding it -- and the tuning is put
+// back on the way out, whichever return it takes.
+struct DistantSwitchScope {
+  Tuning was;
+  explicit DistantSwitchScope(bool on) : was(CurrentTuning()) {
+    Tuning t = was;
+    t.distant.enabled = on;
+    SetCurrentTuning(t);
+  }
+  ~DistantSwitchScope() { SetCurrentTuning(was); }
+  DistantSwitchScope(const DistantSwitchScope&) = delete;
+  DistantSwitchScope& operator=(const DistantSwitchScope&) = delete;
+};
+
 }  // namespace sandvox

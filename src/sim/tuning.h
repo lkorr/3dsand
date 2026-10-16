@@ -872,8 +872,9 @@ struct Tuning {
   // residency window, out to `radius` around the window centre. Read once a
   // tick by MobSystem's park rule and EntityParking's promotion pass.
   struct Distant {
-    // THE SWITCH. False = the park rule exactly as before (the tier stays
-    // empty); the parity oracle for every package. Flipped by D3.
+    // THE SWITCH. On by default since D3 (2026-10-15). False = the park rule
+    // exactly as before (the tier stays empty): the parity oracle for every
+    // package, and what a gate testing the PARK path pins.
     bool enabled = TPD(distant, enabled);
     // Demote (instead of park) within this many world voxels of the window
     // centre: 1280 = 128 m.

@@ -2724,6 +2724,131 @@ void ApplyRemoteMeleeHits(Physics& phys, MobSystem& mobs, DebrisSystem& debris,
 }
 
 // =============================================================================
+// A BLOW FROM PAST THE WINDOW (melee.h ApplyEdgeBlow; PLAN_distant_npcs 2.7)
+// =============================================================================
+EdgeBlowResult ApplyEdgeBlow(const EdgeBlow& b, Physics& phys, MobSystem& mobs,
+                             DebrisSystem& debris, World& world,
+                             std::vector<ParticleSpawn>& spawns) {
+  EdgeBlowResult r;
+  Mob* t = mobs.FindMobById(b.targetId);
+  if (t == nullptr || !t->Alive() || !MobSystem::OwnedHere(*t) || t->PlayerControlled())
+    return r;
+  if (b.limb < 0 || b.limb >= t->AppendedBase()) return r;
+  uint64_t hb = mobs.LimbBody(t->Id(), b.limb);
+  Vec3 lc{};
+  if (hb == 0 || !t->LimbCentreWorld(b.limb, lc)) return r;   // that limb is already off
+
+  // ---- THE TRAVEL: from the attacker's side, into the struck limb --------
+  Vec3 into = lc - b.from;
+  if (into.len() < 1e-3f) into = t->Facing() * -1.0f;
+  into = into.normalized();
+
+  // ---- THE CONTACT: that limb's surface, facing the attacker ---------------
+  // A ray from well outside the body along the travel, at THIS limb's
+  // collider: whatever else is on the line first (a worn shell over it, an
+  // arm in front of the chest, a bystander) is stepped past, so the point is
+  // on the limb the roll drew. A ray that never reaches it (a thin limb the
+  // line grazes past) takes the limb's centre. A few casts, each a pure
+  // function of the physics state, so a replay finds the same point.
+  constexpr float kOut = 24.0f;
+  const Vec3 start = lc - into * kOut;
+  Vec3 at = lc;
+  {
+    std::vector<uint64_t> ignore;
+    for (int k = 0; k < 8; k++) {
+      float frac = 1.0f;
+      const uint64_t hit = phys.CastRayBody(start, into, kOut + 2.0f, frac, ignore);
+      if (hit == 0) break;
+      if (hit == hb) {
+        at = start + into * ((kOut + 2.0f) * frac);
+        r.rayHit = true;
+        break;
+      }
+      ignore.push_back(hit);
+    }
+  }
+
+  // ---- THE COVER: a worn shell over it takes the blow (the sweep's march) --
+  const bool edged = b.strike.cut > 0.0f;
+  const float passHard = edged ? std::max(CurrentTuning().gear.cutHardnessRef, 0.0f) : -1.0f;
+  const uint64_t flesh = hb;
+  int clothSlot = -1;
+  Vec3 clothAt{};
+  if (t->LimbHasShells(b.limb)) {
+    Vec3 coverAt{};
+    const int sh = t->WornShellAlong(b.limb, at, into * -1.0f, kCoverReach, 64, nullptr,
+                                     &coverAt, passHard, &clothSlot, &clothAt);
+    const uint64_t sb = sh >= 0 ? mobs.LimbBody(t->Id(), sh) : 0ull;
+    if (sb != 0ull) {
+      hb = sb;
+      at = coverAt;
+      r.covered = true;
+      clothSlot = -1;   // the plate stopped the edge before any cloth
+    }
+  }
+  const uint64_t clothBody = clothSlot >= 0 ? mobs.LimbBody(t->Id(), clothSlot) : 0ull;
+
+  // ---- THE BLOW: the attacker's weapon, as BuildStrikeParts reads a sweep --
+  EdgeSweep es;
+  es.strike = b.strike;
+  es.selfMounted = b.natural;
+  // A natural weapon is a fist-sized thing (Mob::WeaponEdge's floor); a held
+  // one is its item's own edge, width, heft and carve bonus.
+  float halfWidth = MetresToCells(0.10f), bladeLen = 1.5f, carveBonus = 0.0f;
+  if (!b.natural && mobs.Items() != nullptr)
+    if (const ItemDef* it = mobs.Items()->Named(b.weapon); it != nullptr && it->hasEdge) {
+      bladeLen = std::max(1.0f, (it->edgeTo - it->edgeFrom).len());
+      halfWidth = std::max(it->edgeHalfWidth, 0.1f);
+      carveBonus = it->carveBonus;
+      const auto& g = CurrentTuning().gore;
+      es.heft = it->HeftFactor(g.woundHeftRef, g.woundHeftMax);
+    }
+  // A swing lays its edge ACROSS the travel (the slot opens across the body
+  // facing the attacker); a thrust drives its point ALONG it (a bore).
+  Vec3 across = into.cross(Vec3{0, 1, 0});
+  if (across.len() < 0.15f) across = into.cross(Vec3{1, 0, 0});
+  across = across.normalized();
+  const bool stab = b.stab && !b.natural;
+  const Vec3 seg = (stab ? into : across) * bladeLen;
+  es.flatNow = into.cross(across).normalized();
+  const float power = std::clamp(b.power, 0.0f, 1.0f);
+  const float tipSpeed = power * MetresPerSecToCells(CurrentTuning().melee.fullSpeedMps);
+  CreatureBlow blow;
+  blow.hb = hb;
+  blow.reactBody = flesh;
+  blow.clothBody = clothBody;
+  blow.at = at;
+  blow.clothAt = clothAt;
+  blow.sweepDir = into;
+  blow.strike = &b.strike;
+  blow.parts = BuildStrikeParts(es, at, seg, into, halfWidth + carveBonus, power, tipSpeed,
+                                b.seed);
+  blow.power = power;
+  blow.tipSpeed = tipSpeed;
+  blow.repeat = 1.0f;
+  blow.firstContact = true;
+  blow.biteAllowed = true;
+  // blow.coat.strikerId stays 0: no coat exchange (the attacker has no lattice).
+  const float hp0 = t->TotalHp();
+  ResolveOnCreature(blow, phys, mobs, debris, world, spawns);
+  // Looked up again: a resolver may have severed or killed (mobs_ itself is
+  // not resized by either, but the pointer is not the thing to trust).
+  if (const Mob* t2 = mobs.FindMobById(b.targetId))
+    r.hpCharged = std::max(0.0f, hp0 - t2->TotalHp());
+  // ...AND IT IS HEARD, where it landed (the frame loop voices StrikeEvents).
+  StrikeEvent ev;
+  ev.attackerId = b.attackerId;
+  ev.victimId = b.targetId;
+  ev.at = at;
+  ev.power = power;
+  ev.flesh = !r.covered;
+  ev.edged = b.strike.cut > b.strike.blunt;
+  mobs.PushStrikeEvent(ev);
+  r.applied = true;
+  return r;
+}
+
+// =============================================================================
 // THE TUNING BRIDGE
 // =============================================================================
 //

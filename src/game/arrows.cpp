@@ -245,9 +245,67 @@ bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
 
 // ---- THE ARROWS IN FLIGHT ------------------------------------------------------
 
+float ArrowGravityPerTick2() { return (float)kArrowGravityFx / (float)kSpellFxOne; }
+
+ArrowOutside ArrowStepOutside(SpellFxVec& pos, SpellFxVec& vel, const World& world,
+                              const std::function<bool(int, int, int)>& solid) {
+  // ArrowFlights::Tick's integrator, line for line: gravity off the velocity,
+  // then the tick's move in half-voxel samples (the same step count rule), so
+  // a flight handed over at the boundary is on the arc it would have flown.
+  vel.y -= kArrowGravityFx;
+  const int32_t kHalf = kSpellFxOne / 2;
+  const int64_t maxComp = std::max({(int64_t)std::abs(vel.x), (int64_t)std::abs(vel.y),
+                                    (int64_t)std::abs(vel.z)});
+  int32_t steps = (int32_t)((maxComp + kHalf - 1) / kHalf);
+  steps = std::clamp(steps, 1, 512);
+  SpellFxVec p = pos;
+  for (int32_t s = 0; s < steps; s++) {
+    SpellFxVec next = p;
+    next.x += vel.x / steps;
+    next.y += vel.y / steps;
+    next.z += vel.z / steps;
+    const int cx = SpellFxFloor(next.x), cy = SpellFxFloor(next.y), cz = SpellFxFloor(next.z);
+    if (world.CellInWindow({cx, cy, cz})) {
+      pos = next;
+      return ArrowOutside::Entered;
+    }
+    if (solid && solid(cx, cy, cz)) {
+      pos = p;
+      return ArrowOutside::Grounded;
+    }
+    p = next;
+  }
+  pos = p;
+  return ArrowOutside::Flying;
+}
+
+bool ArrowFlights::Inject(const ItemDef& arrow, SpellFxVec pos, SpellFxVec vel,
+                          uint32_t seed, const ArrowShot& shot) {
+  if (!arrow.IsAmmo()) return false;
+  if (vel.x == 0 && vel.y == 0 && vel.z == 0) return false;
+  if ((int)live_.size() >= kMaxLive) {
+    stats.refused++;
+    return false;
+  }
+  ArrowFlight f;
+  f.pos = pos;
+  f.prev = pos;
+  f.vel = vel;
+  f.item = arrow.name;
+  f.seed = seed;
+  f.ticksLeft = kLifeTicks;
+  f.shot = shot;
+  f.from = FloatOf(pos);
+  // No ignore list: the shooter is a distant creature, with no bodies.
+  live_.push_back(std::move(f));
+  stats.launched++;
+  stats.injected++;
+  return true;
+}
+
 bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
                           float speedVox, Vec3 carryVox, uint32_t seed,
-                          std::vector<uint64_t> ignore) {
+                          std::vector<uint64_t> ignore, const ArrowShot& shot) {
   if (!arrow.IsAmmo()) return false;
   const float dl = dirWorld.len();
   if (!(dl > 1e-6f) || !(speedVox > 0.0f)) return false;
@@ -265,6 +323,8 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   f.seed = seed;
   f.ticksLeft = kLifeTicks;
   f.ignore = std::move(ignore);
+  f.shot = shot;
+  f.from = fromWorld;
   live_.push_back(std::move(f));
   stats.launched++;
   return true;
@@ -444,6 +504,34 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
     e.seed = f.seed;
     return e;
   };
+  // ---- PAST THE EDGE (D3, docs/PLAN_distant_npcs.md section 2.7) ----------
+  // A flight aimed at a creature that is DISTANT now leaves the window into
+  // that tier rather than into nothing: it is handed over at the point it
+  // left, with the speed it has, and the tier lands it by its ranged roll at
+  // the flight time left (MobSystem::QueueEdgeArrowOut; false = the target is
+  // no living distant creature, and the flight expires as before).
+  auto handOver = [&](const ArrowFlight& f, SpellFxVec at) {
+    if (f.shot.target == 0) return false;
+    const ItemDef* def = w.items.Named(f.item);
+    NearArrowOut o;
+    o.shooter = f.shot.shooter;
+    o.target = f.shot.target;
+    o.tick = tick;
+    o.from = f.from;
+    o.exit = FloatOf(at);
+    o.speed = (float)(std::sqrt((double)f.vel.x * f.vel.x + (double)f.vel.y * f.vel.y +
+                                (double)f.vel.z * f.vel.z) /
+                      kSpellFxOne * kArrowTicksPerSecond);
+    o.damage = def != nullptr ? def->arrow.damage : 0.0f;
+    o.ammo = f.item;
+    if (!w.mobs.QueueEdgeArrowOut(o)) return false;
+    ArrowEvent e = event(ArrowEvent::Kind::PastEdge, f);
+    e.mobId = f.shot.target;
+    e.at = o.exit;
+    Log(e);
+    stats.handedOut++;
+    return true;
+  };
   // An item body for this arrow: stuck (kinematic) or dropped (falling).
   auto placeItem = [&](const ItemDef& def, Vec3 tip, Vec3 dir, Vec3 vel,
                        bool stuck) -> uint64_t {
@@ -461,7 +549,11 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
     bool done = false;
     const IVec3 cell{SpellFxFloor(f.pos.x), SpellFxFloor(f.pos.y),
                      SpellFxFloor(f.pos.z)};
-    if (def == nullptr || !def->IsAmmo() || --f.ticksLeft <= 0 ||
+    if (def != nullptr && def->IsAmmo() && f.ticksLeft > 1 && !w.world.CellInWindow(cell) &&
+        handOver(f, f.pos)) {
+      // The window moved off it: out of the window AT A DISTANT CREATURE.
+      done = true;
+    } else if (def == nullptr || !def->IsAmmo() || --f.ticksLeft <= 0 ||
         !w.world.CellInWindow(cell)) {
       ArrowEvent e = event(ArrowEvent::Kind::Expired, f);
       e.at = FloatOf(f.pos);
@@ -643,6 +735,13 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         done = true;
       }
       // ---- OUT OF THE WINDOW: gone, as the tick-start check would say ------
+      // ...unless it was aimed at a creature that is distant now (D3): then
+      // it flies on in that tier, from the last in-window sample.
+      if (!done && left) {
+        if (handOver(f, p)) {
+          done = true;
+        }
+      }
       if (!done && left) {
         ArrowEvent e = event(ArrowEvent::Kind::Expired, f);
         e.at = FloatOf(p);
