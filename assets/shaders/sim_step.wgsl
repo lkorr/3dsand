@@ -4573,9 +4573,9 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
 // target in one write: the reservoir is infinite, and a held river that has
 // just poured an eighth into a breach must be full again before the breach
 // asks for the next one, or the breach drains the river instead of the river
-// feeding the breach. Returns whether it wrote.
-fn stillReservoir(c : vec3<i32>, mat : u32, f : u32) -> bool {
-  let want = stillWant(c, mat, f);
+// feeding the breach. Returns whether it wrote. `want` is stillWant(c, mat, f),
+// which the caller asked once (stepLiquid: stage 0 and stage 5 share it).
+fn stillReservoir(c : vec3<i32>, mat : u32, f : u32, want : u32) -> bool {
   if (want == STILL_NONE) { return false; }
   if (want == STILL_GIVE) {
     let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + gCaSub, cellIndexW(c)) & 1023u;
@@ -4669,7 +4669,16 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   //    visit and never get back to its level, and the water it hands on would
   //    be whatever was left instead of what the reservoir behind it supplies.
   //    canFlowAnywhere's stage-5 test (stillWant) is the same predicate.
-  if (!submerged && stillWant(c, mat, f) == STILL_TAKE && stillReservoir(c, mat, f)) { return true; }
+  //    ASKED ONCE, here, for stage 5 as well: every stage between writes
+  //    nothing unless it returns, and no other thread writes this cell's
+  //    reach-1 neighbourhood in this pass (the colour lattice), so the answer
+  //    at stage 5 is this one. (It was asked two or three times a visit --
+  //    stage 0, stage 5, and inside stillReservoir -- for every free-surface
+  //    liquid cell in an awake chunk, river or not.) A `submerged` cell never
+  //    qualifies (it needs air above), so it is not asked at all.
+  var want = STILL_NONE;
+  if (!submerged) { want = stillWant(c, mat, f); }
+  if (want == STILL_TAKE && stillReservoir(c, mat, f, want)) { return true; }
 
   // 1) straight down: top a partial same-liquid cell up, else move/swap whole.
   if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) {
@@ -4852,8 +4861,9 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   }
   // 5) nothing the CA can do -- but if this is a map lake / river / sea
   //    surface off its authored level, the reservoir can. See THE RESERVOIR.
-  //    `submerged` cells never qualify (it needs air above).
-  if (!submerged && stillReservoir(c, mat, f)) { return true; }
+  //    `submerged` cells never qualify (it needs air above). `want` is stage
+  //    0's answer (a TAKE never gets here: stage 0 always writes it).
+  if (stillReservoir(c, mat, f, want)) { return true; }
   return false;  // settled — the caller decides whether to stay awake
 }
 
