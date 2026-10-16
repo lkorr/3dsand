@@ -10774,8 +10774,22 @@ const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 // Returns the whitewater cover 0..1. Two vnoise taps, on side-face water
 // pixels only.
 const FALL_SHEET_SPEED : f32 = 3.2;   // m/s the streaks fall
-const FALL_SHEET_WHITE : f32 = 0.85;  // the cover at a streak's core
-const FALL_SHEET_BASE : f32 = 0.35;   // the cover between streaks (aerated, never clear)
+const FALL_SHEET_WHITE : f32 = 0.9;   // the cover at a streak's core
+const FALL_SHEET_BASE : f32 = 0.22;   // the cover between streaks (aerated, never clear)
+// Only where the water really DROPS AWAY beside the face: at least
+// FALL_SHEET_MIN_DROP cells from this cell's surface down to the water level
+// outside it (that cell's fullness, or the one under it, one cell lower). A
+// fullness step on a running surface -- an eighth or two where the ramp
+// crosses a voxel, every few columns -- is a side face too, and drawing those
+// as whitewater laid white stripes across every sloped river (the default
+// map's silverrun below its outlet). `out` is the face's outward direction.
+const FALL_SHEET_MIN_DROP : f32 = 0.75;
+fn fallingSheetHere(cell : vec3<i32>, out : vec3<i32>) -> bool {
+  let n = cell + out;
+  let fn0 = liquidFullnessAt(n);
+  let level = select(liquidFullnessAt(n - vec3<i32>(0, 1, 0)) - 1.0, fn0, fn0 > 0.0);
+  return liquidFullnessAt(cell) - level >= FALL_SHEET_MIN_DROP;
+}
 fn fallingSheet(hitP : vec3f, axis : i32) -> f32 {
   let pm = hitP * VOXEL_METERS;
   let u = select(pm.x, pm.z, axis == 0);   // along the face
@@ -11562,6 +11576,8 @@ fn fallMassAt(cell : vec3<i32>) -> f32 {
 // SEVEN voxel reads worst case, and only on a pixel that already resolved a CA
 // liquid surface. The branches are exclusive because the second question is a
 // different question in each: a cell either has air under it or it does not.
+// How much of the in-flight veil a held curtain's face throws (fallCueAt).
+const HELD_SHEET_MIST : f32 = 0.3;
 fn fallCueAt(cell : vec3<i32>) -> FallCue {
   var cue : FallCue;
   cue.fall = 0.0;
@@ -11602,8 +11618,12 @@ fn fallCueAt(cell : vec3<i32>) -> FallCue {
           along += 1.0;
         }
       }
+      // A light veil on the face (a held sheet is smooth water, not a
+      // plume: measured on the default map's lake outlet, the full in-flight
+      // veil covered the curtain in cloud) and the full spray at its foot.
       if (open > 0.0) { cue.fall = smoothstep(0.5, 2.0, along); }
       cue.impact = cue.impact * cue.fall;
+      cue.fall = cue.fall * HELD_SHEET_MIST;
     }
   }
   return cue;
@@ -12551,7 +12571,13 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   let m = materials[mat];
   // Up-facing means the ray entered through the TOP of the liquid — the only
   // face that gets the fullness-gradient normal and the sky reflection.
-  let upFacing = (axis == 1 && sgn < 0.0);
+  // A RISER counts as top: a side face where the water outside stands less
+  // than FALL_SHEET_MIN_DROP below this cell's surface is a step of a few
+  // eighths on a running surface (a held ramp crosses a voxel every few
+  // columns), and lit as a wall it caught the sky at grazing and drew a white
+  // stripe across the river at every step. As top it is part of the sheet.
+  let riser = axis != 1 && !underwater && !fallingSheetHere(cell, vec3<i32>(axisVec(axis, -sgn)));
+  let upFacing = (axis == 1 && sgn < 0.0) || riser;
   var n = waterNormal(cell, mat, axis, sgn, hitP, upFacing);
   if (underwater) { n = -n; }   // seen from below, the interface faces down
   if (SEAM_DBG == 19u && upFacing && !underwater) {

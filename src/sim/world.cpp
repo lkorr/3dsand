@@ -3067,7 +3067,7 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
     // The piece's steepness M, from the packed length (kS_RivBed bits 16..25).
     const int plen = std::max(std::clamp(st.len, 0, 1023), 1);
     const int m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
-    if (strip != 0 && d2 >= hw * hw) lipY = std::max(lipY, lipV);
+    if (strip != 0 && d2 >= hw * hw && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, lipV);
     if (trace) {
       char b[200];
       std::snprintf(b, sizeof b, " [%s d2 %d hw %d tq %d s8 %d m %d strip %d%s]", st.id.c_str(), d2, hw, tq, s8, m, strip,

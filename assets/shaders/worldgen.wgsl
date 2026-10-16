@@ -2452,7 +2452,9 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     let m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
     // The crest and the curtain hold the reach above across the channel and
     // the bank next to it (water above can touch nothing further out).
-    if (strip != 0 && d2 >= hw * hw) { lipY = max(lipY, lipV); }
+    // (A band 2 RIVER_LIP wide beside the channel: the whole bank width at
+    // every fall walled a cascade into a canyon.)
+    if (strip != 0 && d2 >= hw * hw && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, lipV); }
     if (d2 < hw * hw) {
       inCh = true;
       if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = s8; }
