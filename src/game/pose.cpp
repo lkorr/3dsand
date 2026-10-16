@@ -165,6 +165,54 @@ float SneakWeight(float crouchHold, const AnimState& st) {
   return full > 1e-3f ? std::clamp(crouchHold / full, 0.0f, 1.0f) : 0.0f;
 }
 
+// THE SNEAK'S STRIDE (2026-10-15, owner: "legs should be angled and one foot
+// behind the other when walking while sneaking"). At sneak pace the plain
+// gait stepped every stepThreshold (0.3 leg lengths) of travel and landed
+// each foot one velocity lead (~0.17 L) ahead of the hip, so both feet lived
+// within a fifth of a leg under the pelvis and stepped back to back at ~3.5
+// steps a second: a squat-shuffle. A sneak STRIDES. Each foot lands well
+// ahead of the hip and stays planted until it is as far behind, so at every
+// moment one foot is out in front, the other trails, and both legs are
+// angled off the vertical. The step threshold IS that stride (a foot steps
+// once the body has carried it kSneakStride leg lengths) and the lead is half
+// of it, a point along the travel rather than a velocity times a time, so the
+// excursion stays centred on the hip at any pace: the sneak and the quick
+// sneak (Shift) keep the same angled legs and the quick one just cycles them
+// faster. The held crouch (0.44 L on the human) leaves the hip reach for
+// ~0.8 L fore and aft, so +/- half of this costs no extra stance crouch.
+// The KNEE STOP must admit the crouch's bend (~113 degrees with the foot
+// under the hip; human.json legL poseLimit is 135): at the old 100 the
+// clamp lengthened the leg AFTER this solve and every planted foot skated
+// ~1 vox a stance. Gate `sneak-stride` measures the skate.
+constexpr float kSneakStride = 0.85f;
+// The stride takes over between these shares of top speed (speedFactor): on
+// by the sneak's own pace (0.25 on the human), off at a standstill, where the
+// standing stagger and the settle step own the feet.
+constexpr float kSneakStrideOn0 = 0.05f;
+constexpr float kSneakStrideOn1 = 0.15f;
+// ...and only ALONG the facing: a sidestep with a whole-leg stride crosses
+// the feet, so the share fades with |cos| of the travel against the heading
+// (a pure strafe keeps the plain step; a diagonal takes about half).
+constexpr float kSneakStrideAlong0 = 0.5f;
+constexpr float kSneakStrideAlong1 = 0.9f;
+// While striding, the wide standing base comes in to the rest width (one
+// foot ahead of the other, not a waddle) and the knees keep this share of
+// their splay (they track the stride instead of bowing out across it).
+constexpr float kSneakStrideFootOut = 0.0f;
+constexpr float kSneakStrideKneeOut = 0.5f;
+
+// How much of the sneak's stride the gait takes this tick, 0..1, BEFORE the
+// sneak's own weight (SneakWeight): on with the pace, and only along the
+// facing. `heading` is the rig's (forward = (sin h, 0, cos h)).
+float SneakStrideShare(const AnimState& st, float heading, float speedFactor) {
+  const float sp = std::sqrt(st.velocity.x * st.velocity.x + st.velocity.z * st.velocity.z);
+  if (sp < 1e-3f) return 0.0f;
+  const float along =
+      std::fabs(st.velocity.x * std::sin(heading) + st.velocity.z * std::cos(heading)) / sp;
+  return SmoothSpan(kSneakStrideOn0, kSneakStrideOn1, speedFactor) *
+         SmoothSpan(kSneakStrideAlong0, kSneakStrideAlong1, along);
+}
+
 // Stride-clock lock. `kStrideSyncGain` is how much of the phase error is taken
 // out at each touchdown: 1 snaps (and pops the bob), 0 never locks. Half
 // converges inside two steps while keeping every correction sub-visible once
@@ -1406,8 +1454,11 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     // chain index: a rig whose arms are interleaved with its legs must still
     // split its legs fore and aft, the same argument SyncStrideClock makes.
     int legOrdinal = 0;
-    // Knees out over the toes while sneaking (kSneakKneeOut).
-    const float kneeOut = kSneakKneeOut * Smooth01(SneakWeight(pose_.crouchHold, st));
+    // Knees out over the toes while sneaking (kSneakKneeOut), less of it
+    // while striding (kSneakStrideKneeOut).
+    const float kneeOut =
+        kSneakKneeOut * Smooth01(SneakWeight(pose_.crouchHold, st)) *
+        (1.0f - (1.0f - kSneakStrideKneeOut) * SneakStrideShare(st, heading_, speedFactor));
     for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
       if (!IsLegChain(sk, c)) continue;
       const FootState& f = st.feet[c];
@@ -2021,6 +2072,33 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
   const float sneakW = Smooth01(SneakWeight(pose_.crouchHold, st));
   const float sneakStagger =
       sneakW * (1.0f - SmoothSpan(0.05f, kSneakStaggerSpeed, speedFactor));
+  // ...and of its stride (kSneakStride): the step threshold, in leg lengths,
+  // and the share of the lead that is the stride's half rather than the
+  // velocity's.
+  const float strideShare = SneakStrideShare(st, heading_, speedFactor);
+  const float strideW = sneakW * strideShare;
+  const float stepThresh =
+      g.stepThreshold + std::max(0.0f, kSneakStride - g.stepThreshold) * strideW;
+  // How long a swing lasts at this pace (the swing below, which advances on
+  // it, and the stride's alternation gate after the loop, which predicts the
+  // ground a swing covers from it). SWING TIME IS BOUNDED BY THE STRIDE
+  // BUDGET (kSwingTravelFrac): the speed-scaled duration is the DESIRED swing
+  // and the budget caps it, so the swing never lasts longer than it takes the
+  // body to consume the ground the foot is able to gain. At low speed the
+  // budget is enormous and the speed scaling governs, so a slow walk is
+  // unaffected.
+  auto swingSeconds = [&](float legLength) {
+    const float durScale = std::clamp(speedFactor, kMinSwingScale, 1.5f);
+    float dur = std::max(g.stepDuration / durScale, kMinSwingSeconds);
+    const float reach = kMaxLeadLegLengths * legLength;
+    if (speedNow_ > 0.01f) dur = std::min(dur, kSwingTravelFrac * reach / speedNow_);
+    return std::max(dur, kMinSwingSeconds);
+  };
+  // Each planted leg's drift this tick (the alternation gate), -1 = swinging
+  // or not a walking leg.
+  float legDrift[16];
+  for (float& d : legDrift) d = -1.0f;
+  float strideGate = 0.0f;
   int legOrdinal = 0;
 
   for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
@@ -2065,7 +2143,8 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
     if (sneakW > 0.0f) {
       const float side =
           sk.parts[ch.parts[0]].anchorLocal.x >= pivot.x ? 1.0f : -1.0f;
-      restLocal.x += side * kSneakFootOut * sneakW * f.legLength;
+      restLocal.x += side * kSneakFootOut * sneakW *
+                     (1.0f - (1.0f - kSneakStrideFootOut) * strideShare) * f.legLength;
       restLocal.z += (leadLeg ? kSneakLeadFwd : -kSneakTrailBack) *
                      sneakStagger * f.legLength;
     }
@@ -2091,6 +2170,12 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
     const float maxLead = kMaxLeadLegLengths * f.legLength;
     const float leadLen = lead.len();
     if (leadLen > maxLead) lead = lead * (maxLead / leadLen);
+    // The sneak's stride lands the foot HALF A STRIDE ahead along the travel
+    // (kSneakStride): it then trails back as far behind before it steps.
+    if (strideW > 0.0f) {
+      const Vec3 dir = Vec3{st.velocity.x, 0, st.velocity.z}.normalized();
+      lead = lead + (dir * (0.5f * stepThresh * f.legLength) - lead) * strideW;
+    }
     Vec3 goal = stance + lead;
     // Probe from just above the SOLE (origin_.y) and fall back to the sole when
     // the probe misses — never from bodyY_, which is what let the avatar's
@@ -2115,17 +2200,7 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
       f.swinging = false;
     }
     if (f.swinging) {
-      // SWING TIME IS BOUNDED BY THE STRIDE BUDGET (kSwingTravelFrac): the
-      // speed-scaled duration is the DESIRED swing and the budget caps it, so
-      // the swing never lasts longer than it takes the body to consume the
-      // ground the foot is able to gain. At low speed the budget is enormous
-      // and the speed scaling governs, so a slow walk is unaffected.
-      const float durScale = std::clamp(speedFactor, kMinSwingScale, 1.5f);
-      float dur = std::max(g.stepDuration / durScale, kMinSwingSeconds);
-      const float reach = kMaxLeadLegLengths * f.legLength;
-      if (speedNow_ > 0.01f) dur = std::min(dur, kSwingTravelFrac * reach / speedNow_);
-      dur = std::max(dur, kMinSwingSeconds);
-      f.swingT += dt / dur;
+      f.swingT += dt / swingSeconds(f.legLength);
       if (f.swingT >= 1.0f) {
         // Land ON the target: at t = 1 the arc's lift term is sin(pi) = 0 (and
         // the land ease below has already shed it), so assigning swingTo is
@@ -2178,7 +2253,15 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
       const bool moving = speedFactor > 0.05f;
       const bool settle =
           !moving && sneakW > 0.5f && drift > kSneakSettleStep * f.legLength;
-      if (((moving && drift > g.stepThreshold * f.legLength) || settle) &&
+      if (c < 16) legDrift[c] = drift;
+      // The stride's alternation gate (after the loop): half of what the
+      // stance covers beyond the swing, see there.
+      if (strideW > 0.0f)
+        strideGate = std::max(
+            strideGate, 0.5f * strideW *
+                            std::max(0.0f, stepThresh * f.legLength -
+                                               speedNow_ * swingSeconds(f.legLength)));
+      if (((moving && drift > stepThresh * f.legLength) || settle) &&
           nBids < 8) {
         int myGroup = -1;
         for (size_t gi = 0; gi < g.groups.size(); gi++)
@@ -2230,6 +2313,26 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
       for (int i = 1; i < nBids; i++)
         if (bids[i].drift > best->drift) best = &bids[i];
       swingingGroup = best->group;
+      // THE SNEAK'S STRIDE ALTERNATES. The slot rule alone never spaces the
+      // feet: from a standstill both reach the threshold together, the second
+      // waits out the first's swing, and the pair stays one swing apart for
+      // good -- two quick steps, then both feet sliding back together under
+      // a hip that rocks over them. The plain walk never shows it because its
+      // swing outlasts its stance (each foot lifts as the other lands); the
+      // stride's stance is long. So a foot may lift only once every OTHER
+      // planted foot has drifted half of what a stance covers beyond a swing,
+      // (stride - swing travel) / 2: exactly where that foot sits at
+      // half-cycle when the two are evenly spaced. A pair that starts in step
+      // is spread on the first step and stays spread.
+      if (strideGate > 0.0f) {
+        for (size_t c = 0; c < sk.chains.size() && c < 16; c++) {
+          if (legDrift[c] < 0.0f) continue;
+          bool inGroup = false;
+          for (int i = 0; i < nBids; i++)
+            if (bids[i].chain == c && bids[i].group == swingingGroup) inGroup = true;
+          if (!inGroup && legDrift[c] < strideGate) swingingGroup = -1;
+        }
+      }
     }
     for (int i = 0; i < nBids; i++) {
       const StepBid& b = bids[i];

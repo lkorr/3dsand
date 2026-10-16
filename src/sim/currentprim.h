@@ -291,10 +291,25 @@ WaveImpactRing& WaveImpacts();
 // The player is not part of the world hash, so this is float and needs no
 // integer twin.
 Vec3 CurrentAtCpu(Vec3 posVox);
-// The same field over the SIM-LICENSED primitives only (kCurrentPrimSim, the
-// authority line above) -- what currentAtQ sums. For anything that moves a
-// body the tick owns (an NPC swimmer, mob_afloat.cpp): a primitive seeded off
-// a readback would make where the NPC ends up depend on when the CPU noticed.
+// THE CURRENT A BODY FEELS: for anything that moves a body the tick owns (the
+// player's swim stroke, an NPC afloat, mob_afloat.cpp). The SIM-LICENSED
+// primitives only (kCurrentPrimSim, the authority line above): a primitive
+// seeded off a readback would make where the NPC ends up depend on when the
+// CPU noticed. Plus the terrain flow field with the MEASURED flow blended over
+// it (flowfield.h; DESIGN.md §9d.12) at sim.currentMeasuredCarry -- the
+// composition currentAt draws, so a body is carried by a breached dam's flood
+// along the current the F4 overlay shows, not along the map's old lines. The
+// measured grid is not a readback in the sense above: it is the snapshot's
+// copy, published at a FIXED World::kSnapshotLatency ticks (PublishMeasured)
+// from an integer fold, so its value at a tick is a pure function of the
+// ticks before it.
+//
+// `wetLo` .. `wetHi` is the body's SUBMERGED vertical span (world cells): the
+// measured flow is the band of rows the water moved in -- for a lake the CA
+// levels, its top few -- and a floating body is carried by it when any part
+// of the body is in it (flowfield::SampleMeasuredSpan). The one-argument form
+// is the span of a point.
+Vec3 CurrentAtCpuSim(Vec3 posVox, float wetLo, float wetHi);
 Vec3 CurrentAtCpuSim(Vec3 posVox);
 
 // ---- the arrow overlay's lattice -------------------------------------------

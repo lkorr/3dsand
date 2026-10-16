@@ -114,7 +114,7 @@ instantaneously"; "a little shorter/smaller"):**
   stuck, a third of a second after the loose. Now a render-only body
   (`game/renderonly.h`, `ArrowFlights::AppendRenderBodies`) walked by
   `BodyRegistry` after every real body, tick-interpolated like the camera.
-  `--shot-mob human:>3~` photographs arrows in the air.
+  `--shot-mob human:>3~` photographs arrows in the air (`>3~6`: six ticks of flight, so their trails show the arc).
 - SMALLER: 0.725 m -> 0.60 m (`gen_bow_items.py` ARROW_LEN 58 -> 48), the
   vanes and the head's socket slimmer.
 

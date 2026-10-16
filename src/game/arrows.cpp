@@ -15,6 +15,7 @@
 #include "game/worlditems.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
+#include "sim/arrowtrail.h"   // kArrowTrailSlots / kArrowTrailPts: the trails' rows
 #include "sim/world.h"
 
 namespace {
@@ -280,6 +281,7 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   f.ignore = std::move(ignore);
   f.shooter = shooterActor;
   f.from = fromWorld;
+  f.fxId = ++nextFxId_;
   live_.push_back(std::move(f));
   stats.launched++;
   return true;
@@ -305,6 +307,101 @@ void ArrowFlights::AppendRenderBodies(const ItemLibrary& items, float tickAlpha,
     b.model = (uint32_t)def->microModel;
     out.push_back(b);
   }
+}
+
+// ---- THE TRAILS BEHIND THEM ----------------------------------------------------
+
+static_assert(ArrowTrails::kPts == (int)kArrowTrailPts, "trail rows: arrows.h vs arrowtrail.h");
+
+void ArrowTrails::Update(const ArrowFlights& flights, float tickAlpha, float dt) {
+  const float a = std::clamp(tickAlpha, 0.0f, 1.0f);
+  dt = std::max(dt, 0.0f);
+  constexpr float kSpacing = kLife / (float)(kPts - 1);
+  for (Trail& t : trails_) t.live = false;
+  // Age what is laid; lay a point every kSpacing s of the head's way from
+  // `from` to `to` this frame -- as many as fell in it, each where the head
+  // was at that instant (the same rule as the gust streaks' push),
+  // so a slow frame draws the same trail as a fast one.
+  auto advance = [&](Trail& t, Vec3 to, bool lay) {
+    for (int k = 0; k < t.n; k++) t.age[k] += dt;
+    if (lay) {
+      const Vec3 from = t.head;
+      const float total = t.timer + dt;
+      const int cnt = (int)std::floor(total / kSpacing);
+      for (int k = std::max(0, cnt - (kPts - 1)); k < cnt; k++) {
+        const float ago = total - kSpacing * (float)(k + 1);
+        const float f = dt > 0.0f ? std::clamp(1.0f - ago / dt, 0.0f, 1.0f) : 1.0f;
+        const int keep = std::min(t.n, kPts - 2);
+        for (int j = keep; j > 0; j--) {
+          t.pt[j] = t.pt[j - 1];
+          t.age[j] = t.age[j - 1];
+        }
+        t.pt[0] = from + (to - from) * f;
+        t.age[0] = ago;
+        t.n = keep + 1;
+      }
+      t.timer = total - kSpacing * (float)cnt;
+      t.head = to;
+    }
+    while (t.n > 0 && t.age[t.n - 1] >= kLife) t.n--;
+  };
+  for (const ArrowFlight& f : flights.Flights()) {
+    const Vec3 p0 = FloatOf(f.prev), p1 = FloatOf(f.pos);
+    const Vec3 at = p0 + (p1 - p0) * a;
+    Trail* t = nullptr;
+    for (Trail& c : trails_)
+      if (c.id == f.fxId) t = &c;
+    if (t == nullptr) {
+      trails_.emplace_back();
+      t = &trails_.back();
+      t->id = f.fxId;
+      t->head = at;
+    }
+    t->live = true;
+    advance(*t, at, true);
+  }
+  for (Trail& t : trails_) {
+    if (t.live) continue;
+    t.headAge += dt;
+    advance(t, t.head, false);
+  }
+  trails_.erase(std::remove_if(trails_.begin(), trails_.end(),
+                               [](const Trail& t) {
+                                 return !t.live && t.headAge >= kLife && t.n == 0;
+                               }),
+                trails_.end());
+  // BOUNDED: over the rows, the oldest go first (the ones fading out).
+  if (trails_.size() > kArrowTrailSlots)
+    trails_.erase(trails_.begin(),
+                  trails_.begin() + (ptrdiff_t)(trails_.size() - kArrowTrailSlots));
+}
+
+uint32_t ArrowTrails::Pack(std::vector<float>& rows) const {
+  const uint32_t count = (uint32_t)std::min<size_t>(trails_.size(), kArrowTrailSlots);
+  rows.assign((size_t)count * kPts * 4, 0.0f);
+  auto fade = [](float age) { return kAlpha * std::clamp(1.0f - age / kLife, 0.0f, 1.0f); };
+  for (uint32_t i = 0; i < count; i++) {
+    const Trail& t = trails_[i];
+    float* r = rows.data() + (size_t)i * kPts * 4;
+    auto put = [&](int k, Vec3 p, float alpha) {
+      r[k * 4 + 0] = p.x;
+      r[k * 4 + 1] = p.y;
+      r[k * 4 + 2] = p.z;
+      r[k * 4 + 3] = alpha;
+    };
+    put(0, t.head, fade(t.headAge));
+    Vec3 last = t.head;
+    for (int k = 1; k < kPts; k++) {
+      // Past the trail's end: on the point before, alpha 0 -- no segment.
+      if (k - 1 < t.n) {
+        last = t.pt[k - 1];
+        put(k, last, fade(t.age[k - 1]));
+      } else {
+        put(k, last, 0.0f);
+      }
+    }
+  }
+  return count;
 }
 
 // ---- THE DRAWN BOW AS SEEN ----------------------------------------------------

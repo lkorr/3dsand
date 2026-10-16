@@ -93,19 +93,25 @@
 // THE MEASURED FLOW'S ACCUMULATOR (src/sim/flowfield.h kFlowMeas*; slim group,
 // the same number as simBGL_): `mark` adds every live particle's horizontal
 // momentum to the node bin it is in, beside the CA's moves (sim_step.wgsl
-// flowMeasNote). Render-only -- no fluid or sim kernel reads it back.
+// flowMeasNote). A side record -- no fluid or sim kernel reads it back; the
+// renderer and, through the snapshot ring, the bodies the water carries do.
 @group(0) @binding(61) var<storage, read_write> flowMeasAcc : array<atomic<i32>>;
 // Must match sim_step.wgsl's block of the same name.
 const FLOWM_N : i32 = 67;
 const FLOWM_ACC_Q : i32 = 16;
 const FLOWM_Y_BIAS : i32 = 1048576;
 // One particle is one eighth of liquid moving `v` cells this tick (Q16.16):
-// eighths x cells x FLOWM_ACC_Q (= 2^4) is v >> 12. A particle at rest, or
-// one moving straight up or down, records nothing.
+// eighths x cells x FLOWM_ACC_Q (= 2^4) is v / 4096. A particle at rest, or
+// one moving straight up or down, records nothing. TRUNCATED TOWARD ZERO, not
+// shifted: `v >> 12` floors, so every particle creeping at -1/65536 cells a
+// tick recorded -1 while its +1/65536 twin recorded 0, so a pool of a few
+// thousand barely-moving, zero-mean particles summed to a steady pull toward
+// -x/-z that nothing in it was doing (found 2026-10-15, when bodies began to
+// read the field).
 fn flowMeasParticle(cell : vec3<i32>, vx : i32, vz : i32) {
-  if (TUNE_CURRENT_MEASURED <= 0.0) { return; }
-  let fx = vx >> 12u;
-  let fz = vz >> 12u;
+  if (TUNE_CURRENT_MEASURED <= 0.0 && TUNE_CURRENT_MEASURED_CARRY <= 0.0) { return; }
+  let fx = vx / 4096;
+  let fz = vz / 4096;
   if (fx == 0 && fz == 0) { return; }
   let kx = ((((cell.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let kz = ((((cell.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;

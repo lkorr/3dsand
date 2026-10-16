@@ -210,7 +210,7 @@
       "desc": "A heavy black key, its bit worn smooth by a century of turning."
     },
     {
-      "//": "THE BOW AND ARROWS (docs/PLAN_projectiles.md C, game/arrows.h). A bow is kind melee so it rides a hand slot like any weapon, but weaponClass `bow` takes it out of the stroke system: with it in hand the hand's button DRAWS (held) and SHOOTS (released). `bow.drawSpeedMps` is the arrow's speed at full draw, `windupMs` how long raising the bow and nocking takes before the string can be pulled at all (let go inside it and nothing flies -- owner, 2026-10-14), `drawTimeMs` how long the pull from brace to a full draw then takes, `drawMoveScale` / `drawSwayScale` the walk speed and the gait's side-to-side sway while drawn (owner 2026-10-14: 40% slower, 80% less sway), `minDraw` the least draw that looses an arrow at all (a tap is a fumble, not a shot), `ammo` the item id it shoots (consumed one per shot from the pack or hotbar; none = no shot). Speed = eased draw fraction x drawSpeedMps. 50 m/s is a real longbow's (was 65, a modern compound bow's, until 2026-10-13: owner, 'they move too fast'); the drop is real too, ~1 m over 20 m, which the NPC archers' holdover (ArrowHoldover) pays and the player aims over by eye. Art: scripts/gen_bow_items.py.",
+      "//": "THE BOW AND ARROWS (docs/PLAN_projectiles.md C, game/arrows.h). A bow is kind melee so it rides a hand slot like any weapon, but weaponClass `bow` takes it out of the stroke system: with it in hand the hand's button DRAWS (held) and SHOOTS (released). `bow.drawSpeedMps` is the arrow's speed at full draw, `windupMs` how long raising the bow and nocking takes before the string can be pulled at all (let go inside it and nothing flies -- owner, 2026-10-14), `drawTimeMs` how long the pull from brace to a full draw then takes, `drawMoveScale` / `drawSwayScale` the walk speed and the gait's side-to-side sway while drawn (owner 2026-10-14: 40% slower, 80% less sway), `minDraw` the least draw that looses an arrow at all (a tap is a fumble, not a shot), `ammo` the item id it shoots (consumed one per shot from the pack or hotbar; none = no shot). Speed = eased draw fraction x drawSpeedMps. 35 m/s since 2026-10-15 (was 50, a real longbow's, and 65, a compound bow's, before 2026-10-13: owner, both times, slower in the air so the arc reads); the arrow's massKg went up with it so a full draw still carries the 37.5 J the penetration calibration was measured at. The drop is ~1.6 m over 20 m, which the NPC archers' holdover (ArrowHoldover) pays and the player aims over by eye. Art: scripts/gen_bow_items.py.",
       "id": "bow",
       "kind": "melee",
       "weaponClass": "bow",
@@ -218,7 +218,7 @@
       "blunt": 2.0,
       "reach": 9.0,
       "bow": {
-        "drawSpeedMps": 50.0,
+        "drawSpeedMps": 35.0,
         "windupMs": 450,
         "drawTimeMs": 800,
         "minDraw": 0.15,
@@ -234,7 +234,7 @@
       "kind": "ammo",
       "startCount": 30,
       "arrow": {
-        "massKg": 0.03,
+        "massKg": 0.0612,
         "tipRadius": 1.0,
         "sharpness": 0.8,
         "damage": 35.0
