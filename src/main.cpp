@@ -23225,6 +23225,25 @@ int main(int argc, char** argv) {
           // The shared readback FIFO, whole run: who asked, how long they
           // waited, what was dropped. See World::FetchProbe.
           std::printf("    %s\n", world.FetchReport().c_str());
+          // THE DISTANT TIER, whole run (docs/PLAN_distant_npcs.md): what THIS
+          // loop demoted, promoted, activated and drew. Every distant gate
+          // drives TickAuthority through the rig; only a game run goes
+          // through the frame loop's wiring (the statue items, the producer).
+          {
+            const DistantMobs::Stats& ds = DistantRunTotals();
+            const DistantDrawRunStats& dr = DistantDrawRunTotals();
+            std::printf("    distant tier: demoted %llu (%llu dead, %llu anchored), "
+                        "promoted %llu, retired %llu, activated %llu, refused full "
+                        "%llu, peak %llu | statues: drawn peak %llu, drawn %llu, "
+                        "culled %llu, starved %llu, unbaked %llu, bakes %llu\n",
+                        (unsigned long long)ds.demoted, (unsigned long long)ds.demotedDead,
+                        (unsigned long long)ds.anchored, (unsigned long long)ds.promoted,
+                        (unsigned long long)ds.retired, (unsigned long long)ds.activated,
+                        (unsigned long long)ds.refusedFull, (unsigned long long)ds.peak,
+                        (unsigned long long)dr.drawnPeak, (unsigned long long)dr.drawnTotal,
+                        (unsigned long long)dr.culledTotal, (unsigned long long)dr.starvedTotal,
+                        (unsigned long long)dr.unbakedTotal, (unsigned long long)dr.bakes);
+          }
         }
         std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
                     "(the GPU owed >= 2 snapshots when a second tick was due)\n",
