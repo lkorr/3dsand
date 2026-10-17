@@ -25441,6 +25441,36 @@ white water, not black streaks and glowing flecks (2026-10-16 tickets
 `fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
+**HELD STEPS ARE NOT WATERFALLS UNLESS WATER FALLS** (2026-10-17, tickets
+11-26-13 / 11-37-20: a frozen spill fan and a frozen stream drawn as a fan of
+white curtains). The raymarch now binds the still table read-only (render
+binding 50, the sim's 58) and asks, per CA water pixel, whether the column is
+held (`heldColumnT8`, `gHeldKind`). For a HELD column (map or adopted stream) a
+side face is a sheet only over a real drop (`heldSideKind`): the water or floor
+in front at least `HELD_SHEET_MIN_DROP` (2.5) cells under the column's surface,
+or open air down past `HELD_SHEET_LOOK` (3) cells — an overhang, a cliff, the
+bake's curtain; a step of a cell or two is a riser, lit as surface. Unheld (live
+CA) water keeps the 0.75 rule: its spill really is in flight.
+**THE FROZEN STREAM PLAYS BACK** (same tickets; owner: "when frozen it
+continues to flicker"): a RUNNING held column's surface is DRAWN at
+T8 + o(t) eighths. For an ADOPTED stream o is the column's recording
+(`STILL_ECHO`, two words a column after the mouth words: 8 signed byte samples
+of its live surface relative to T8, one per 4 ticks; written by
+`sim_stream.wgsl`; -128 = no water, drawn dry), played back at 7.5 samples/s
+from a per-column phase and stepped in whole eighths; with no recording (both
+words 0) a procedural -3..+3 eighth flicker. A map RIVER column (its
+`STILL_MOUTH` word set — worldgen writes it for river water only) takes the
+procedural flicker scaled by its current (none under 0.08 m/s, all of it from
+0.6 m/s), so a slack reach stays glassy; a lake and the sea never flicker
+(ticket 11-37-20's "frozen waterfall" is map river water, not a stream). In fs the ray is re-met against the column's box topped at that height
+(`streamSurfaceHit`): lowered, the ray goes down onto it or out of its side onto
+the next column (drawn as surface); raised, it is met earlier through its top or
+side; dry, the bed shows. `waterNormal` adds the neighbours' drawn offsets to
+the column gradient, as a live partial cell is tilted by its neighbours'
+fullness — the patchwork of per-cell tilts is what made the live stream read as
+moving. Render-only: the voxels stay held. Not drawn: a raised column seen only
+past its own water (under a cell of silhouette), and the far field.
+`HELD_WATER_LOOK` (a const) turns both off for an A/B.
 
 **What is dissolved in held water rides it** (`sim_solute.wgsl`, THE HELD
 FLOW CARRIES WHAT IS DISSOLVED IN IT; ticket 2026-10-16_11-11-51). Held water

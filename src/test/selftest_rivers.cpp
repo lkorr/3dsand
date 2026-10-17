@@ -82,7 +82,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/camera.h"
+#include "gpu/resources.h"
 #include "sim/biomes.h"
+#include "sim/celestial.h"
 #include "sim/currentprim.h"
 #include "sim/flowfield.h"
 #include "sim/horizon.h"
@@ -1730,6 +1733,75 @@ Status GateRivers(Ctx& c, std::string& detail) {
         for (int b = 0; b < kDirtyReasonBits; b++)
           if ((awakeWhy >> b) & 1u) runWho += Format(" %s", kDirtyReasonName[b]);
         const int nBy = static_cast<int>(byCols.size());
+        // SANDVOX_RIVERS_SHOT=1: pictures of the ADOPTED stream before the
+        // plug -- the look iteration of raymarch.wgsl's THE FROZEN STREAM
+        // PLAYS BACK and heldSideKind (2026-10-17), which needs a held
+        // player-made stream on screen and has no other fixture. From over
+        // the channel's upper third, looking down it: noon at render time
+        // 10.0 s and 10.25 s (two samples of the flicker apart), and
+        // midnight. build/rivers_stream_{day,dayb,night}.bmp. Draws only.
+        if (std::getenv("SANDVOX_RIVERS_SHOT") && !path.empty()) {
+          using namespace sandvox;
+          // The middle of the channel's own run (not the lake's, not main's).
+          std::vector<size_t> own;
+          for (size_t i = 0; i < path.size(); i++)
+            if (worldmap::WaterColumnAt(path[i].x, path[i].z, kDefaultSeed).water < 0) own.push_back(i);
+          const PP& p = path[own.empty() ? path.size() / 2 : own[own.size() / 2]];
+          // High enough to clear the cut's banks (the channel is dug through
+          // the hill between the lake and main), looking steeply down it.
+          // The value is "back,up,pitchDeg" (voxels upstream of that point,
+          // voxels over the channel floor, degrees; "1" = the defaults), so
+          // the framing can be moved without a rebuild.
+          float back = 24.0f, up = 48.0f, pitchDeg = -58.0f;
+          std::sscanf(std::getenv("SANDVOX_RIVERS_SHOT"), "%f,%f,%f", &back, &up, &pitchDeg);
+          if (back < 2.0f && up == 48.0f) back = 24.0f;   // "1"
+          const Vec3 eye{static_cast<float>(p.x) + 0.5f, static_cast<float>(p.y) + up,
+                         static_cast<float>(p.z) + 0.5f + static_cast<float>(dir) * back};
+          Camera cam;
+          // Camera::Forward is (cos yaw, ., sin yaw): downstream, -dir in z.
+          cam.yaw = dir > 0 ? -1.5707963f : 1.5707963f;
+          cam.pitch = pitchDeg * 0.0174532925f;
+          uint32_t noonT = 0, midT = 0;
+          float bestUp = -2.0f, bestDown = 2.0f;
+          for (uint32_t t = 0; t < 200000u; t += 64u) {
+            const float up = ComputeSky(CurrentTuning(), (double)t).sunDir[1];
+            if (up > bestUp) { bestUp = up; noonT = t; }
+            if (up < bestDown) { bestDown = up; midT = t; }
+          }
+          const uint32_t W = c.width, H = c.height;
+          auto shoot = [&](uint32_t skyTick, float time, const char* file) {
+            rhi::Buffer buf = CreateBuffer(c.ctx.device, (uint64_t)W * H * 4,
+                                           rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "riversShot");
+            for (uint32_t f = 0; f < 6; f++) {
+              WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, true, time, kFarFogDensity, (float)H,
+                                skyTick);
+              rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+              c.sim.EncodeShadowResolve(enc);
+              rhi::RenderPass rp = c.sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+              c.sim.DrawWorld(rp);
+              rp.End();
+              if (f == 5) {
+                rhi::TexelCopyTexture srcT{};
+                srcT.texture = c.offscreen;
+                rhi::TexelCopyBuffer dstB{};
+                dstB.buffer = buf;
+                dstB.bytesPerRow = W * 4;
+                dstB.rowsPerImage = H;
+                rhi::Extent3D ext{W, H, 1};
+                enc.CopyTextureToBuffer(srcT, dstB, ext);
+              }
+              c.ctx.queue.Submit(enc.Finish());
+            }
+            std::vector<uint8_t> px((size_t)W * H * 4, 0);
+            if (rhi::ReadBufferBlocking(c.ctx.device, buf, 0, px.data(), px.size()))
+              WriteBmpFile(file, px, W, H);
+          };
+          shoot(noonT, 10.0f, "build/rivers_stream_day.bmp");
+          shoot(noonT, 10.25f, "build/rivers_stream_dayb.bmp");
+          shoot(midT, 10.0f, "build/rivers_stream_night.bmp");
+          std::printf("rivers: S shots at eye (%.1f, %.1f, %.1f), %d of %d columns adopted\n", eye.x, eye.y, eye.z,
+                      adopted, nBy);
+        }
         // (c) the plug: stone over the mouth, from below the channel floor up.
         std::vector<CellOp> plug;
         const uint32_t stoneW = matIdOf("stone");
