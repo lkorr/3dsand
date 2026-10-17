@@ -8132,19 +8132,57 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // bands are on in this run's range. A neighbour inside the level chunk is
   // another thread's column, whose `h` (wgFarColH, published above the
   // barrier) is the colHeightAt it would have paid a whole landColumn for;
-  // only one across the chunk's edge is computed (one call site, a fenced
-  // loop: see farCornerTop's note).
+  // only one across the chunk's edge is computed.
+  //
+  // AND THE SURFACE BAND'S CORNER MAX (farCornerTop), in the SAME loop. Both
+  // are "one landColumn per asked column", and every call site of landColumn
+  // is a full inlined copy (pond scan, bowl, shore, roads, pads, rivers): two
+  // fenced loops were two copies, ~67k instructions each in this entry's
+  // expansion (scripts/spv_inline_tree.py). One fenced worklist is one copy:
+  // j 0..3 the cave neighbours (-x, +x, -z, +z: the old order), j 4..7 the
+  // corners (farCornerTop's (x0|x1, z0|z1), in its order). The corner max is
+  // a pure function of the column, so it is taken here ONCE, exactly when an
+  // entry this group fills holds the band's row (bandHeld; THE COLUMN STACK's
+  // exactness note), and that entry reads it below instead of calling
+  // farCornerTop itself. Same columns, same landColumn, same max/min.
+  var bandHeld = false;
+  if (bcyBand) {
+    for (var e = grp; e < nRun; e += groups) {
+      let s = farList[hi + e] & FAR_SLOT_MASK;
+      let sc = vec3<i32>(vec3<u32>(s % FAR_NCHUNK, (s / FAR_NCHUNK) % FAR_NCHUNK,
+                                   s / (FAR_NCHUNK * FAR_NCHUNK)));
+      let by = farSlotToChunk(sc, origin).y * i32(CHUNK);
+      if (bcy >= by && bcy < by + i32(CHUNK)) { bandHeld = true; }
+    }
+  }
+  let caveAsk = (caveU.on1 || caveU.on2) && !col.inRim && !col.wet && yLoU <= col.h;
   var caveNbrMin = 2147483647;
-  if ((caveU.on1 || caveU.on2) && !col.inRim && !col.wet && yLoU <= col.h) {
-    for (var ni = unrollFenceU(); ni < 4u; ni++) {
-      let d = select(-1, 1, (ni & 1u) != 0u);
-      let nc = select(vec2<i32>(i32(cxi), i32(zi) + d), vec2<i32>(i32(cxi) + d, i32(zi)), ni < 2u);
+  var btopC = topC;
+  let cx0 = cc0.x << shift;
+  let cz0 = cc0.z << shift;
+  for (var j = select(0u, 4u, !caveAsk) + unrollFenceU(); j < select(4u, 8u, bandHeld); j++) {
+    var px = 0;
+    var pz = 0;
+    if (j < 4u) {
+      let d = select(-1, 1, (j & 1u) != 0u);
+      let nc = select(vec2<i32>(i32(cxi), i32(zi) + d), vec2<i32>(i32(cxi) + d, i32(zi)), j < 2u);
       if (all(nc >= vec2<i32>(0)) && all(nc < vec2<i32>(i32(CHUNK)))) {
         caveNbrMin = min(caveNbrMin, wgFarColH[u32(nc.y) * CHUNK + u32(nc.x)]);
-      } else {
-        caveNbrMin = min(caveNbrMin, colHeightAt(fx + (nc.x - i32(cxi)) * step,
-                                                 fz + (nc.y - i32(zi)) * step, T.seed));
+        continue;
       }
+      px = fx + (nc.x - i32(cxi)) * step;
+      pz = fz + (nc.y - i32(zi)) * step;
+    } else {
+      let ci = j - 4u;
+      px = select(cx0, cx0 + step - 1, (ci & 1u) != 0u);
+      pz = select(cz0, cz0 + step - 1, (ci & 2u) != 0u);
+    }
+    var L : LandCol;
+    landColumn(px, pz, T.seed, &L);
+    if (j < 4u) {
+      caveNbrMin = min(caveNbrMin, L.h);
+    } else {
+      btopC = max(btopC, farColTopFrom(L.h, L.fluidTop, px, pz));
     }
   }
   // The candidates, the canopy memo and the crown proxy in one tile walk
@@ -8251,7 +8289,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // one cc.y per column.
     var btop = topC;
     if (bcyBand && bcy >= base.y && bcy < base.y + i32(CHUNK)) {
-      btop = farCornerTop(topC, cc0.x, cc0.z, shift, T.seed);
+      btop = btopC;   // farCornerTop's answer, taken in the worklist above
     }
     let skyCeil = max(max(ceil0, btop), max(trees.top, can.top));
 
