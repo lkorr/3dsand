@@ -244,6 +244,7 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
   // ======== W: the long walk on `peaks` =======================================
   float wWalked = 0, wProgress = 0, wMinY = 1e9f, wMaxY = -1e9f;
   int wOffGround = 0, wTicks = 0, wHeadingDeg = -1, wRange = 0;
+  int wOnOverlay = 0;   // D10: ticks stood on worldgen-overlay ground (a root, a stump)
   uint64_t wDigest[2] = {0, 0};
   uint32_t wReplans = 0;
   uint64_t wClimb = 0, wDrop = 0;
@@ -326,13 +327,19 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
                         d->asleep ? 1 : 0, d->steps);
           }
           if (run == 0) {
+            // ON DistantGround: the cell under the feet carries weight and the
+            // feet's cell is clear (D10: the worldgen overlay counts -- a
+            // root flare is ground; it was y == TerrainTop + 1 before).
             const Vec3 cc = d->Centre();
-            const float gy = (float)(ground.TerrainTop(ifloor(cc.x), ifloor(cc.z)) + 1);
-            if (!d->swimming && d->origin.y != gy) {
+            const int gx = ifloor(cc.x), gz = ifloor(cc.z), fy = ifloor(d->origin.y + 1e-3f);
+            const float gy = (float)(ground.TerrainTop(gx, gz) + 1);
+            const bool on = (float)fy == d->origin.y && ground.Solid(gx, fy - 1, gz) && !ground.Solid(gx, fy, gz);
+            if (on && d->origin.y != gy) wOnOverlay++;
+            if (!d->swimming && !on) {
               wOffGround++;
               if (wWhy.empty())
-                wWhy = Format("tick %d: feet y %.2f, ground %.0f at (%d,%d)", ticks, (double)d->origin.y,
-                              (double)gy, ifloor(cc.x), ifloor(cc.z));
+                wWhy = Format("tick %d: feet y %.2f, terrain ground %.0f at (%d,%d)", ticks,
+                              (double)d->origin.y, (double)gy, gx, gz);
             }
             wMinY = std::min(wMinY, d->origin.y);
             wMaxY = std::max(wMaxY, d->origin.y);
@@ -779,6 +786,7 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
   RecordObserved("distantWalk.climbRefusals", (double)wClimb);
   RecordObserved("distantWalk.dropRefusals", (double)wDrop);
   RecordObserved("distantWalk.replans", (double)wReplans);
+  RecordObserved("distantWalk.ticksOnOverlay", (double)wOnOverlay);
   RecordObserved("distantWalk.lineDepthMax", (double)pDepthMax);
   RecordObserved("distantWalk.promoteSnapErr", (double)pErr);
   RecordObserved("distantWalk.craterDip", (double)cDip);
@@ -789,10 +797,11 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
   const bool ok = okW && okDW && okA && okX && okP && okC && okS && okDC;
   detail = Format(
       "W %s: %.0f vox walked (%.0f progress, heading %d deg, y %.0f..%.0f, %d ticks, %llu climb + "
-      "%llu drop refusals, %u replans) | D %s | A %s (turned %.2f rad) | X %s | P %s: deepest "
-      "%.2f, %llu holds, snap %.2f | C %s: dip %.1f, %llu drains | S %s",
+      "%llu drop refusals, %u replans, %d ticks on overlay ground) | D %s | A %s (turned %.2f rad) | "
+      "X %s | P %s: deepest %.2f, %llu holds, snap %.2f | C %s: dip %.1f, %llu drains | S %s",
       okW ? "ok" : "FAIL", (double)wWalked, (double)wProgress, wHeadingDeg, (double)wMinY,
       (double)wMaxY, wTicks, (unsigned long long)wClimb, (unsigned long long)wDrop, wReplans,
+      wOnOverlay,
       okDW && okDC ? "ok" : "FAIL", okA ? "ok" : "FAIL", (double)aTurn, okX ? "ok" : "FAIL",
       okP ? "ok" : "FAIL", (double)pDepthMax, (unsigned long long)pHolds, (double)pErr,
       okC ? "ok" : "FAIL", (double)cDip, (unsigned long long)cDrains, okS ? "ok" : "FAIL");

@@ -25,6 +25,7 @@
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
 #include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
+#include "sim/worldgen_twin.h"  // SetGenEnv: the CPU twin reads what worldgen was handed (D10)
 #include "sim/solutes.h"     // LoadSolutes: the species table UploadTables packs
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
@@ -75,6 +76,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // (gpu/resources.cpp WorldgenPrelude). Set BEFORE the first
   // LoadShader below, and it stays set for F5 reloads and --shader-stats.
   treeatlas::SetCurrentTreeLattice(trees.lattice);
+  // ...and the atlas and the packed map themselves, for the CPU twin of
+  // worldgen's features (sim/worldgen_twin.h: the distant tier's obstacles,
+  // D10). Copies: what the GPU was handed, whatever the caller does after.
+  wgtwin::SetGenEnv(trees, worldMapWords);
   // The pond lattice the same way (POND_TILE, from the map already set as
   // CurrentWorldMap by the caller); remembered so UploadEnvironment knows
   // whether a reload moved it under the compiled shaders.
@@ -1641,6 +1646,9 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
                                    const TreeAtlas& trees,
                                    const std::vector<uint32_t>& worldMapWords) {
   FlushQueuedUploads(device, queue);
+  // The CPU twin follows the upload (Init's note): a gate's environment is a
+  // local, so the twin keeps its own copy.
+  wgtwin::SetGenEnv(trees, worldMapWords);
   // Grow-only: a table that shrank keeps its buffer and is zero-padded, the
   // same way Init pads to the header floor. Only a table that no longer fits
   // costs a new buffer -- and with it the two bind groups, because a bind

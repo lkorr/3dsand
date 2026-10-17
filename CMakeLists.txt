@@ -531,6 +531,7 @@ add_library(sandvox_core OBJECT
   # (docs/PLAN_distant_npcs.md; game/distant.h), and the pure steer both
   # tiers turn with (game/steer.h).
   src/game/distant.cpp
+  src/game/distant_obstacles.cpp
   src/game/steer.cpp
   src/game/mob_shock.cpp
   # A body the water carries (MobDef::SwimDef): the swimmers' locomotion.
@@ -733,6 +734,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_stagger.cpp
   src/test/selftest_distant_look.cpp
   src/test/selftest_distant.cpp
+  src/test/selftest_distant_obstacles.cpp
   src/test/selftest_distant_life.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_heat.cpp

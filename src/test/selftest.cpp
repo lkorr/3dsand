@@ -151,6 +151,10 @@ const std::vector<Gate>& DistantGates();
 // schedules walked at distance, saves that keep distant damage
 // (selftest_distant_life.cpp, PLAN_distant_npcs D5+D6).
 const std::vector<Gate>& DistantLifeGates();
+// Trees, buildings and ruins are obstacles at distance: the worldgen overlay
+// against the GPU, walks round them, a door (selftest_distant_obstacles.cpp,
+// PLAN_distant_npcs D10).
+const std::vector<Gate>& DistantObstacleGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -1527,6 +1531,14 @@ const char* const kOrder[] = {
     // the way out, and only voxregion / worldedit (which regenerate again)
     // run after it.
     "distant-calib-matrix",
+    // THE DISTANT TIER'S OBSTACLES (docs/PLAN_distant_npcs.md D10). Here, as
+    // late as it can go, for voxregion's reason: it generates boxes of the
+    // GAME's map through BuildVoxRegion (which moves the window and resets
+    // the page table) and loads that map through ReloadEnvironment; it puts
+    // the harness map back and regenerates the window at home on the way
+    // out (village-harrowby's exit), and only voxregion / worldedit -- which
+    // regenerate again -- run after it.
+    "distant-obstacles",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -1554,7 +1566,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates(), &DistantLifeGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates(), &DistantLifeGates(), &DistantObstacleGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

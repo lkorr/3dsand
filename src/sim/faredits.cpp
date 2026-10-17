@@ -8,6 +8,7 @@
 #include "sim/stream.h"  // RleDecodeChunk
 #include "sim/treeatlas.h"  // the run word (a stamp block uses the tree atlas layout)
 #include "sim/world.h"   // World::TerrainHeight, the ground slot's h
+#include "sim/worldgen_twin.h"  // StampTemplateCell: the one CPU stamp decoder
 #include "sim/worldmap.h"  // the stamps' container cells (StampContainers)
 
 namespace {
@@ -378,20 +379,10 @@ void FarEdits::StampContainers(std::unordered_map<LKey, std::vector<uint32_t>, L
   if (stamps.empty()) return;
   // worldgen.wgsl wmStampCell over the CPU's copy of the block (offsets
   // relative to its start): the template voxel at a world cell, 0 if none.
-  // Run word: material 0..11, y0 16..26, length 27..31 (treeatlas.h).
+  // The ONE CPU decoder (sim/worldgen_twin.h, lifted out of this file for the
+  // distant tier's obstacles, D10).
   auto stampAt = [](const WorldMapData::StampSite& s, int x, int y, int z) -> uint32_t {
-    const int lx = x - (s.x - s.nx / 2), lz = z - (s.z - s.nz / 2);
-    const int ly = y - s.padY - 1 + s.sink;
-    if (lx < 0 || lz < 0 || ly < 0 || lx >= s.nx || lz >= s.nz || ly >= s.ny) return 0;
-    const size_t ci = worldmap::kStampHdrWords + ((size_t)lz * s.nx + lx) * 2;
-    const uint32_t runOff = s.words[ci], cnt = s.words[ci + 1];
-    for (uint32_t k = 0; k < cnt; k++) {
-      const uint32_t r = s.words[runOff + k];
-      const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0);
-      if (ly < y0) return 0;
-      if (ly < y0 + (int)(r >> 27)) return r & 0xFFFu;
-    }
-    return 0;
+    return wgtwin::StampTemplateCell(s, x, y, z, s.padY);
   };
   // What genCellIn puts at a cell, as far as this side can say: the first
   // stamp's template voxel (wmStampsCell); under template air the PAD's

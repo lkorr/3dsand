@@ -26,6 +26,7 @@
 #include <map>
 
 #include "game/arrows.h"   // MobShotsLeft: an archer's arrows, cached at demotion
+#include "game/distant_obstacles.h"  // GenOverlay: the ground's worldgen overlay (D10)
 #include "game/mob.h"
 #include "game/persist.h"   // EntityParking::kUnparkMarginChunks: the promotion line
 #include "game/workpool.h"  // InTask: OutsideGroundFor is single-threaded (D11)
@@ -953,15 +954,11 @@ inline uint64_t TileKey(int tx, int tz) {
   return ((uint64_t)(uint32_t)tx << 32) | (uint64_t)(uint32_t)tz;
 }
 
-// The near tier's "carries weight" (Mob::GroundHeightAt's `supports`): solid,
-// or a powder holding at least kPowderMobSupportMin of a cell. Liquids, gases
-// and passable vegetation (mapped to gas in the class table) never.
+// The near tier's "carries weight" (Mob::GroundHeightAt's `supports`), ONE
+// definition: game/distant_obstacles.h WordCarriesWeight (the overlay
+// classifies the worldgen twin's cells by the same test).
 inline bool WordSupports(uint32_t w, const std::vector<uint32_t>& cls) {
-  const uint32_t mat = w & 0xFFFu;
-  if (mat == 0 || mat >= cls.size()) return false;
-  return cls[mat] == CLASS_SOLID ||
-         (cls[mat] == CLASS_POWDER &&
-          PowderMassOfState((w >> 12) & 0xFu) >= kPowderMobSupportMin);
+  return WordCarriesWeight(w, cls);
 }
 
 }  // namespace
@@ -969,10 +966,18 @@ inline bool WordSupports(uint32_t w, const std::vector<uint32_t>& cls) {
 // The seed is the world's (sandvox::kDefaultSeed, D0's classifier's) from the
 // start, so a query made before the first Bind answers for the right world.
 DistantGround::DistantGround()
-    : seed_(sandvox::kDefaultSeed), inbox_(std::make_shared<Inbox>()) {}
+    : seed_(sandvox::kDefaultSeed), inbox_(std::make_shared<Inbox>()),
+      overlay_(std::make_unique<GenOverlay>(this)) {}
+DistantGround::~DistantGround() = default;
+
+void DistantGround::SetOverlayEnabled(bool on) { overlay_->SetEnabled(on); }
+bool DistantGround::OverlayEnabled() const { return overlay_->Enabled(); }
 
 void DistantGround::Bind(Stream* stream, const std::vector<uint32_t>* classOf,
-                         uint32_t seed) {
+                         uint32_t seed, const std::vector<MaterialGpu>* gpu) {
+  // The overlay classifies with the same classes, at the same seed (it keeps
+  // its own epoch; two compares when nothing changed).
+  overlay_->Bind(classOf, gpu, seed);
   if (classOf != classOf_ || (classOf != nullptr && classOf->size() != classOfSize_)) {
     // What carries weight changed: every decoded mask is wrong.
     classOf_ = classOf;
@@ -1017,6 +1022,7 @@ void DistantGround::Bind(Stream* stream, const std::vector<uint32_t>* classOf,
 }
 
 void DistantGround::InvalidateAll() {
+  overlay_->InvalidateAll();
   tiles_.clear();
   chunks_.clear();
   winChunks_.clear();
@@ -1201,15 +1207,19 @@ bool DistantGround::EditedPossible() const {
 }
 
 bool DistantGround::AnyStored(int x, int z, int yLo, int yHi) {
+  // "ANY NON-PROCGEN" (D10): the TerrainHeight fast path of Stand /
+  // ProbeGround / Land holds only where no source but the base can answer.
   // D8: a column the window source answers for is NOT procgen either -- the
   // per-cell path reads it (Solid's first source).
   if (window_ != nullptr)
     for (int cy = yLo >> 4; cy <= (yHi >> 4); cy++)
       if (WindowChunk(IVec3{x >> 4, cy, z >> 4}) != nullptr) return true;
-  if (!EditedPossible()) return false;
-  for (int cy = yLo >> 4; cy <= (yHi >> 4); cy++)
-    if (StoredChunk(IVec3{x >> 4, cy, z >> 4}) != nullptr) return true;
-  return false;
+  if (EditedPossible())
+    for (int cy = yLo >> 4; cy <= (yHi >> 4); cy++)
+      if (StoredChunk(IVec3{x >> 4, cy, z >> 4}) != nullptr) return true;
+  // D10: a column the worldgen overlay answers differently somewhere in the
+  // range (a trunk, a house, a ruin wall, a layer's edit) leaves it too.
+  return overlay_->Touches(x, z, yLo, yHi);
 }
 
 bool DistantGround::Solid(int x, int y, int z) {
@@ -1227,6 +1237,10 @@ bool DistantGround::Solid(int x, int y, int z) {
       return (c->solid[v >> 6] >> (v & 63)) & 1ull;
     }
   }
+  // D10: THE WORLDGEN OVERLAY, between the stored chunk (whose bytes already
+  // hold the house as the GPU made it) and the base.
+  bool s = false;
+  if (overlay_->Cell(x, y, z, s)) return s;
   return y <= TerrainTop(x, z);
 }
 
@@ -1710,7 +1724,7 @@ Vec3 DistantSpread(Vec3 dir, float spread, uint64_t id, uint32_t tick) {
 }  // namespace
 
 void MobSystem::SetDistantStream(Stream* s) {
-  distantGround_.Bind(s, &classOf_, sandvox::kDefaultSeed);
+  distantGround_.Bind(s, &classOf_, sandvox::kDefaultSeed, &matGpu_);
 }
 
 // ============================================================================
@@ -2438,7 +2452,7 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   distant_.Note(&DistantMobs::Stats::tickCallsAll);
   // The classes and the seed the ground answers for (a materials reload
   // re-points classOf_; Bind is two compares when nothing changed).
-  distantGround_.Bind(distantGround_.BoundStream(), &classOf_, sandvox::kDefaultSeed);
+  distantGround_.Bind(distantGround_.BoundStream(), &classOf_, sandvox::kDefaultSeed, &matGpu_);
   const IVec3 wo = world.WindowOrigin();
   const Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
                  (float)(wo.z * (int)kChunk)};
@@ -3069,6 +3083,15 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     const float hx = d.worldSize.x * 0.5f, hz = d.worldSize.z * 0.5f;
     const float h = d.worldSize.y;
     enum Refusal { kNone = 0, kClimb, kDrop, kWater, kLine, kRing };
+    // Which budget refused a step (stats only): is there matter in the
+    // column between the feet and the head -- a bank past the climb reach, a
+    // trunk, a wall (D10: the overlay's, not just TerrainHeight's) -- or only
+    // a drop below?
+    auto wallAt = [&](int qx, int qz, int fromY) {
+      for (int y = fromY; y < fromY + std::max(d.headroomCells, 1); y++)
+        if (distantGround_.Solid(qx, y, qz)) return true;
+      return false;
+    };
     // ONE substep from origin `p` (feet at `p.y`) by `dv`, onto the ground of
     // the column it lands in. Writes the new origin and the swim state.
     auto stepOnce = [&](Vec3 p, Vec3 dv, bool& swim, Vec3& outP) -> Refusal {
@@ -3125,7 +3148,7 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
         const int ref = swim ? std::max(from, wt) : from;
         const int down = d.stepDownCells + std::max(0, (int)std::ceil(depth));
         if (!distantGround_.Stand(qx, qz, ref, d.stepUpCells, down, d.headroomCells, sy))
-          return distantGround_.TerrainTop(qx, qz) + 1 > ref ? kClimb : kDrop;
+          return wallAt(qx, qz, ref) ? kClimb : kDrop;
         swim = false;
         q.y = (float)sy;
         outP = q;
@@ -3133,11 +3156,8 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       }
       int sy = 0;
       if (!distantGround_.Stand(qx, qz, from, d.stepUpCells, d.stepDownCells,
-                                d.headroomCells, sy)) {
-        // Which budget refused it: is there ground ABOVE the climb reach?
-        const int top = distantGround_.TerrainTop(qx, qz) + 1;
-        return top > from ? kClimb : kDrop;
-      }
+                                d.headroomCells, sy))
+        return wallAt(qx, qz, from) ? kClimb : kDrop;
       q.y = (float)sy;
       outP = q;
       return kNone;
