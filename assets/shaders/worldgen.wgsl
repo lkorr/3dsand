@@ -6190,12 +6190,18 @@ fn farCaveSealed(col : ptr<function, Col>, cave : ptr<function, CaveBands>, y : 
   let ground = min((*col).h - drop, nbrMin);
   return ground - (y + half) < (2 << shift);
 }
-fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
-                 mat : u32, fine : vec3<i32>, shift : u32, seed : u32,
-                 ground : u32, can : FarCanopy) -> u32 {
+// farSurfaceMat in two halves around its genCellCol asks (2026-10-17, shader
+// slimming), so that `far` can make those asks through the genCellIn call site
+// its row loop already has instead of a second inlined genCellIn (see the
+// sweep). farSurfacePre is everything before the asks: the final material,
+// or FAR_SURF_ASK when the cell needs them -- which is only ever the
+// column's topmost solid cell (fine.y <= h < fine.y + step).
+const FAR_SURF_ASK : u32 = 0xFFFFFFFFu;
+fn farSurfacePre(col : ptr<function, Col>, mat : u32, fine : vec3<i32>, shift : u32,
+                 can : FarCanopy) -> u32 {
   let k = materials[mat].klass;
   if (k != CLASS_SOLID && k != CLASS_POWDER) { return mat; }  // fluids keep their ID
-  var h = (*col).h;
+  let h = (*col).h;
   if (farCoverStalkDrop(col, mat, fine.y, shift)) { return MAT_AIR; }
   // "Topmost solid cell of this column": solid means center <= h, and the cell
   // above (center + 2^shift) samples past h. NOT "cell span contains h" — when
@@ -6210,6 +6216,51 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // crown (a shaped one only where it comes down to the ground), and the
   // cells over it in its span do too (farCanopyMat).
   if (shift >= FAR_CANOPY_MIN_SHIFT && farCanopyPaintsGround(can, h, shift)) { return can.mat; }
+  return FAR_SURF_ASK;
+}
+// The asks' surface-band test (the fluid over a bed thinner than the cell,
+// below): whether the topmost cell at `fineY` wears the fluid's surface.
+fn farSurfaceWetTop(col : ptr<function, Col>, fineY : i32, shift : u32) -> bool {
+  let ft = (*col).fluidTop;
+  return ft >= 0 && ft > (*col).h && fineY + (1 << shift) > ft &&
+         farCellIsSolid((*col).fluid);
+}
+// ...and everything after them, from their answers: `skin` (the column at h),
+// `pristine` (procgen at the sample; read only for FAR_GROUND_SAMPLE) and
+// `top` (the voxel at the fluid's surface; read only when wetTop).
+fn farSurfacePost(col : ptr<function, Col>, mat : u32, fine : vec3<i32>, shift : u32,
+                  ground : u32, skin : u32, pristine : u32, topIn : u32) -> u32 {
+  let wetTop = farSurfaceWetTop(col, fine.y, shift);
+  var top = topIn;
+  // A plant floating on the surface (a lily pad) is not far-solid: the fluid.
+  if (wetTop && !farCellIsSolid(top)) { top = (*col).fluid; }
+  // a stamp's hollow interior can be air at y == h; keep the body mat then
+  let skinOk = skin != MAT_AIR && materials[skin].klass != CLASS_GAS;
+  if (ground < FAR_GROUND_SAMPLE) {
+    // The live ground. Dug away, or holding gas / a plant: the cell's top is
+    // whatever the sample found under it. Something else than the skin's
+    // slot: that is what lies on the ground now.
+    if (!farCellIsSolid(ground)) { return mat; }
+    if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
+      return ground;
+    }
+    if (wetTop) { return top; }
+    return roadTint(col, skin, shift);
+  }
+  if (ground == FAR_GROUND_SAMPLE &&
+      matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
+    return mat;
+  }
+  if (wetTop) { return top; }
+  if (!skinOk) { return mat; }
+  return roadTint(col, skin, shift);
+}
+fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
+                 mat : u32, fine : vec3<i32>, shift : u32, seed : u32,
+                 ground : u32, can : FarCanopy) -> u32 {
+  let pre = farSurfacePre(col, mat, fine, shift, can);
+  if (pre != FAR_SURF_ASK) { return pre; }
+  let h = (*col).h;
   // MEADOW COVER IS NOT FLATTENED INTO THE SKIN (tried and taken out): the
   // strand palette painted over a far meadow reads darker than the near
   // field, where the eye sees the skin between thin blades. A blade thinner
@@ -6238,8 +6289,7 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // still read first: the live-ground and sample modes below compare against
   // it to tell an edited bed from an untouched one.
   let ft = (*col).fluidTop;
-  let wetTop = ft >= 0 && ft > h && fine.y + (1 << shift) > ft &&
-               farCellIsSolid((*col).fluid);
+  let wetTop = farSurfaceWetTop(col, fine.y, shift);
   var skin = MAT_AIR;
   var pristine = mat;
   var top = MAT_AIR;
@@ -6250,28 +6300,7 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
     let g = genCellCol(col, ponds, vec3<i32>(fine.x, y, fine.z), seed) & 0xFFFu;
     if (q == 0u) { skin = g; } else if (q == 1u) { pristine = g; } else { top = g; }
   }
-  // A plant floating on the surface (a lily pad) is not far-solid: the fluid.
-  if (wetTop && !farCellIsSolid(top)) { top = (*col).fluid; }
-  // a stamp's hollow interior can be air at y == h; keep the body mat then
-  let skinOk = skin != MAT_AIR && materials[skin].klass != CLASS_GAS;
-  if (ground < FAR_GROUND_SAMPLE) {
-    // The live ground. Dug away, or holding gas / a plant: the cell's top is
-    // whatever the sample found under it. Something else than the skin's
-    // slot: that is what lies on the ground now.
-    if (!farCellIsSolid(ground)) { return mat; }
-    if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
-      return ground;
-    }
-    if (wetTop) { return top; }
-    return roadTint(col, skin, shift);
-  }
-  if (ground == FAR_GROUND_SAMPLE &&
-      matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
-    return mat;
-  }
-  if (wetTop) { return top; }
-  if (!skinOk) { return mat; }
-  return roadTint(col, skin, shift);
+  return farSurfacePost(col, mat, fine, shift, ground, skin, pristine, top);
 }
 // A COVER STALK PAST THE STALK LEVELS IS COVERAGE, NOT A CELL (2026-10-14,
 // ticket 2026-10-14_11-20-12). A biome's solid cover row -- a crystal spire,
@@ -8299,17 +8328,48 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // into the owner's word in wgFarWords, genCellIn called with the valid
     // flags set exactly as genChunk does -- the flags pick the other spelling
     // of the SAME function, so the bytes are the unhoisted ones.
+    //
+    // THE SURFACE ASKS RIDE THE ROW LOOP (2026-10-17, shader slimming). The
+    // column's topmost solid cell is coloured from the skin at h and, over a
+    // submerged bed, from the voxel at the fluid's surface (farSurfaceMat's
+    // genCellCol asks). Asked from inside farSurfaceMat they were a SECOND
+    // inlined genCellIn in this entry -- ~35-50k of its instructions after
+    // the worldgen recipe (scripts/spv_sizes.sh, stubbing each in turn). So
+    // they are the loop's first two iterations, through its one genCellIn
+    // call site with the valid flags OFF (exactly genCellCol's arguments:
+    // genCellIn only READS cave/trees, and only when told they are valid),
+    // and the row that needs them takes farSurfacePre/Post around the
+    // answers. Asked only when this entry holds that row -- the one whose
+    // sample satisfies farSurfacePre's fine.y <= h < fine.y + step, i.e.
+    // (h - half) >> shift -- and not when the crown paints the ground (Pre's
+    // answer comes before the asks there). Same calls, same arguments, same
+    // byte.
+    let yiS = ((col.h - half) >> shift) - base.y;
+    let surfHeld = yiS >= 0 && yiS < i32(CHUNK) &&
+                   !(shift >= FAR_CANOPY_MIN_SHIFT && farCanopyPaintsGround(can, col.h, shift));
+    let wetS = surfHeld && farSurfaceWetTop(&col, ((base.y + yiS) << shift) + half, shift);
+    var skinS = MAT_AIR;
+    var fluidS = MAT_AIR;
     var count = 0u;
     var top = 0u;   // one plus the highest row with a non-empty cell, this thread
-    for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
+    for (var j = unrollFenceU(); j < CHUNK + 2u; j++) {
+      let ask = j < 2u;   // the surface asks: j 0 the skin at h, j 1 the fluid's top
+      let yi = j - 2u;    // the row (the asks never read it)
       // The row's floor.
       let yRow = (base.y + i32(yi)) << shift;
-      if (yRow > skyCeil) { break; }
-      let fine = vec3<i32>(fx, yRow + half, fz);
+      var fine = vec3<i32>(fx, yRow + half, fz);
+      if (ask) {
+        if (!surfHeld || (j == 1u && !wetS)) { continue; }
+        fine.y = select(col.fluidTop, col.h, j == 0u);
+      } else if (yRow > skyCeil) { break; }
       var mat = M_STONE;
-      if (fine.y > deepTop || (!col.inRim && !col.wet && caveIn(cave, fine.y) != 0)) {
-        mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
+      if (ask || fine.y > deepTop || (!col.inRim && !col.wet && caveIn(cave, fine.y) != 0)) {
+        mat = genCellIn(&col, &cave, !ask, &trees, !ask, &ponds, select(-1, canopyArg, !ask),
                         fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
+        if (ask) {
+          if (j == 0u) { skinS = mat; } else { fluidS = mat; }
+          continue;
+        }
         if (!farCellIsSolid(mat) && farCaveSealed(&col, &cave, fine.y, shift, caveNbrMin)) { mat = M_STONE; }
       }
       // THE DUNGEON at the sample: genChunk's own dgCell, skin, scatter and
@@ -8354,9 +8414,13 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         // What lands in the byte is the skin material's FAR PALETTE SLOT, not
         // its id (common.wgsl farCellByte), and it replaces the blocker: a
         // cell with a material blocks by having one.
-        byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&col, &ponds, mat, fine, shift,
-                                                                T.seed, FAR_GROUND_PROCGEN, can)),
-                            byteV);
+        var sm = farSurfacePre(&col, mat, fine, shift, can);
+        if (sm == FAR_SURF_ASK) {
+          // this is row yiS: the asks above answered it (pristine is read
+          // only for FAR_GROUND_SAMPLE)
+          sm = farSurfacePost(&col, mat, fine, shift, FAR_GROUND_PROCGEN, skinS, mat, fluidS);
+        }
+        byteV = farCellByte(matFarPal(&materials, sm), byteV);
       } else if (fine.y > col.h && fine.y <= peak) {
         // A summit between the sample columns (farPeakTop).
         byteV = farCellByte(matFarPal(&materials, farPeakMat(col.biome, peak, col.tl)), byteV);
