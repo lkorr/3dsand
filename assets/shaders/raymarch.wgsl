@@ -11076,14 +11076,26 @@ fn waterCurrentAt(p : vec3f) -> vec3f {
 fn waterConvergeAt(p : vec3f) -> f32 {
   if (gFlowSlack < 0.0) { return currentConvergeAt(p, &R); }
   if (R.currentRenderOn == 0u || !FLOW_BOUND) { return 0.0; }
-  let c = waterCurrentAt(p);
-  if (c.x == 0.0 && c.z == 0.0) { return 0.0; }
+  // ONE waterCurrentAt CALL SITE (2026-10-17, shader slimming): the centre
+  // tap (k 0, whose stillness ends it) and the four +-x / +-z taps of the
+  // divergence, in the old order, through one loop. Five call sites were five
+  // inlined copies of the field lookup in each of this function's four copies
+  // (every waterFoam). Same points -- p + o / p - o exactly as written before
+  // -- and the same difference quotient.
   let e = 1.5;
-  let vx1 = waterCurrentAt(p + vec3f(e, 0.0, 0.0)).x;
-  let vx0 = waterCurrentAt(p - vec3f(e, 0.0, 0.0)).x;
-  let vz1 = waterCurrentAt(p + vec3f(0.0, 0.0, e)).z;
-  let vz0 = waterCurrentAt(p - vec3f(0.0, 0.0, e)).z;
-  return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);
+  var v = vec4f(0.0);   // vx1, vx0, vz1, vz0
+  for (var k = 0u; k < 5u; k++) {
+    let o = select(vec3f(0.0, 0.0, e), vec3f(e, 0.0, 0.0), k < 3u);
+    var q = p;
+    if (k != 0u) { q = select(p - o, p + o, (k & 1u) != 0u); }
+    let c = waterCurrentAt(q);
+    if (k == 0u) {
+      if (c.x == 0.0 && c.z == 0.0) { return 0.0; }
+      continue;
+    }
+    v = select(v, vec4f(select(c.z, c.x, k < 3u)), vec4<u32>(k) == vec4<u32>(1u, 2u, 3u, 4u));
+  }
+  return -((v.x - v.y) + (v.z - v.w)) / (2.0 * e);
 }
 
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
@@ -11266,19 +11278,39 @@ const FLOW_FOAM_WIDTH : f32 = 0.16; // m across it
 const FLOW_FLECK : vec2f = vec2f(0.45, 0.06);
 fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   var flowMS = gWaveFlow.xz;
-  if (gFlowSlack >= 0.0 || gWaveFlow.y <= 0.0) {
-    flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
-  }
-  let speed = length(flowMS);
-  let st = flowMarkStrength(speed);
-  if (st <= 0.0) { return 0.0; }
-  let dir = flowMS / speed;
-  let perp = vec2f(-dir.y, dir.x);
+  let ownFlow = gFlowSlack >= 0.0 || gWaveFlow.y <= 0.0;
   // The shear across the flow, per second: the along-flow speed 0.6 m to
-  // either side. Two more taps of a bilinear grid.
+  // either side. Two more taps of a bilinear grid -- and the column's own
+  // flow before them, all three through ONE waterCurrentAt call site
+  // (2026-10-17, shader slimming; this function is inlined four times).
   let e = 0.6;
-  let aL = dot(waterCurrentAt(hitP + vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS)).xz, dir);
-  let aR = dot(waterCurrentAt(hitP - vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS)).xz, dir);
+  var speed = 0.0;
+  var st = 0.0;
+  var dir = vec2f(0.0);
+  var perp = vec2f(0.0);
+  var aL = 0.0;
+  var aR = 0.0;
+  for (var k = 0u; k < 3u; k++) {
+    var q = hitP;
+    if (k != 0u) {
+      let o = vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS);
+      q = select(hitP - o, hitP + o, k == 1u);
+    }
+    var cur = vec3f(0.0);
+    if (k != 0u || ownFlow) { cur = waterCurrentAt(q); }
+    if (k == 0u) {
+      if (ownFlow) { flowMS = cur.xz * VOXEL_METERS + gSlopeFlow; }
+      speed = length(flowMS);
+      st = flowMarkStrength(speed);
+      if (st <= 0.0) { return 0.0; }
+      dir = flowMS / speed;
+      perp = vec2f(-dir.y, dir.x);
+    } else if (k == 1u) {
+      aL = dot(cur.xz, dir);
+    } else {
+      aR = dot(cur.xz, dir);
+    }
+  }
   let shear = abs(aL - aR) * VOXEL_METERS / (2.0 * e);
   let density = clamp(0.45 * st * st + shear * 2.0, 0.0, 1.0);
   if (density <= 0.02) { return 0.0; }
