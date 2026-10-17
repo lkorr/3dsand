@@ -589,7 +589,13 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
           R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams) R(ElecPool) A(ElecMeta)
-          R(ElecParams) R(StillWater) A(FlowMeasure)))
+          R(ElecParams) A(StillWater) A(FlowMeasure)))
+// A(StillWater) on both colour-row sets (was R): THE CONDUIT's ledger
+// (sim_step.wgsl, docs/PLAN_running_water.md phase 3) -- a POOL stream's
+// deposits and withdrawals are atomicAdd / atomicSub on the two ledger words
+// after the column records, through binding 62 (`stillLedger`, the same
+// buffer as 58); the CA's table reads stay plain reads of 58. Results never
+// read in the pass; sim_stream.wgsl `commit` snapshots the sum after it.
 // A(FlowMeasure) on both colour-row sets: THE MEASURED FLOW's accumulator
 // (sim_step.wgsl flowMeasNote) -- every lateral liquid move adds its flux to
 // its node bin. Render-only, like A(GasOuter): integer adds and maxes that no
@@ -614,7 +620,7 @@ PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP1, K_INDIRECT, IND_CAARGS,
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
           R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams) R(ElecPool) A(ElecMeta)
-          R(ElecParams) R(StillWater) A(FlowMeasure)))
+          R(ElecParams) A(StillWater) A(FlowMeasure)))
 
 // ---- THE MEASURED FLOW'S FOLD (flow_measure.wgsl; DESIGN.md §9d.12) --------
 // After both colour-row sets, so the accumulator holds this tick's CA moves
@@ -644,7 +650,10 @@ PASS(fill_flowMeasField, nullptr, PT_TICK, PIPE_NONE, K_FILL, kFlowMeasStateOffs
 // committed targets and writes its own column's observation; `commit`, after
 // the barrier this row pair implies, applies it. The CA reads the targets on
 // the NEXT tick (stillLevel8). Read-only voxels: the module declares them
-// read_write for common.wgsl, and stores nothing.
+// read_write for common.wgsl, and stores nothing. RW(StillWater) covers THE
+// CONDUIT's ledger words too (`commit` snapshots the live balance the CA's
+// atomics left); A(DirtyOut) on `commit`: WAKE ON RELEASE marks a released
+// column's chunk for the next tick (docs/PLAN_running_water.md phase 3).
 PASS(streamScan, "stream", PT_TICK, PIPE_STREAM_SCAN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
@@ -652,7 +661,7 @@ PASS(streamScan, "stream", PT_TICK, PIPE_STREAM_SCAN, K_INDIRECT, IND_DISPATCHAR
 PASS(streamCommit, "stream", PT_TICK, PIPE_STREAM_COMMIT, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
-          R(PageTable) RW(StillWater)))
+          R(PageTable) RW(StillWater) A(DirtyOut)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //

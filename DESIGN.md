@@ -25168,6 +25168,37 @@ the stream above it is adopted). Derived, not saved; dense worldgen
 clears it, and so does a load (`clearStreams`, PT_LOADRESET: the load's
 streamed refill keeps a stream while its column's tag is unchanged).
 
+**A stream from a FINITE source — THE CONDUIT** (phase 3, 2026-10-16; tickets
+2026-10-16_11-14-41 / 11-16-43). A pour, a pool or a broken tank has no
+infinite reservoir behind it, so its stream is adopted as a POOL stream ([3]
+bit 24; a pending POOL adopt is action 3) and accounted through a LEDGER
+instead. ROOT: a steady, running column with no held feeder may be fed by an
+UNHELD neighbour that stands at least 2 eighths over it, can pour (not a
+stranded one-eighth film) and is itself a root (nothing stands 2 eighths over
+it) — the top of the slope, so POOL adoption walks down the hop chain from the
+source as a map stream does. RELEASE has hysteresis: a POOL column with no held
+feeder of smaller hop stays while any unheld water still pours into it, so as
+the source runs down the held stream RETREATS from the top (a released head's
+water feeds the next column, now the head). The ledger is two words after the
+column records (live, snapshot), added to through binding 62 (`stillLedger`,
+the same buffer as 58 bound again as atomics) and snapshotted by
+`sim_stream.wgsl commit` after the CA. In `sim_step.wgsl` (THE CONDUIT): a POOL
+cell over its target DEPOSITS all its excess at stage 0 (refused at the cap,
+1024 eighths); TAKE / GROW WITHDRAW (refused while the snapshot is <= 0); while
+the snapshot is empty a POOL column under its target is full to held
+neighbours at rest, and a POOL cell at rest moves nothing sideways (the CLOSED
+VALVE: the mouth emits only what the head deposited, and keeps its chunk
+awake while it has somewhere to go — `liquidSideWork`, the same predicate
+`canFlowAnywhere` asks). So only the head (absorbing) and the mouth (emitting)
+are awake; the middle sleeps and is drawn running. Decisions read the
+snapshot only (rule 1); voxels + MPM + ledger is exact; what the ledger can
+strand when no POOL column is left is bounded by the cap plus one tick's
+deposits (and an overdraft of one tick's withdrawals). One ledger for the
+whole window: two finite streams at once share it. Not saved (a load clears
+it). Known limit: a POOL stream into MAP water cannot discharge (the held rule
+refuses its mouth), fills the cap and runs awake as before. Gate `stream-pool`
+(a stone reservoir, channel and basin on the harness pad).
+
 **The look** (`raymarch.wgsl`): a SIDE face of water where the water outside
 drops away by 0.75 cell or more is a falling sheet (`fallingSheet`: vertical
 whitewater streaks scrolling down at 3.2 m/s) — a held curtain, a rapid's step

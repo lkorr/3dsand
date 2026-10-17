@@ -4303,7 +4303,18 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   if (canDescend(c, c + vec3<i32>(0, -1, 0), mat, m.density)) { return true; }
   // 1b) brine above lighter liquid of its own kind (solTrySink, read only).
   if (solTrySink(c, w, mat, false)) { return true; }
+  // 2) - 4), shared with stepLiquid's closed valve (THE CONDUIT).
+  if (liquidSideWork(c, mat, m, f, submerged, rest)) { return true; }
+  // 5) the reservoir: same predicate as stepLiquid's stage 5.
+  return stillWant(c, mat, f) != STILL_NONE;
+}
 
+// canFlowAnywhere's stages 2 - 4 (diagonals, laterals, the bridge): would the
+// cell find a sideways or diagonal move? PURE READ. Split out so stepLiquid's
+// CLOSED VALVE (THE CONDUIT: a POOL column at rest while the ledger is empty
+// moves nothing sideways, but keeps its chunk awake while it has somewhere to
+// go) asks exactly what the mirror asks.
+fn liquidSideWork(c : vec3<i32>, mat : u32, m : Material, f : u32, submerged : bool, rest : bool) -> bool {
   // 2a) the four axis down-diagonals.
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
@@ -4352,9 +4363,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   }
   // 4) last resort: level two of the neighbours THROUGH this cell. Same scan and
   //    same predicate as the moving path — one function, so they cannot drift.
-  if (!submerged && bridgeLevel(c, mat, false)) { return true; }
-  // 5) the reservoir: same predicate as stepLiquid's stage 5.
-  return stillWant(c, mat, f) != STILL_NONE;
+  return !submerged && bridgeLevel(c, mat, false);
 }
 
 // ============================ 5) THE RESERVOIR ==============================
@@ -4441,6 +4450,79 @@ const STILL_GROW : u32 = 3u;     // a one-eighth cell into the air above
 // window column can have, in eighths.
 const STILL_UNHELD : i32 = -1073741824;
 
+// ============================ THE CONDUIT ===================================
+// docs/PLAN_running_water.md phase 3 (tickets 2026-10-16_11-16-43 and
+// 11-14-41). sim_stream.wgsl adopts a stream whose source is FINITE (a pour,
+// a pool, a broken tank) as a POOL stream: [3] bit STILL_POOL_BIT. Its held
+// columns rest and sleep like any held water, but behind them there is no
+// infinite reservoir -- there is a LEDGER, and the stream is a conduit:
+//   * DEPOSIT: a free-surface cell of a POOL column OVER its target (what
+//     the source pours into the head) gives ALL of its excess to the ledger,
+//     unrolled, and it does so FIRST (stage 0, beside the TAKE): left to
+//     stage 5 the excess would split into the next held column's air and
+//     run down the whole stream as water, waking every chunk of it.
+//   * WITHDRAW: a POOL cell UNDER its target (what the mouth spilled into the
+//     basin) is refilled to it (TAKE / GROW) from the ledger -- only when the
+//     ledger's SNAPSHOT is positive.
+//   * STARVED: while the snapshot is empty, a POOL column under its target is
+//     FULL to its held neighbours at rest (heldBlocks): the deficit stays at
+//     the mouth instead of running up the stream (which would wake all of it
+//     to carry real water). The mouth waits, awake; its source refills the
+//     ledger, or sim_stream.wgsl lets it go (the starved count).
+//   * CAPPED: a deposit needs the snapshot under STILL_LEDGER_CAP. Refused,
+//     the head's cells over the target are AT REST anyway (heldRest): they
+//     pour nothing into the held stream, the source fills the head to its
+//     own level and stops, and the head waits, awake (the GIVE it wants),
+//     until the mouth has drawn the ledger down. So the conduit is regulated
+//     at whichever end is slower -- a slow mouth holds the head back (CAPPED),
+//     a slow head closes the mouth (STARVED) -- and the middle sleeps either
+//     way. sim_stream.wgsl counts a capped wait +1 a visit on the flood count
+//     (never the deep +16), so a mouth that has stopped emitting for good (a
+//     drowned or plugged one) still lets the head go in bounded time.
+//   * A POOL REFILL DOES NOT SPEND THE VISIT (stepLiquid stage 0).
+// MASS: every deposit and withdrawal moves the same eighths it writes, so
+// voxels + ledger is EXACT. What the ledger can strand is bounded: a
+// withdrawal decided on a positive snapshot may take the live balance under
+// zero by at most ONE TICK's withdrawals (each cell decides on the snapshot,
+// not on what the others took), and a deposit may take it over the cap by at
+// most one tick's deposits; whatever balance is left when the last POOL
+// column is released (or a load, or a window shift that drops the columns)
+// is lost -- ONE GLOBAL LEDGER for the window, so two finite-source streams
+// running at once share it (the approximation: water poured into one can
+// leave by the other's mouth, never more than the cap).
+// RULE 1: the adds are atomicAdd / atomicSub on binding 62 whose results are
+// never read (order-free sums); every DECISION reads the snapshot, binding
+// 58's STILL_LEDGER + 1, which sim_stream.wgsl `commit` wrote after the last
+// tick's CA. RULE 2: a POOL stream at rest has no deposit or withdrawal to
+// make; its head and mouth stay awake only while the source pours (or while
+// the mouth waits on an empty ledger, which the starved count bounds).
+// Binding 62 is the SAME buffer as 58 (pass_table.def: Buf StillWater under
+// both names); this module touches only the ledger words through it.
+@group(0) @binding(62) var<storage, read_write> stillLedger : array<atomic<u32>>;
+// sim_stream.wgsl's STREAM_LEDGER / STREAM_POOL_BIT: must agree.
+const STILL_LEDGER : u32 = WORLD_N * WORLD_N * STILL_WORDS;
+const STILL_POOL_BIT : u32 = 1u << 24u;
+// The most a conduit holds in transit, in eighths (64 voxels) -- the buffer
+// between the head's and the mouth's rates, and the bound on stranded water.
+// Small on purpose: the regulation (CAPPED / STARVED) does not need a deep
+// buffer, only one that is rarely empty AND rarely full. sim_stream.wgsl's
+// STREAM_LEDGER_CAP must agree.
+const STILL_LEDGER_CAP : i32 = 512;
+fn ledgerSnap() -> i32 { return bitcast<i32>(stillWater[STILL_LEDGER + 1u]); }
+// DIAGNOSTIC, never read by the sim: the ledger's spare words count every
+// eighth deposited ([2]) and withdrawn ([3]) since the table was cleared, so
+// a gate can check live == deposits - withdrawals and see each end's rate.
+fn ledgerNote(dep : u32, wd : u32) {
+  if (dep != 0u) { atomicAdd(&stillLedger[STILL_LEDGER + 2u], dep); }
+  if (wd != 0u) { atomicAdd(&stillLedger[STILL_LEDGER + 3u], wd); }
+}
+// Is the held record of column (x, z) a POOL stream's? Asked only of a column
+// stillLevel8 found held (its tag already matched).
+fn stillPool(x : i32, z : i32) -> bool {
+  let si = stillIndex(x, z);
+  return stillWater[si + 1u] == 0u && (stillWater[si + 3u] & STILL_POOL_BIT) != 0u;
+}
+
 // The column's HELD surface in EIGHTHS (T8: full cells to (T8 - 1) >> 3, the
 // top one holding the rest) -- the map's (word [1]) or, where the map holds
 // none, a stream's that sim_stream.wgsl adopted (word [2]) -- or STILL_UNHELD:
@@ -4511,12 +4593,23 @@ fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
 // eighths, 0 when it holds no liquid of this kind (air, a gas).
 fn heldRest(c : vec3<i32>, mat : u32, f : u32) -> bool {
   let t8 = stillLevel8(c.x, c.z, mat);
-  return t8 != STILL_UNHELD && 8 * c.y + i32(f) <= t8;
+  if (t8 == STILL_UNHELD) { return false; }
+  if (8 * c.y + i32(f) <= t8) { return true; }
+  // THE CONDUIT, CAPPED: a POOL column over its target while the ledger is
+  // full is AT REST too -- the head waits (its excess stands in it, the
+  // source stops pouring once level with it) instead of running down the
+  // held stream. Only evaluated over a held target, so it costs nothing on
+  // the common path.
+  return ledgerSnap() >= STILL_LEDGER_CAP && stillPool(c.x, c.z);
 }
 fn heldBlocks(rest : bool, n : vec3<i32>, mat : u32, nf : u32) -> bool {
   if (!rest) { return false; }
   let t8 = stillLevel8(n.x, n.z, mat);
-  return t8 != STILL_UNHELD && 8 * n.y + i32(nf) >= t8;
+  if (t8 == STILL_UNHELD) { return false; }
+  if (8 * n.y + i32(nf) >= t8) { return true; }
+  // THE CONDUIT, STARVED: a POOL column under its target is full while the
+  // ledger is empty (see THE CONDUIT).
+  return ledgerSnap() <= 0 && stillPool(n.x, n.z);
 }
 // The fullness of liquid `mat` in the word, 0 when it holds something else.
 fn heldFullness(nw : u32, mat : u32) -> u32 {
@@ -4529,7 +4622,8 @@ fn heldBlocksAt(rest : bool, n : vec3<i32>, mat : u32) -> bool {
   if (!rest || !inBounds(n)) { return false; }
   let t8 = stillLevel8(n.x, n.z, mat);
   if (t8 == STILL_UNHELD) { return false; }
-  return 8 * n.y + i32(heldFullness(voxWordAt(n), mat)) >= t8;
+  if (8 * n.y + i32(heldFullness(voxWordAt(n), mat)) >= t8) { return true; }
+  return ledgerSnap() <= 0 && stillPool(n.x, n.z);   // THE CONDUIT, STARVED
 }
 
 // Which branch, if any, cell c (liquid `mat`, fullness f) is in. PURE READ:
@@ -4575,9 +4669,20 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
 // asks for the next one, or the breach drains the river instead of the river
 // feeding the breach. Returns whether it wrote. `want` is stillWant(c, mat, f),
 // which the caller asked once (stepLiquid: stage 0 and stage 5 share it).
-fn stillReservoir(c : vec3<i32>, mat : u32, f : u32, want : u32) -> bool {
+// `pool`: the column is a POOL stream's (THE CONDUIT) -- every branch then
+// goes through the ledger instead: a GIVE deposits ALL of the cell's excess
+// (unrolled; refused at the cap), a TAKE / GROW withdraws what it writes
+// (refused while the snapshot is empty). A refusal keeps the cell's own chunk
+// awake (DIRTY_R_REACT), as a failed roll always has.
+fn stillReservoir(c : vec3<i32>, mat : u32, f : u32, want : u32, pool : bool) -> bool {
   if (want == STILL_NONE) { return false; }
-  if (want == STILL_GIVE) {
+  if (pool) {
+    let snap = ledgerSnap();
+    if ((want == STILL_GIVE && snap >= STILL_LEDGER_CAP) || (want != STILL_GIVE && snap <= 0)) {
+      markDirtyR(c, DIRTY_R_REACT);
+      return false;
+    }
+  } else if (want == STILL_GIVE) {
     let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + gCaSub, cellIndexW(c)) & 1023u;
     if (roll >= T.stillWaterRelax) {
       markDirtyR(c, DIRTY_R_REACT);   // matched, did not fire: own chunk only
@@ -4587,17 +4692,31 @@ fn stillReservoir(c : vec3<i32>, mat : u32, f : u32, want : u32) -> bool {
   let stamp = stampFor(T.tick, gCaSub);
   let iw = voxIndexAndWord(c);
   if (want == STILL_GIVE) {
-    if (f <= 1u) { voxStore(iw.x, 0u); }
+    if (pool) {
+      // ALL of the excess: the whole cell over the target's top row, the
+      // eighths over ft in it. (stillWant's GIVE: dy > 0 standing on this
+      // water, or dy == 0 with f > ft.)
+      let t8 = stillLevel8(c.x, c.z, mat);
+      let yt = (t8 - 1) >> 3u;
+      var keep = 0u;
+      if (c.y == yt) { keep = u32(t8 - 8 * yt); }
+      if (keep == 0u) { voxStore(iw.x, 0u); }
+      else { voxStore(iw.x, packVoxKeepStain(mat, keep - 1u, stamp, iw.y)); }
+      atomicAdd(&stillLedger[STILL_LEDGER], f - keep);
+      ledgerNote(f - keep, 0u);
+    } else if (f <= 1u) { voxStore(iw.x, 0u); }
     else { voxStore(iw.x, packVoxKeepStain(mat, f - 2u, stamp, iw.y)); }
   } else if (want == STILL_TAKE) {
     let t8 = stillLevel8(c.x, c.z, mat);
     let yt = (t8 - 1) >> 3u;
     let full = select(8u, u32(t8 - 8 * yt), c.y == yt);
     voxStore(iw.x, packVoxKeepStain(mat, full - 1u, stamp, iw.y));
+    if (pool) { atomicSub(&stillLedger[STILL_LEDGER], full - f); ledgerNote(0u, full - f); }
   } else {
     let ai = voxWordIndex(c + vec3<i32>(0, 1, 0));
     voxStore(ai, packVoxKeepStain(mat, 0u, stamp, 0u));
     markVoxActive(ai);
+    if (pool) { atomicSub(&stillLedger[STILL_LEDGER], 1u); ledgerNote(0u, 1u); }
   }
   markVoxActive(iw.x);
   markDirtyR(c, DIRTY_R_MOVE | DIRTY_R_WATERBODY);
@@ -4607,8 +4726,11 @@ fn stillReservoir(c : vec3<i32>, mat : u32, f : u32, want : u32) -> bool {
 // Mass-conserving liquid flow (fullness in eighths, DESIGN.md §4).
 // Returns whether the cell moved any mass this substep; the caller uses that to
 // decide whether a settled cell still has a reason to stay awake (defect 4).
-fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : u32) -> bool {
-  let f = voxState(w) + 1u;  // fullness 1..8
+fn stepLiquid(c : vec3<i32>, idx : u32, w0 : u32, mat : u32, m : Material, rnd : u32) -> bool {
+  // `var`: THE CONDUIT's refill (stage 0) rewrites this cell and the visit
+  // goes on with the refilled word.
+  var w = w0;
+  var f = voxState(w) + 1u;  // fullness 1..8
   // Diagnostic only (the DIRTY_M_* block above): tagged onto every successful
   // move so ONE run says which stage keeps a settled pond awake, and whether
   // the mover was under its own liquid at the time.
@@ -4676,9 +4798,30 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   //    stage 0, stage 5, and inside stillReservoir -- for every free-surface
   //    liquid cell in an awake chunk, river or not.) A `submerged` cell never
   //    qualifies (it needs air above), so it is not asked at all.
+  //    THE CONDUIT: a POOL column's DEPOSIT is tried here too (an excess that
+  //    reached stage 3 would split into the next held column's air and run
+  //    down the stream); `early` says stage 0 had its try, so stage 5 does not
+  //    ask again.
   var want = STILL_NONE;
+  var pool = false;
   if (!submerged) { want = stillWant(c, mat, f); }
-  if (want == STILL_TAKE && stillReservoir(c, mat, f, want)) { return true; }
+  if (want != STILL_NONE) { pool = stillPool(c.x, c.z); }
+  let early = want == STILL_TAKE || (pool && want == STILL_GIVE);
+  if (early && stillReservoir(c, mat, f, want, pool)) {
+    // A POOL REFILL DOES NOT SPEND THE VISIT. Before it was held, the mouth's
+    // top cell was filled by its upstream neighbour's move and spent its own
+    // visit passing water on; held, the refill took the whole visit, so the
+    // mouth emitted at about half the rate the head absorbed and the ledger
+    // ran to its cap (measured, the first `stream-pool` run: capped by tick
+    // 301). So a POOL cell refilled from the ledger goes on with its visit as
+    // the refilled cell: same reach (its own cell, then the move it would
+    // make anyway), same mass (the ledger paid for the refill). A map TAKE
+    // still ends the visit, as it always has.
+    if (!(pool && want == STILL_TAKE)) { return true; }
+    w = voxWordAt(c);
+    f = voxState(w) + 1u;
+    want = STILL_NONE;
+  }
 
   // 1) straight down: top a partial same-liquid cell up, else move/swap whole.
   if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) {
@@ -4693,6 +4836,24 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   //     comparison. Strictly decreases SUM(solute density * y) (a bounded
   //     integer), so it terminates on its own; not a film licence.
   if (solTrySink(c, w, mat, true)) { return true; }
+
+  // THE CONDUIT'S CLOSED VALVE. A cell at rest in a POOL column while the
+  // ledger is empty sends nothing sideways or diagonally: the mouth emits only
+  // what the head has deposited, so it never drains its own column empty while
+  // it waits (an empty column has no cell to take the refill, and nothing
+  // would wake it when the ledger came back). It KEEPS ITS CHUNK AWAKE while
+  // it has somewhere to go (the same stages-2-to-4 question canFlowAnywhere
+  // asks, liquidSideWork) or a refill it wants (a GROW, refused while
+  // starved; a TAKE was refused and marked at stage 0); a column of the
+  // stream's middle has neither (its neighbours are held and full, or starved
+  // and so full -- heldBlocks) and sleeps. Only REFUSES moves (rule 2); the
+  // straight descent above still settles the column within itself.
+  if (rest && ledgerSnap() <= 0 && stillPool(c.x, c.z)) {
+    if (want != STILL_NONE || liquidSideWork(c, mat, m, f, submerged, rest)) {
+      markDirtyR(c, DIRTY_R_REACT);
+    }
+    return false;
+  }
 
   // 2a) the four AXIS down-diagonals, RNG order.
   let r = rnd >> 10u;
@@ -4862,8 +5023,9 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   // 5) nothing the CA can do -- but if this is a map lake / river / sea
   //    surface off its authored level, the reservoir can. See THE RESERVOIR.
   //    `submerged` cells never qualify (it needs air above). `want` is stage
-  //    0's answer (a TAKE never gets here: stage 0 always writes it).
-  if (stillReservoir(c, mat, f, want)) { return true; }
+  //    0's answer (a map TAKE never gets here: stage 0 always writes it; a
+  //    POOL one refused there is not asked twice).
+  if (!early && stillReservoir(c, mat, f, want, pool)) { return true; }
   return false;  // settled — the caller decides whether to stay awake
 }
 
