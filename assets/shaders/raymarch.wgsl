@@ -2737,8 +2737,26 @@ fn detailDist(ro : vec3f, cell : vec3<i32>) -> f32 {
 // far side from the feature's height.
 const BLADE_SALT : u32 = 0xB1ADEu;
 const BLADE_W0 : f32 = 0.15;       // a blade's true width, voxels (tall_grass: halfWidth 0.075)
-const BLADE_COVER : f32 = 0.45;    // share of a card's length the blades cover
+// THE CARD COVERS WHAT THE MODEL COVERS (2026-10-16, ticket
+// 2026-10-16_11-03-34, "grass rendering differences ... expanding like a
+// sphere"). 0.45 drew a meadow's far form at about half the coverage of the
+// full model it replaces across DETAIL_FADE_START_M..END_M: on the ticket's
+// tall grass (eight 15 cm blades a column, tracePlant) the model covered
+// 50-55 % of the ground pixels at 16-18 m and the cards 25-27 % just past the
+// handoff, so the stand visibly thinned on a ring round the camera. Eight
+// blades of 0.15 spread over a column hide 1 - 0.85^8 = 0.73 of its width;
+// 0.75 measured 47 % / 39 % either side of the line (SEAM_DBG 1, the
+// tall-grass share of the ground pixels, 10 rows either side).
+const BLADE_COVER : f32 = 0.75;    // share of a card's length the blades cover
 const BLADE_MIN_PX : f32 = 0.8;    // the thinnest a blade is drawn, pixels
+// A card blade's HEAD (its plant's tip / seed-head material), as tracePlant
+// paints the model: the top BLADE_HEAD_V voxels of every blade (the model's
+// tipFrac of a ~4-voxel stand plus its seed heads, ~0.5-0.7 voxels) and the
+// whole of one blade in eight (the model's dead blades). The cards used to
+// take the head only in the column's top voxel, where a blade ends 0.35-1
+// voxel up: 2-5 % of a stand's pixels against the model's ~25 %, so the
+// meadow's olive seed heads stopped at the same ring.
+const BLADE_HEAD_V : f32 = 0.6;
 // The card of the column (or level-2 sub-column) whose min corner is `org`
 // and width `W`: its hash, its direction and its centre.
 struct BladeCard { hc : u32, dir : vec2f, ctr : vec2f };
@@ -2771,20 +2789,22 @@ fn bladeCardNormal(c : BladeCard, rd : vec3f) -> vec3f {
   if (dot(rd.xz, nn) > 0.0) { nn = -nn; }
   return normalize(vec3f(nn.x, 0.3, nn.y));
 }
-// t of the ray against card `c` in [tA, tB), or -1. `W` the footprint width,
-// `topV` the column's top voxel y (1e9 when this is not the top cell),
-// `occ` plants per fine column along the card (1 for one column; a level-2
-// sub-column's count / 2), `pxVox` one pixel's width in voxels at this t.
+// (t, head) of the ray against card `c` in [tA, tB): t = -1 for a miss, head
+// 1 where the blade hit wears its plant's head (BLADE_HEAD_V). `W` the
+// footprint width, `topV` the column's top voxel y (1e9 when this is not the
+// top cell), `occ` plants per fine column along the card (1 for one column; a
+// level-2 sub-column's count / 2), `pxVox` one pixel's width in voxels at t.
 fn bladeCardHit(c : BladeCard, org : vec2<i32>, W : f32, topV : f32, occ : f32,
-                pxVox : f32, ro : vec3f, rd : vec3f, tA : f32, tB : f32) -> f32 {
+                pxVox : f32, ro : vec3f, rd : vec3f, tA : f32, tB : f32) -> vec2f {
+  let miss = vec2f(-1.0, 0.0);
   let nrm = vec2f(-c.dir.y, c.dir.x);
   let den = dot(rd.xz, nrm);
-  if (abs(den) < 1e-5 || occ <= 0.0) { return -1.0; }
+  if (abs(den) < 1e-5 || occ <= 0.0) { return miss; }
   let t = dot(c.ctr - ro.xz, nrm) / den;
-  if (t < tA || t >= tB) { return -1.0; }
+  if (t < tA || t >= tB) { return miss; }
   let p = ro + rd * t;
   let lp = p.xz - vec2f(org);
-  if (any(lp < vec2f(0.0)) || any(lp >= vec2f(W))) { return -1.0; }
+  if (any(lp < vec2f(0.0)) || any(lp >= vec2f(W))) { return miss; }
   let w = max(BLADE_W0, BLADE_MIN_PX * pxVox);
   let cf = min(BLADE_COVER * occ, 0.9);
   let sp = w / cf;
@@ -2792,11 +2812,12 @@ fn bladeCardHit(c : BladeCard, org : vec2<i32>, W : f32, topV : f32, occ : f32,
   let k = floor(u);
   let hk = hash3(c.hc, bitcast<u32>(i32(k)), 0x7A11u);
   let tip = topV + 0.35 + 0.65 * f32((hk >> 8u) & 255u) * (1.0 / 255.0);
-  if (p.y >= tip) { return -1.0; }
+  if (p.y >= tip) { return miss; }
   let jit = (f32(hk & 255u) * (1.0 / 255.0) - 0.5) * (1.0 - cf);
   let taper = clamp(tip - p.y, 0.35, 1.0);
-  if (abs(fract(u) - 0.5 - jit) * sp > 0.5 * w * taper) { return -1.0; }
-  return t;
+  if (abs(fract(u) - 0.5 - jit) * sp > 0.5 * w * taper) { return miss; }
+  let head = ((hk >> 16u) & 7u) == 0u || p.y >= tip - BLADE_HEAD_V;
+  return vec2f(t, select(0.0, 1.0, head));
 }
 // ---- PHASE 3 of trace(): the far forms the march passed ----
 // A voxel DDA from t0 to t1 (< NEAR_FF_STEPS cells) over the cells phase 1
@@ -2839,11 +2860,22 @@ fn nearFarForm(ro : vec3f, rd : vec3f, inv : vec3f, t0 : f32, t1 : f32) -> NearF
           topV = f32(cell.y);
         }
         let tb = bladeCardHit(bc, cell.xz, 1.0, topV, 1.0, px, ro, rd, tCur, min(tNext, t1));
-        if (tb >= 0.0) {
+        if (tb.x >= 0.0) {
           r.hit = true;
-          r.t = tb;
+          r.t = tb.x;
           r.cell = cell;
-          r.word = w;
+          // A plant's card wears its body or its head by the blade
+          // (BLADE_HEAD_V), as the far card does from the feature word --
+          // not the cell's own material, which put the head on the column's
+          // top voxel only.
+          var cw = w;
+          if ((mb.flags & MICROF_PLANT) != 0u) {
+            let w0 = microPool[mb.base];
+            let pm = select((w0 >> 8u) & 0xFFu, (w0 >> 16u) & 0xFFu,
+                            tb.y > 0.5 && ((w0 >> 16u) & 0xFFu) != 0u);
+            if (pm != 0u) { cw = (w & ~0xFFFu) | pm; }
+          }
+          r.word = cw;
           r.key = bc.hc | 1u;
           return r;
         }
@@ -5140,8 +5172,19 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
   // The plant cells phase 1 passed as their far form (past their vanish
   // distance) are re-walked from the first of them to whatever the ray
   // resolved, and the first card hit wins if it is nearer.
-  if (ffT0 >= 0.0) {
-    let tEnd = select(tExit, out.t, out.hit || out.saturated);
+  // ONLY WHEN THE RAY RESOLVED SOMETHING HERE (2026-10-16, ticket
+  // 2026-10-16_11-03-34). A ray that leaves the fine march unresolved hands
+  // its plants to the far field's march (fs: farFeatMarch, which now starts
+  // up to FAR_CARD_MILE inside the handoff): the rule is "the cards within
+  // FAR_CARD_MILE of the GROUND the ray meets", and only the far march knows
+  // where that ground is. This tested the last mile before the handoff
+  // instead, whatever lay behind it, so every plant 18.9-20.5 m out was drawn
+  // against ground any distance away and every plant just past the line was
+  // not: tall grass covered 43 % of the ground pixels just inside the sphere
+  // and 19 % just outside it, its seed heads 10 % and 0.7 %, on the ticket's
+  // meadow -- a line in the grass that moved with the camera.
+  if (ffT0 >= 0.0 && (out.hit || out.saturated)) {
+    let tEnd = out.t;
     // The same last stretch the far field's cards are tested over.
     let t0 = max(ffT0, tEnd - FAR_CARD_MILE);
     if (t0 < tEnd) {
@@ -6335,28 +6378,40 @@ fn farFeatCell(fq : vec4<u32>, level : u32, vc : vec3<i32>, ro : vec3f, rd : vec
     if (sA >= sB) { continue; }
     r.tested = true;
     var t = -1.0;
+    var onHead = false;
     let ax = 1;
     {
       let W = f32(1 << wsh);
       let org = select(fc, sm << vec2<u32>(wsh), level > 1u);
       let occ = f32(((e >> 14u) & 3u) + 1u) / W * keep;
-      t = bladeCardHit(bladeCardOf(org, W), org, W, f32(topF), occ, pxVoxAt(tA), ro, rd,
-                       sA, sB);
+      let th = bladeCardHit(bladeCardOf(org, W), org, W, f32(topF), occ, pxVoxAt(tA), ro, rd,
+                            sA, sB);
+      t = th.x;
+      onHead = th.y > 0.5;
       // A card has no bottom of its own (on the ground the ray meets the ground
       // at its foot); a ray that passes UNDER the plant's ground -- down a hall
       // or a cave beneath the moor -- would otherwise draw the card from the
       // hall floor to its ceiling as a thin vertical line (ticket
       // 2026-10-12_16-52-07). The plant stands on its column's ground.
       if (t >= 0.0 && ro.y + rd.y * t < f32(topF - hg) - 0.5) { t = -1.0; }
+      // INSIDE THE HANDOFF (farFeatMarch may start up to FAR_CARD_MILE in
+      // front of it) a plant nearer than its vanish distance is the near
+      // field's full model, not its card: the fine march already drew it, or
+      // passed between its blades, and a card there would fill its gaps.
+      if (t >= 0.0 && t * VOXEL_METERS < DETAIL_FADE_END_M) {
+        let pc = vec3<i32>(fc.x, i32(floor(ro.y + rd.y * t)), fc.y);
+        if (detailDist(ro, pc) < detailVanishDist(detailColumnId(pc))) { t = -1.0; }
+      }
     }
     if (t >= 0.0 && t < best) {
       best = t;
       r.t = t;
       r.axis = ax;
       r.card = true;
-      let yh = ro.y + rd.y * t;
+      // Body or head by the blade (bladeCardHit's BLADE_HEAD_V), as the
+      // near card takes it.
       let head = (e >> 23u) & 0x7Fu;
-      r.pal = select((e >> 16u) & 0x7Fu, head, head != 0u && yh >= f32(topF));
+      r.pal = select((e >> 16u) & 0x7Fu, head, head != 0u && onHead);
     }
   }
   return r;
@@ -16025,14 +16080,84 @@ const FAR_OPEN_RISER : f32 = 0.6;
 // voxel inside it — and the weight eases to the far constant over the band,
 // which ends before the window face can, so the one law that differs changes
 // over ~2 m of ground instead of on a line, and never on the stepping face.
-// 1 at the handoff, 0 from FAR_BAND_END_M on; 0 everywhere with the handoff
-// disabled (>= the half extent).
+// 0 from FAR_BAND_END_M on; 0 everywhere with the handoff disabled (>= the
+// half extent).
+//
+// THE BAND STRADDLES THE SPHERE (2026-10-16, ticket 2026-10-16_11-03-34:
+// "clear shadow differences ... on the first lod seam, expanding like a
+// sphere", a meadow at night, flying). The band used to START at the handoff
+// (weight 1 there) and end 1.8 m later, so all of the change from the near
+// grid's per-block openness to the far law happened in 1.8 m of ground past
+// the line -- at eye height a few pixel rows, i.e. a line. On open ground the
+// far law is the closed form (farOpenness: a tread 1, a riser 0.6; the
+// patch's definition fan runs only where the prefilter finds something
+// standing near), while the grid holds what the near walk measured: treads
+// darkened in front of every step (11-17 % of the tread pixels at the
+// ticket's camera read under 1, the soft dark blotches) and risers spread
+// round 0.6. Measured at the ticket's camera at night (SEAM_DBG 3, 6 rows
+// either side of the line): the openness step was +4.7 (encoded, far over
+// near), -1.4 with this; final luma +0.75 -> +0.54 and the near side's
+// texture sd 3.22 -> 2.83 against the far's 3.06. Under the moon the ambient
+// is nearly all of the light, so it is the most visible term then.
+// Now ONE weight is used on both sides of the handoff: it eases the grid
+// out from FAR_BAND_IN_M inside the sphere to FAR_BAND_END_M outside it,
+// the near shade applying it (nearBandGridWeight, where the far patch would
+// keep the closed form: nearFarClosedForm) and the far shade continuing it,
+// so the two agree AT the line by construction and the change is spread over
+// ~8 m of ground instead of 1.8.
+const FAR_BAND_IN_M : f32 = 6.0;
 const FAR_BAND_END_M : f32 =
     min(SEAM_HANDOFF + 1.8,
         WINDOW_HALF_EXTENT_METERS - 2.0 * f32(CHUNK) * VOXEL_METERS - 0.1);
+fn bandGridWeight(tFine : f32) -> f32 {
+  return 1.0 - smoothstep(SEAM_HANDOFF - FAR_BAND_IN_M, FAR_BAND_END_M,
+                          tFine * VOXEL_METERS);
+}
 fn farBandNearWeight(tFine : f32) -> f32 {
   if (SEAM_HANDOFF >= FAR_BAND_END_M) { return 0.0; }
-  return 1.0 - smoothstep(SEAM_HANDOFF, FAR_BAND_END_M, tFine * VOXEL_METERS);
+  return bandGridWeight(tFine);
+}
+// The near half: the grid's weight in a NEAR hit's openness (1 = the grid
+// alone, as everywhere before the band; 1 with the handoff disabled, where
+// the window box edge is the seam and there is no far arm to meet).
+fn nearBandGridWeight(tFine : f32) -> f32 {
+  if (SEAM_HANDOFF >= FAR_BAND_END_M) { return 1.0; }
+  return bandGridWeight(tFine);
+}
+// Would the far shade keep the CLOSED FORM for ground here? It does unless
+// its patch's prefilter (shadow_resolve.wgsl farGroundOver, copied below:
+// MUST AGREE) finds something standing over the cell -- a crown, a wall, the
+// rock over a cave -- in which case it measures the near walk's definition,
+// which the grid already is, and the near side has nothing to ease toward.
+// Level 1, the level the far field draws at the handoff. `p` fine voxels.
+fn nearFarClosedForm(p : vec3f) -> bool {
+  let c = vec3<i32>(floor(p / f32(1u << farCellShift(1u))));
+  return !farGroundOverR(1u, c);
+}
+// shadow_resolve.wgsl farGroundOver, verbatim (MUST AGREE): the two-levels-
+// coarser chunk round the cell and its four side neighbours, one chunk row
+// up; true if any holds something over the cell's row (+1 row of relief).
+fn farGroundOverR(level : u32, cell : vec3<i32>) -> bool {
+  if (f32(cell.y + 1) >= farSkyCeil(level)) { return false; }
+  let shift = farCellShift(level);
+  let l2 = min(level + 2u, FAR_LEVELS);
+  let b2 = farBox(l2);
+  let o2 = ((cell << vec3<u32>(shift)) + vec3<i32>(i32(1u << shift) >> 1u)) >>
+           vec3<u32>(farCellShift(l2));
+  let ch = i32(CHUNK);
+  for (var i = 0; i < 10; i++) {
+    let side = i >> 1;
+    var off = vec3<i32>(0, (i & 1) * ch, 0);
+    if (side == 1) { off.x = ch; } else if (side == 2) { off.x = -ch; }
+    else if (side == 3) { off.z = ch; } else if (side == 4) { off.z = -ch; }
+    let pr = o2 + off;
+    if (!farInValid(pr, b2)) { continue; }
+    let occ = farOcc[farOccIndex(l2, pr)];
+    if (occ == 0u) { continue; }
+    let top = farOccTop(occ);
+    if (top == 0u || (pr.y >> 4u) * ch + i32(top) - 1 > o2.y + 1) { return true; }
+  }
+  return false;
 }
 
 // ---- THE SKY OVER A FAR FEATURE (LOD seam, 2026-10-09) ----
@@ -17357,7 +17482,15 @@ fn fs(in : VSOut) -> FSOut {
       // The plants in the far ray's way (package F, farFeatMarch).
       // Rides the refine's knob: the feature plane is the refine levels' data,
       // and render.farRefineLevel 0 (the `norefine` budget arm) prices both.
-      if (far.hit && TUNE_FAR_REFINE_LEVEL >= 1) { far = farFeatMarch(R.camPos, rd, far, h.tExit); }
+      // It may start up to FAR_CARD_MILE INSIDE the handoff: the fine march
+      // left this ray's plants to it (trace() PHASE 3 runs only for a ray it
+      // resolved), so the last mile before the ground is one walk whichever
+      // side of the line it falls on -- but never in front of a liquid or
+      // tinted-solid surface the fine march latched (no unwind here).
+      if (far.hit && TUNE_FAR_REFINE_LEVEL >= 1) {
+        far = farFeatMarch(R.camPos, rd, far,
+                           max(h.tExit - FAR_CARD_MILE, max(h.liqT, h.tsT)));
+      }
     }
     // CHUNK TICKETS (traceTickets, above): from the WINDOW's exit — a ticket
     // is never inside the window, and trace()'s tExit may be the LOD handoff
@@ -18447,6 +18580,15 @@ fn fs(in : VSOut) -> FSOut {
       let nb = farHitBuried(1u, hp, openN);
       gHitSky = select(0.0, 1.0 - nb, nb >= 0.0);
       if (openRaw < 0.0 && nb > 0.0) { openRaw = (1.0 - nb) * hzSkyVis(hp); }
+    }
+    // THE HANDOFF BAND, NEAR HALF (bandGridWeight): over the last
+    // FAR_BAND_IN_M before the sphere the grid eases toward the law the far
+    // shade takes just past it, so the line itself carries no openness step.
+    if (openRaw >= 0.0) {
+      let wG = nearBandGridWeight(h.t);
+      if (wG < 1.0 && nearFarClosedForm(hp)) {
+        openRaw = mix(farOpenness(openN) * hzSkyVis(hp), openRaw, wG);
+      }
     }
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     let dbgLamPreN = lambert;
