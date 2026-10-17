@@ -1633,7 +1633,9 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   // water back, so every grain poured in lifted another cell onto the pile:
   // a sheet of water climbing the gravel for as long as you poured. The held
   // body is the reservoir: the water a grain displaces from it goes back to
-  // it -- the source becomes AIR, not water. Water over a target, a bucket on
+  // it -- the source becomes AIR, not water. Only the MAP's (or a map-fed
+  // stream's) infinite reservoir: a conduit's (HELD_REST_POOL) water is
+  // counted in its ledger and swaps as before. Water over a target, a bucket on
   // the bank, oil, any unheld liquid still swaps as before. Pure reads of the
   // displaced word and the still table (rule 1); it only writes air where the
   // swap wrote water, so no move is added (rule 2).
@@ -1641,7 +1643,7 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   let tm = voxMat(tw);
   if (tm != MAT_AIR && materials[tm].klass == CLASS_LIQUID &&
       materials[voxMat(myWord)].klass != CLASS_LIQUID &&
-      heldRest(dst, tm, voxState(tw) + 1u)) {
+      heldRest(dst, tm, voxState(tw) + 1u) == HELD_REST) {
     back = packVox(MAT_AIR, 0u, 0u);
     // The river's dissolved mass leaves with its water (counted, as every
     // discard is).
