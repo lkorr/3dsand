@@ -183,6 +183,8 @@ struct MpRun {
   float pSnapDy = 0.0f;
   int wWait = -1;               // ticks from W's hand-in to its return on A
   int dPromote = -1;            // ticks from the disconnect to B's promotion of the waiting walker
+  int eTicks = -1;              // E: ticks until a blow crossed each way
+  uint64_t eBlowsToA = 0, eSwingsToB = 0, eAppliedOnB = 0, eActorsToA = 0;
   uint64_t viewEntries = 0, viewShapes = 0, viewGones = 0, viewBytes = 0, viewBatches = 0;
   uint64_t ticks = 0;
   uint64_t handOuts = 0, handInsSent = 0, handInsPromoted = 0, handInsReturned = 0;
@@ -683,6 +685,104 @@ MpRun RunMp(Ctx& c) {
                  kHandInMaxWaitTicks + (uint32_t)giveBackSlack, wBackClean));
   }
 
+  // ======== E: THE EDGE ACROSS B'S FACE (D7b) ==================================
+  // A swordsman B owns stands just inside B's -z face (z chunk 0: no window
+  // has it with margin, so B, its incumbent, keeps it); a duelist of the other faction in A's tier
+  // stands 8 voxels past that face. Neither tier holds both, so every blow
+  // crosses the wire: its swings are resolved by A's impact pass and
+  // ROLLED ON B against the swordsman's live body (B's door applies them);
+  // the swordsman's strokes at it (seen on B through A's view band)
+  // are cut on B and LANDED by A's impact pass on the distant body.
+  {
+    const DistantMobs::Stats a0 = aSt;
+    const DistantMobs::Stats b0 = bSt;
+    const int zombie = human;   // a swordsman of the other faction (D3's M pair)
+    const int ex = vox(Awo.x + 30) + 4, ez = vox(Awo.z) + 4;
+    const uint64_t wId = far.Spawn(human, {ex, standY(ex, ez), ez});
+    bool armed = false;
+    if (wId != 0) {
+      far.SetMobBehavior(wId, "duelist_blue");   // D3's pair: blue against monster
+      if (const ItemDef* sw = c.items.Named("sword")) armed = far.EquipItem(wId, sw);
+    }
+    uint64_t zId = 0;
+    if (zombie >= 0) {
+      const int sx = (int)aCx, sz = (int)aCz;
+      zId = c.mobs.Spawn(zombie, {sx, standY(sx, sz), sz});
+      if (zId != 0) {
+        c.mobs.SetMobBehavior(zId, "duelist");
+        if (const ItemDef* sw = c.items.Named("sword")) c.mobs.EquipItem(zId, sw);
+        if (c.mobs.DemoteForTest(zId)) {
+          const int tz = vox(Awo.z) - 8;
+          const float gy =
+              (float)(c.mobs.DistantGroundMut().TerrainTop(ex + 2, tz + 2) + 1);
+          c.mobs.DistantMut().Relocate(zId, Vec3{(float)ex, gy, (float)tz});
+          c.mobs.DistantMut().MarkMoved();
+        } else {
+          zId = 0;
+        }
+      }
+    }
+    float wHp0 = 0.0f;
+    for (int li = 0; li < base; li++) wHp0 += far.LimbHp(wId, li);
+    const int eMax = (int)BaselineNumber("distantMp.edgeMaxTicks", 400);
+    int eTicks = 0;
+    for (int i = 0; i < eMax; i++) {
+      step();
+      eTicks = i + 1;
+      // ATTRIBUTION: where each fighter is and what its brain holds, and
+      // whether B sees it in its band.
+      if (i % 100 == 0) {
+        const DistantMob* z = c.mobs.Distant().Find(zId);
+        const Mob* w = far.FindMobById(wId);
+        const ai::Brain* wb = far.MobBrain(wId);
+        bool inBand = false;
+        for (const DistantViewMob& v : far.DistantViewMobs())
+          if (v.id == zId) inBand = v.band;
+        std::printf("distant-mp: E t%d distant %d at (%.1f,%.1f,%.1f) asleep %d target %llu/%d "
+                    "| sword %d at (%.1f,%.1f,%.1f) target %llu/%d | it is in B's band %d, B's "
+                    "band %zu\n",
+                    i, z != nullptr, z ? (double)z->origin.x : 0.0, z ? (double)z->origin.y : 0.0,
+                    z ? (double)z->origin.z : 0.0, z ? (int)z->asleep : -1,
+                    z ? (unsigned long long)z->brain.targetId : 0ull,
+                    z ? (int)z->brain.hasTarget : -1, w != nullptr,
+                    w ? (double)w->Origin().x : 0.0, w ? (double)w->Origin().y : 0.0,
+                    w ? (double)w->Origin().z : 0.0,
+                    wb ? (unsigned long long)wb->targetId : 0ull, wb ? (int)wb->hasTarget : -1,
+                    inBand, far.DistantBand().size());
+      }
+      if (aSt.edgeWireBlowsIn > a0.edgeWireBlowsIn && bSt.edgeRemoteApplied > b0.edgeRemoteApplied)
+        break;
+    }
+    float wHp1 = 0.0f;
+    const Mob* wm = far.FindMobById(wId);
+    if (wm != nullptr)
+      for (int li = 0; li < base; li++) wHp1 += far.LimbHp(wId, li);
+    const uint64_t aRolled = (aSt.edgeNearHits - a0.edgeNearHits) +
+                             (aSt.edgeNearMisses - a0.edgeNearMisses) +
+                             (aSt.edgeNearBlocked - a0.edgeNearBlocked) +
+                             (aSt.edgeNearOutOfReach - a0.edgeNearOutOfReach);
+    out.eTicks = eTicks;
+    out.eBlowsToA = aSt.edgeWireBlowsIn - a0.edgeWireBlowsIn;
+    out.eSwingsToB = bSt.edgeWireBlowsIn - b0.edgeWireBlowsIn;
+    out.eAppliedOnB = bSt.edgeRemoteApplied - b0.edgeRemoteApplied;
+    out.eActorsToA = aSt.edgeWireActorsIn - a0.edgeWireActorsIn;
+    check(wId != 0 && armed && zId != 0 && wm != nullptr && !wm->IsGhost() &&
+              out.eBlowsToA > 0 && aRolled > 0 && out.eSwingsToB > 0 && out.eAppliedOnB > 0 &&
+              wHp1 < wHp0,
+          Format("E: swordsman on B %d (armed %d), distant duelist in A's tier %d; after %d ticks: B's "
+                 "strokes landed on A %llu (rolled %llu), A's swings rolled on B %llu (applied "
+                 "%llu), swordsman hp %.1f -> %.1f, still B's own %d, B's edge actors seen on A "
+                 "%llu",
+                 wId != 0, armed, zId != 0, eTicks, (unsigned long long)out.eBlowsToA,
+                 (unsigned long long)aRolled, (unsigned long long)out.eSwingsToB,
+                 (unsigned long long)out.eAppliedOnB, (double)wHp0, (double)wHp1,
+                 wm != nullptr && !wm->IsGhost(), (unsigned long long)out.eActorsToA));
+    // Out of the way of D: the distant duelist retired from the tier, the swordsman gone.
+    if (zId != 0) c.mobs.DistantMut().Erase(zId);
+    if (wId != 0) far.RemoveMob(wId);
+    for (int i = 0; i < 3; i++) step();
+  }
+
   // ======== D: a disconnect with a creature in transit =========================
   {
     // x chunk 30: in the overlap's far half (B nearer), and two chunks clear
@@ -801,6 +901,7 @@ Status GateDistantMp(Ctx& c, std::string& detail) {
   RecordObserved("distantMp.promoteTicks", (double)a.pPromote);
   RecordObserved("distantMp.giveBackTicks", (double)a.wWait);
   RecordObserved("distantMp.disconnectPromoteTicks", (double)a.dPromote);
+  RecordObserved("distantMp.edgeTicks", (double)a.eTicks);
   std::string fails;
   for (const std::string& f : a.fails) fails += (fails.empty() ? "" : " | ") + f;
   for (const std::string& f : b.fails) fails += (fails.empty() ? "" : " | ") + ("run 2: " + f);
@@ -809,7 +910,8 @@ Status GateDistantMp(Ctx& c, std::string& detail) {
       "(promoted %llu, given back %llu), transits restored %llu, H bleed %.4f | view: %llu "
       "entries (%llu with the shape), %llu gones, %llu bytes in %llu batches = %.1f B/batch, "
       "%.1f B/tick | H round trip %d, P walk %d + promote %d (snap dy %+.2f), W give-back %d, "
-      "D promote %d ticks",
+      "D promote %d ticks | E edge %d ticks: strokes to A %llu, swings to B %llu (applied %llu), "
+      "edge actors %llu",
       fails.c_str(), fails.empty() ? "" : " || ", same ? "equal" : "DIFFER",
       (unsigned long long)a.digest, (unsigned long long)b.digest,
       (unsigned long long)a.ticks, (unsigned long long)a.handOuts,
@@ -818,7 +920,9 @@ Status GateDistantMp(Ctx& c, std::string& detail) {
       (double)a.hBleed, (unsigned long long)a.viewEntries, (unsigned long long)a.viewShapes,
       (unsigned long long)a.viewGones, (unsigned long long)a.viewBytes,
       (unsigned long long)a.viewBatches, perBatch, perTick, a.hRoundTrip, a.pWalk, a.pPromote,
-      (double)a.pSnapDy, a.wWait, a.dPromote);
+      (double)a.pSnapDy, a.wWait, a.dPromote, a.eTicks, (unsigned long long)a.eBlowsToA,
+      (unsigned long long)a.eSwingsToB, (unsigned long long)a.eAppliedOnB,
+      (unsigned long long)a.eActorsToA);
   return a.fails.empty() && b.fails.empty() && same ? Status::Pass : Status::Fail;
 }
 

@@ -722,6 +722,11 @@ struct DistantArrowFlight {
   // meets). Uses pos / vel / seed / life as an inbound one does, plus the
   // arrow's flat damage; `target` 0 until it strikes.
   bool outbound = false;
+  // D7b: an INBOUND flight at a PEER's near creature: it is handed to that
+  // peer (DistantEdgeWire::arrowsIn) where it crosses into `peerWo`, the
+  // peer's window (chunks), instead of into this machine's.
+  bool toPeer = false;
+  IVec3 peerWo{};
   float damage = 0.0f;           // outbound: ItemDef::ArrowSpec::damage
   int32_t pos[3] = {0, 0, 0};    // inbound: the point, 24.8 fixed world voxels
   int32_t vel[3] = {0, 0, 0};    // inbound: per tick, 24.8 fixed
@@ -742,6 +747,11 @@ struct NearEdgeBlow {
   Vec3 from{};                   // the attacker's body centre at the cut
   distant::DistantKit kit;
   int style = -1;                // index into kit.styles
+  // D7b: a DISTANT swing at a peer's near creature (host -> client) carries
+  // the planar distance the host measured from its tick-start snapshots, so
+  // the client rolls exactly the roll the host would have. < 0 on a near
+  // stroke (client -> host): the host measures it against its own tier.
+  float dist = -1.0f;
 };
 // An INBOUND arrow crossing into the window this tick: what MobArcheryTick
 // turns into a real ArrowFlight (ArrowFlights::Inject), in the order queued.
@@ -816,6 +826,48 @@ struct NearShotOut {
   float damage = 0.0f;
   std::string ammo;
 };
+// ---- D7b: THE EDGE ACROSS A PEER'S WINDOW (docs/PLAN_distant_npcs.md 8.3) -------
+//
+// One tick's edge traffic between the host (the distant world) and a client
+// (whose near creatures stand at a face of ITS window), both ways, carried in
+// the EntityBatch (net/distantsync.h codecs). Exactly D3's edge, with the wire
+// between the two halves -- what the near tier hands the distant one on the
+// client is applied by the host's next impact pass, and what the host's
+// impact pass resolves at a client's creature is rolled by the client against
+// its LIVE body with the host's keys:
+//   client -> host  actors (its near creatures in its window's edge band,
+//                   never a player, only while its view's band is non-empty),
+//                   blows (near strokes at a view creature, NearEdgeBlow),
+//                   arrowsOut / boxHits / shotsOut (its flights at, into or
+//                   past the host's creatures, D3 and D9's hand-overs);
+//   host -> client  blows (distant swings at the client's creatures, `dist`
+//                   set), arrowsIn (inbound flights crossing into its window).
+struct DistantEdgeWire {
+  std::vector<ai::Actor> actors;
+  std::vector<NearEdgeBlow> blows;
+  std::vector<NearArrowOut> arrowsOut;
+  std::vector<NearArrowBoxHit> boxHits;
+  std::vector<NearShotOut> shotsOut;
+  std::vector<DistantArrowIn> arrowsIn;
+  bool Empty() const {
+    return actors.empty() && blows.empty() && arrowsOut.empty() && boxHits.empty() &&
+           shotsOut.empty() && arrowsIn.empty();
+  }
+  void Clear() {
+    actors.clear();
+    blows.clear();
+    arrowsOut.clear();
+    boxHits.clear();
+    shotsOut.clear();
+    arrowsIn.clear();
+  }
+};
+// A client sends at most this many edge actors a tick (its whole living cap).
+constexpr size_t kDistantEdgeActorsMax = 64;
+// The host trusts a client's edge actors for this many ticks after the batch
+// that carried them (one batch a tick; a gap of more means the client's band
+// emptied or the link stalled).
+constexpr uint32_t kDistantEdgeActorTicks = 2;
 // What an arrow the distant tier flew or landed did (the gates' window into
 // D9; bounded, never an input).
 struct DistantShotEvent {
@@ -1074,6 +1126,17 @@ class DistantMobs {
     uint64_t donesUnknown = 0;       // ...for an id not in transit (counted, ignored)
     uint64_t transitRestored = 0;    // ...put back in the tier (or parked) at a disconnect
     uint64_t transitPeak = 0;        // the most creatures in transit at once
+    // ---- D7b: THE EDGE ACROSS A PEER'S WINDOW (DistantEdgeWire) --------------
+    uint64_t edgeWireBlowsOut = 0;   // client: near strokes sent to the host; host: distant
+                                     // swings at a peer's creature sent to it to roll
+    uint64_t edgeWireBlowsIn = 0;    // ...received (host: queued for its impact pass;
+                                     // client: rolled against its live bodies)
+    uint64_t edgeWireArrowsOut = 0;  // client: arrows out / box hits / shots out sent
+    uint64_t edgeWireArrowsIn = 0;   // host: inbound flights handed to a peer at its window
+    uint64_t edgeWireActorsOut = 0;  // client: edge actors sent, summed over ticks
+    uint64_t edgeWireActorsIn = 0;   // host: peer edge actors in a distant band, summed
+    uint64_t edgeRemoteApplied = 0;  // client: host swings that entered a near body's door
+    uint64_t edgeRemoteNoBody = 0;   // ...whose target was not a living body this machine owns
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 

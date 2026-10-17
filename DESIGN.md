@@ -1271,9 +1271,15 @@ incumbent in `EntitySync`'s memory, and a creature made live inside a tick is
 held by its maker for one tick (`Mob::ownLatch_`) so the next `ScanHandoffs`
 hands it over WITH its record (the latent "promoted near a peer, ghosted with
 no handoff, expired" case, for every path). Nothing of it runs unconnected:
-the role is Off outside a two-player session. D7b (the edge across a peer's
-window: blows and arrows between the client's near creatures and the host's
-distant ones) is the open half.
+the role is Off outside a two-player session. **D7b (2026-10-17) carries the
+edge across a peer's window** (`DistantEdgeWire`, EntityBatch v6): the
+client's near creatures at its faces are actors in the host's distant band;
+its strokes, arrows out, box hits and shots past the face are landed by the
+host's impact pass; the host's swings at the client's creatures are ROLLED ON
+THE CLIENT with the host's keys against the live body and enter through D3's
+door; inbound flights cross into the client's window there. Open: a player's
+shot that re-enters the client's window after leaving it is flown and
+tested on the host only.
 
 **Off** (`distant.enabled = false`): the park rule exactly as S5b ran it; the
 gates that test the PARK path pin it off (`DistantSwitchScope`: `mob-park`
@@ -1282,8 +1288,7 @@ Counters: `build/last_run.json` -> `distant`. Gates `distant-roundtrip`,
 `distant-walk`, `distant-sleep`, `distant-fight`, `distant-calibrate`,
 `distant-calib-matrix`, `distant-look`, `distant-edge`, `distant-schedule`,
 `distant-save`, `distant-overflow`, `distant-arrow`, `distant-obstacles`,
-`distant-walkout`, `distant-mp` (D7a, the tier across machines). Planned:
-D7b (the edge across a peer's window).
+`distant-walkout`, `distant-mp` (D7a + D7b, the tier across machines).
 
 ---
 

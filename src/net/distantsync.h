@@ -67,10 +67,13 @@
 #include "net/mobsync.h"   // MobBrainWire: the brain, as much of it as travels
 #include "sim/bytestream.h"
 
+struct DistantEdgeWire;   // game/distant.h (D7b): one tick's edge traffic
+
 namespace net {
 
 // v1 (2026-10-16, D7a): the four records below.
-inline constexpr uint32_t kDistantSyncVersion = 1;
+// v2 (2026-10-17, D7b): DistantEdgeWire.
+inline constexpr uint32_t kDistantSyncVersion = 2;
 
 // `EntityBatch::livingFree` when the sender has nothing to report this batch
 // (the host never reports; a client reports on change and on a keyframe).
@@ -196,5 +199,12 @@ bool Decode(ByteReader& r, DistantView& v);
 // The bytes one view entry costs on the wire (the gate's and the smoke's
 // "wire bytes per tick for the view" -- a measurement, never an input).
 size_t EncodedSize(const DistantView& v);
+
+// D7b: THE EDGE ACROSS A PEER'S WINDOW (game/distant.h DistantEdgeWire), field
+// by field -- every record it holds, both directions, one codec. A kit travels
+// as its STYLES (the roll reads the attacker's styles and slack, never its
+// body), each StrikeProfile member by member (it has padding).
+void Encode(ByteWriter& w, const ::DistantEdgeWire& e);
+bool Decode(ByteReader& r, ::DistantEdgeWire& e);
 
 }  // namespace net

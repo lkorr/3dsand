@@ -61,6 +61,7 @@
 #include "net/authority.h"
 #include "net/debrissync.h"
 #include "net/distantsync.h"
+#include "game/distant.h"   // DistantEdgeWire (D7b), carried by value
 #include "net/mobsync.h"
 
 class MobSystem;
@@ -87,7 +88,10 @@ namespace net {
 //     the view (the view's GONE for a creature handed in this batch must
 //     not leave a gap the waiting room fills a batch later), the view
 //     before the tick's band (it is applied before the tick at all).
-inline constexpr uint32_t kEntityBatchVersion = 5;
+//   6 (2026-10-17, D7b; game/distant.h DistantEdgeWire): the edge across the
+//     peer's window, last -- edge actors, blows, arrows out / box hits / shots
+//     out (client -> host), blows and inbound arrows (host -> client).
+inline constexpr uint32_t kEntityBatchVersion = 6;
 
 // How often the sender's player gear rides its PlayerBody when it has not
 // changed: the keyframe that dresses a ghost avatar the receiver rebuilt (a
@@ -188,6 +192,8 @@ struct EntityBatch {
   std::vector<DistantHandIn> distantHandIns;     // host -> client
   DistantView distantView;                       // host -> client
   uint32_t livingFree = kNoLivingFree;           // client -> host
+  // v6 (D7b): the edge across the peer's window, both ways (game/distant.h).
+  ::DistantEdgeWire distantEdge;
 
   bool Empty() const {
     return mobHandoffs.empty() && mobAnnounces.empty() &&
@@ -197,7 +203,7 @@ struct EntityBatch {
            itemGrants.empty() && meleeHits.empty() && playerBodies.empty() &&
            distantHandOuts.empty() && distantDones.empty() &&
            distantHandIns.empty() && distantView.Empty() &&
-           livingFree == kNoLivingFree;
+           livingFree == kNoLivingFree && distantEdge.Empty();
   }
   void Clear();
   size_t RecordCount() const {

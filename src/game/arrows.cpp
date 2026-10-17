@@ -254,7 +254,20 @@ bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
 float ArrowGravityPerTick2() { return (float)kArrowGravityFx / (float)kSpellFxOne; }
 
 ArrowOutside ArrowStepOutside(SpellFxVec& pos, SpellFxVec& vel, const World& world,
-                              const std::function<bool(int, int, int)>& solid) {
+                              const std::function<bool(int, int, int)>& solid,
+                              const IVec3* windowOrigin) {
+  // D7b: "the window" may be a PEER's (an inbound flight at its creature):
+  // its origin in chunks, the same half-open cube World::CellInWindow tests.
+  const int n = (int)(kWorldN / kChunk);
+  auto inWindow = [&](int cx, int cy, int cz) {
+    if (windowOrigin == nullptr) return world.CellInWindow({cx, cy, cz});
+    auto chunk = [](int v) {   // floored, whatever kChunk is
+      return v >= 0 ? v / (int)kChunk : -((-v + (int)kChunk - 1) / (int)kChunk);
+    };
+    const int x = chunk(cx), y = chunk(cy), z = chunk(cz);
+    return x >= windowOrigin->x && x < windowOrigin->x + n && y >= windowOrigin->y &&
+           y < windowOrigin->y + n && z >= windowOrigin->z && z < windowOrigin->z + n;
+  };
   // ArrowFlights::Tick's integrator, line for line: gravity off the velocity,
   // then the tick's move in half-voxel samples (the same step count rule), so
   // a flight handed over at the boundary is on the arc it would have flown.
@@ -271,7 +284,7 @@ ArrowOutside ArrowStepOutside(SpellFxVec& pos, SpellFxVec& vel, const World& wor
     next.y += vel.y / steps;
     next.z += vel.z / steps;
     const int cx = SpellFxFloor(next.x), cy = SpellFxFloor(next.y), cz = SpellFxFloor(next.z);
-    if (world.CellInWindow({cx, cy, cz})) {
+    if (inWindow(cx, cy, cz)) {
       pos = next;
       return ArrowOutside::Entered;
     }

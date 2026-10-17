@@ -2021,9 +2021,16 @@ const ai::Actor* MobSystem::EdgeActor(uint64_t id) const {
 
 bool MobSystem::QueueEdgeBlow(const Mob& attacker, int styleIndex, uint64_t targetId,
                               uint32_t tick) {
-  if (!CurrentTuning().distant.enabled) return false;
-  const DistantMob* d = distant_.Find(targetId);
-  if (d == nullptr || d->dead || attacker.def_ == nullptr) return false;
+  if (!CurrentTuning().distant.enabled || attacker.def_ == nullptr) return false;
+  // D7b: on a CLIENT the distant creature is the host's, seen through the
+  // view (it is in this window's band, or the stroke could not have picked
+  // it); the blow goes to the host (TickDistant's client branch forwards it).
+  if (netRole_ == DistantNetRole::Client) {
+    if (!ViewMobAlive(targetId)) return false;
+  } else {
+    const DistantMob* d = distant_.Find(targetId);
+    if (d == nullptr || d->dead) return false;
+  }
   NearEdgeBlow b;
   b.attacker = attacker.id_;
   b.target = targetId;
@@ -2057,6 +2064,15 @@ bool MobSystem::QueueEdgeBlow(const Mob& attacker, int styleIndex, uint64_t targ
 
 bool MobSystem::QueueEdgeArrowOut(const NearArrowOut& out) {
   if (!CurrentTuning().distant.enabled) return false;
+  // D7b: a client hands it to the host, whose tier holds the target; the
+  // host's impact pass applies the in-window refusal below against its own
+  // tier (the view's box test already judged a target inside this window).
+  if (netRole_ == DistantNetRole::Client) {
+    if (!ViewMobAlive(out.target)) return false;
+    edgeArrowsOut_.push_back(out);
+    distant_.Note(&DistantMobs::Stats::edgeArrowsOut);
+    return true;
+  }
   const DistantMob* d = distant_.Find(out.target);
   if (d == nullptr || d->dead) return false;
   // D8/D9: A TARGET INSIDE THE WINDOW (an overflow creature, one held at the
@@ -2141,8 +2157,13 @@ bool MobSystem::DistantBoxAlong(Vec3 a, Vec3 b, uint64_t ignore, DistantBoxHit& 
 
 bool MobSystem::QueueEdgeArrowBoxHit(const NearArrowBoxHit& h) {
   if (!CurrentTuning().distant.enabled) return false;
-  const DistantMob* d = distant_.Find(h.target);
-  if (d == nullptr || d->dead) {
+  const bool alive = netRole_ == DistantNetRole::Client
+                         ? ViewMobAlive(h.target)   // D7b: the host's creature, via the view
+                         : [&] {
+                             const DistantMob* d = distant_.Find(h.target);
+                             return d != nullptr && !d->dead;
+                           }();
+  if (!alive) {
     // Its box was published at the start of the tick and it died since (this
     // tick's distant pass): the arrow is spent on the falling statue all the
     // same -- counted.
@@ -2541,10 +2562,39 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   // tier queued at a distant creature has no tier here to land in (D7b puts
   // the edge across the wire), so it goes.
   if (netRole_ == DistantNetRole::Client) {
+    // D7b: ...EXCEPT ACROSS THE WIRE. What the near tier queued at one of the
+    // host's creatures (a stroke's cut, a flight out of the window, a box hit,
+    // a player's shot past the face) goes to the host, whose impact pass lands
+    // it exactly as it lands its own near tier's.
+    distant_.Note(&DistantMobs::Stats::edgeWireBlowsOut, edgeBlows_.size());
+    distant_.Note(&DistantMobs::Stats::edgeWireArrowsOut,
+                  edgeArrowsOut_.size() + edgeBoxHits_.size() + edgeShotsOut_.size());
+    for (NearEdgeBlow& b : edgeBlows_) edgeOut_.blows.push_back(std::move(b));
+    for (NearArrowOut& o : edgeArrowsOut_) edgeOut_.arrowsOut.push_back(std::move(o));
+    for (NearArrowBoxHit& h : edgeBoxHits_) edgeOut_.boxHits.push_back(std::move(h));
+    for (NearShotOut& s : edgeShotsOut_) edgeOut_.shotsOut.push_back(std::move(s));
     edgeBlows_.clear();
     edgeArrowsOut_.clear();
     edgeBoxHits_.clear();
     edgeShotsOut_.clear();
+    // ...this window's near creatures at its faces, for the host's distant
+    // creatures to see (only while the host's view has any in the band)...
+    {
+      const IVec3 two = TierWindowOrigin(world);
+      BuildEdgeActors(nearActors, Vec3{(float)(two.x * (int)kChunk), (float)(two.y * (int)kChunk),
+                                       (float)(two.z * (int)kChunk)});
+    }
+    // ...and what the host sent: its inbound flights crossing into this
+    // window (MobArcheryTick injects them this tick), and its swings at this
+    // machine's creatures, rolled HERE against the live bodies with the
+    // host's own keys, in (attacker, tick) order.
+    for (DistantArrowIn& in : edgeIn_.arrowsIn) edgeArrowsIn_.push_back(std::move(in));
+    std::sort(edgeIn_.blows.begin(), edgeIn_.blows.end(),
+              [](const NearEdgeBlow& x, const NearEdgeBlow& y) {
+                return x.attacker != y.attacker ? x.attacker < y.attacker : x.tick < y.tick;
+              });
+    for (const NearEdgeBlow& b : edgeIn_.blows) ResolveRemoteSwing(b, world, spawns);
+    edgeIn_.Clear();
     nearBand_.clear();
     return;
   }
@@ -2605,6 +2655,35 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       if (edge > kDistantEdgeBandVox && !wholeCrowd) continue;
       band.push_back(a);
     }
+  // D7b: A PEER'S NEAR CREATURES AT ITS FACES (its edge actors, the client
+  // filtered them by its own window's band). One that is also a ghost here
+  // (in this window's interest) is the peer's entry, not the ghost's: the
+  // peer's actor is its own tick-start state. Their swings and arrows go to
+  // the peer (remoteNear, below).
+  thread_local std::vector<uint64_t> remoteBand;
+  remoteBand.clear();
+  if (netRole_ == DistantNetRole::Host && !peers_.empty() && !peerEdgeActors_.empty() &&
+      tick - peerEdgeTick_ <= kDistantEdgeActorTicks) {
+    for (const ai::Actor& a : peerEdgeActors_) {
+      auto it = std::find_if(band.begin(), band.end(),
+                             [&](const ai::Actor& b) { return b.id == a.id; });
+      if (it != band.end())
+        *it = a;
+      else
+        band.push_back(a);
+      remoteBand.push_back(a.id);
+    }
+    std::sort(remoteBand.begin(), remoteBand.end());
+    distant_.Note(&DistantMobs::Stats::edgeWireActorsIn, peerEdgeActors_.size());
+  }
+  // A near creature of the band that is NOT this machine's to roll against:
+  // a peer's edge actor, or a ghost here (a peer steps it).
+  auto remoteNear = [&](uint64_t id) {
+    if (netRole_ != DistantNetRole::Host || peers_.empty()) return false;
+    if (std::binary_search(remoteBand.begin(), remoteBand.end(), id)) return true;
+    const Mob* m = FindMobById(id);
+    return m != nullptr && m->IsGhost();
+  };
   std::sort(band.begin(), band.end(),
             [](const ai::Actor& x, const ai::Actor& y) { return x.id < y.id; });
   // ...and a near creature that MOVED INTO a distant sleeper's neighbourhood
@@ -3684,7 +3763,24 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       a.strokeImpactTick = 0;   // resolved, once: the arm stays busy to strokeEndTick
       const size_t ti = indexOf(a.strokeTarget);
       const ai::Actor* na = ti == SIZE_MAX ? bandFind(a.strokeTarget) : nullptr;
-      if (na != nullptr && a.strokeStyle < a.kit.styles.size()) {
+      if (na != nullptr && a.strokeStyle < a.kit.styles.size() && remoteNear(na->id)) {
+        // ---- DISTANT HITS A PEER'S NEAR CREATURE (D7b): the peer rolls it,
+        // with this swing's own keys, against its live body -- the attacker's
+        // kit (styles), the style, the distance measured here from the
+        // tick-start snapshots.
+        NearEdgeBlow w;
+        w.attacker = a.id;
+        w.target = na->id;
+        w.tick = tick;
+        w.from = as.centre;
+        w.kit = a.kit;
+        w.kit.limbs.clear();   // the defender's body is the peer's; the roll never reads ours
+        w.style = (int)a.strokeStyle;
+        w.dist = planarDist(as.centre, na->centre);
+        edgeOut_.blows.push_back(std::move(w));
+        distant_.Note(&DistantMobs::Stats::edgeFarSwings);
+        distant_.Note(&DistantMobs::Stats::edgeWireBlowsOut);
+      } else if (na != nullptr && a.strokeStyle < a.kit.styles.size()) {
         // ---- DISTANT HITS NEAR (D3): the same roll, the near body's numbers
         const int nd = nearDef(na->id);
         if (nd < 0) {
@@ -3775,6 +3871,11 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
         f.ammo = a.kit.ammo;
         f.seed = rng::Hash3(ai::kSaltDistantArrow ^ 0xA770B2u, tick, (uint32_t)a.id);
         setFx(f, from, dir * (speed / 30.0f));
+        // D7b: at a PEER's creature, the flight crosses into the PEER's window.
+        if (remoteNear(na->id)) {
+          f.toPeer = true;
+          f.peerWo = peers_.front().windowOrigin;
+        }
         distant_.ArrowsMut().push_back(std::move(f));
         distant_.Note(&DistantMobs::Stats::looses);
         distant_.Note(&DistantMobs::Stats::edgeArrowsIn);
@@ -3954,7 +4055,8 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       // ---- AN INBOUND ARROW: one tick of real flight outside the window ----
       if (f.inbound) {
         SpellFxVec p{f.pos[0], f.pos[1], f.pos[2]}, v{f.vel[0], f.vel[1], f.vel[2]};
-        const ArrowOutside r = ArrowStepOutside(p, v, world, solid);
+        const ArrowOutside r =
+            ArrowStepOutside(p, v, world, solid, f.toPeer ? &f.peerWo : nullptr);
         f.pos[0] = p.x;
         f.pos[1] = p.y;
         f.pos[2] = p.z;
@@ -3975,7 +4077,13 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
           }
           in.seed = f.seed;
           in.ammo = f.ammo;
-          edgeArrowsIn_.push_back(std::move(in));
+          if (f.toPeer) {
+            // D7b: into the PEER's window: a real flight there.
+            edgeOut_.arrowsIn.push_back(std::move(in));
+            distant_.Note(&DistantMobs::Stats::edgeWireArrowsIn);
+          } else {
+            edgeArrowsIn_.push_back(std::move(in));
+          }
           continue;
         }
         if (r == ArrowOutside::Grounded) {
@@ -4061,38 +4169,9 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   // blood and their ops are the near creature's own; THIS TIER STILL EMITS
   // NOTHING. With no door to enter (a CPU-only arm: no physics, no spawns),
   // it is counted, not applied.
-  for (const NearHit& h : nearHits) {
-    const DistantSnap& as = snapAt(h.att);
-    const float total = std::max(1e-3f, h.style.strike.Total());
-    const float preShell = h.o.hp / std::max(1e-3f, h.o.shellFactor);
-    EdgeBlow eb;
-    eb.attackerId = distant_.At(h.att).id;
-    eb.targetId = h.target;
-    eb.limb = h.o.limb;
-    eb.from = as.centre;
-    eb.strike = h.style.strike;
-    eb.weapon = h.style.natural ? std::string() : h.style.weapon;
-    eb.natural = h.style.natural;
-    eb.stab = !h.style.natural && h.style.name.find("thrust") != std::string::npos;
-    eb.power = std::clamp(preShell / total, 0.15f, 1.0f);
-    eb.seed = rng::Hash3((uint32_t)eb.attackerId ^ ai::kSaltDistantStrike, tick, 7u);
-    distant_.Note(&DistantMobs::Stats::edgeFarHpRollMilli,
-                  (uint64_t)std::llround((double)h.o.hp * 1000.0));
-    if (spawns == nullptr || phys_ == nullptr || debris_ == nullptr) {
-      distant_.Note(&DistantMobs::Stats::edgeFarUnapplied);
-      continue;
-    }
-    const EdgeBlowResult r = ApplyEdgeBlow(eb, *phys_, *this, *debris_, world, *spawns);
-    if (!r.applied) {
-      distant_.Note(&DistantMobs::Stats::edgeFarUnapplied);
-      continue;
-    }
-    distant_.Note(&DistantMobs::Stats::edgeFarApplied);
-    if (!r.rayHit) distant_.Note(&DistantMobs::Stats::edgeFarRayMisses);
-    if (r.covered) distant_.Note(&DistantMobs::Stats::edgeFarCovered);
-    distant_.Note(&DistantMobs::Stats::edgeFarHpDoorMilli,
-                  (uint64_t)std::llround((double)r.hpCharged * 1000.0));
-  }
+  for (const NearHit& h : nearHits)
+    ApplyDistantHitOnNear(distant_.At(h.att).id, snapAt(h.att).centre, h.style, h.o, h.target,
+                          tick, world, spawns);
   // ---- (e) THE STATUSES: a tick of bleeding, a tick of burning ---------------
   for (const size_t i : status) {
     DistantMob& d = distant_.At(i);
@@ -5820,4 +5899,174 @@ void MobSystem::AppendDistantViewDrawItems(std::vector<DistantDrawItem>& out) co
     it.dead = m.dead;
     out.push_back(it);
   }
+}
+
+
+// ============================================================================
+// D7b: THE EDGE ACROSS A PEER'S WINDOW (game/distant.h DistantEdgeWire)
+// ============================================================================
+
+bool MobSystem::ApplyDistantHitOnNear(uint64_t attackerId, Vec3 from,
+                                      const distant::DistantStyle& style,
+                                      const distant::StrikeOutcome& o, uint64_t target,
+                                      uint32_t tick, World& world,
+                                      std::vector<ParticleSpawn>* spawns) {
+  // DISTANT HITS NEAR (D3), through the near creature's ORDINARY door
+  // (game/melee.h ApplyEdgeBlow), at the limb the roll drew, as hard as it
+  // drew -- the roll's hp before the shell, over the style's strike total, is
+  // the sweep's own 0..1 power; the near model then prices it with its own
+  // carve, organs and shell. The wound, the blood and their ops are the near
+  // creature's own. One function for the host's own band (the impact pass)
+  // and for a client rolling a host's swing (ResolveRemoteSwing): the same
+  // door at the same power from the same numbers.
+  const float total = std::max(1e-3f, style.strike.Total());
+  const float preShell = o.hp / std::max(1e-3f, o.shellFactor);
+  EdgeBlow eb;
+  eb.attackerId = attackerId;
+  eb.targetId = target;
+  eb.limb = o.limb;
+  eb.from = from;
+  eb.strike = style.strike;
+  eb.weapon = style.natural ? std::string() : style.weapon;
+  eb.natural = style.natural;
+  eb.stab = !style.natural && style.name.find("thrust") != std::string::npos;
+  eb.power = std::clamp(preShell / total, 0.15f, 1.0f);
+  eb.seed = rng::Hash3((uint32_t)eb.attackerId ^ ai::kSaltDistantStrike, tick, 7u);
+  distant_.Note(&DistantMobs::Stats::edgeFarHpRollMilli,
+                (uint64_t)std::llround((double)o.hp * 1000.0));
+  if (spawns == nullptr || phys_ == nullptr || debris_ == nullptr) {
+    distant_.Note(&DistantMobs::Stats::edgeFarUnapplied);
+    return false;
+  }
+  const EdgeBlowResult r = ApplyEdgeBlow(eb, *phys_, *this, *debris_, world, *spawns);
+  if (!r.applied) {
+    distant_.Note(&DistantMobs::Stats::edgeFarUnapplied);
+    return false;
+  }
+  distant_.Note(&DistantMobs::Stats::edgeFarApplied);
+  if (!r.rayHit) distant_.Note(&DistantMobs::Stats::edgeFarRayMisses);
+  if (r.covered) distant_.Note(&DistantMobs::Stats::edgeFarCovered);
+  distant_.Note(&DistantMobs::Stats::edgeFarHpDoorMilli,
+                (uint64_t)std::llround((double)r.hpCharged * 1000.0));
+  return true;
+}
+
+bool MobSystem::ViewMobAlive(uint64_t id) const {
+  auto it = std::lower_bound(viewMobs_.begin(), viewMobs_.end(), id,
+                             [](const DistantViewMob& a, uint64_t v) { return a.id < v; });
+  return it != viewMobs_.end() && it->id == id && !it->dead;
+}
+
+void MobSystem::ApplyDistantEdge(DistantEdgeWire&& in, uint32_t tick) {
+  if (netRole_ == DistantNetRole::Host) {
+    // What the peer's near tier handed over, into this machine's own queues:
+    // the next impact pass lands them as it lands this window's (D3 / D9),
+    // against the tier's tick-start state, in its own sorted orders.
+    distant_.Note(&DistantMobs::Stats::edgeWireBlowsIn, in.blows.size());
+    for (NearEdgeBlow& b : in.blows) {
+      edgeBlows_.push_back(std::move(b));
+      distant_.Note(&DistantMobs::Stats::edgeNearBlows);
+    }
+    for (NearArrowOut& o : in.arrowsOut) {
+      edgeArrowsOut_.push_back(std::move(o));
+      distant_.Note(&DistantMobs::Stats::edgeArrowsOut);
+    }
+    for (NearArrowBoxHit& h : in.boxHits) {
+      edgeBoxHits_.push_back(std::move(h));
+      distant_.Note(&DistantMobs::Stats::boxHits);
+    }
+    for (NearShotOut& s : in.shotsOut) {
+      edgeShotsOut_.push_back(std::move(s));
+      distant_.Note(&DistantMobs::Stats::shotsOut);
+    }
+    // Its edge actors replace the last set (a batch without any leaves the
+    // last set to age out: kDistantEdgeActorTicks).
+    if (!in.actors.empty()) {
+      peerEdgeActors_ = std::move(in.actors);
+      std::sort(peerEdgeActors_.begin(), peerEdgeActors_.end(),
+                [](const ai::Actor& x, const ai::Actor& y) { return x.id < y.id; });
+      peerEdgeTick_ = tick;
+    }
+    if (!edgeBlows_.empty() || !edgeArrowsOut_.empty() || !edgeBoxHits_.empty() ||
+        !edgeShotsOut_.empty())
+      distant_.MarkAwakeHint();
+    return;
+  }
+  if (netRole_ == DistantNetRole::Client) {
+    // The host's swings at this machine's creatures and its inbound flights:
+    // taken by the next TickDistant (its client branch).
+    for (NearEdgeBlow& b : in.blows) edgeIn_.blows.push_back(std::move(b));
+    for (DistantArrowIn& a : in.arrowsIn) edgeIn_.arrowsIn.push_back(std::move(a));
+  }
+}
+
+void MobSystem::BuildEdgeActors(const std::vector<ai::Actor>* nearActors, Vec3 wlo) {
+  if (nearActors == nullptr || !CurrentTuning().distant.enabled) return;
+  // Only while the host's view puts any of its creatures in this window's
+  // band: with none there, nobody out there is near enough to see ours.
+  bool anyBand = false;
+  for (const DistantViewMob& v : viewMobs_)
+    if (v.band && !v.dead) {
+      anyBand = true;
+      break;
+    }
+  if (!anyBand) return;
+  size_t n = 0;
+  for (const ai::Actor& a : *nearActors) {
+    if (ai::IsPlayerActorId(a.id) || ai::IsLooseActorId(a.id) || !a.alive) continue;
+    // THIS machine's own creatures only: a ghost here is the host's (it has
+    // the creature itself), never a player (section 2.7).
+    const Mob* m = FindMobById(a.id);
+    if (m == nullptr || !OwnedHere(*m) || m->PlayerControlled()) continue;
+    const float v[3] = {a.centre.x - wlo.x, a.centre.y - wlo.y, a.centre.z - wlo.z};
+    float edge = std::numeric_limits<float>::infinity();
+    for (int k = 0; k < 3; k++) edge = std::min(edge, std::min(v[k], (float)kWorldN - v[k]));
+    if (edge > kDistantEdgeBandVox) continue;
+    edgeOut_.actors.push_back(a);
+    if (++n >= kDistantEdgeActorsMax) break;
+  }
+  std::sort(edgeOut_.actors.begin(), edgeOut_.actors.end(),
+            [](const ai::Actor& x, const ai::Actor& y) { return x.id < y.id; });
+  distant_.Note(&DistantMobs::Stats::edgeWireActorsOut, n);
+}
+
+void MobSystem::ResolveRemoteSwing(const NearEdgeBlow& b, World& world,
+                                   std::vector<ParticleSpawn>* spawns) {
+  distant_.Note(&DistantMobs::Stats::edgeWireBlowsIn);
+  Mob* m = FindMobById(b.target);
+  if (m == nullptr || !m->alive_ || m->PlayerControlled() || !OwnedHere(*m) || b.style < 0 ||
+      (size_t)b.style >= b.kit.styles.size()) {
+    distant_.Note(&DistantMobs::Stats::edgeRemoteNoBody);
+    return;
+  }
+  // THE DEFENDER as the host's own roll would read a near one (the impact
+  // pass's nearDef): its kit off the live rig, its base limbs' hp, a ruined
+  // limb still in the way.
+  distant::DistantKit def = distant::BuildDistantKit(*m, items_);
+  def.absorbRuined = true;
+  std::vector<float> hp;
+  for (int li = 0; li < m->AppendedBase(); li++) hp.push_back(m->LimbHpAt(li));
+  if (def.limbs.empty() || hp.size() != def.limbs.size()) {
+    distant_.Note(&DistantMobs::Stats::edgeRemoteNoBody);
+    return;
+  }
+  // THE HOST'S KEYS: the attacker's id and the swing's own tick, so the roll
+  // is the one the host would have taken against this body.
+  const distant::StrikeOutcome o =
+      distant::ResolveStrike(b.kit, def, hp, b.style, std::max(0.0f, b.dist), {b.attacker, b.tick},
+                             distantCalib_, CurrentTuning().gear);
+  distant_.Note(&DistantMobs::Stats::edgeFarSwings);
+  switch (o.result) {
+    case distant::StrikeResult::Hit: distant_.Note(&DistantMobs::Stats::edgeFarHits); break;
+    case distant::StrikeResult::Miss: distant_.Note(&DistantMobs::Stats::edgeFarMisses); break;
+    case distant::StrikeResult::Blocked: distant_.Note(&DistantMobs::Stats::edgeFarBlocked); break;
+    case distant::StrikeResult::OutOfReach:
+      distant_.Note(&DistantMobs::Stats::edgeFarOutOfReach);
+      break;
+    case distant::StrikeResult::NoTarget: distant_.Note(&DistantMobs::Stats::strokeNoTarget); break;
+  }
+  if (!o.hit) return;
+  if (ApplyDistantHitOnNear(b.attacker, b.from, b.kit.styles[(size_t)b.style], o, b.target,
+                            b.tick, world, spawns))
+    distant_.Note(&DistantMobs::Stats::edgeRemoteApplied);
 }

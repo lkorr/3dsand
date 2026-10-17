@@ -8455,6 +8455,17 @@ class MobSystem {
   bool QueueEdgeArrowOut(const NearArrowOut& out);
   // The inbound arrows that crossed into the window this tick, taken (the
   // caller, MobArcheryTick, makes each a real ArrowFlight).
+  // ---- D7b: THE EDGE ACROSS A PEER'S WINDOW (game/distant.h DistantEdgeWire)
+  // What this machine sends across the wire this tick (EntitySync::Build
+  // takes it; a client: its edge actors and its near tier's hand-overs at the
+  // host's creatures; a host: its swings and inbound flights at the peer's
+  // creatures), and what arrived for the next tick (EntitySync::ApplyForTick
+  // gives it; consumed by the next TickDistant). Nothing unconnected.
+  void TakeDistantEdge(DistantEdgeWire& out) {
+    out = std::move(edgeOut_);
+    edgeOut_.Clear();
+  }
+  void ApplyDistantEdge(DistantEdgeWire&& in, uint32_t tick);
   std::vector<DistantArrowIn> TakeEdgeArrowsIn() {
     std::vector<DistantArrowIn> out;
     out.swap(edgeArrowsIn_);
@@ -8651,6 +8662,8 @@ class MobSystem {
   // Anything waiting (a hand-in, connected or not: after a disconnect the
   // room is still promoted, never given back).
   bool HasWaitingRoom() const;
+  // D7b: a LIVING creature of the host's view (a client's mirror) by id.
+  bool ViewMobAlive(uint64_t id) const;
   // Hand-ins held kHandInMaxWaitTicks or longer go back (connected only):
   // erased here, DistantHandInDone{returned} queued. Returns how many.
   uint32_t ReturnStaleHandIns(uint32_t tick);
@@ -10847,6 +10860,25 @@ class MobSystem {
   std::vector<NearEdgeBlow> edgeBlows_;
   std::vector<NearArrowOut> edgeArrowsOut_;
   std::vector<DistantArrowIn> edgeArrowsIn_;
+  // D7b: the edge across the wire (TakeDistantEdge / ApplyDistantEdge).
+  DistantEdgeWire edgeOut_;
+  DistantEdgeWire edgeIn_;
+  // The host's copy of a client's edge actors (id order) and the tick they
+  // arrived; trusted for kDistantEdgeActorTicks.
+  std::vector<ai::Actor> peerEdgeActors_;
+  uint32_t peerEdgeTick_ = 0;
+  // A client's near creatures in its window's edge band, for the host
+  // (built in TickDistant's client branch from the near actor list).
+  void BuildEdgeActors(const std::vector<ai::Actor>* nearActors, Vec3 wlo);
+  // A client rolls one host swing at its own creature and applies it
+  // through the creature's door (D3's DISTANT HITS NEAR, the roll done here).
+  void ResolveRemoteSwing(const NearEdgeBlow& b, World& world,
+                          std::vector<ParticleSpawn>* spawns);
+  // DISTANT HITS NEAR's door (D3): a resolved hit on a near creature this
+  // machine owns, through ApplyEdgeBlow. True = it entered.
+  bool ApplyDistantHitOnNear(uint64_t attackerId, Vec3 from, const distant::DistantStyle& style,
+                             const distant::StrikeOutcome& o, uint64_t target, uint32_t tick,
+                             World& world, std::vector<ParticleSpawn>* spawns);
   // ---- D8 / D9 (distant.cpp) ------------------------------------------------
   // Living distant creatures whose body CENTRE is inside the window box, as of
   // the last band membership pass: while any is, the distant tick's near band

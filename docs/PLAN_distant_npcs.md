@@ -2594,3 +2594,56 @@ client's live rig is gone by the time the host builds it. The host draws a
 handed-out creature through the client's look key, which it never baked: its
 producer falls back to the bare look. A client's own save writes its waiting
 room (its save is not the world's; the host's in-transit list is).
+
+### 8.7 D7b as landed (on `distant-gaps`, 2026-10-17, by the orchestrator)
+
+**What landed.** `DistantEdgeWire` (game/distant.h): one tick's edge traffic,
+carried as the last field of `EntityBatch` v6 (`net/distantsync` v2 codecs,
+field by field -- a kit travels as its styles, each `StrikeProfile` member by
+member: it has padding). Client -> host: its EDGE ACTORS (its own near
+creatures within `kDistantEdgeBandVox` of its window, never a player, never a
+ghost, at most 64, only while the host's view puts any creature in its band),
+its near strokes' blows at view creatures, its flights out of the window, box
+hits and shots past the face (D3 / D9's four hand-overs, which D7a dropped).
+Host -> client: distant swings at the client's creatures and inbound flights
+crossing into the client's window.
+
+- **Client.** `QueueEdgeBlow` / `QueueEdgeArrowOut` / `QueueEdgeArrowBoxHit`
+  look the target up in the host's view (`ViewMobAlive`); `TickDistant`'s
+  client branch forwards the four queues, builds the edge actors, hands the
+  host's inbound flights to `MobArcheryTick` (`edgeArrowsIn_`), and ROLLS the
+  host's swings itself (`ResolveRemoteSwing`): `ResolveStrike` with the
+  host's keys (attacker id, the swing's tick, the distance the host measured)
+  against the LIVE body, then D3's door (`ApplyDistantHitOnNear`, factored out
+  of the host's impact pass so both use one function).
+- **Host.** The peer's edge actors join the distant band (replacing a ghost of
+  the same creature: the owner's actor is its own tick-start state), trusted
+  for `kDistantEdgeActorTicks`. A swing or a loose at a creature that is not
+  this machine's to roll (a peer's edge actor, or a ghost) goes to the peer:
+  the swing as a `NearEdgeBlow` with `dist`, the flight with `toPeer` and the
+  peer's window, crossing into it (`ArrowStepOutside`'s new window argument)
+  instead of the host's. The peer's blows and arrows enter the host's own
+  queues and land at its next impact pass, exactly as its own near tier's.
+
+**Measured** (`distant-mp` arm E, both runs e66b63786ef2ac69): a blue swordsman
+B owns just inside B's -z face and a monster swordsman in A's tier 8 voxels
+past it: they engage within 100 ticks, B's stroke lands on A, A's swings are
+rolled on B (3) and one entered the swordsman's door, inside 129 ticks; 384
+edge actors over the arm. The whole verify (distant-mp, mob-handoff,
+net-melee, net-corpse, net-player-melee, authority, ops-exchange,
+determinism, distant-roundtrip / walkout / fight / edge / save / overflow /
+arrow / obstacles, archer, arrow): all PASS.
+
+**Deviations / open.**
+1. **The client rolls the host's swing a batch later than the host would
+   have** (the swing is resolved by the host's impact pass, then crosses):
+   the roll uses the host's keys, the defender's state is the client's own at
+   that tick. Deterministic on the client; a near defender meets a distant
+   blow D+1 ticks after the host decided it.
+2. **A player's shot that re-enters the CLIENT's window after flying past its
+   face** is still flown on the host and tested against the host's window
+   only (it lands or expires); the reverse case of D9 is not modelled.
+3. **The overflow (D8) and the player's ring are the host's**, as D7a left
+   them.
+4. Not run: the two-process `--host` / `--join` smoke. The in-process gate
+   carries every record as encoded bytes both ways.

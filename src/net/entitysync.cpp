@@ -42,6 +42,7 @@ void EntityBatch::Clear() {
   distantView.entries.clear();
   distantView.gones.clear();
   livingFree = kNoLivingFree;
+  distantEdge.Clear();
   tick = 0;
   playerId = 0;
 }
@@ -95,6 +96,8 @@ void EntityBatch::Encode(std::vector<uint8_t>& out) const {
   for (const DistantHandIn& r : distantHandIns) ::net::Encode(w, r);
   ::net::Encode(w, distantView);
   w.U32(livingFree);
+  // v6 (D7b): the edge across the peer's window.
+  ::net::Encode(w, distantEdge);
 }
 
 namespace {
@@ -148,6 +151,8 @@ bool EntityBatch::Decode(const uint8_t* p, size_t n) {
   if (!ReadVec(r, distantHandIns, distRec)) return false;
   if (!::net::Decode(r, distantView)) return false;
   r.U32(livingFree);
+  // v6 (D7b).
+  if (!::net::Decode(r, distantEdge)) return false;
   return r.ok;
 }
 
@@ -682,6 +687,10 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
     }
     if (mobs.GetDistantNetRole() == DistantNetRole::Host && peerCount_ >= 2)
       BuildDistantView(mobs, label, out.distantView);
+    // D7b: THE EDGE ACROSS THE PEER'S WINDOW -- whatever this tick's tier
+    // queued for the other side (game/distant.h DistantEdgeWire). Empty
+    // without a role.
+    mobs.TakeDistantEdge(out.distantEdge);
   }
 
   // ---- interest, which needs to know where the peer is -------------------
@@ -1058,6 +1067,8 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
       peerLivingFree_ = b.livingFree;
       havePeerFree_ = true;
     }
+    // D7b: the edge across the window, into the tier's queues for this tick.
+    if (!b.distantEdge.Empty()) mobs.ApplyDistantEdge(::DistantEdgeWire(b.distantEdge), tick);
 
     it = inbox_.erase(it);
   }
