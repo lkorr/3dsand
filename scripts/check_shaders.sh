@@ -691,7 +691,11 @@ if [ -f "$RAY_COMBINED" ]; then
     # the pre-opt counts are printed with a note, because a checker that fails
     # on a missing diagnostic tool is a checker people stop running.
     if command -v spirv-opt >/dev/null 2>&1; then optSpv=1; else optSpv=0; fi
-    for pair in "universal:$RAY_COMBINED" "lean:$RAY_LEAN"; do
+    # CHECK_SHADERS_FAST=1 skips this report: the two -O runs over raymarch
+    # are ~2 minutes, and an iteration loop on the shader wants the validation.
+    pairs=("universal:$RAY_COMBINED" "lean:$RAY_LEAN")
+    [ -n "${CHECK_SHADERS_FAST:-}" ] && pairs=()
+    for pair in "${pairs[@]}"; do
       tag="${pair%%:*}"; src="${pair#*:}"
       spv="$TMP/raymarch_${tag}.spv"
       "$TINT_BIN" -f spirv -ep fs -o "$spv" "$src" >/dev/null 2>&1 || {
