@@ -4217,7 +4217,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
                         (materials[mat]._r2 & ELEC_R2_SOURCE) != 0u;
         if (wantMedia && discharge) {
           if (out.elecCell == 0u) { out.elecCell = packWinCell(cell) | 0x80000000u; }
-        } else if (wantMedia && !liqInAir) {
+        } else if (wantMedia && !liqInAir && !(TUNE_PERF_EXP == 2 && k == CLASS_LIQUID)) {
           weight = 1.0;
           cellOp = f32(materials[mat].opacity) / 255.0;
           cellTint = (unpackColor(materials[mat].color0) +
@@ -12716,10 +12716,11 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // waterSideKind says which a side face is (a wall behind glass, a riser, a
   // falling sheet); asked on side faces seen from the air only.
   var side = SIDE_WALL;
-  if (axis != 1 && !underwater) { side = waterSideKind(cell, vec3<i32>(axisVec(axis, -sgn))); }
+  if (axis != 1 && !underwater && TUNE_PERF_EXP != 8) { side = waterSideKind(cell, vec3<i32>(axisVec(axis, -sgn))); }
   let riser = side == SIDE_RISER;
   let upFacing = (axis == 1 && sgn < 0.0) || riser;
-  var n = waterNormal(cell, mat, axis, sgn, hitP, upFacing);
+  var n = axisVec(axis, -sgn);
+  if (TUNE_PERF_EXP != 4) { n = waterNormal(cell, mat, axis, sgn, hitP, upFacing); }
   if (underwater) { n = -n; }   // seen from below, the interface faces down
   if (SEAM_DBG == 19u && upFacing && !underwater) {
     // The near surface's per-COLUMN inputs, the ones that can step from one
@@ -12776,7 +12777,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // the waves that cast it.
   var lit = sceneBehind;
   gVCurv = 0.0;
-  if (!underwater && depthM > 0.02) {
+  if (!underwater && depthM > 0.02 && TUNE_PERF_EXP != 11) {
     gVCurv = waterCausticCurv(hitP, rd, pathVox, depthM);
     lit *= veilCaustic(gVCurv, depthM);
   }
@@ -12795,7 +12796,9 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Read along the refracted-free primary path (solPathLook), so a cloud
   // anywhere in the column shows, not only one touching the surface.
   // Composited front to back into one equivalent body (SolColumn).
-  let sol = solPathLook(hitP, rd, pathVox, mat, absorbK, scatter);
+  var sol : SolColumn;
+  sol.any = false; sol.absorbK = absorbK; sol.scatter = scatter; sol.tint = vec3f(0.0); sol.g = 0.0;
+  if (TUNE_PERF_EXP != 5) { sol = solPathLook(hitP, rd, pathVox, mat, absorbK, scatter); }
   absorbK = sol.absorbK;
   scatter = sol.scatter;
   // liqVisFade: the march stopped at LIQ_VIS_M of water, so the column must be
@@ -12874,7 +12877,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   if (!underwater && (axis == 1 || side == SIDE_SHEET)) {
     inFlight = (axis == 1 && sgn > 0.0) || openBelow(cell);
   }
-  if (inFlight || side == SIDE_SHEET) {
+  if ((inFlight || side == SIDE_SHEET) && TUNE_PERF_EXP != 3) {
     let a = fallingSheet(hitP, axis, cell, select(FALL_SHEET_BASE, FALL_FLIGHT_BASE, inFlight));
     color = mix(color, whiteWaterLight(n), a);
     gVK *= 1.0 - a;
@@ -12885,7 +12888,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // correct-but-dull surface into something that reads as water in motion:
   // the ripple slopes scatter the highlight into moving sparkle rather than
   // one blob. Gated on the sun being above the horizon relative to the normal.
-  if (upFacing && !underwater) {
+  if (upFacing && !underwater && TUNE_PERF_EXP != 6) {
     // Key light, so a moonlit lake gets a moon track instead of staying flat
     // black at night — a still lake under a full moon is one of the strongest
     // night-lighting cues there is (waterGlint).
@@ -12936,7 +12939,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // and damping it would dissolve the far shore's foam line) is the mask so
     // the foam moves with the waves.
     let simFoam = clamp(length(waveFluxAt(cell)) * TUNE_WAVE_SIM_FOAM, 0.0, 1.0);
-    let foamA = waterFoam(hitP, depthM, simFoam);
+    var foamA = 0.0;
+    if (TUNE_PERF_EXP != 7) { foamA = waterFoam(hitP, depthM, simFoam); }
     if (foamA > 0.0) {
       // Foam is white MATTER, lit by what lights the water (THE MEDIUM'S
       // SKY): the authored colour is its noon look. Unlit, it glowed at full
@@ -18840,7 +18844,7 @@ fn fs(in : VSOut) -> FSOut {
         let uw = voxWordAt(up1);
         let um = voxMat(uw);
         if (um != MAT_AIR && materials[um].klass == CLASS_LIQUID &&
-            (materials[um].flags & MATF_OPAQUE) == 0u) {
+            (materials[um].flags & MATF_OPAQUE) == 0u && TUNE_PERF_EXP != 10) {
           // Probe from just OFF the face, not from the hit point itself: a hit
           // point sits exactly on a cell boundary, and floor() there lands
           // inside the solid half the time, which reads the surface's own
@@ -19195,13 +19199,17 @@ fn fs(in : VSOut) -> FSOut {
         }
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
+      } else if (!mpmOwned && TUNE_PERF_EXP == 1) {
+        caShadedLiquid = true;
       } else if (!mpmOwned) {
         rsAdd(RS_PX_WATER, 1u);
         color = shadeWater(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
                            h.liqPath + liqExtra, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
         if (SEAM_DBG >= 5u) { gDbgW0.x = 0.5; gDbgW0.y = h.liqT; }
+        if (TUNE_PERF_EXP != 12) {
         color = bubbleComposite(color, R.camPos, rd, h.liqCell, h.liqFace, h.liqT);
+        }
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
         veilT = h.liqT;
@@ -19215,7 +19223,7 @@ fn fs(in : VSOut) -> FSOut {
       // that resolved a CA liquid, where it costs three voxel reads and one
       // short sun ray; every other pixel in the frame pays nothing, and with
       // render.mistDensity at 0 so does this one.
-      if (!underwater && caShadedLiquid) {
+      if (!underwater && caShadedLiquid && TUNE_PERF_EXP != 9) {
         color = waterfallMist(color, hitP, rd, h.liqT, liqCell, lm);
       }
       // ---- a charged liquid's surface (E5b) ----
