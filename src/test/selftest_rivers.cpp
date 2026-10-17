@@ -621,7 +621,11 @@ bool PassSoluteCarried(Ctx& c, sandvox::support::TickCursor& tick, const worldma
   // floor had taken at most discMax of it; at the end, still exact.
   const bool bOk = moved1 == ledger1 && disc1 <= discMax * poured && moved == ledger;
   const bool asleep = settledAt >= 0 && awakeEnd == 0;
-  const bool cOk = asleep || (!needSleep && pEnd.carry == 0);
+  // A few carried pairs may be left where the fixture's own water is still
+  // moving (it re-ranks cells it stirs: measured 0 and 2 of the 746 at the
+  // start, on two trees whose solute code is identical), never over the fall.
+  const int carryLeftMax = static_cast<int>(BaselineNumber("rivers.soluteCarryLeftMax", 4));
+  const bool cOk = asleep || (!needSleep && pEnd.carry <= carryLeftMax && pEnd.carryAbove == 0);
   const bool vOk = aOk && bOk && cOk;
   std::printf("rivers: V solute carried: %s (ink poured %u units at (%d,%d) y%d over a %d-voxel fall to y%d (%u as "
               "powder, %u lost); (a) after %d ticks %llu units (%.2f >= %.2f) stand below the fall, tick:below/total%s; "
@@ -1647,6 +1651,53 @@ Status GateRivers(Ctx& c, std::string& detail) {
       }
       // ---- V. the held flow carries solute (sim_solute.wgsl), after S ----
       PassSoluteCarried(c, tick, *rFalls, problems);
+      // ---- W. gravel poured into the river does not lift it onto the pile ----
+      // (After S: a pile in main beside S's mouth floods the stream's mouth.)
+      // Ticket 2026-10-17_00-02-59: a grain sinking into held water swapped
+      // that water UP onto the pile, over the target, where nothing takes it
+      // back, while the reservoir refilled the river -- a sheet of water
+      // climbed every pile poured into a river. A 5 x 5 column of gravel 14
+      // cells tall dropped half on main's bank, half in it, at a quarter of
+      // its length; after the pile settles, count the water standing ON
+      // gravel above main's own surface there.
+      {
+        const auto& Lm = rMain->line;
+        const auto& pg = Lm[Lm.size() / 4];
+        const auto& pg0 = Lm[Lm.size() / 4 - 2];
+        const auto& pg1 = Lm[Lm.size() / 4 + 2];
+        double tx = pg1[0] - pg0[0], tz = pg1[1] - pg0[1];
+        const double tl = std::max(std::hypot(tx, tz), 1e-6);
+        const double nx = -tz / tl, nz = tx / tl;
+        const int gx = pg[0] + static_cast<int>(std::lround(nx * pg[3])), gz = pg[1] + static_cast<int>(std::lround(nz * pg[3]));
+        const int gTop = pg[2];
+        const uint32_t mGravel = matIdOf("gravel");
+        std::vector<CellOp> pour;
+        for (int dz = -2; dz <= 2; dz++)
+          for (int dx = -2; dx <= 2; dx++)
+            for (int y = gTop + 2; y <= gTop + 15; y++)
+              pour.push_back(CellOp{World::SlotCellIndex(IVec3{gx + dx, y, gz + dz}), mGravel | 0x80000000u});
+        sandvox::support::TickOps gops;
+        gops.cells = pour;
+        tick(gops);
+        const int gTicks = static_cast<int>(BaselineNumber("rivers.gravelTicks", 400));
+        for (int k = 1; k < gTicks; k++) tick();
+        c.ctx.WaitIdle();
+        rows.clear();
+        int onPile = 0, pileCells = 0;
+        for (int dz = -10; dz <= 10; dz++)
+          for (int dx = -10; dx <= 10; dx++)
+            for (int y = gTop + 1; y <= gTop + 16; y++) {
+              const uint32_t m = vox(gx + dx, y, gz + dz);
+              if (m == mGravel) pileCells++;
+              if (m == mWater && vox(gx + dx, y - 1, gz + dz) == mGravel) onPile++;
+            }
+        const int onPileMax = static_cast<int>(BaselineNumber("rivers.gravelWaterMax", 4));
+        const bool wOk = pileCells > 20 && onPile <= onPileMax;
+        std::printf("rivers: W gravel into the river: %s (%d gravel cells over main's surface after %d ticks; %d water "
+                    "cells standing on gravel over it (<= %d))\n",
+                    wOk ? "PASS" : "FAIL", pileCells, gTicks, onPile, onPileMax);
+        if (!wOk) problems.push_back(Format("W: %d water cells on the gravel pile (%d gravel over the surface)", onPile, pileCells));
+      }
       weather::SetOverride(prevPin);
       if (!gOk) problems.push_back(Format("G: %u chunks awake after %d ticks (%d at the water)", active, ticks, nearWater));
     }

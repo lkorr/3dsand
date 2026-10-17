@@ -25414,7 +25414,7 @@ its chunks stall and sleep when nothing lower has room (`docs/PLAN_solutes.md`
 downstream face is no sink).
 **The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted. Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
 
-**Gate `rivers`** grew: **L** walks every waterfall of the SHIPPED map
+**Gate `rivers`** grew: **W** pours a 5x5 column of gravel half into main (ticket 2026-10-17_00-02-59: a grain sinking into AT-REST held water used to swap that water up onto the pile while the reservoir refilled the river, so water climbed every pile poured into a river; `tryMove` now returns displaced held water to the reservoir -- the source becomes air) and counts water standing on the pile (<= `rivers.gravelWaterMax`). **L** walks every waterfall of the SHIPPED map
 (`default`, CPU twin, a 41-column box round each) and counts leaking faces —
 water over a dry neighbour whose ground is under it, the sea excepted
 (`rivers.fallLeakMax` = 0); E holds only the fixture's one fall and passed both

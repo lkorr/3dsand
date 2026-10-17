@@ -39,6 +39,7 @@
   "rivers.soluteDiscardMax": "0.05",
   "rivers.soluteRequireSleep": "0",
   "rivers.soluteSettleTicks": "4000",
+  "rivers.soluteCarryLeftMax": "4",
   "rivers.fallBoxHalf": "20",
   "rivers.fallStride": "1",
   "rivers.fallLeakMax": "0",
