@@ -1761,7 +1761,10 @@ SSBO lists of chunk indices.
     and spill bytes exactly (worldgen/worldgenList 128 + 800 B, worldgenCols
     168 + 416 B, far* unchanged); `worldgenCols`' binary grows 1.65 -> 1.83
     MB because each `colHeightAt` is inlined, which is why `looseStep` has one
-    call site for cover and bed and its far probes are one loop.
+    call site for cover and bed and its far probes are one loop. (Since
+    2026-10-17 the four axis neighbours ride that same loop: one
+    `colHeightAt` call site in all, `cols` 382k -> 133k instructions after
+    the worldgen recipe; docs/PLAN_shader_compile.md "Slimming".)
     The `worldmap` gate's skin probe (`selftest_biomes.cpp`) now counts the
     biome's own `cover.firmSkin` as its skin: its desert sample at (144,426)
     is on ground steeper than 34° and is generated sandstone, which is the

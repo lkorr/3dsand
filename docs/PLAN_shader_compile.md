@@ -455,3 +455,118 @@ unchanged costs only Tint + spirv-opt for it. Also seen: the main checkout's
   in 0 ms and the `[shutdown]` line never prints), so the exit-time
   `SavePipelineCache` is dead there; the mid-build saves are what persist.
 
+
+## Slimming — fewer inlined copies, same output (2026-10-17, branch `shader-slim`)
+
+**The lever, measured rather than guessed.** spirv-opt's recipes (worldgen:
+legalization, everything else: performance) both start with
+`inline-exhaustive`, so the driver compiles ONE function per entry point in
+which every call site of a big function is a full copy. Tint's own count (the
+old `check_shaders.sh` ceiling) emits each function once and cannot see this:
+every change below moved it by under 100 instructions while the inlined size
+fell by up to 65 %. `scripts/spv_inline_tree.py <module.spv> <entry>` prints an
+entry's inlined expansion per call site, so you can see where the copies are. `scripts/spv_sizes.sh` gives
+the counts after the engine's recipes. A helper function does not remove a copy;
+only fewer call sites do, so every change is a fenced worklist loop (unrollFence)
+around ONE call site, asking the same points with the same arguments in the
+same order.
+
+### Worldgen (inlined size after the legalization recipe, instructions)
+
+| entry | before | B: genColumn worklist | C: looseStep | D: far land worklist | E: far surface asks |
+|---|---:|---:|---:|---:|---:|
+| far | 377,053 | 283,036 | 283,036 | 244,353 | **210,080** |
+| farpatch | 263,034 | 168,888 | | | **168,968** |
+| fardown | 265,992 | 171,975 | | | **172,053** |
+| farmap | 245,219 | **151,198** | | | |
+| cols | 382,317 | 288,298 | **133,180** | | |
+
+- **B** `plantColumnAt` does the column's own `landColumn` and the fern and
+  toadstool site tests (each a whole `landColumn` + undergrowth scan) at one
+  call site. Before this, they were three copies in every entry that reaches `genColumn`.
+- **C** `looseStep`'s four axis-neighbour `colHeightAt` and its slide probes
+  are now one call site instead of five. The ~337k-instruction expansion of `cols` was mostly this.
+- **D** `far`'s cave-neighbour ground and the surface band's corner max
+  (`farCornerTop`) share one `landColumn` site. The corner max is a pure function of the column, so it is taken once per column for the entry that holds the band row.
+- **E** `farSurfaceMat` is split into `farSurfacePre`/`Post`. `far`'s two surface
+  asks (skin at h, the fluid's top) are the first two iterations of its row
+  loop and go through the row's own `genCellIn` call with the valid flags off.
+  That is exactly genCellCol's arguments, and genCellIn only READS cave/trees. `farpatch` and
+  `fardown` still call `farSurfaceMat` and are unchanged.
+
+Cold compile per entry (tint + spirv-opt + driver; worldgen salted so both
+caches miss, everything else warm; `SANDVOX_BUILD_THREADS=1`; the far set
+compiles on its own four threads). These runs had other sessions' compiles
+alongside them: `main`/`list` are unchanged code and spread 9.5-16.4 s, so
+read ±15 %.
+
+| entry | before | B | C | D | E |
+|---|---:|---:|---:|---:|---:|
+| cols | 115.1 s | 50.8 | 20.9 | 19.0 | **17.3** |
+| far | 113.3 s | 91.7 | 77.1 | 64.6 | **51.3** |
+| farpatch | 90.9 s | 66.9 | 51.9 | 49.1 | **47.6** |
+| fardown | 92.2 s | 69.2 | 55.4 | 50.7 | **49.0** |
+| farmap | 86.5 s | 48.0 | 37.7 | 32.9 | **33.6** |
+| far cascades ready | 259.8 s | 171.9 | 125.3 | 109.3 | **89.7** |
+| sim init (all compute) | 277.9 s | 184.5 | 139.6 | — | **101.1** |
+
+The driver's binaries are smaller too (`--shader-stats`, before -> after): farFill 2.13 -> 1.38 MB,
+farDown 1.52 -> 1.05, farPatchFill 1.50 -> 1.04, farMapFill 1.39 -> 0.97,
+worldgenCols 1.93 -> 0.76. Registers: unchanged except farMapFill 163 -> 168
+(local 800 -> 832 B). Local memory: farFill 2176 -> 2160, farDown 1040 -> 944,
+farPatchFill 976 -> 832, worldgenCols 144 -> 16. Runtime unchanged (far bench,
+default map, `SANDVOX_GPU_TIMER_SERIAL=1`, farFill refill / sprint mean ms):
+before 3.38 / 2.90 and a rerun 2.87 / 2.49, after 2.88 / 2.49. The first before arm
+was the slow outlier.
+
+**Identity:** `determinism` 4993b9b0 at every step. The far digest after
+determinism + far-fog (`SANDVOX_FAR_DIGEST=1`) is `05ca10cd6f9b2e95 / 50533e68b3110639`
+at every step. The default-map far bench digest is `e5c96c4f563f6d42 /
+22c3f84271f6647b` before and after. `--voxserve` dumps were byte-identical
+(mesa ground lod 1, origin lod 4). `--verify
+determinism,far-fog,far-downsample,lod-seam,rivers,terrain` PASS on the final tree.
+
+`check_shaders.sh` now also checks the INLINED size (legalization recipe)
+of far/farpatch/fardown/farmap/cols against ~1.2x these numbers. The raw Tint
+ceilings are untouched: Tint's count did not shrink, so they cannot be lowered.
+
+### Raymarch `fs` (performance recipe; register cliff 128)
+
+| | before | F: traceReflection | G: applyAerial |
+|---|---:|---:|---:|
+| inlined expansion | 977,541 | 917,821 | **846,650** |
+| after -O (instructions) | 413,993 | 382,926 | **345,999** |
+| spirv-opt (s, warm machine) | 57.5 | 49.9 | 49.3 |
+| render pipelines built, raymarch cold (s) | 179.0 | 181.6 | **154.1** |
+
+- **F** `traceReflection`'s three exits share one `reflectionSkyBlur(rr, blur)`,
+  evaluated after the trace, as the hit path's `mix()` already did.
+- **G** `applyAerial` evaluates `skyAirglowV(normalize(rd), dayWeight())` once for
+  both modes (`skyBackdropG`, `skyColorPartsG`, `cloudySkyAirglowG` take it).
+- Registers (`--shader-stats`): 128 + 112 B local before and after. ISA 4.67 ->
+  4.00 MB.
+- Frame p50 ms (`--render-budget` baseline; before / before rerun / G): noon
+  8.00/8.49/8.63, cascade 7.96/8.07/8.05, seamveg 13.43/13.91/14.02, silverrun
+  22.19/22.04/22.25, slope 19.42/19.23/19.54. All within the rerun spread.
+- Pixels: the renderer is not bit-reproducible run to run, so G is judged against
+  the before-vs-before rerun. noon 0 px differ (rerun: 1), seamveg 10.7 %
+  max 14 (rerun 11.0 % max 15), silverrun 5.7 % max 14 (5.7 % max 14), slope
+  7.7 % max 1 (7.9 % max 2), screenshot_far 8.7 % max 14 (8.0 % max 20),
+  cascade 57 px (41 px).
+
+**Tried and left out, because the output or the frame changed:**
+- `nightGlow`'s seven `fbm` calls as one loop (branch `slim-with-r3`): fs
+  -O 346k -> 280k, render pipelines 154 -> 138 s. Frame time was **+10-19 % on
+  noon, +13 % on silverrun**, including noon, where the night glow never runs.
+  That points at the driver's codegen, not at extra work. Reverted.
+- `waterConvergeAt` / `flowFoamLines`' `waterCurrentAt` taps as one loop each
+  (branch `slim-with-r4`): about -4 % more code, but silverrun's plunge-pool foam
+  visibly thinned (25 % of pixels, max 197; pixel sum 1,278.1M -> 1,273.5M). The
+  rewrite reads as exact and the cause was not found, so it stays out. Possible cause: different FMA contraction of
+  the offset taps feeding a thresholded difference quotient.
+- Not attempted: `shadeWater` x2, `shadeFarWater` x2 and `fs`'s seven
+  `applyAerial` sites. Each pair sits in different stages of `fs` (water, then
+  MPM raft; far hit, then horizon), so merging them means restructuring `fs`'s
+  control flow across the register cliff. In worldgen, `farpatch`/`fardown`
+  could fold `farCornerTop`'s `landColumn` into genColumn's worklist (about -39k
+  each by stubbing). They now compile no slower than `far`, which bounds far-ready, so this was left alone.
