@@ -37,6 +37,8 @@
 #include "sim/tuning.h"
 #include "sim/world.h"
 #include "sim/worldmap.h"
+#include "sim/worldgen_run.h"  // ReadVoxelsSync: the pour far probe
+#include "test/selftest.h"     // FarVoxByte: the pour far probe
 #include "test/support.h"
 #include "world/structures.h"
 
@@ -3188,10 +3190,69 @@ bool CamLake(Scene& s, uint32_t& tick, std::string& why) {
 // prices dissolved blood on a pour. Leaves the harness lake breached and the
 // pit full of water, so these come late in the default order.
 constexpr uint32_t kPourBudgetTicks = 180;
+// SANDVOX_POUR_EYE=x,y,z,yawDeg,pitchDeg (ticket 2026-10-16_00-29-21, the
+// breach seen from past the LOD handoff): the same pour, looked at from
+// another place WITHOUT recentring the window -- SANDVOX_BUDGET_AT's `at`
+// camera regenerates the window and so heals the breach. Set before the
+// ticks, so the far levels centre on that eye as they would in play.
+void PourEyeOverride(Scene& s) {
+  const char* e = std::getenv("SANDVOX_POUR_EYE");
+  float v[5];
+  if (!e || std::sscanf(e, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]) != 5)
+    return;
+  s.eye = {v[0], v[1], v[2]};
+  s.cam.yaw = v[3] * 0.0174532925f;
+  s.cam.pitch = v[4] * 0.0174532925f;
+}
+// SANDVOX_POUR_FARPROBE=x,z[;x,z...]: after the pour's ticks, one column per
+// (x, z) from 34 over the waterline to 24 under the pit floor: the live cell
+// beside the cascade byte (far slot | blocker bit) of the level 1-3 cells
+// holding it. Blocking readbacks, harness only.
+void PourFarProbe(Scene& s, const PourGeom& g) {
+  const char* e = std::getenv("SANDVOX_POUR_FARPROBE");
+  if (!e) return;
+  std::printf("        farprobe slots:");
+  for (const MaterialDef& m : s.mats)
+    if (m.name == "water" || m.name == "sand" || m.name == "sandstone" || m.name == "stone")
+      std::printf(" %s=%u", m.name.c_str(), m.farPalSlot);
+  std::printf("\n");
+  std::vector<uint32_t> vox(kChunkVol);
+  for (const char* p = e; p && *p;) {
+    int px = 0, pz = 0;
+    if (std::sscanf(p, "%d,%d", &px, &pz) != 2) break;
+    std::printf("        farprobe column (%d, %d):\n", px, pz);
+    int haveSlot = -1;
+    for (int y = g.surf + 34; y >= g.floorY - kPourPitBelowBed - 4; y--) {
+      const IVec3 c{px, y, pz};
+      uint32_t live = 0xFFFFFFFFu;
+      if (s.world.CellInWindow(c)) {
+        const int slot = (int)World::SlotChunkIndex({px >> 4, y >> 4, pz >> 4});
+        if (slot != haveSlot) {
+          ReadVoxelsSync(s.ctx, s.world, (uint32_t)slot, 1, vox.data(), "pourFarProbe");
+          haveSlot = slot;
+        }
+        live = vox[World::SlotCellIndex(c) % kChunkVol];
+      }
+      const uint32_t lm = live & 0xFFFu;
+      std::printf("          y %4d  live %-10s st%2u |", y,
+                  live == 0xFFFFFFFFu ? "-" : lm < s.mats.size() ? s.mats[lm].name.c_str() : "?",
+                  (live >> 12) & 15u);
+      for (uint32_t lv = 1; lv <= 3; lv++) {
+        const int sh = (int)(lv + kFarShiftBase);
+        std::printf("  L%u %02x", lv,
+                    selftest::FarVoxByte(s.ctx, s.world, lv, {px >> sh, y >> sh, pz >> sh}));
+      }
+      std::printf("\n");
+    }
+    p = std::strchr(p, ';');
+    if (p) p++;
+  }
+}
 bool CamPourImpl(Scene& s, uint32_t& tick, std::string& why, bool blood) {
   PourGeom g;
   if (!PourFind(s, g, why)) return false;
   PourEye(s, g);
+  PourEyeOverride(s);
   const IVec3 pc{(int)s.eye.x >> 4, (int)s.eye.y >> 4, (int)s.eye.z >> 4};
   s.fluidLive = 0;
   const uint32_t t0 = 6000;
@@ -3209,6 +3270,7 @@ bool CamPourImpl(Scene& s, uint32_t& tick, std::string& why, bool blood) {
   s.ctx.WaitIdle();
   s.ctx.ProcessEvents();
   if (s.world.Snap().valid) s.fluidLive = s.world.Snap().fluidLive;
+  PourFarProbe(s, g);
   char note[256];
   std::snprintf(note, sizeof note,
                 "lake r=%d at (%d,%d) breached into a pit, %u ticks after the cut%s; "

@@ -1057,6 +1057,20 @@ def check_flow_measure():
                                 f"{mw.group(1)}, kFlowStep {ms.group(1)})")
     if len(bias) > 1:
         problems.append(f"measured flow: FLOWM_Y_BIAS differs between shaders ({sorted(bias)})")
+    # The solved field's FAR grid sits after the window grid in the same
+    # buffer (flowfield.h kFlowFarBase = kFlowNearWords); raymarch.wgsl reads
+    # it at FLOW_FAR_BASE.
+    if not re.search(r"constexpr\s+uint32_t\s+kFlowFarBase\s*=\s*kFlowNearWords\s*;", ff):
+        problems.append("flow far grid: flowfield.h kFlowFarBase is no longer kFlowNearWords; "
+                        "update this check and raymarch.wgsl FLOW_FAR_BASE")
+    rm = read("assets/shaders/raymarch.wgsl")
+    mf = re.search(r"const\s+FLOW_FAR_BASE\s*:\s*u32\s*=\s*(\d+)u", rm or "")
+    near_words = int(mh.group(1)) + slots * 2
+    if not mf:
+        problems.append("flow far grid: raymarch.wgsl declares no FLOW_FAR_BASE")
+    elif int(mf.group(1)) != near_words:
+        problems.append(f"flow far grid: raymarch.wgsl FLOW_FAR_BASE = {mf.group(1)} but "
+                        f"flowfield.h kFlowNearWords = {near_words}")
     if int(mh.group(1)) != 4:
         problems.append("measured flow: common.wgsl's FLOW_HEADER is 4 words; "
                         f"flowfield.h kFlowHeaderWords = {mh.group(1)}")

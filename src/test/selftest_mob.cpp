@@ -12108,6 +12108,319 @@ Status GateRagdollDress(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ragdoll-equip ------------------------------------------------------
+//
+// AN ITEM PUT IN A LIMP HAND FALLS WITH THE HAND (owner ticket
+// 2026-10-16_11-00-57: "if i equip a weapon while ragdolling and falling the
+// weapon stays stuck in the sky, and the rest of the body stretches out").
+//
+// Mob::EquipItem built every held slot the way a LIVING hand carries it: a
+// kinematic body that SubmitPose re-poses onto the socket each tick. A limp rig
+// runs no SubmitPose, so an item equipped mid-ragdoll was a kinematic body
+// nobody moved again, welded by a Fixed joint to a falling hand -- infinite
+// mass, so the rig hung from it. The class is "a held-item change while limp",
+// so the fixture makes three: an equip into the right fist, an equip into the
+// left (a second slot appended behind the first), and a re-equip of the right
+// (the unequip + rebuild path, which renumbers nothing here but rebuilds the
+// body and joint mid-flight).
+//
+// THE CLAIM, per item: in flight it sits in its hand exactly as a LIVING hand
+// holds it (measured against the grip SubmitPose gives the same sword on the
+// standing body -- not against its own equip tick, which a weld taken at a
+// wrong pose would hold constant), the rig's joint anchors do not tear
+// (ragdoll-dress's LimbStretch), and the item actually DESCENDS with the body:
+// a fixture that never fell, or an item that never left the sky, would
+// otherwise pass a constancy test against a hand that also did not move.
+// Through the LANDING the claim is only "still in the fist": a Fixed joint
+// gives under impact in this solver like any other, which a CONTROL fall --
+// both fists holding the sword from the standing body (StartRagdoll's flip,
+// the path that already worked) -- shows and is held to the same caps for.
+Status GateRagdollEquip(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+
+  int wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  if (wizDef < 0 || sword == nullptr) {
+    detail = "no avatar mob def or no \"sword\" item to hold";
+    return Status::Fail;
+  }
+  const int baseLimbs = (int)mobs.Defs()[wizDef].limbs.size();
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  const IVec3 wlo = world.WindowOrigin();
+  const float lift =
+      std::min(160.0f, std::max(0.0f, (float)(wlo.y + kWorldN - 24 - (h + 1))));
+  // "In flight": the pelvis still well clear of the ground it will land on.
+  const float flightAbove = (float)h + MetresToCells(1.5f);
+
+  auto restore = [&]() {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+  };
+  auto quatOf = [](const BodyTransform& x) {
+    return Quat{x.quat[0], x.quat[1], x.quat[2], x.quat[3]};
+  };
+
+  // One held item's weld: where it sits in its hand, against the grip a LIVING
+  // hand gives it (see `truth` below), in flight and through the landing.
+  struct Weld {
+    const char* what = "";
+    Hand hand = Hand::Right;
+    int slot = -1, host = -1;
+    Vec3 relPos{};
+    Quat relRot{};
+    float y0 = 0.0f, rootY0 = 0.0f;     // item / pelvis height at equip
+    float flightDrift = 0.0f, flightTwist = 0.0f;
+    float peakDrift = 0.0f, peakTwist = 0.0f;
+    int peakTick = -1;
+    float lastDrift = 0.0f, lastTwist = 0.0f;
+    float itemDrop = 0.0f, rootDrop = 0.0f;   // over the in-flight ticks
+    bool equipped = false;
+  };
+  struct Run {
+    bool spawned = false, limp = false;
+    int ticks = 0;
+    float stretch = 0.0f;
+    std::string stretchName;
+    Weld w[3];
+    int n = 0;
+  };
+
+  // ONE FALL. `control`: both fists hold a sword from the standing body on --
+  // StartRagdoll flips them with the limbs, the path that worked before the
+  // ticket -- so its landing numbers are what a held weapon does in this
+  // solver. Otherwise the fists are emptied before the flip and the items
+  // arrive mid-fall: right at tick 6, left at 18, and the right RE-equipped
+  // (unequip + rebuild of a dynamic slot) at 30.
+  auto run = [&](bool control) -> Run {
+    Run r;
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    AiTicker ticker{c, 21500, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const uint64_t id = mobs.Spawn(wizDef, {spot.x, h + 1 + (int)lift, spot.z});
+    Mob* mob = id ? mobs.FindMobById(id) : nullptr;
+    if (mob == nullptr) return r;
+    r.spawned = true;
+    ticker();
+    auto xfOf = [&](int limb, BodyTransform& out) {
+      const uint64_t b = mobs.LimbBody(id, limb);
+      return b != 0 && phys.GetTransform(b, out);
+    };
+    // The rig's own joints, captured upright (ragdoll-dress's Link).
+    struct Link {
+      int child = -1, parent = -1;
+      Vec3 anchorInParent{};
+    };
+    std::vector<Link> links;
+    for (int i = 0; i < baseLimbs && i < mob->LimbCount(); i++) {
+      const std::string& parent = mob->LimbDefAt(i).parent;
+      if (parent.empty()) continue;
+      int pi = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { pi = p; break; }
+      BodyTransform pp{};
+      if (pi < 0 || mobs.LimbBody(id, i) == 0 || !xfOf(pi, pp)) continue;
+      Link l;
+      l.child = i;
+      l.parent = pi;
+      l.anchorInParent =
+          QuatRotateInv(quatOf(pp), mobs.LimbAnchorPos(id, i) - pp.pos);
+      links.push_back(l);
+    }
+    // Resolve a weld's slot + host and read the item-in-hand relationship.
+    auto bind = [&](Weld& w) {
+      w.slot = mob->HeldSlot(w.hand);
+      w.host = -1;
+      if (w.slot < 0) return false;
+      const std::string& parent = mob->LimbDefAt(w.slot).parent;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { w.host = p; break; }
+      BodyTransform hs{}, is{};
+      if (w.host < 0 || !xfOf(w.host, hs) || !xfOf(w.slot, is)) return false;
+      w.relPos = QuatRotateInv(quatOf(hs), is.pos - hs.pos);
+      w.relRot = QuatMul(QuatConj(quatOf(hs)), quatOf(is));
+      w.y0 = is.pos.y;
+      w.rootY0 = mobs.MobRootPos(id).y;
+      return true;
+    };
+    auto equip = [&](Weld& w, const char* what, Hand hand) {
+      w = Weld{};
+      w.what = what;
+      w.hand = hand;
+      w.equipped = mobs.EquipItem(id, sword, HandContext(hand)) && bind(w);
+    };
+    auto measure = [&](Weld& w, int t) {
+      if (!w.equipped || mob->HeldSlot(w.hand) != w.slot) return;
+      BodyTransform hs{}, is{};
+      if (!xfOf(w.host, hs) || !xfOf(w.slot, is)) return;
+      const float d =
+          (QuatRotateInv(quatOf(hs), is.pos - hs.pos) - w.relPos).len();
+      const Quat err = QuatMul(QuatConj(w.relRot),
+                               QuatMul(QuatConj(quatOf(hs)), quatOf(is)));
+      const float tw =
+          2.0f * std::acos(std::min(1.0f, std::fabs(err.w))) * 57.29578f;
+      w.lastDrift = d;
+      w.lastTwist = tw;
+      if (d > w.peakDrift) {
+        w.peakDrift = d;
+        w.peakTick = t;
+      }
+      w.peakTwist = std::max(w.peakTwist, tw);
+      if (mobs.MobRootPos(id).y > flightAbove) {
+        w.flightDrift = std::max(w.flightDrift, d);
+        w.flightTwist = std::max(w.flightTwist, tw);
+        w.itemDrop = w.y0 - is.pos.y;
+        w.rootDrop = w.rootY0 - mobs.MobRootPos(id).y;
+      }
+    };
+
+    // THE GRIP, AS A LIVING HAND HOLDS IT: equip both fists on the standing
+    // body and let one tick pose them (SubmitPose's held block puts the hilt
+    // on the socket). Every limp weld is measured against THIS, not against
+    // whatever pose the item had on its own equip tick: a weld taken at a
+    // wrong pose holds that wrong pose perfectly constant, and a constancy
+    // check alone would pass a sword welded at a wrong angle.
+    Weld truth[2];
+    equip(truth[0], "truth-right", Hand::Right);
+    equip(truth[1], "truth-left", Hand::Left);
+    ticker();
+    for (Weld& t : truth) t.equipped = t.equipped && bind(t);
+    if (!truth[0].equipped || !truth[1].equipped) return r;
+    if (control) {
+      r.w[0] = truth[0];
+      r.w[0].what = "held right";
+      r.w[1] = truth[1];
+      r.w[1].what = "held left";
+      r.n = 2;
+    } else {
+      mobs.EquipItem(id, nullptr, HandContext(Hand::Right));
+      mobs.EquipItem(id, nullptr, HandContext(Hand::Left));
+      r.n = 3;
+    }
+
+    // Limp from here; minSeconds covers the whole descent.
+    mob->StartRagdoll(12.0f, "gate");
+    r.limp = mobs.RagdollPhaseOf(id) == 1;
+    auto againstTruth = [&](Weld& w, const Weld& tr) {
+      if (!w.equipped) return;
+      w.relPos = tr.relPos;
+      w.relRot = tr.relRot;
+    };
+    const int kTicks = 150;
+    for (int t = 0; t < kTicks && mobs.IsAlive(id); t++) {
+      if (!control && t == 6) {
+        equip(r.w[0], "right", Hand::Right);
+        againstTruth(r.w[0], truth[0]);
+      }
+      if (!control && t == 18) {
+        equip(r.w[1], "left", Hand::Left);
+        againstTruth(r.w[1], truth[1]);
+      }
+      if (!control && t == 30) {
+        equip(r.w[2], "re-equip right", Hand::Right);
+        againstTruth(r.w[2], truth[0]);
+      }
+      ticker();
+      r.ticks = t + 1;
+      if (mobs.RagdollPhaseOf(id) != 1) continue;   // only while Jolt owns it
+      for (int k = 0; k < r.n; k++) measure(r.w[k], t);
+      for (const Link& l : links) {
+        BodyTransform pp{};
+        if (mobs.LimbBody(id, l.child) == 0 || !xfOf(l.parent, pp)) continue;
+        const float gap =
+            (QuatRotateInv(quatOf(pp), mobs.LimbAnchorPos(id, l.child) - pp.pos) -
+             l.anchorInParent)
+                .len();
+        if (gap > r.stretch) {
+          r.stretch = gap;
+          r.stretchName = mob->LimbDefAt(l.child).name;
+        }
+      }
+    }
+    return r;
+  };
+
+  const Run ctl = run(true);
+  const Run sub = run(false);
+
+  const double maxDrift = BaselineNumber("ragdollEquipMaxItemDriftVox", 1.0);
+  const double maxTwist = BaselineNumber("ragdollEquipMaxItemTwistDeg", 10.0);
+  const double maxStretch = BaselineNumber("ragdollDressMaxLimbStretchVox", 4.0);
+  const double maxLandDrift =
+      BaselineNumber("ragdollEquipMaxItemLandingDriftVox", 6.0);
+  const double maxSettledDrift =
+      BaselineNumber("ragdollEquipMaxItemSettledDriftVox", 3.0);
+  // The body must have actually fallen while each item was held, and the item
+  // with it: at least 10 voxels, and the item's drop within an arm's reach
+  // (or 20%) of the pelvis's -- a limp arm swings the fist about the shoulder.
+  const float kMinDrop = 10.0f;
+  bool ok = ctl.spawned && sub.spawned && ctl.limp && sub.limp &&
+            sub.stretch <= (float)maxStretch && ctl.n == 2 && sub.n == 3;
+  std::string items;
+  auto judge = [&](const Weld& w, const Weld* control) {
+    const float slack = std::max(MetresToCells(1.2f), 0.2f * w.rootDrop);
+    const bool fell = w.rootDrop >= kMinDrop &&
+                      std::fabs(w.itemDrop - w.rootDrop) <= slack;
+    // IN FLIGHT the weld is the grip, to the cap. THROUGH THE LANDING a
+    // sword's Fixed joint gives under a 15 m/s impact like any constraint in
+    // this solver -- the CONTROL, held from the standing body, measured 1.5 vox
+    // / 26-33 deg peaks and up to 13 deg left over once settled against the
+    // ground (2026-10-16) -- and which fist meets the ground first is chaos,
+    // so a landing is not compared sample-to-sample with the control. The
+    // claim there is the ticket's: the item is still IN THE FIST (within the
+    // landing / settled caps, for subject and control alike), not left
+    // behind; the twist is reported, not asserted.
+    const bool landOk = w.peakDrift <= (float)maxLandDrift &&
+                        w.lastDrift <= (float)maxSettledDrift;
+    const bool wOk = w.equipped && fell && w.flightDrift <= (float)maxDrift &&
+                     w.flightTwist <= (float)maxTwist && landOk;
+    std::printf(
+        "  ragdoll equip %s: %s (equipped %d, slot %d on part %d; in flight "
+        "drift %.3f vox / twist %.2f deg (caps %.2f / %.1f), fell %.1f vox "
+        "with the pelvis's %.1f; landing peak drift %.3f at tick %d (cap "
+        "%.1f) / twist %.2f; settled drift %.3f (cap %.1f) / twist %.2f%s)\n",
+        w.what, wOk ? "PASS" : "FAIL", (int)w.equipped, w.slot, w.host,
+        w.flightDrift, w.flightTwist, maxDrift, maxTwist, w.itemDrop,
+        w.rootDrop, w.peakDrift, w.peakTick, maxLandDrift, w.peakTwist,
+        w.lastDrift, maxSettledDrift, w.lastTwist,
+        control ? Format(", vs held-from-standing peak %.3f / settled %.3f",
+                         control->peakDrift, control->lastDrift)
+                      .c_str()
+                : ", control");
+    ok = ok && wOk;
+    items += Format("%s flight %.3f/%.1f peak %.2f settled %.3f; ", w.what,
+                    w.flightDrift, w.flightTwist, w.peakDrift, w.lastDrift);
+  };
+  for (int k = 0; k < ctl.n; k++) judge(ctl.w[k], nullptr);
+  for (int k = 0; k < sub.n; k++)
+    judge(sub.w[k], &ctl.w[sub.w[k].hand == Hand::Left ? 1 : 0]);
+  std::printf("  ragdoll equip rig: limp %d/%d, %d/%d ticks, limb stretch %.2f "
+              "vox (control %.2f, cap %.2f, worst \"%s\")\n",
+              (int)ctl.limp, (int)sub.limp, ctl.ticks, sub.ticks, sub.stretch,
+              ctl.stretch, maxStretch, sub.stretchName.c_str());
+  detail = Format("%slimb stretch %.2f (control %.2f, cap %.2f) from %.0f vox; "
+                  "fixture (%d,%d,%d)",
+                  items.c_str(), sub.stretch, ctl.stretch, maxStretch, lift,
+                  spot.x, h, spot.z);
+  restore();
+  std::printf("ragdoll equip: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ragdoll-falldamage -------------------------------------------------
 //
 // A LIMP BODY STILL HITS THE GROUND — AND A LIMP BODY IN FLIGHT DOES NOT.
@@ -19749,6 +20062,10 @@ const std::vector<Gate>& MobGates() {
       // 50 m of fall: the clothes may not leave the limbs and the joints may not
       // be torn open by the anti-tunnel clamp.
       {"ragdoll-dress", "mob", {}, false, GateRagdollDress,
+       /*needsRender=*/false},
+      // ...and a weapon put into a LIMP hand: part of the falling body, not a
+      // prop left in the sky with the rig hanging from it (ticket 10-16).
+      {"ragdoll-equip", "mob", {}, false, GateRagdollEquip,
        /*needsRender=*/false},
   };
   return g;

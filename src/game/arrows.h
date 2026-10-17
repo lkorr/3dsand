@@ -107,6 +107,34 @@ float BowArrowSpeed(const ItemDef& bow, int ticks);
 // The penetrator an arrow flies as, at `speedMps`.
 Penetrator ArrowPenetrator(const ItemDef& arrow, float speedMps, uint32_t seed);
 
+// ---- THE BOW'S SIGHT (session.cpp THE LOOSE) ---------------------------------
+// The bow's zero when the crosshair is on nothing (sky): the flight aims at
+// the point this far down the reticle's line, and the player holds over.
+constexpr float kBowZeroVox = 300.0f;   // 30 m
+// Where the drawn bow holds the ARROW REST -- where the flight leaves from --
+// in the camera's frame off the head's eye: at arm's length, a hand left of
+// and under the eye line standing (the string hand at the left cheek, the
+// shaft parallel to the look, bow_draw* as gen_archery_clips.py solves them);
+// crouched, the flat bow lower and a third of a voxel right. World voxels;
+// mirrored for a bow in the left fist.
+Vec3 BowRestPoint(Vec3 eye, Vec3 fwd, Vec3 right, Vec3 up, bool crouched,
+                  bool leftHand);
+// How far down the RETICLE's line -- from `sight` (the render eye the
+// crosshair is drawn from) along `fwd` (unit) -- the thing the crosshair is on
+// lies, so the flight can leave from the arrow rest and still arrive ON the
+// reticle (the parallax between the rest and the sight line cancels exactly
+// at that distance). The nearer of:
+//   * the grid: `snap`'s sim_pick cell (cast from the render camera, so the
+//     cell under the crosshair), where the line ENTERS it;
+//   * a body: Jolt, skipping `ignore` (the shooter's own limbs).
+// Only hits past `rest`'s plane count (a third-person sight line starts
+// behind the shooter). Nothing: `noHit` (the bow's zero). Never nearer than a
+// voxel past the rest's plane, so the flight cannot be turned sideways.
+struct WorldSnapshot;
+float BowSightDistance(const WorldSnapshot& snap, const Physics& phys,
+                       const std::vector<uint64_t>& ignore, Vec3 sight,
+                       Vec3 fwd, Vec3 rest, float noHit);
+
 // ---- AN ARROW STAYS ONLY WITH ITS HEAD IN ----------------------------------
 // (ticket 2026-10-14_22-26-58, owner: "it should only really stick out if
 // it's actually embedded in the flesh. i shouldn't just see the whole arrow

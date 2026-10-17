@@ -43,6 +43,7 @@
 #include "game/container.h"
 #include "game/equipment.h"
 #include "game/worlditems.h"
+#include "game/lookpick.h"
 #include "game/corpses.h"
 #include "game/dialogue.h"
 #include "world/refs_doors.h"
@@ -6080,6 +6081,12 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
   return failures == 0 ? 0 : 1;
 }
 
+namespace worldmap {
+// world.cpp: what every river piece said about a column (`rivers` E's leak
+// report; --mapcheck's SANDVOX_WATERCOL).
+std::string WaterColumnTrace(int x, int z, uint32_t seed);
+}  // namespace worldmap
+
 int main(int argc, char** argv) {
   InstallCrashHandler();
   StartupMark("main");
@@ -7058,6 +7065,19 @@ int main(int argc, char** argv) {
     ok = ok && biomes::LoadBiomeSet(ad, m, set, blog);
     ok = ok && worldmap::LoadWorldMap(ad, mapcheckName, set, m.size(), kDefaultSeed, map, blog);
     std::printf("MAPCHECK %s\n", worldmap::MapCheckJson(mapcheckName, ok, map, ok ? "" : blog).c_str());
+    // SANDVOX_WATERCOL="x,z;x,z;...": every river piece's view of those
+    // columns and what waterApply made of them (the CPU twin's trace, the
+    // one `rivers` E prints beside a leak) -- for a leak seen on a real map.
+    if (const char* wc = std::getenv("SANDVOX_WATERCOL"); ok && wc != nullptr) {
+      worldmap::SetCurrentWorldMap(map);
+      for (const char* p = wc; *p;) {
+        int x = 0, z = 0, n = 0;
+        if (std::sscanf(p, "%d,%d%n", &x, &z, &n) != 2) break;
+        std::printf("WATERCOL %d,%d:%s\n", x, z, worldmap::WaterColumnTrace(x, z, kDefaultSeed).c_str());
+        p += n;
+        while (*p == ';' || *p == ' ') p++;
+      }
+    }
     return 0;
   }
 
@@ -14370,11 +14390,12 @@ int main(int argc, char** argv) {
       ui.pendingDetonate = true;
     // ---- E: PICK IT UP ------------------------------------------------------
     //
-    // A short camera ray filtered through the ground registry, which is what
-    // makes this cheap: the ray finds the nearest DYNAMIC body (the same cast
-    // the laser uses), and the registry answers "is that a thing, and which
-    // thing". A body the registry does not know is scenery — a rock, a corpse,
-    // a chunk of somebody's wall — and is left alone.
+    // A short camera query against the ground registry and the arrows stuck
+    // in creatures (game/lookpick.h): the registry answers "is that a thing,
+    // and which thing", and the pick takes the one nearest the reticle within
+    // a small cone rather than only what a pixel-thin ray touches. A body the
+    // registry does not know is scenery — a rock, a corpse, a chunk of
+    // somebody's wall — and is only named when the bare centre ray is on it.
     //
     // THE RAY RUNS EVERY FRAME, NOT ONLY ON THE PRESS, because the prompt is
     // the feature: "E  pick up robe" under the crosshair is what tells the
@@ -14461,20 +14482,55 @@ int main(int argc, char** argv) {
       // This is the one ray that reads the camera: it is a UI query against
       // Jolt bodies, not a sim input, so the "picking rays use player.EyePos
       // so the camera cannot change what the sim sees" contract in the camera
-      // block below is not what it is protecting. `tpRig.EyePos()` is last
-      // frame's boom, which is where the picture the player is aiming with
-      // was drawn from.
+      // block below is not what it is protecting.
+      //
+      // THE RAY STARTS AT LAST FRAME'S RENDER EYE (`pourFrom`, the vessel
+      // pour's origin for the same reason), in first person too: the picture
+      // the reticle sits in is drawn from the head-tracked, tick-interpolated
+      // eye, not from `player.EyePos()`, and a ray from the latter runs beside
+      // the crosshair line by however far the head is from the box's eye
+      // point -- most of all crouched over the thing you are picking up.
+      //
+      // AND IT IS A CONE, NOT A RAY (owner ticket 2026-10-16_11-00-17, "not
+      // reduced to pixel perfect clicks"): game/lookpick.h takes the pickable
+      // nearest the reticle by angle within player.pickConeDeg (wider for a
+      // thin thing like an arrow), the nearer on a near-tie, never through
+      // rock or another body; a corpse with loot exactly under the reticle
+      // still competes. Its answer is `lookBody`, which is both what the
+      // prompt below names and what the tap takes -- one decision, so the
+      // press cannot pick something other than what the screen promised.
       lookIgnore.clear();
       avatar.AppendLiveLimbBodies(lookIgnore);
       const Vec3 hand = player.EyePos();
-      const Vec3 from = camMode == CameraMode::First ? hand : tpRig.EyePos();
+      const Vec3 from = pourFromValid
+                            ? pourFrom
+                            : (camMode == CameraMode::First ? hand : tpRig.EyePos());
       const Vec3 fwd = cam.Forward();
-      const float castLen = kPickupReach + (from - hand).len();
-      float frac = 1.0f;
-      const uint64_t hit =
-          phys.CastRayBody(from, fwd, castLen, frac, lookIgnore);
-      if (hit && (from + fwd * (frac * castLen) - hand).len() <= kPickupReach)
-        lookBody = hit;
+      {
+        const Tuning::Player& tp = CurrentTuning().player;
+        lookpick::Params pp;
+        pp.reach = kPickupReach;
+        pp.coneDeg = tp.pickConeDeg;
+        pp.coneSmallDeg = tp.pickConeSmallDeg;
+        pp.smallSize = tp.pickSmallSize;
+        lookpick::Query lq;
+        lq.from = from;
+        lq.dir = fwd;
+        lq.hand = hand;
+        lq.ignore = &lookIgnore;
+        lq.kindAt = kindAt;
+        lq.exactActionable = [&](uint64_t b) {
+          const Mob* c = mobs.FindOwner(b);
+          if (c == nullptr || !c->Lootable()) return false;
+          std::vector<LootPiece> pieces;
+          c->LootPieces(pieces);
+          return !pieces.empty();
+        };
+        const lookpick::Result lr = lookpick::Pick(lq, pp, phys, mobs, ground);
+        // Nothing pickable in the cone: the bare ray's body, for the prompts
+        // about exactly what is under the reticle (a bare corpse, the grab).
+        lookBody = lr.body ? lr.body : lr.exactBody;
+      }
       // The ground registry FIRST: a shed robe still lying beside the body
       // it came off reads as the robe, not as the corpse (ShedCorpseLoot).
       // Then a DEAD MOB under the crosshair — any of its limbs, shells or the
@@ -16667,6 +16723,32 @@ int main(int argc, char** argv) {
       // throttle above, the readback pump, the park probe, and the HANDOVER
       // of one TickInput. That handover IS the authority boundary.
       //
+      // THE BOW'S SIGHT (TickInput::aimAt; ticket 2026-10-16_11-02-47): the
+      // point the crosshair is on, settled HERE because only the frame has
+      // the render eye the reticle is drawn from (last frame's, `pourFrom`:
+      // the posed head in first person, the boom in third) and the pick cast
+      // from it -- per tick, after the pump above, so the pick is the
+      // freshest there is. A loose flies from the arrow rest AT this point.
+      // Only while a bow is up (session.bowHand, the tick's own record of
+      // it): one Jolt ray a tick, none otherwise.
+      if (session.bowHand >= 0) {
+        static std::vector<uint64_t> bowOwn;
+        bowOwn.clear();
+        avatar.AppendLiveLimbBodies(bowOwn);
+        if (playerBody) bowOwn.push_back(playerBody);
+        const Vec3 head = player.EyePos();
+        const Vec3 sight = pourFromValid ? pourFrom : head;
+        const Vec3 fwd = cam.Forward();
+        const Vec3 rest =
+            BowRestPoint(head, fwd, cam.Right(), cam.Up(),
+                         player.crouching && !player.prone,
+                         HandAt(session.bowHand) == Hand::Left);
+        feeder.SetAim(true, sight + fwd * BowSightDistance(world.Snap(), phys,
+                                                           bowOwn, sight, fwd,
+                                                           rest, kBowZeroVox));
+      } else {
+        feeder.SetAim(false, Vec3{});
+      }
       // `ti` is consumed here rather than inside, because consuming the
       // command is the frame layer's last act as the player's proxy: a server
       // would take the same value off the wire and call the same function.
