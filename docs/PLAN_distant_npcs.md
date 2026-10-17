@@ -2313,3 +2313,111 @@ counters.
 **Not in D7.** The cap overflow (D8) on a client (a client's full cap waits;
 it does not swap), a peer of a peer (M9 is two machines), saving a client's
 waiting room separately (it is the host's in-transit list, saved by the host).
+
+### 8.4 D11 as landed (branch `dg-d11`, 2026-10-16)
+
+**What landed.** Past the window face the near tier reads the distant tier's
+ground. `MobSystem::DistantReachable()` (mob.h, beside the distant accessors):
+`distant.enabled` and a park function -- the leaver is KEPT (demoted, or
+parked when the tier is full / past the radius); D7a adds a client handing its
+leavers to the host here, and nothing else. `MobSystem::OutsideGroundFor(m)`
+hands out `distantGround_` for a creature that is alive, not a ghost and not
+player-driven, when `DistantReachable()`; null otherwise, and null inside a
+work-pool task (counted, `OutsideGroundTaskRefusals`). Its readers, each
+asking LAZILY on the first out-of-window cell it meets (a creature that never
+nears a face never calls it):
+
+- `Mob::GroundHeightAt`'s `supports` lambda: an out-of-window cell is
+  `DistantGround::Solid` -- known solid or known air, never unknown -- with
+  `MobSystem::OutsideGroundMat()` as its material ("dirt" by name, "stone" if
+  a table has none: no CPU source names a column's surface material, genCellIn
+  is WGSL only). So `FootprintFooting`, the steering fan (`SenseGround`),
+  `UpdateFall`, the planner's ground probe, foot IK and every other caller get
+  the answer unchanged in shape.
+- `Mob::CellSupportsWeight` (the footprint's headroom) and the planner's
+  `blocked` probe (`AiCellBlocked(..., readOutside = true)`).
+- The swim cell readers: `mob_swim.cpp`'s private copy of `CellCache` is gone;
+  both swimmers use `mobwater::CellCache` (`mob_cellcache.h`), built by
+  `MobSystem::WaterCache(world, mob, fetch)`. Past the face: `Solid` where
+  DistantGround carries weight, `Liquid` below its `WaterTop`, `Air` above.
+- `Mob::ShedCoat` prints nothing past the face (no op can write there; the
+  sole keeps its coat).
+
+`last_run.json`'s `distant` block gains `outsideGrounds` (grants),
+`nearPastFace` (near creature-ticks with the footprint centre outside the
+window box), `walkedOut` (park-rule demotions of a creature on its feet or
+afloat, at most kPad + 4 past the face -- a crossing by its own drive, not a
+window move's) and `outsideTaskRefusals`; the selftest loop prints
+`<gate>: N near creature(s) walked out of the window` for any gate that
+walked one out. Gate `distant-walkout` (`selftest_distant.cpp`, kOrder between
+`distant-walk` and `distant-sleep`, thresholds `distantWalkout.*`).
+
+**Deviations from 8.1.**
+1. **Line of sight past the face stays OPEN** (`AiCellBlocked(...,
+   readOutside = false)` for `AiLineOfSight`). 8.1 named "the AI's blocked
+   adapter" without separating its two users. The planner's headroom test
+   reads the distant ground (it must agree with the drive, ai_nav.h rule 2);
+   the eye does not: the distant tier's own sight is open-field (no line test),
+   so a look across the face keeps the fidelity of the tier it ends in, and
+   D3's near-vs-distant fights across the edge see each other exactly as
+   before. With D10, trees and houses past the face would otherwise block a
+   near creature's look at a distant one that sees straight back.
+2. **The swim readers are ONE struct now** (the old header's own TODO): the
+   two copies would otherwise have needed the same change twice.
+3. **The dead, ghosts and player-driven bodies keep the old face.** A corpse
+   does not walk (its ragdoll has no Jolt terrain past the face either way); a
+   ghost's window is its owner's to decide; a player is never distant.
+4. **The task assert answers "unknown" rather than aborting**: in a task the
+   creature sees the old face, which is deterministic. Measured 0 refusals.
+5. **(C) is a REAL swimmer at a real face, not the cell reader.** No fixture
+   lake reaches the home window's faces, so the gate moves the window six
+   chunks -X (a full regen) so its +X face cuts the harness map's
+   `harness_lake`, and runs every arm in that window: C1 a human AFLOAT
+   (`mob_afloat.cpp`, the duelist profile's Goto) and C2 a PIRANHA
+   (`mob_swim.cpp`'s fish drive; the piranha profile has no Goto weight, so
+   its wander anchor is placed past the face -- wander legs are 3..8 voxels,
+   so it swims out on its first leg).
+
+**Measured** (`--verify distant-walkout, distant-walk, distant-edge,
+distant-overflow, distant-roundtrip, mob-park, npc-strike, crowd`, 42.8 s, all
+PASS but `crowd` -- below; `distant-walkout` 1.65 s, both runs identical): A, a
+duelist 24 voxels inside the -Z face with a Goto 64 past it, demoted at phase
+tick 59 under the same id, profile and Goto (bit-equal goal), SURFACE, feet 1
+voxel off the centre column's `TerrainTop + 1` (the footprint's max), and
+reached the goal at the distant tier at tick 106. C1 demoted swimming at 78
+and reached its goal swimming at 105; C2 demoted at 100 and spent 90 distant
+ticks with 0 dry. B (the same walk, parking unbound) stood with its footprint
+centre at most 1.6 voxels past the face for 150 ticks -- D3's measured old
+face -- never demoted, still near. Per run: 3 walked out, 196 near
+creature-ticks in the pad, 9,899 `OutsideGroundFor` grants, 0 task
+refusals. The whole gate (two fresh worlds at the lake window, ~450 ticks
+each, the regen home) 1.65-2.3 s.
+
+**Behaviour that moved, by construction.** Only where a park function is
+bound AND a creature reaches a face. In the must-stay-green set that is
+`distant-edge` arm M (its near swordsman fights a distant one 3 voxels past
+the +X face and may now step after it): it passes, twice-run digest
+`f019adb2d4296bc4` against `49b0e0500a7b54fc` from main's own exe with this
+tree's assets (control run) -- M: near->distant 10 hits and distant->near 9
+applied (7 limbs carved) against 13 and 7 (6). Nobody crossed the pad line in
+it: `walkedOut` over the whole verify is 6, distant-walkout's two runs, and
+the per-gate walk-out line printed for that gate alone. What moved is near
+creatures standing in the pad on known ground instead of frozen at the face
+(1,322 near creature-ticks past a face across the other seven gates); not
+attributed further. Everything else reproduced its last package's numbers:
+`distant-walk` D1's (1,123 voxels walked, 1,118 progress, 27 replans; line
+0.58 deep, snap 3.70; crater dip 6.0, 1 drain), `distant-overflow` D8's
+digest `a5b6dab76075581b` (8 and 11 swaps); `distant-roundtrip`, `mob-park`,
+`npc-strike` pass. `crowd` FAILS at subset scope -- identically on main's
+own exe (`10aefb3e`, control run with this tree's assets: the four crowders
+never leave their spawn ring in either arm, min gap 18.38 = the ring's own
+spacing; a known subset-scope red since 2026-10-15). It binds no park
+function, so `DistantReachable` is false there and no D11 path runs.
+
+**Open.** No Jolt terrain past the face: a creature ragdolled in the pad falls
+until the park rule's y test demotes it (`landPending`), as a thrown body
+always has. A creature in the pad is on the distant ground at near fidelity:
+the matter passes (burn, stain, splatter, wash) read nothing past the face
+(no voxels there) for the <= 16 voxels it spends crossing. A footstep past
+the face is a footstep on dirt. LOS past the face is open (deviation 1). The
+gate cannot see trees past the face until D10 lands (the pad box has none).

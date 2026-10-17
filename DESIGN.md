@@ -996,7 +996,7 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
     biome whose cover splits (desert, ocean); tundra's snow skin opted out of
     the firm split and keeps its settle transient.
 
-### Distant creatures (2026-10-15/16; `docs/PLAN_distant_npcs.md` D0-D3, D5+D6, D8, D9, `game/distant.h`)
+### Distant creatures (2026-10-15/16; `docs/PLAN_distant_npcs.md` D0-D3, D5+D6, D8, D9, D11, `game/distant.h`)
 
 The window is 51.2 m across and used to be the edge of the living world: a
 creature 16 voxels past it was PARKED (its record in a region bucket, frozen,
@@ -1017,7 +1017,20 @@ ops**. PARKED = `ChunkStore::DormantEntities` (bytes; nothing ticks).
   the radius with room in the tier -- the living AND the dead (a corpse is a
   dead `DistantMob`, asleep forever) -- keeps its id and brain; the kit,
   vitals and statue are read off the live rig before `ReleaseRig`. Past the
-  radius or with the tier full it parks as before (counted).
+  radius or with the tier full it parks as before (counted). A creature
+  reaches the pad by WALKING (or swimming) as well as by being thrown or by
+  the window moving (D11, 2026-10-16): past the face the near tier reads the
+  distant tier's ground -- `Mob::GroundHeightAt`, `CellSupportsWeight`, the
+  planner's headroom probe and the swim cell readers (`mob_cellcache.h`: solid,
+  then `WaterTop`'s water, then air) answer an out-of-window cell from
+  `DistantGround` -- so a Goto, a chase or a flee past the face carries it over
+  the pad and the park rule demotes it with its brain mid-walk. Only where a
+  leaver is KEPT (`MobSystem::DistantReachable`: the tier on and a park
+  function bound; D7a adds a client handing its leavers to the host) and only
+  for a living, owned, AI-driven body; elsewhere past the face stays unknown
+  and the drive stops it at the face as before (with no park function a leaver
+  is released and erased). Line of sight past the face stays open (the tier's
+  own sight is open-field). Nothing pushes anyone out. Gate `distant-walkout`.
 - *Promote* (`EntityParking::Unpark`, phase H, before `mobs.PreTick`): inside
   the window by `kUnparkMarginChunks` (THE PROMOTION LINE), nearest first, under
   Unpark's waits (budget, living cap, ground in the fetch cache incl. the snap's
@@ -14986,7 +14999,11 @@ inspection:
   blocked stops a mob dead at the edge of its own knowledge — an invisible wall.
   This is the mob-scale twin of the projectile rule in CLAUDE.md: *unknown* and
   *out-of-window* are different tests. The drive's own `haveGround` check is
-  what prevents walking off into space.
+  what prevents walking off into space. PAST THE WINDOW FACE (2026-10-16, D11)
+  the ground is not unknown for a creature that may leave: the near tier reads
+  the distant tier's (`MobSystem::OutsideGroundFor` -> `DistantGround`), so
+  the drive walks it off the window onto the ground it will walk on as a
+  distant creature (see "Distant creatures", the demote border).
 - **Probe reach is per-axis, not an isotropic `max`.** A long creature that
   probes at `max(sizeX, sizeZ)` reaches well past where it can walk and refuses
   gaps it would fit through.
