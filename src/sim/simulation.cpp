@@ -852,6 +852,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // here in the fragment and vertex stages, covered by the global
         // barrier every command buffer opens with (gasOuter's standing).
         entry(49, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // flowMeas
+        // THE STILL-WATER TABLE (worldgen.wgsl / sim_stream.wgsl, the sim's
+        // binding 58), read-only: an ADOPTED STREAM's column is drawn as
+        // running water (raymarch.wgsl THE FROZEN STREAM PLAYS BACK) and a
+        // held column's side face is a falling sheet only over a real drop.
+        // Written on the TICK command buffer (cols, streamCommit), read in the
+        // FRAGMENT stage, covered by the global barrier every command buffer
+        // opens with (flowMeas's standing). Render-only.
+        entry(50, T::ReadOnlyStorage, S::Fragment),               // stillWater
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1009,7 +1017,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // mouth + 1 (0 = none), the downstream direction sim_solute.wgsl drifts
     // dissolved mass along on a level reach. Its own region, so the four-word
     // records and every reader of them keep their stride.
-    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u + (uint64_t)kWorldN * kWorldN;
+    // ...plus TWO words per window column after the mouth words (2026-10-17,
+    // STILL_ECHO): an adopted stream's recorded surface, 8 signed byte
+    // samples of its offset from the held target in eighths, which the
+    // renderer plays back (raymarch.wgsl THE FROZEN STREAM PLAYS BACK). Both
+    // words 0 = no recording.
+    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u +
+                                          (uint64_t)kWorldN * kWorldN +
+                                          2u * (uint64_t)kWorldN * kWorldN;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
                                       rhi::BufferUsage::CopySrc,
@@ -4567,6 +4582,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(47, world_->shadowHist),    // far patches' indirect light (shadow_resolve.wgsl)
         b(48, flowGridBuf_),          // the terrain flow field (flowfield.h)
         b(49, flowMeasBuf_),          // the measured flow (flowfield.h kFlowMeas*)
+        b(50, stillWaterBuf_),        // the still-water table (held + adopted streams)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
