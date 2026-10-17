@@ -1181,6 +1181,23 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         }
         out.push_back(std::move(r));
       }
+      // ...AND THE HOST'S CREATURES IN TRANSIT TO A PEER (D7a): a remote
+      // promotion the peer has not answered yet is still the host's creature
+      // (it comes back on a "returned" or a disconnect), so the world file
+      // keeps it -- the same patched record, where it stood when it left.
+      // (A client's waiting room is that same transit seen from the other
+      // end; the client's save is not the world's.)
+      for (const DistantTransit& t : mobs.DistantInTransit()) {
+        EntityRecord r;
+        r.pos = t.d.origin;
+        if (!mobs.DistantRecord(t.d, r.bytes)) {
+          std::fprintf(stderr,
+                       "save: distant mob %llu ('%s') in transit did not patch; not saved\n",
+                       (unsigned long long)t.d.id, t.d.defName.c_str());
+          continue;
+        }
+        out.push_back(std::move(r));
+      }
     };
     // Straight to LoadOne (LoadState's loop body) rather than through a
     // count-1 LoadState: LoadState reports only whether the BYTES parsed, and
@@ -1486,10 +1503,107 @@ bool EntityParking::GroundKnown(World& world, IVec3 wc, uint32_t tick) {
   return false;
 }
 
+bool EntityParking::FootprintGround(World& world, Vec3 p, uint32_t tick) {
+  // THE GROUND UNDER A CREATURE'S FOOTPRINT, known in the fetch cache. The
+  // position is the body's MIN CORNER (Mob::Origin), and the ground the body
+  // rests on runs under the whole footprint -- so the chunks under the corner
+  // AND half a chunk on in x and z (the centre column of anything up to a
+  // chunk wide), at the feet and one below. Every one is asked every time (no
+  // short-circuit), so the fetches go out together rather than one call
+  // apart. A parked record and a distant creature wait on the same rule.
+  auto chunkOf = [](float v) { return (int)std::floor((double)v / (double)kChunk); };
+  const float half = 0.5f * (float)kChunk;
+  const int xs[2] = {chunkOf(p.x), chunkOf(p.x + half)};
+  const int zs[2] = {chunkOf(p.z), chunkOf(p.z + half)};
+  const int fy = chunkOf(p.y);
+  bool ground = true;
+  for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++) {
+      if (a == 1 && xs[1] == xs[0]) continue;
+      if (b == 1 && zs[1] == zs[0]) continue;
+      for (int dy = 0; dy >= -1; dy--)
+        ground &= GroundKnown(world, {xs[a], fy + dy, zs[b]}, tick);
+    }
+  return ground;
+}
+
+// ---- D7a: A CLIENT'S WAITING ROOM (game/distant.h's D7a paragraph) -----------
+//
+// A client parks nothing (its store is not the world's) and steps no distant
+// tier (the distant world is the host's), but the host HANDS IN the creatures
+// that reach this machine's promotion line, and placing them is this
+// machine's job: its living cap, its ground. So the distant half of the pass
+// below runs here although parking is off -- over the waiting room only
+// (DistantMob::handIn), under the client's own waits: the budget, the living
+// cap, and the ground under the footprint and the snap's chunks in ITS fetch
+// cache. The thrash bound is the host's (it noted the flip when it handed
+// the creature in). Promoted -> DistantHandInDone{promoted}; refused for good
+// -> {returned} (the host takes its in-transit copy back); still waiting after
+// kHandInMaxWaitTicks -> {returned} (MobSystem::ReturnStaleHandIns, connected
+// only: after a disconnect the room is still placed, never given back).
+uint32_t EntityParking::PromoteWaitingRoom(MobSystem& mobs, World& world, uint32_t tick,
+                                           uint32_t budget) {
+  mobs.ReturnStaleHandIns(tick);
+  if (!mobs.HasWaitingRoom()) return 0;
+  const IVec3 wo = mobs.TierWindowOrigin(world);
+  const int n = (int)(kWorldN / kChunk);
+  if (!haveOrigin_ || wo.x != lastOrigin_.x || wo.y != lastOrigin_.y || wo.z != lastOrigin_.z) {
+    // Unpark's rule: a chunk that left the window forgets its wait.
+    for (auto it = waits_.begin(); it != waits_.end();) {
+      const IVec3& c = it->second.wc;
+      const bool in = c.x >= wo.x && c.x < wo.x + n && c.y >= wo.y && c.y < wo.y + n &&
+                      c.z >= wo.z && c.z < wo.z + n;
+      it = in ? std::next(it) : waits_.erase(it);
+    }
+  }
+  haveOrigin_ = true;
+  lastOrigin_ = wo;
+  DistantMobs& tier = mobs.DistantMut();
+  tier.ClearPromoteScan();
+  std::vector<uint64_t> cands;
+  std::vector<IVec3> snapChunks;
+  tier.PromotionCandidates(wo, kUnparkMarginChunks, cands);
+  uint32_t made = 0;
+  for (const uint64_t cid : cands) {
+    const DistantMob* d = tier.Find(cid);
+    if (d == nullptr || !d->handIn) continue;
+    if (made >= budget) {
+      tier.Note(&DistantMobs::Stats::budgetWaits);
+      continue;
+    }
+    if (!mobs.HasRoomForDistant(*d)) {
+      tier.Note(&DistantMobs::Stats::capWaits);
+      continue;
+    }
+    bool ground = FootprintGround(world, d->origin, tick);
+    mobs.DistantPromotionChunks(*d, snapChunks);
+    for (const IVec3& wc : snapChunks) ground &= GroundKnown(world, wc, tick);
+    if (!ground) {
+      tier.Note(&DistantMobs::Stats::handInGroundWaits);
+      continue;
+    }
+    bool refused = false;
+    if (mobs.PromoteDistant(cid, &refused, tick) != nullptr) {
+      made++;
+      mobs.NoteWaitingRoomResult(cid, /*promoted=*/true);
+    } else if (refused) {
+      budget = made;   // Spawn short of a body: kept, retried next call
+    } else {
+      // Refused for good (PromoteDistant dropped and logged it): the host's
+      // in-transit copy is the creature, so it goes back there.
+      mobs.NoteWaitingRoomResult(cid, /*promoted=*/false);
+    }
+  }
+  stats_.lastCall = made;
+  stats_.maxCall = std::max(stats_.maxCall, made);
+  return made;
+}
+
 uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
                             uint32_t tick, uint32_t budget) {
   stats_.lastCall = 0;
-  if (!enabled_) return 0;
+  // D7a: a CLIENT (parking off) still places what the host handed it.
+  if (!enabled_) return PromoteWaitingRoom(mobs, world, tick, budget);
   // PARKED -> DISTANT (D5+D6, MobSystem::ActivateParked): records beyond the
   // park pad, inside distant.radius. Its own scan memory and budget; the
   // records it takes are never the ones below (those are over the line).
@@ -1523,28 +1637,8 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
     return cx >= wo.x + m && cx < wo.x + n - m && cy >= wo.y + m &&
            cy < wo.y + n - m && cz >= wo.z + m && cz < wo.z + n - m;
   };
-  // THE GROUND UNDER A CREATURE'S FOOTPRINT, known in the fetch cache. The
-  // position is the body's MIN CORNER (Mob::Origin), and the ground the body
-  // rests on runs under the whole footprint -- so the chunks under the corner
-  // AND half a chunk on in x and z (the centre column of anything up to a
-  // chunk wide), at the feet and one below. Every one is asked every time (no
-  // short-circuit), so the fetches go out together rather than one call
-  // apart. A parked record and a distant creature wait on the same rule.
-  auto footprintGround = [&](const Vec3& p) {
-    const float half = 0.5f * (float)kChunk;
-    const int xs[2] = {chunkOf(p.x), chunkOf(p.x + half)};
-    const int zs[2] = {chunkOf(p.z), chunkOf(p.z + half)};
-    const int fy = chunkOf(p.y);
-    bool ground = true;
-    for (int a = 0; a < 2; a++)
-      for (int b = 0; b < 2; b++) {
-        if (a == 1 && xs[1] == xs[0]) continue;
-        if (b == 1 && zs[1] == zs[0]) continue;
-        for (int dy = 0; dy >= -1; dy--)
-          ground &= GroundKnown(world, {xs[a], fy + dy, zs[b]}, tick);
-      }
-    return ground;
-  };
+  // THE GROUND UNDER A CREATURE'S FOOTPRINT (FootprintGround, above).
+  auto footprintGround = [&](const Vec3& p) { return FootprintGround(world, p, tick); };
   uint32_t made = 0, itemsMade = 0;
 
   // ---- 0. THE CAP OVERFLOW (D8, MobSystem::OverflowSwaps; game/distant.h) --
@@ -1583,6 +1677,10 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
       for (const uint64_t cid : cands) {
         const DistantMob* d = tier.Find(cid);
         if (d == nullptr) continue;
+        // D7a: over a PEER's line too, where the ownership rule names that
+        // peer for its feet: the peer promotes it (MobSystem::
+        // RemotePromotions, below), not this machine. Never with no peer.
+        if (mobs.DistantGoesToPeer(*d)) continue;
         if (made >= budget) {
           tier.Note(&DistantMobs::Stats::budgetWaits);
           pending_ = true;
@@ -1629,6 +1727,13 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
         // A permanent refusal was dropped and logged by PromoteDistant.
       }
     }
+    // ---- 1b. THE REMOTE PROMOTIONS (D7a; game/distant.h) ------------------
+    // The host's creatures over a PEER's promotion line are handed IN to that
+    // peer (DistantHandIn) under its reported room, the flip bound and a
+    // budget of kUnparkPerCall per peer per tick -- its own budget, not this
+    // call's: the peer's slots are not this machine's. They are not made live
+    // HERE, so they are not counted in `made`. Nothing at all without a peer.
+    mobs.RemotePromotions(tick);
   }
 
   // ---- 2. THE PARKED RECORDS ----------------------------------------------

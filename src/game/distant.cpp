@@ -345,33 +345,43 @@ void DistantMobs::NoteMax(uint64_t Stats::*field, uint64_t v) {
 }
 
 // ---- the statues' item list (D4a's seam) ----------------------------------------
+namespace {
+// ONE CREATURE'S STATUE, minus its look: where it stands, which way it faces,
+// what the flipbook shows. The one rule FillDistantDrawItems draws the tier
+// with and D7a's view (MobSystem::BuildDistantView) sends a peer, so a host's
+// creature looks the same on both machines.
+DistantDrawItem StatueOf(const DistantMob& d, uint32_t tick, int idleStride) {
+  const uint32_t walkWindow = (uint32_t)std::max(1, idleStride) + 1u;
+  DistantDrawItem it;
+  it.look = d.look;
+  it.dead = d.dead;
+  it.heading = d.steer.heading;
+  it.origin = d.origin;
+  // A corpse rests at the height its own lying body reached (the statue's
+  // lowest cell), not at its pelvis-following origin.
+  if (d.dead) it.origin.y = d.statueRestY;
+  // WALKING while it moved within its last stride: a strider moves once
+  // every `idleStride` ticks and must not flicker to idle between.
+  const bool walking = !d.dead && d.lastMoveTick != 0 && tick >= d.lastMoveTick &&
+                       tick - d.lastMoveTick <= walkWindow;
+  // STRIKING from the swing's start to its end (D2b): the statue's one
+  // strike pose for the whole stroke -- windup, cut and recovery alike.
+  const bool striking = !d.dead && d.strokeEndTick != 0 && tick >= d.strokeStartTick &&
+                        tick < d.strokeEndTick;
+  it.state = striking  ? DistantDrawState::Strike
+             : walking ? DistantDrawState::Walk
+                       : DistantDrawState::Idle;
+  it.gaitPhase = d.gaitPhase;
+  return it;
+}
+}  // namespace
+
 void FillDistantDrawItems(const DistantMobs& tier, uint32_t tick, int idleStride,
                           std::vector<DistantDrawItem>& out) {
   out.clear();
-  const uint32_t walkWindow = (uint32_t)std::max(1, idleStride) + 1u;
   for (const DistantMob& d : tier.All()) {
     if (!d.look.Valid()) continue;
-    DistantDrawItem it;
-    it.look = d.look;
-    it.dead = d.dead;
-    it.heading = d.steer.heading;
-    it.origin = d.origin;
-    // A corpse rests at the height its own lying body reached (the statue's
-    // lowest cell), not at its pelvis-following origin.
-    if (d.dead) it.origin.y = d.statueRestY;
-    // WALKING while it moved within its last stride: a strider moves once
-    // every `idleStride` ticks and must not flicker to idle between.
-    const bool walking = !d.dead && d.lastMoveTick != 0 && tick >= d.lastMoveTick &&
-                         tick - d.lastMoveTick <= walkWindow;
-    // STRIKING from the swing's start to its end (D2b): the statue's one
-    // strike pose for the whole stroke -- windup, cut and recovery alike.
-    const bool striking = !d.dead && d.strokeEndTick != 0 && tick >= d.strokeStartTick &&
-                          tick < d.strokeEndTick;
-    it.state = striking  ? DistantDrawState::Strike
-               : walking ? DistantDrawState::Walk
-                         : DistantDrawState::Idle;
-    it.gaitPhase = d.gaitPhase;
-    out.push_back(it);
+    out.push_back(StatueOf(d, tick, idleStride));
   }
 }
 
@@ -468,7 +478,10 @@ bool MobSystem::DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo
   const Vec3 centre{mob.origin_.x + def.worldSize.x * 0.5f,
                     mob.origin_.y + def.worldSize.y * 0.5f,
                     mob.origin_.z + def.worldSize.z * 0.5f};
-  if (!(DistSq(centre, WindowCentre(wlo)) <= tune.radius * tune.radius)) {
+  // D7a: against the NEAREST window centre of the game (the host's own and
+  // every peer's) -- a creature leaving the host's window toward a peer is
+  // still near somebody. Just the host's with no peers (single player).
+  if (!(NearestCentreDistSq(wlo, centre) <= tune.radius * tune.radius)) {
     distant_.Note(&DistantMobs::Stats::outsideRadius);
     return false;
   }
@@ -699,6 +712,10 @@ bool MobSystem::DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo
   // THE THRASH BOUND's clock (section 2.7): a tier change, on the tick it
   // happened.
   NoteTierFlip(did, atTick);
+  // D7a: ownership's memory forgets the incumbent it had for this id (a host
+  // with a peer only): it comes back near through a promotion, on whichever
+  // machine, and is owned from that moment's answer, not a stale one.
+  NoteTierEntry(did);
   // ---- THE STATUE (D4a, game/distant_draw.h) ------------------------------
   // Baked from the LIVE rig -- its gear, its blood, its lost limbs -- which
   // still exists: the caller releases it right after this returns. Render
@@ -727,23 +744,27 @@ void MobSystem::RetireDistant(Vec3 wlo) {
                  (int)std::floor(wlo.z / (float)kChunk)};
   const float reach = tune.radius + tune.hysteresis;
   // What could have moved the border: the window, the tier (D1's drive, via
-  // the latch), or the border itself (an F5 that changed radius/hysteresis).
+  // the latch), or the border itself (an F5 that changed radius/hysteresis);
+  // D7a: or a PEER's window (W's other members).
   const bool moved = !distantScanHave_ || wo.x != distantScanOrigin_.x ||
                      wo.y != distantScanOrigin_.y || wo.z != distantScanOrigin_.z ||
-                     std::memcmp(&reach, &distantScanReach_, sizeof(float)) != 0;
+                     std::memcmp(&reach, &distantScanReach_, sizeof(float)) != 0 ||
+                     retirePeersGen_ != peersGen_;
   // RULE 2: a frozen tier under a still window has nothing to retire. The
   // switch turned off is the exception -- then everybody parks, now.
   if (tune.enabled && !moved && !distant_.RetireScanDue()) return;
   distantScanHave_ = true;
   distantScanOrigin_ = wo;
   distantScanReach_ = reach;
+  retirePeersGen_ = peersGen_;
   distant_.ClearRetireScan();
   distant_.Note(&DistantMobs::Stats::retireScans);
-  const Vec3 c = WindowCentre(wlo);
   // In ID ORDER, decided over the tier as it stood at the top of the pass.
+  // D7a: past radius + hysteresis of EVERY window centre of the game -- a
+  // creature the host walked away from but a peer still stands near stays.
   std::vector<uint64_t> out;
   for (const DistantMob& d : distant_.All())
-    if (!tune.enabled || !(DistSq(d.Centre(), c) <= reach * reach))
+    if (!tune.enabled || !(NearestCentreDistSq(wlo, d.Centre()) <= reach * reach))
       out.push_back(d.id);
   for (uint64_t id : out) {
     DistantMob d;
@@ -878,7 +899,19 @@ MobSystem::CreatureWhere MobSystem::LocateCreature(uint64_t id) const {
     w.distant = true;
     w.alive = !d->dead;
     w.id = id;
+    return w;
   }
+  // D7a: IN TRANSIT to a peer (a remote promotion not yet answered) is still
+  // in the world -- the host takes it back if the peer does not place it --
+  // so it is never "gone" to a liveness question (a spawner slot, a pact).
+  for (const DistantTransit& t : inTransit_)
+    if (t.d.id == id) {
+      w.exists = true;
+      w.distant = true;
+      w.alive = !t.d.dead;
+      w.id = id;
+      break;
+    }
   return w;
 }
 
@@ -897,7 +930,17 @@ MobSystem::CreatureWhere MobSystem::LocateByRef(const std::string& refId) const 
     w.distant = true;
     w.alive = !d->dead;
     w.id = d->id;
+    return w;
   }
+  // D7a: in transit (LocateCreature's note): one ref, one body, on its way.
+  for (const DistantTransit& t : inTransit_)
+    if (t.d.refId == refId) {
+      w.exists = true;
+      w.distant = true;
+      w.alive = !t.d.dead;
+      w.id = t.d.id;
+      break;
+    }
   return w;
 }
 
@@ -905,7 +948,10 @@ bool MobSystem::IdInUse(uint64_t id) const {
   if (id == 0) return false;
   for (const Mob& m : mobs_)
     if (m.id_ == id) return true;
-  return distant_.Find(id) != nullptr;
+  if (distant_.Find(id) != nullptr) return true;
+  for (const DistantTransit& t : inTransit_)
+    if (t.d.id == id) return true;
+  return false;
 }
 
 bool MobSystem::SetDistantRefId(uint64_t id, const std::string& refId) {
@@ -1818,6 +1864,65 @@ bool MobSystem::DemoteNow(uint64_t id, Vec3 wlo, uint32_t flipTick, bool overflo
 void MobSystem::PublishDistantBand(uint32_t tick, Vec3 wlo) {
   distantBand_.clear();
   distantBoxes_.clear();
+  // ---- D7a: A CLIENT'S BAND IS THE HOST'S VIEW OF IT -----------------------
+  // The distant creatures past a client's face live in the HOST's tier; the
+  // host sends, every batch, the ones in this window's edge band as actors
+  // (their tick-start snapshot, the very function below builds them with)
+  // and the ones whose body box reaches into this window as boxes
+  // (net/distantsync.h DistantView). Published here exactly as the host's own
+  // are: at most kDistantBandMax, nearest to the window box first, ties by
+  // id, then in id order -- so EdgeActor, the near actor list and the arrows'
+  // DistantBoxes work unchanged. The waiting room is not published: it is
+  // held at the line and promoted within a few ticks (or given back).
+  if (netRole_ == DistantNetRole::Client) {
+    bandHave_ = false;
+    bandIds_.clear();
+    boxIds_.clear();
+    bandInWindow_ = 0;
+    if (viewMobs_.empty() || !CurrentTuning().distant.enabled) return;
+    const float n = (float)kWorldN;
+    thread_local std::vector<std::pair<float, size_t>> in;
+    in.clear();
+    for (size_t i = 0; i < viewMobs_.size(); i++) {
+      const DistantViewMob& v = viewMobs_[i];
+      if (v.dead) continue;
+      if (v.band) {
+        const Vec3 c = v.actor.centre;
+        const float dx = std::max({wlo.x - c.x, 0.0f, c.x - (wlo.x + n)});
+        const float dy = std::max({wlo.y - c.y, 0.0f, c.y - (wlo.y + n)});
+        const float dz = std::max({wlo.z - c.z, 0.0f, c.z - (wlo.z + n)});
+        in.push_back({std::sqrt(dx * dx + dy * dy + dz * dz), i});
+      }
+      if (v.box) {
+        DistantBox b;
+        b.id = v.id;
+        b.lo = v.boxLo;
+        b.hi = v.boxHi;
+        b.heading = v.heading;
+        distantBoxes_.push_back(b);   // the mirror is in id order
+      }
+    }
+    if (in.size() > kDistantBandMax) {
+      std::nth_element(in.begin(), in.begin() + (ptrdiff_t)kDistantBandMax, in.end(),
+                       [&](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                         return a.first != b.first ? a.first < b.first
+                                                   : viewMobs_[a.second].id < viewMobs_[b.second].id;
+                       });
+      in.resize(kDistantBandMax);
+      distant_.Note(&DistantMobs::Stats::bandCapped);
+    }
+    std::sort(in.begin(), in.end(), [&](const std::pair<float, size_t>& a,
+                                        const std::pair<float, size_t>& b) {
+      return viewMobs_[a.second].id < viewMobs_[b.second].id;
+    });
+    for (const auto& e : in) distantBand_.push_back(viewMobs_[e.second].actor);
+    (void)tick;
+    if (!distantBand_.empty()) {
+      distant_.Note(&DistantMobs::Stats::bandPublished, distantBand_.size());
+      distant_.NoteMax(&DistantMobs::Stats::bandPeak, distantBand_.size());
+    }
+    return;
+  }
   if (distant_.Count() == 0 || !CurrentTuning().distant.enabled) {
     bandHave_ = false;
     bandIds_.clear();
@@ -1842,7 +1947,9 @@ void MobSystem::PublishDistantBand(uint32_t tick, Vec3 wlo) {
     thread_local std::vector<std::pair<float, uint64_t>> in;
     in.clear();
     for (const DistantMob& d : distant_.All()) {
-      if (d.dead) continue;
+      // D7a: a waiting-room creature (a hand-in kept after a disconnect) is
+      // held inert until this machine promotes it: never published.
+      if (d.dead || d.handIn) continue;
       // Distance from the body centre to the window BOX (0 inside it: a
       // creature held at the promotion line is in the band too).
       const Vec3 c = d.Centre();
@@ -2090,7 +2197,10 @@ uint32_t MobSystem::OverflowSwaps(uint32_t tick, uint32_t budget,
   };
   std::vector<Waiting> waiting;
   for (const uint64_t id : line)
-    if (const DistantMob* dm = distant_.Find(id); dm != nullptr && !dm->dead)
+    // D7a: one the ownership rule gives to a PEER waits for the peer's
+    // promotion (RemotePromotions), not for a slot here.
+    if (const DistantMob* dm = distant_.Find(id);
+        dm != nullptr && !dm->dead && !DistantGoesToPeer(*dm))
       waiting.push_back({PlayerDistance(dm->Centre()), id});
   if (waiting.empty()) return 0;
   const uint32_t live = LiveMobCount();
@@ -2423,6 +2533,19 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     distant_.Note(&DistantMobs::Stats::edgeArrowsExpired, edgeArrowsIn_.size());
     edgeArrowsIn_.clear();
   }
+  // D7a: A CLIENT STEPS NOTHING. The distant world is the host's; what this
+  // machine's tier holds is its WAITING ROOM (hand-ins held for promotion),
+  // which is never stepped, and its band is the host's view. What the near
+  // tier queued at a distant creature has no tier here to land in (D7b puts
+  // the edge across the wire), so it goes.
+  if (netRole_ == DistantNetRole::Client) {
+    edgeBlows_.clear();
+    edgeArrowsOut_.clear();
+    edgeBoxHits_.clear();
+    edgeShotsOut_.clear();
+    nearBand_.clear();
+    return;
+  }
   if (distant_.Count() == 0 && distant_.Arrows().empty() && !edgeWork) {
     nearBand_.clear();
     return;
@@ -2592,7 +2715,9 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   uint64_t engagedSteps = 0;
   for (size_t i = 0; i < distant_.Count(); i++) {
     DistantMob& d = distant_.At(i);
-    if (d.dead) continue;
+    // D7a: a waiting-room creature (kept after a disconnect) is held inert
+    // until this machine promotes it -- the host's tier stepped it, not this.
+    if (d.dead || d.handIn) continue;
     if (d.asleep) {
       if (d.wakeTick == 0 || tick < d.wakeTick) {
         if (d.wakeTick != 0) nextWake = std::min(nextWake, d.wakeTick);
@@ -2717,6 +2842,14 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     return (uint32_t)nbUsed++;
   };
   const PromoBox box = PromoBoxOf(wo);
+  // D7a: THE PROMOTION LINES OF EVERY PEER'S WINDOW too (a Host's; none in
+  // single player): a creature over a peer's line waits there for the remote
+  // promotion exactly as one over the host's waits for the local one -- held,
+  // never deeper -- so no statue walks into a peer's real voxel world either.
+  thread_local std::vector<PromoBox> peerBoxes;
+  peerBoxes.clear();
+  if (netRole_ == DistantNetRole::Host)
+    for (const DistantPeerWindow& pw : peers_) peerBoxes.push_back(PromoBoxOf(pw.windowOrigin));
   const Vec3 wc{wlo.x + 0.5f * (float)kWorldN, wlo.y + 0.5f * (float)kWorldN,
                 wlo.z + 0.5f * (float)kWorldN};
   const float retireReach = tune.radius + tune.hysteresis;
@@ -3117,6 +3250,9 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
           return kLine;
         }
       }
+      // D7a: ...and every peer's line, by the same rule.
+      for (const PromoBox& pb : peerBoxes)
+        if (pb.Inside(p) && pb.Inside(q) && pb.Depth(q) > pb.Depth(p) + 1e-4f) return kLine;
       const int qx = ifloor(q.x + hx), qz = ifloor(q.z + hz);
       const int from = ifloor(p.y + 1e-3f);
       const int wt = distantGround_.WaterTop(qx, qz);
@@ -4102,11 +4238,14 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     // THE BORDER LATCHES (game/distant.h): a creature that ended its step
     // over the promotion line, or past the retire border, asks its scan.
     if (box.Inside(nx.origin)) distant_.MarkPromoteDue();
+    for (const PromoBox& pb : peerBoxes)   // D7a: a peer's line asks the same scan
+      if (pb.Inside(nx.origin)) distant_.MarkPromoteDue();
     const DistantMob* dm = distant_.Find(id);
     if (dm != nullptr) {
+      // D7a: past the reach of EVERY window centre of the game (the host's
+      // alone with no peers: wc's own test).
       const Vec3 cc = dm->Centre();
-      const float ex = cc.x - wc.x, ey = cc.y - wc.y, ez = cc.z - wc.z;
-      if (!(ex * ex + ey * ey + ez * ez <= retireReach * retireReach)) distant_.MarkRetireDue();
+      if (!(NearestCentreDistSq(wlo, cc) <= retireReach * retireReach)) distant_.MarkRetireDue();
     }
   }
   // The sleep summary the fast path reads: anyone left awake, and the
@@ -4584,10 +4723,12 @@ uint32_t MobSystem::ActivateParked(ChunkStore& store, World& world, uint32_t tic
   // ---- IS A SCAN DUE (rule 2) ----------------------------------------------
   const bool roomFreed = actRoomAt_ != SIZE_MAX && distant_.Count() < actRoomAt_;
   const bool stride = tick >= actTick_ + kActivateStrideTicks || tick < actTick_;
+  // D7a: ...or a peer's window moved (W changed: a record near a PEER may be
+  // in reach now).
   const bool due = !actHave_ || wo.x != actWo_.x || wo.y != actWo_.y || wo.z != actWo_.z ||
                    epoch != actEpoch_ || parkedTotal_ != actParked_ ||
                    std::memcmp(&actRadius_, &tune.radius, sizeof(float)) != 0 || actPending_ ||
-                   roomFreed || stride;
+                   roomFreed || stride || actPeersGen_ != peersGen_;
   if (!due) return 0;
   actHave_ = true;
   actWo_ = wo;
@@ -4597,13 +4738,18 @@ uint32_t MobSystem::ActivateParked(ChunkStore& store, World& world, uint32_t tic
   actTick_ = tick;
   actPending_ = false;
   actRoomAt_ = SIZE_MAX;
+  actPeersGen_ = peersGen_;
   distant_.Note(&DistantMobs::Stats::activateScans);
 
   // ---- THE CANDIDATES: every 'MOBS' record beyond the park pad and inside
   // the radius, in the regions the store knows inside the radius's box ----
+  // D7a: the radius of ANY window centre of the game (the host's first), so
+  // a village near the CLIENT lives too and -- inside the client's window --
+  // is handed in (RemotePromotions); its box is the union of the centres'.
   const Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
                  (float)(wo.z * (int)kChunk)};
-  const Vec3 wc = WindowCentre(wlo);
+  thread_local std::vector<Vec3> centres;
+  WindowCentres(wlo, centres);
   const float r = tune.radius;
   // PreTick's park rule's pad: a record nearer the window than this is where
   // a creature would still be NEAR (or parked in the band), not distant.
@@ -4613,8 +4759,13 @@ uint32_t MobSystem::ActivateParked(ChunkStore& store, World& world, uint32_t tic
     return p.x < wlo.x - kPad || p.y < wlo.y - kPad || p.z < wlo.z - kPad ||
            p.x > wlo.x + hi || p.y > wlo.y + hi || p.z > wlo.z + hi;
   };
-  const IVec3 rlo = ChunkStore::RegionOfVoxel(Vec3{wc.x - r, wc.y - r, wc.z - r});
-  const IVec3 rhi = ChunkStore::RegionOfVoxel(Vec3{wc.x + r, wc.y + r, wc.z + r});
+  Vec3 bmin = centres[0], bmax = centres[0];
+  for (const Vec3& c : centres) {
+    bmin = Vec3{std::min(bmin.x, c.x), std::min(bmin.y, c.y), std::min(bmin.z, c.z)};
+    bmax = Vec3{std::max(bmax.x, c.x), std::max(bmax.y, c.y), std::max(bmax.z, c.z)};
+  }
+  const IVec3 rlo = ChunkStore::RegionOfVoxel(Vec3{bmin.x - r, bmin.y - r, bmin.z - r});
+  const IVec3 rhi = ChunkStore::RegionOfVoxel(Vec3{bmax.x + r, bmax.y + r, bmax.z + r});
   thread_local std::vector<IVec3> regs;
   store.EntityRegionsAny(regs);
   struct Cand {
@@ -4636,7 +4787,8 @@ uint32_t MobSystem::ActivateParked(ChunkStore& store, World& world, uint32_t tic
     for (size_t i = 0; i < bucket.size(); i++) {
       const ChunkStore::EntityRecord& e = bucket[i];
       if (e.section != kMobsFourCC || !beyondPad(e.pos)) continue;
-      const float d2 = DistSq(e.pos, wc);
+      // The nearest centre (the host's alone in single player: DistSq to it).
+      const float d2 = NearestCentreDistSq(wlo, e.pos);
       if (!(d2 <= r * r)) continue;
       cands.push_back({d2, ri, (uint32_t)i});
     }
@@ -4821,4 +4973,836 @@ bool MobSystem::SeverDistantForTest(uint64_t id, int limb, uint32_t tick) {
     distant_.MarkAwakeHint();
   }
   return died == distant::DistantDeath::None;
+}
+
+// ============================================================================
+// D7a: THE TIER ACROSS MACHINES (docs/PLAN_distant_npcs.md 8.3 / 8.6; game/
+// distant.h's D7a paragraph; the four records are net/distantsync.h's)
+// ============================================================================
+//
+// THE DISTANT WORLD IS THE HOST'S. Below: the role and the peers' windows
+// (W), the client's park rule handing a creature out and the host taking it,
+// the host's remote promotion (the hand-in, the in-transit list) and the
+// client's answer, the view a host sends a peer and the mirror a client keeps
+// of it. Everything is gated on `netRole_`, which is Off unless the net layer
+// set it: single player never reaches a line of this section.
+
+namespace {
+
+// The brain on the wire: MobHandoff's rule (net/mobsync.h MobBrainWire) --
+// the profile by NAME (an index dies on an R reload) and the five facts the
+// arbiter cannot rebuild (who it was fighting, where it last saw them).
+::net::MobBrainWire BrainWireOf(const ai::Brain& b, const ai::Library& lib) {
+  ::net::MobBrainWire w;
+  const ai::Profile* pr = lib.At(b.profile);
+  w.profile = pr != nullptr ? pr->name : std::string();
+  w.targetId = b.targetId;
+  w.hasTarget = b.hasTarget ? 1u : 0u;
+  w.targetPos = b.targetPos;
+  w.lastSeenPos = b.lastSeenPos;
+  w.lastSeenTick = b.lastSeenTick;
+  return w;
+}
+// ...and back: a fresh Brain on the named profile (SetMobBehavior's rule:
+// timers and half-walked paths belong to the run that made them), the five
+// facts on top -- exactly what MobSystem::ApplyHandoff restores.
+ai::Brain BrainFromWire(const ::net::MobBrainWire& w, const ai::Library& lib) {
+  ai::Brain b(w.profile.empty() ? -1 : lib.Find(w.profile));
+  b.targetId = w.targetId;
+  b.hasTarget = w.hasTarget != 0;
+  b.targetPos = w.targetPos;
+  b.lastSeenPos = w.lastSeenPos;
+  b.lastSeenTick = w.lastSeenTick;
+  return b;
+}
+
+::net::WireLook WireLookOf(const DistantLookKey& k) {
+  ::net::WireLook w;
+  w.full = k.full;
+  w.pristine = k.pristine;
+  w.bare = k.bare;
+  w.def = k.def;
+  return w;
+}
+DistantLookKey LookOfWire(const ::net::WireLook& w) {
+  DistantLookKey k;
+  k.full = w.full;
+  k.pristine = w.pristine;
+  k.bare = w.bare;
+  k.def = w.def;
+  return k;
+}
+
+::net::WireSteer WireSteerOf(const SteerState& s) {
+  ::net::WireSteer w;
+  w.heading = s.heading;
+  w.desiredHeading = s.desiredHeading;
+  w.turnVel = s.turnVel;
+  w.speedNow = s.speedNow;
+  return w;
+}
+SteerState SteerOfWire(const ::net::WireSteer& w) {
+  SteerState s;
+  s.heading = w.heading;
+  s.desiredHeading = w.desiredHeading;
+  s.turnVel = w.turnVel;
+  s.speedNow = w.speedNow;
+  return s;
+}
+
+}  // namespace
+
+// ---- the role, the peers, W --------------------------------------------------
+
+void MobSystem::SetDistantNetRole(DistantNetRole r) {
+  if (netRole_ == r) return;
+  // A host leaving the role with creatures still in transit (a reconnect that
+  // skipped the disconnect) puts them back first: never lost.
+  if (netRole_ == DistantNetRole::Host && !inTransit_.empty()) DistantNetDisconnect(tick_);
+  netRole_ = r;
+  peers_.clear();
+  peersGen_++;
+  viewMobs_.clear();
+  handOutsOut_.clear();
+  handInsOut_.clear();
+  donesOut_.clear();
+  tierEntries_.clear();
+}
+
+void MobSystem::SetDistantPeers(std::span<const DistantPeerWindow> peers) {
+  // Only a HOST's rules read W; anywhere else the list stays empty, so a
+  // client's tier (its waiting room) never sees a peer's line.
+  if (netRole_ != DistantNetRole::Host) peers = {};
+  bool moved = peers.size() != peers_.size();
+  bool room = false;
+  for (size_t i = 0; i < peers.size() && !moved; i++) {
+    const DistantPeerWindow& a = peers[i];
+    const DistantPeerWindow& b = peers_[i];
+    moved = a.playerId != b.playerId || a.windowOrigin.x != b.windowOrigin.x ||
+            a.windowOrigin.y != b.windowOrigin.y || a.windowOrigin.z != b.windowOrigin.z;
+    room = room || a.livingFree != b.livingFree || a.haveFree != b.haveFree;
+  }
+  if (!moved && !room) return;
+  peers_.assign(peers.begin(), peers.end());
+  // W moved: the retire and activation scans look again (rule 2's memory),
+  // and a creature may stand over a peer's new line. Only the room changed:
+  // a hand-in held for it may go now. Either way the promotion pass looks.
+  if (moved) peersGen_++;
+  distant_.MarkPromoteDue();
+}
+
+bool MobSystem::DistantHandOutLive() const {
+  return netRole_ == DistantNetRole::Client && CurrentTuning().distant.enabled;
+}
+
+void MobSystem::WindowCentres(Vec3 hostWlo, std::vector<Vec3>& out) const {
+  out.clear();
+  out.push_back(WindowCentre(hostWlo));
+  if (netRole_ != DistantNetRole::Host) return;
+  for (const DistantPeerWindow& p : peers_)
+    out.push_back(WindowCentre(Vec3{(float)(p.windowOrigin.x * (int)kChunk),
+                                    (float)(p.windowOrigin.y * (int)kChunk),
+                                    (float)(p.windowOrigin.z * (int)kChunk)}));
+}
+
+float MobSystem::NearestCentreDistSq(Vec3 hostWlo, Vec3 p) const {
+  // The host's own centre FIRST and alone in single player: the very
+  // DistSq(p, WindowCentre(wlo)) every border used before D7a, bit for bit.
+  float best = DistSq(p, WindowCentre(hostWlo));
+  if (netRole_ != DistantNetRole::Host) return best;
+  for (const DistantPeerWindow& pw : peers_) {
+    const float d2 = DistSq(p, WindowCentre(Vec3{(float)(pw.windowOrigin.x * (int)kChunk),
+                                                 (float)(pw.windowOrigin.y * (int)kChunk),
+                                                 (float)(pw.windowOrigin.z * (int)kChunk)}));
+    best = std::min(best, d2);
+  }
+  return best;
+}
+
+void MobSystem::DistantNetDisconnect(uint32_t tick) {
+  // THE HOST PUTS ITS IN-TRANSIT CREATURES BACK (id order): a remote promotion
+  // the peer never answered is the host's creature again, where it stood when
+  // it left (the waiting room never stepped it). The peer may have promoted
+  // it already -- after a disconnect the two machines are two worlds, and each
+  // keeps the copy it holds.
+  if (netRole_ == DistantNetRole::Host) {
+    std::vector<DistantTransit> back;
+    back.swap(inTransit_);
+    // Off FIRST, so the restore below reads no peer (W is the host's alone).
+    netRole_ = DistantNetRole::Off;
+    peers_.clear();
+    for (DistantTransit& t : back) {
+      RestoreFromTransit(std::move(t.d), tick);
+      distant_.Note(&DistantMobs::Stats::transitRestored);
+    }
+  }
+  // A CLIENT forgets the host's view and its own looks; its WAITING ROOM stays
+  // (DistantMob::handIn, still never stepped) and its own promotion pass goes
+  // on placing it -- there is nobody to give it back to now.
+  netRole_ = DistantNetRole::Off;
+  peers_.clear();
+  peersGen_++;
+  viewMobs_.clear();
+  handedLooks_.clear();
+  handedOrder_.clear();
+  handOutsOut_.clear();
+  handInsOut_.clear();
+  donesOut_.clear();
+  tierEntries_.clear();
+}
+
+void MobSystem::RestoreFromTransit(DistantMob&& d, uint32_t tick) {
+  (void)tick;
+  d.handIn = false;
+  // AWAKE (a demotion's rule: it decides once before it may sleep again); a
+  // corpse is asleep forever.
+  d.asleep = d.dead;
+  d.wakeTick = 0;
+  if (!d.dead) distant_.MarkAwakeHint();
+  const uint64_t id = d.id;
+  if (distant_.Find(id) == nullptr && !IdInUse(id) && distant_.HasRoom()) {
+    if (distant_.Insert(std::move(d))) {
+      // Over a border (a line, the retire reach): both scans look.
+      distant_.MarkMoved();
+      NoteTierEntry(id);
+      return;
+    }
+  }
+  // NO ROOM (or the id is live here again): parked as its patched record,
+  // the retire path's door -- never lost.
+  std::vector<uint8_t> bytes;
+  if (parkFn_ && DistantRecord(d, bytes) && parkFn_(d.origin, bytes)) {
+    parkedTotal_++;
+    distant_.Note(&DistantMobs::Stats::retired);
+    return;
+  }
+  std::fprintf(stderr,
+               "distant: mob %llu ('%s') back from transit had no room and no park "
+               "function; it is lost\n",
+               (unsigned long long)id, d.defName.c_str());
+  distant_.Note(&DistantMobs::Stats::failed);
+}
+
+// ---- the client's park rule: HAND IT OUT ---------------------------------------
+
+bool MobSystem::HandOutToHost(Mob& mob, std::vector<uint8_t>& record) {
+  ::net::DistantHandOut h;
+  h.id = mob.id_;
+  h.brain = BrainWireOf(mob.ai_, behaviors_);
+  h.recordVersion = kSaveVersion;
+  h.record = std::move(record);
+  h.steer.heading = mob.heading_;
+  h.steer.desiredHeading = mob.desiredHeading_;
+  h.steer.turnVel = mob.turnVel_;
+  h.steer.speedNow = mob.speedNow_;
+  // DemoteToDistant's velocity: the planar drive along the facing, the fall
+  // and a lunge's carry when airborne (the host lands it with them).
+  h.vel = Vec3{std::sin(mob.heading_) * mob.speedNow_, 0.0f,
+               std::cos(mob.heading_) * mob.speedNow_};
+  if (mob.airborne_) {
+    h.vel.y = mob.fallVel_;
+    h.vel = h.vel + mob.airVel_;
+  }
+  h.airborne = mob.airborne_ ? 1u : 0u;
+  // THE STATUSES, read off the live rig before it goes (DemoteToDistant's
+  // CaptureDistantVitals): its open wounds as a bleed rate, its fire as burn
+  // ticks. A near SaveOne writes no status tail (its wounds are its limbs'),
+  // so they travel beside the record, as the brain does.
+  if (mob.alive_) {
+    const distant::DistantVitals v = distant::CaptureDistantVitals(mob, distantCalib_);
+    h.status.bleedRate = v.bleedRate > 0.0f ? v.bleedRate : 0.0f;
+    h.status.burnTicksLeft = (uint32_t)std::max(0, v.burnTicksLeft);
+    h.status.burnFrac = v.burnFrac > 0.0f ? v.burnFrac : 0.0f;
+    h.status.stumps = (uint32_t)std::max(0, v.stumps);
+  }
+  // THE LOOK, baked NOW from this very rig (D4a's Bake, before the caller's
+  // ReleaseRig) -- its gear, its blood, its lost limbs -- and remembered by
+  // id: the host's view of it comes back naming this key, and this machine
+  // draws the statue it baked. Render only. No cache, no statue (the host's
+  // view falls back to the def's bare look).
+  if (distantDraw_ != nullptr && microSet_ != nullptr) {
+    const DistantBake b = distantDraw_->Bake(mob, *microSet_);
+    if (b.baked) {
+      h.look = WireLookOf(b.key);
+      if (handedLooks_.emplace(mob.id_, b.key).second) {
+        handedOrder_.push_back(mob.id_);
+        while (handedOrder_.size() > kHandedLooksMax) {
+          handedLooks_.erase(handedOrder_.front());
+          handedOrder_.pop_front();
+        }
+      } else {
+        handedLooks_[mob.id_] = b.key;
+      }
+    }
+  }
+  handOutsOut_.push_back(std::move(h));
+  distant_.Note(&DistantMobs::Stats::handOutsSent);
+  NoteTierEntry(mob.id_);
+  return true;
+}
+
+// ---- the host takes a hand-out ---------------------------------------------------
+
+bool MobSystem::ApplyDistantHandOut(const ::net::DistantHandOut& h, uint32_t tick) {
+  if (netRole_ != DistantNetRole::Host || h.id == 0) {
+    distant_.Note(&DistantMobs::Stats::handOutsRefused);
+    return false;
+  }
+  // THE GHOST THIS MACHINE DREW OF IT (the client stepped it, and announced
+  // it while it stood in this window's interest): the client's MobGone in the
+  // same batch normally released it already (gones apply before this); if it
+  // did not, it goes now -- one creature, one body. A creature this machine
+  // OWNS under that id is a disagreement, and the local copy is the truth.
+  for (size_t i = 0; i < mobs_.size(); i++) {
+    if (mobs_[i].id_ != h.id) continue;
+    if (!mobs_[i].IsGhost()) {
+      std::fprintf(stderr, "distant: a hand-out for mob %llu, which this host steps; "
+                           "the local creature stands\n",
+                   (unsigned long long)h.id);
+      distant_.Note(&DistantMobs::Stats::handOutsRefused);
+      return false;
+    }
+    mobs_[i].ReleaseRig();
+    mobs_[i] = std::move(mobs_.back());
+    mobs_.pop_back();
+    instancesDirty_ = true;
+    break;
+  }
+  if (distant_.Find(h.id) != nullptr) {
+    distant_.Note(&DistantMobs::Stats::handOutsRefused);
+    return false;
+  }
+  // The record as this build reads it: kSaveVersion, or a v12 the tail
+  // upgrade turns into it (D5+D6's UpgradeRecordToCurrent), parsed whole.
+  std::vector<uint8_t> bytes = h.record;
+  MobRecord rec;
+  bool parsed = false;
+  {
+    uint32_t version = h.recordVersion;
+    if (UpgradeRecordToCurrent(bytes, version)) {
+      ByteReader rd{bytes.data(), bytes.size()};
+      parsed = ReadMobRecord(rd, rec, version) && rd.ok && rd.off == bytes.size();
+    }
+  }
+  // A creature is never lost to a refusal: what cannot be made distant is
+  // PARKED, as its record (the very bytes a park writes), where it stands.
+  auto parkRaw = [&](const char* why) {
+    std::fprintf(stderr, "distant: hand-out of mob %llu: %s; parked\n",
+                 (unsigned long long)h.id, why);
+    if (parsed && parkFn_ && parkFn_(rec.origin, bytes)) {
+      parkedTotal_++;
+      distant_.Note(&DistantMobs::Stats::handOutsParked);
+      return;
+    }
+    std::fprintf(stderr, "distant: hand-out of mob %llu could not be parked; it is lost\n",
+                 (unsigned long long)h.id);
+    distant_.Note(&DistantMobs::Stats::failed);
+  };
+  if (!parsed) {
+    parkRaw("the record does not read");
+    return false;
+  }
+  // A player's corpse keeps its own id band (activation's rule): parked.
+  if (rec.playerCorpse) {
+    parkRaw("a player's corpse");
+    return false;
+  }
+  const int defIndex = FindOrComposeDef(rec.defName);
+  DistantMob d;
+  if (defIndex < 0 || !DistantFromRecord(rec, defIndex, tick, d)) {
+    parkRaw("its def does not fit it here");
+    return false;
+  }
+  // THE OVERLAY MUST ROUND-TRIP (DemoteToDistant's proof, the statuses left
+  // out: a near SaveOne wrote no tail -- they ride beside it).
+  {
+    std::vector<uint8_t> probe = bytes;
+    DistantOverlay ov = d.Overlay();
+    ov.ClearStatuses();
+    if (!PatchMobRecord(probe, kSaveVersion, ov) || probe != bytes) {
+      parkRaw("its record did not round-trip its own overlay");
+      return false;
+    }
+  }
+  // THE SAME CREATURE: its id (ids are banded per machine, so a client-band
+  // id is unique here too), its brain, its turn and speed, its statuses.
+  d.record = std::move(bytes);
+  d.id = h.id;
+  d.kit.id = d.id;
+  d.activated = false;
+  d.brain = BrainFromWire(h.brain, behaviors_);
+  d.steer = SteerOfWire(h.steer);
+  d.vel = h.vel;
+  d.demotedTick = tick;
+  if (!d.dead) {
+    d.bloodLossPerTick = h.status.bleedRate > 0.0f ? h.status.bleedRate : 0.0f;
+    d.lastWoundLimb = (int16_t)std::clamp(h.status.bleedLimb, -1, 32767);
+    d.burnTicksLeft = (uint16_t)std::min<uint32_t>(h.status.burnTicksLeft, 65535u);
+    d.burnFrac = h.status.burnFrac > 0.0f ? h.status.burnFrac : 0.0f;
+    d.stumps = (uint8_t)std::min<uint32_t>(h.status.stumps, 255u);
+  }
+  // It left the client's window IN THE AIR (thrown, falling): it lands on its
+  // first distant step, with the fall's damage, as a demotion does.
+  d.landPending = !d.dead && h.airborne != 0 && d.groundMode == DistantGroundMode::Surface;
+  // It stood on the CLIENT's real ground, not this tier's: its promotion
+  // snaps it onto whoever's window it comes back into, and it comes back
+  // where it is, never through the catch-up placer.
+  d.movedWhileDistant = true;
+  // The client's own statue of it when it baked one (a key is a pure
+  // function of the body, so this host's producer resolves it -- or falls
+  // back to the bare look -- like any other).
+  const DistantLookKey wl = LookOfWire(h.look);
+  if (wl.Valid()) d.look = wl;
+  d.asleep = d.dead;
+  // IN REACH OF A WINDOW OF THE GAME, AND ROOM -- or parked (the retire path's
+  // door: its patched record, statuses and all).
+  const IVec3 wo = world_ != nullptr ? TierWindowOrigin(*world_) : IVec3{};
+  const Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
+                 (float)(wo.z * (int)kChunk)};
+  const float r = CurrentTuning().distant.radius;
+  if (!CurrentTuning().distant.enabled || !distant_.HasRoom() ||
+      !(NearestCentreDistSq(wlo, d.Centre()) <= r * r)) {
+    std::vector<uint8_t> patched;
+    if (parkFn_ && DistantRecord(d, patched) && parkFn_(d.origin, patched)) {
+      parkedTotal_++;
+      distant_.Note(&DistantMobs::Stats::handOutsParked);
+      return true;
+    }
+    std::fprintf(stderr, "distant: hand-out of mob %llu: no room, no park; it is lost\n",
+                 (unsigned long long)h.id);
+    distant_.Note(&DistantMobs::Stats::failed);
+    return false;
+  }
+  const uint64_t id = d.id;
+  if (!distant_.Insert(std::move(d))) {
+    distant_.Note(&DistantMobs::Stats::failed);
+    return false;
+  }
+  distant_.Note(&DistantMobs::Stats::handOutsTaken);
+  // A tier change on the host's flip log: the creature DEMOTED (on the
+  // client's side of the edge). The host's remote promotion of it back is
+  // bounded by this log alone.
+  NoteTierFlip(id, tick);
+  NoteTierEntry(id);
+  return true;
+}
+
+// ---- the host's remote promotion: HAND IT IN ----------------------------------
+
+bool MobSystem::DistantGoesToPeer(const DistantMob& d) {
+  if (netRole_ != DistantNetRole::Host || peers_.empty() || !ownershipFn_) return false;
+  const Vec3 feet{d.origin.x + d.worldSize.x * 0.5f, d.origin.y,
+                  d.origin.z + d.worldSize.z * 0.5f};
+  for (const DistantPeerWindow& p : peers_) {
+    if (!PromoBoxOf(p.windowOrigin).Inside(d.origin)) continue;
+    // Over this peer's line AND the host's (the caller's candidates are over
+    // the host's): the ownership rule decides, at the FEET -- the very
+    // question RefreshOwnership will ask of it once it is near.
+    if (ownershipFn_(d.id, feet) == p.playerId) return true;
+  }
+  return false;
+}
+
+uint32_t MobSystem::RemotePromotions(uint32_t tick) {
+  if (netRole_ != DistantNetRole::Host || peers_.empty() || distant_.Count() == 0 ||
+      !CurrentTuning().distant.enabled || world_ == nullptr)
+    return 0;
+  const PromoBox hostBox = PromoBoxOf(TierWindowOrigin(*world_));
+  uint32_t total = 0;
+  thread_local std::vector<uint64_t> cands;
+  for (const DistantPeerWindow& p : peers_) {
+    // Over THIS peer's line, nearest to ITS window centre first, ties by id
+    // (PromotionCandidates' order: the host's own pass, for another window).
+    distant_.PromotionCandidates(p.windowOrigin, EntityParking::kUnparkMarginChunks, cands);
+    if (cands.empty()) continue;
+    // ITS ROOM: what it last reported, minus the LIVING already in transit
+    // to it (a hand-in on the wire is not in its report yet). Conservative:
+    // one it holds in its waiting room is counted twice until it answers.
+    int64_t room = p.haveFree ? (int64_t)p.livingFree : 0;
+    for (const DistantTransit& t : inTransit_)
+      if (t.peer == p.playerId && !t.d.dead) room--;
+    uint32_t made = 0;
+    for (const uint64_t cid : cands) {
+      const DistantMob* d = distant_.Find(cid);
+      if (d == nullptr) continue;
+      // WHOSE. Over this peer's line ALONE: the peer's (nobody else can
+      // promote it -- and holding it would freeze it at the line). Over the
+      // host's line too: the ownership rule decides (DistantGoesToPeer's
+      // question); otherwise the host's own pass promotes it.
+      if (hostBox.Inside(d->origin)) {
+        const Vec3 feet{d->origin.x + d->worldSize.x * 0.5f, d->origin.y,
+                        d->origin.z + d->worldSize.z * 0.5f};
+        if (!ownershipFn_ || ownershipFn_(cid, feet) != p.playerId) continue;
+      }
+      // THE WAITS, in the host pass's order: the budget, the room (a corpse
+      // never waits on the living cap), the thrash bound. A held one stays
+      // distant, held at this peer's line (the drive's box list).
+      if (made >= EntityParking::kUnparkPerCall) {
+        distant_.Note(&DistantMobs::Stats::handInBudgetWaits);
+        distant_.MarkPromoteDue();
+        continue;
+      }
+      if (!d->dead && room <= 0) {
+        // Re-asked when its room changes (SetDistantPeers marks the scan).
+        distant_.Note(&DistantMobs::Stats::handInRoomWaits);
+        continue;
+      }
+      if (!DistantFlipBudgetOk(cid, tick)) {
+        distant_.Note(&DistantMobs::Stats::handInFlipWaits);
+        distant_.MarkPromoteDue();
+        continue;
+      }
+      ::net::DistantHandIn h;
+      h.id = cid;
+      h.brain = BrainWireOf(d->brain, behaviors_);
+      h.recordVersion = kSaveVersion;
+      // THE PATCHED RECORD, statuses in its tail and distant severs as
+      // kLimbSevered: what a promotion loads (one door, D5+D6).
+      if (!DistantRecord(*d, h.record, /*withStatus=*/true)) {
+        std::fprintf(stderr, "distant: mob %llu ('%s') did not patch for a hand-in\n",
+                     (unsigned long long)cid, d->defName.c_str());
+        distant_.Note(&DistantMobs::Stats::failed);
+        continue;
+      }
+      h.steer = WireSteerOf(d->steer);
+      h.vel = d->vel;
+      h.flags = (d->movedWhileDistant ? ::net::DistantHandIn::kMoved : 0u) |
+                (d->landPending ? ::net::DistantHandIn::kLandPending : 0u);
+      h.look = WireLookOf(d->look);
+      const bool dead = d->dead;
+      DistantTransit t;
+      if (!distant_.Take(cid, t.d)) continue;
+      t.peer = p.playerId;
+      t.sentTick = tick;
+      // IN TRANSIT, id order: kept whole until the peer answers -- the copy
+      // a return or a disconnect puts back, and what a save writes for it.
+      const auto at = std::lower_bound(
+          inTransit_.begin(), inTransit_.end(), cid,
+          [](const DistantTransit& a, uint64_t v) { return a.d.id < v; });
+      inTransit_.insert(at, std::move(t));
+      handInsOut_.push_back(std::move(h));
+      // ONE FLIP: the promotion, on the host's log (section 2.7's bound holds
+      // across the wire on this log alone: a hand-out arriving is the other).
+      NoteTierFlip(cid, tick);
+      distant_.Note(&DistantMobs::Stats::handInsSent);
+      made++;
+      total++;
+      if (!dead) room--;
+    }
+  }
+  distant_.NoteMax(&DistantMobs::Stats::transitPeak, inTransit_.size());
+  return total;
+}
+
+bool MobSystem::ApplyDistantDone(const ::net::DistantHandInDone& done, uint32_t tick) {
+  auto it = std::lower_bound(inTransit_.begin(), inTransit_.end(), done.id,
+                             [](const DistantTransit& a, uint64_t v) { return a.d.id < v; });
+  if (it == inTransit_.end() || it->d.id != done.id) {
+    distant_.Note(&DistantMobs::Stats::donesUnknown);
+    return false;
+  }
+  DistantTransit t = std::move(*it);
+  inTransit_.erase(it);
+  if (done.outcome == ::net::kHandInPromoted) {
+    // The peer's near creature now: it announces it to this machine if it
+    // stands in this window's interest, like any creature the peer steps.
+    distant_.Note(&DistantMobs::Stats::donesPromoted);
+    return true;
+  }
+  // RETURNED: the waiting room never stepped it, so the copy kept here is the
+  // creature exactly -- its whole brain, its kit -- back in the tier.
+  RestoreFromTransit(std::move(t.d), tick);
+  distant_.Note(&DistantMobs::Stats::donesReturned);
+  return true;
+}
+
+// ---- the client's waiting room ------------------------------------------------
+
+bool MobSystem::ApplyDistantHandIn(const ::net::DistantHandIn& h, uint32_t tick) {
+  // Every refusal is an ANSWER: the host holds the creature in transit and
+  // takes its own copy back on a "returned" -- never lost.
+  auto giveBack = [&](const char* why) {
+    std::fprintf(stderr, "distant: hand-in of mob %llu given back: %s\n",
+                 (unsigned long long)h.id, why);
+    donesOut_.push_back({h.id, ::net::kHandInReturned});
+    distant_.Note(&DistantMobs::Stats::handInsReturned);
+    return false;
+  };
+  if (netRole_ != DistantNetRole::Client || h.id == 0) return giveBack("not a client");
+  for (size_t i = 0; i < mobs_.size(); i++) {
+    if (mobs_[i].id_ != h.id) continue;
+    if (!mobs_[i].IsGhost()) return giveBack("this machine steps that id");
+    // A ghost of the host's near creature it used to be: the host's MobGone
+    // normally removed it before the demotion; one body per id regardless.
+    mobs_[i].ReleaseRig();
+    mobs_[i] = std::move(mobs_.back());
+    mobs_.pop_back();
+    instancesDirty_ = true;
+    break;
+  }
+  if (distant_.Find(h.id) != nullptr) return giveBack("already waiting");
+  if (!distant_.HasRoom()) return giveBack("the waiting room is full");
+  std::vector<uint8_t> bytes = h.record;
+  MobRecord rec;
+  {
+    uint32_t version = h.recordVersion;
+    bool parsed = false;
+    if (UpgradeRecordToCurrent(bytes, version)) {
+      ByteReader rd{bytes.data(), bytes.size()};
+      parsed = ReadMobRecord(rd, rec, version) && rd.ok && rd.off == bytes.size();
+    }
+    if (!parsed) return giveBack("the record does not read");
+  }
+  const int defIndex = FindOrComposeDef(rec.defName);
+  DistantMob d;
+  if (defIndex < 0 || !DistantFromRecord(rec, defIndex, tick, d))
+    return giveBack("its def does not fit it here");
+  // The patched record carries its statuses in the v13 tail and
+  // DistantFromRecord read them: the whole overlay must give its bytes back
+  // (activation's proof).
+  {
+    std::vector<uint8_t> probe = bytes;
+    if (!PatchMobRecord(probe, kSaveVersion, d.Overlay()) || probe != bytes)
+      return giveBack("its record did not round-trip its own overlay");
+  }
+  d.record = std::move(bytes);
+  d.id = h.id;
+  d.kit.id = d.id;
+  d.activated = false;
+  // THE MIND ON THE WIRE (the record's brain tail is the one written at the
+  // creature's demotion; the wire's is the host's brain NOW), the turn, and
+  // whether it walked while distant (a walker is snapped onto this machine's
+  // real ground at promotion and never catch-up placed).
+  d.brain = BrainFromWire(h.brain, behaviors_);
+  d.steer = SteerOfWire(h.steer);
+  d.vel = h.vel;
+  d.movedWhileDistant = (h.flags & ::net::DistantHandIn::kMoved) != 0;
+  d.landPending = (h.flags & ::net::DistantHandIn::kLandPending) != 0;
+  // ITS LOOK: this machine's own bake if it handed this creature out once
+  // (the body it last saw), else the host's key, else the def's bare look
+  // (DistantFromRecord's default).
+  if (const auto own = handedLooks_.find(h.id); own != handedLooks_.end()) {
+    d.look = own->second;
+  } else if (const DistantLookKey wl = LookOfWire(h.look); wl.Valid()) {
+    d.look = wl;
+  }
+  // HELD: never stepped, published, retired or activated here (game/
+  // distant.h); asleep, so nothing that sums the awake counts it.
+  d.handIn = true;
+  d.handInTick = tick;
+  d.asleep = true;
+  const uint64_t id = d.id;
+  if (!distant_.Insert(std::move(d))) return giveBack("the insert was refused");
+  distant_.Note(&DistantMobs::Stats::handInsReceived);
+  distant_.MarkPromoteDue();
+  NoteTierEntry(id);
+  return true;
+}
+
+bool MobSystem::HasWaitingRoom() const {
+  for (const DistantMob& d : distant_.All())
+    if (d.handIn) return true;
+  return false;
+}
+
+uint32_t MobSystem::ReturnStaleHandIns(uint32_t tick) {
+  if (netRole_ != DistantNetRole::Client) return 0;
+  std::vector<uint64_t> stale;
+  for (const DistantMob& d : distant_.All())
+    if (d.handIn && tick >= d.handInTick + kHandInMaxWaitTicks) stale.push_back(d.id);
+  for (const uint64_t id : stale) {
+    distant_.Erase(id);
+    donesOut_.push_back({id, ::net::kHandInReturned});
+    distant_.Note(&DistantMobs::Stats::handInsReturned);
+  }
+  return (uint32_t)stale.size();
+}
+
+void MobSystem::NoteWaitingRoomResult(uint64_t id, bool promoted) {
+  distant_.Note(promoted ? &DistantMobs::Stats::handInsPromoted
+                         : &DistantMobs::Stats::handInsReturned);
+  if (netRole_ == DistantNetRole::Client)
+    donesOut_.push_back({id, promoted ? ::net::kHandInPromoted : ::net::kHandInReturned});
+}
+
+uint32_t MobSystem::DistantLivingFree() const {
+  const int64_t live = (int64_t)LiveMobCount();
+  int64_t waiting = 0;
+  for (const DistantMob& d : distant_.All())
+    if (d.handIn && !d.dead) waiting++;
+  const int64_t free = (int64_t)kMaxMobs - live - waiting;
+  return free > 0 ? (uint32_t)free : 0u;
+}
+
+void MobSystem::TakeDistantOutgoing(std::vector<::net::DistantHandOut>& handOuts,
+                                    std::vector<::net::DistantHandIn>& handIns,
+                                    std::vector<::net::DistantHandInDone>& dones) {
+  handOuts.swap(handOutsOut_);
+  handOutsOut_.clear();
+  handIns.swap(handInsOut_);
+  handInsOut_.clear();
+  dones.swap(donesOut_);
+  donesOut_.clear();
+}
+
+// ---- the view -------------------------------------------------------------------
+
+void MobSystem::BuildDistantView(IVec3 peerWo, uint32_t tick,
+                                 std::vector<::net::DistantViewEntry>& out) {
+  out.clear();
+  const Tuning::Distant& tune = CurrentTuning().distant;
+  if (netRole_ != DistantNetRole::Host || !tune.enabled || distant_.Count() == 0) return;
+  const Vec3 pwlo{(float)(peerWo.x * (int)kChunk), (float)(peerWo.y * (int)kChunk),
+                  (float)(peerWo.z * (int)kChunk)};
+  const Vec3 pc = WindowCentre(pwlo);
+  const float r2 = tune.radius * tune.radius;
+  const float n = (float)kWorldN;
+  DistantSnap snap;
+  for (const DistantMob& d : distant_.All()) {
+    if (!(DistSq(d.Centre(), pc) <= r2)) continue;
+    ::net::DistantViewEntry e;
+    e.id = d.id;
+    // THE SHAPE rides every entry built here; net::EntitySync strips it from
+    // all but first sight and keyframes.
+    e.flags = ::net::DistantViewEntry::kShape;
+    e.defName = d.defName;
+    e.look = WireLookOf(d.look);
+    // THE STATUE: StatueOf, the rule this host draws its own with.
+    const DistantDrawItem it = StatueOf(d, tick, tune.idleStride);
+    e.origin = it.origin;
+    e.heading = it.heading;
+    e.gaitPhase = it.gaitPhase;
+    e.state = (uint32_t)it.state;
+    if (d.dead) {
+      e.flags |= ::net::DistantViewEntry::kDead;
+      out.push_back(std::move(e));
+      continue;
+    }
+    // THE PEER'S EDGE BAND: within kDistantEdgeBandVox of ITS window box (0
+    // inside it: one held at its line), PublishDistantBand's test for this
+    // host's own window -- the actor its near creatures will see, built by
+    // the same function (FillDistantSnap / DistantActorOf).
+    const Vec3 c = d.Centre();
+    const float dx = std::max({pwlo.x - c.x, 0.0f, c.x - (pwlo.x + n)});
+    const float dy = std::max({pwlo.y - c.y, 0.0f, c.y - (pwlo.y + n)});
+    const float dz = std::max({pwlo.z - c.z, 0.0f, c.z - (pwlo.z + n)});
+    if (std::sqrt(dx * dx + dy * dy + dz * dz) <= kDistantEdgeBandVox) {
+      FillDistantSnap(d, behaviors_, distantGround_, tick, snap);
+      if (snap.valid) {
+        const ai::Actor a = DistantActorOf(snap);
+        e.flags |= ::net::DistantViewEntry::kBand;
+        e.actor.centre = a.centre;
+        e.actor.radius = a.radius;
+        e.actor.height = a.height;
+        e.actor.hpFrac = a.hpFrac;
+        e.actor.heading = a.heading;
+        e.actor.immersion = a.immersion;
+        e.actor.reach = a.reach;
+        e.actor.faction = a.faction;
+        e.actor.targetId = a.targetId;
+        e.actor.velocity = a.velocity;
+        e.actor.armed = a.armed ? 1 : 0;
+        e.actor.hostile = a.hostile ? 1 : 0;
+        e.actor.bleeding = a.bleeding ? 1 : 0;
+        e.actor.action = (uint8_t)a.action;
+      }
+    }
+    // ITS BODY BOX reaches into the peer's window (D9's test).
+    const Vec3 hi{d.origin.x + d.worldSize.x, d.origin.y + d.worldSize.y,
+                  d.origin.z + d.worldSize.z};
+    if (hi.x > pwlo.x && d.origin.x < pwlo.x + n && hi.y > pwlo.y && d.origin.y < pwlo.y + n &&
+        hi.z > pwlo.z && d.origin.z < pwlo.z + n) {
+      e.flags |= ::net::DistantViewEntry::kBox;
+      e.boxLo = d.origin;
+      e.boxHi = hi;
+    }
+    out.push_back(std::move(e));
+  }
+}
+
+void MobSystem::ApplyDistantView(const ::net::DistantView& v) {
+  if (netRole_ != DistantNetRole::Client) return;
+  for (const ::net::DistantViewEntry& e : v.entries) {
+    auto it = std::lower_bound(viewMobs_.begin(), viewMobs_.end(), e.id,
+                               [](const DistantViewMob& a, uint64_t id) { return a.id < id; });
+    if (it == viewMobs_.end() || it->id != e.id) {
+      DistantViewMob fresh;
+      fresh.id = e.id;
+      it = viewMobs_.insert(it, std::move(fresh));
+    }
+    DistantViewMob& m = *it;
+    if (e.flags & ::net::DistantViewEntry::kShape) {
+      m.haveShape = true;
+      m.defName = e.defName;
+      m.look = LookOfWire(e.look);
+    }
+    m.origin = e.origin;
+    m.heading = e.heading;
+    m.gaitPhase = e.gaitPhase;
+    m.state = e.state <= (uint32_t)DistantDrawState::Strike ? (DistantDrawState)e.state
+                                                            : DistantDrawState::Idle;
+    m.dead = (e.flags & ::net::DistantViewEntry::kDead) != 0;
+    m.band = !m.dead && (e.flags & ::net::DistantViewEntry::kBand) != 0;
+    if (m.band) {
+      // The host's tick-start actor, as an ai::Actor (DistantActorOf's
+      // fields; the rest stay at their "unknown and harmless" defaults).
+      ai::Actor a;
+      a.id = e.id;
+      a.centre = e.actor.centre;
+      a.radius = e.actor.radius;
+      a.height = e.actor.height;
+      a.faction = e.actor.faction;
+      a.alive = true;
+      a.armed = e.actor.armed != 0;
+      a.hpFrac = e.actor.hpFrac;
+      a.heading = e.actor.heading;
+      a.targetId = e.actor.targetId;
+      a.hostile = e.actor.hostile != 0;
+      a.immersion = e.actor.immersion;
+      a.velocity = e.actor.velocity;
+      a.reach = e.actor.reach;
+      a.bleeding = e.actor.bleeding != 0;
+      a.action = e.actor.action <= (uint8_t)ai::Action::Recover ? (ai::Action)e.actor.action
+                                                                : ai::Action::None;
+      m.actor = a;
+    }
+    m.box = !m.dead && (e.flags & ::net::DistantViewEntry::kBox) != 0;
+    if (m.box) {
+      m.boxLo = e.boxLo;
+      m.boxHi = e.boxHi;
+    }
+  }
+  for (const uint64_t g : v.gones) {
+    auto it = std::lower_bound(viewMobs_.begin(), viewMobs_.end(), g,
+                               [](const DistantViewMob& a, uint64_t id) { return a.id < id; });
+    if (it != viewMobs_.end() && it->id == g) viewMobs_.erase(it);
+  }
+}
+
+void MobSystem::AppendDistantViewDrawItems(std::vector<DistantDrawItem>& out) const {
+  for (const DistantViewMob& m : viewMobs_) {
+    if (!m.haveShape) continue;
+    // The waiting room draws its own (FillDistantDrawItems over the tier).
+    if (distant_.Find(m.id) != nullptr) continue;
+    DistantDrawItem it;
+    // ITS LOOK: this machine's own bake for that id (a creature it handed out:
+    // the body it last saw), else the host's key, else the def's bare look --
+    // the producer walks full -> pristine -> bare and bakes a bare look on
+    // demand from the defs, so a key this machine never baked still draws.
+    if (const auto own = handedLooks_.find(m.id); own != handedLooks_.end()) {
+      it.look = own->second;
+    } else if (m.look.Valid()) {
+      it.look = m.look;
+    } else {
+      const int di = FindDef(m.defName);
+      if (di >= 0) it.look = DistantDraw::KeyOfDef(defs_[(size_t)di]);
+    }
+    if (!it.look.Valid()) continue;
+    it.state = m.state;
+    it.gaitPhase = m.gaitPhase;
+    it.origin = m.origin;
+    it.heading = m.heading;
+    it.dead = m.dead;
+    out.push_back(it);
+  }
 }

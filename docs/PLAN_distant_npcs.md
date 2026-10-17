@@ -2467,3 +2467,114 @@ column build 1.2 us mean; the `peaks` walk's tick cost 17.4 -> 44.7 us.
 **Open.** A global (village-scale) route planner for distant creatures; the
 crystal spires; a creature whose goal lies inside a closed compound may still
 stall at its wall (it never walks through it).
+### 8.6 D7a as landed
+
+Branch `dg-d7a` (off `distant-gaps`). Code: `src/net/distantsync.{h,cpp}`
+(the four records and their codecs), the D7a section at the end of
+`src/game/distant.cpp` (role, W, hand-out / hand-in / done, the view, the
+in-transit list, the waiting room's helpers) plus the generalised borders
+in the same file (`DemoteToDistant`'s radius, `RetireDistant`,
+`ActivateParked`, the drive's line hold, `PublishDistantBand`'s client branch,
+`TickDistant`'s client early-out), the park rule's client branch and the
+ownership latch in `src/game/mob.cpp`, `EntityParking::PromoteWaitingRoom` /
+`RemotePromotions` call / in-transit save in `src/game/persist.cpp`,
+`EntityBatch` v5 + `PrepareDistant` / `BuildDistantView` in
+`src/net/entitysync.cpp`, the role at connect / disconnect, the statue fill
+and the `net: distant:` exit line in `src/main.cpp`. Gate `distant-mp`
+(`src/test/selftest_distant_mp.cpp`, kOrder after `distant-arrow`).
+
+**Deviations from 8.3.**
+1. **A RETURN carries no hand-out.** The client answers
+   `DistantHandInDone{returned}` alone and the host puts its own in-transit
+   copy back (`RestoreFromTransit`). The waiting room never steps, so that
+   copy IS the creature -- and it keeps the whole `ai::Brain`, where a
+   hand-out would have cut it to `MobBrainWire`'s five facts. A refusal on the
+   client (a def that does not fit, a duplicate id, a full room, a permanent
+   `PromoteDistant` refusal) is the same answer.
+2. **Whose remote promotion it is.** Over a peer's promotion line ALONE ->
+   that peer, with no ownership question; over the host's line AND a peer's ->
+   the ownership rule at the feet decides (`MobSystem::DistantGoesToPeer`; the
+   host's own pass and the overflow skip a creature it gives to a peer). Asked
+   as 8.3 wrote it ("the ownership rule names that peer"), a creature whose
+   ORIGIN chunk is over a peer's line while its FEET chunk sits on that
+   window's authority margin is owned by nobody (`kNoAuthority` -> the host),
+   is over no line the host promotes on, and is held at the peer's line for
+   ever.
+3. **The flip bound is the host's alone.** A hand-out arriving (the creature
+   demoted on the client's side) and a hand-in sent are flips on the host's
+   log; a return is not (the creature never left the distant world); the
+   client's promotion of a hand-in does not wait on its own log. A creature a
+   client cannot place therefore ping-pongs at most three times per 600 ticks.
+4. **`livingFree` rides a batch when it changed and on a 1 s keyframe**, not
+   literally every batch: an entity batch with nothing else in it is not sent
+   (`EntityBatch::Empty`), so "every batch" would have been a batch every
+   tick. The host assumes no room until the first report (a corpse needs
+   none). Its estimate subtracts EVERY living creature in transit to that
+   peer -- including one the peer already counts in its waiting room -- so it
+   errs toward waiting, never toward overfilling.
+5. **Corpses travel too**: a client's corpse leaving its window used to decay
+   to debris; it is handed out and becomes a dead distant creature on the host
+   (`SavesAsRecord` decides, as for a park).
+6. **The waiting room is not published** to the client's near band (it is held
+   at the line and placed within a few ticks, or given back); the band is the
+   host's view only. Near hits on view creatures, view box hits and a client's
+   arrows past its face are dropped on the client (`TickDistant`'s client
+   early-out clears the edge queues; `QueueEdgeArrowBoxHit` counts
+   `boxHitsLost`) -- D7b's work.
+7. **The view's change test is a hash of the whole entry** (statue, actor,
+   box, shape); the SHAPE rides first sight AND every 1 s keyframe
+   (`kDistantViewKeyframeTicks`), so a client that lost its mirror re-learns
+   it. Gones go in ascending id; the bytes are a pure function of the tier and
+   the peer's window.
+8. **`Spawn` births a creature owned by the LOCAL player** (`owner_ =
+   localPlayerId_`; 0 in single player, so no change there). A client's
+   spawns used to be born owner 0 -- a ghost of the host's -- until the next
+   `RefreshOwnership`, which the latch would otherwise have held for a tick.
+9. **The born-this-tick latch is `Mob::ownLatch_`**: set by `Spawn`, consumed
+   by the first `RefreshOwnership` that runs with an ownership function
+   (keeping `owner_` as it is). It covers every path that makes a creature
+   live inside a tick, not only D7's.
+10. **Machine B's window is `MobSystem::SetTierWindowForTest`**: every border
+    rule a tier applies reads `TierWindowOrigin` (the World's window unless
+    the seam is set). The gate's geometry is in its header.
+11. **A client's `TickDistant` returns at once**, and after a disconnect its
+    leftover waiting room (`DistantMob::handIn`) is skipped by the step and the
+    band; it is still promoted by the waiting-room pass, never given back.
+12. `kHandInMaxWaitTicks` = 150 (5 s) and `kHandedLooksMax` = 1024 (the client's
+    id -> look memory) are constexprs in `distant.h`.
+
+**Measured** (`distant-mp`): MEASURED_NUMBERS
+
+**The API D7b builds on.**
+- The role and W: `MobSystem::GetDistantNetRole()`, `DistantPeers()` (the
+  host's `DistantPeerWindow`s, set every tick by `EntitySync::PrepareDistant`),
+  `TierWindowOrigin`.
+- The client's mirror of the host's tier: `MobSystem::DistantViewMobs()`
+  (sorted by id; the actor and body box of every creature in its window's edge
+  band), from which the client's `DistantBand()` / `EdgeActor()` /
+  `DistantBoxes()` are published. A near stroke, a near arrow out of the
+  window, a box hit and a player's shot out are today DROPPED on a client:
+  `TickDistant`'s client early-out clears `edgeBlows_` / `edgeArrowsOut_` /
+  `edgeBoxHits_` / `edgeShotsOut_`, and `QueueEdgeBlow` / `QueueEdgeArrowOut` /
+  `QueueEdgeArrowBoxHit` look the target up in `distant_` (the waiting room),
+  not the mirror. D7b sends those four queues to the host instead (the target
+  exists in `viewMobs_`).
+- The host's distant tick reads only the HOST's near band (`TickDistant`'s
+  `nearActors`). D7b adds the client's edge actors to the lists of the tier
+  creatures in that client's band -- `BuildDistantView`'s band test (within
+  `kDistantEdgeBandVox` of the peer's window box) is the membership rule -- and
+  routes a distant swing whose target is one of them (today `strokeNoTarget`)
+  to the client to roll and apply.
+- The wire: `net/distantsync.h` (add records there, bump
+  `kDistantSyncVersion`) and `EntityBatch` (v5 -> v6, new vectors after
+  `livingFree`).
+- Ownership: `MobSystem::TakeTierEntries` (ids that entered a tier; drained by
+  `EntitySync::PrepareDistant` into `mobMem_.erase`) and `Mob::ownLatch_`.
+
+**Open.** ITEMS are not handed out (a ground item leaving a client's window is
+still released; persist.h's KNOWN GAP keeps that half). A hand-out's kit is
+`DistantFromRecord`'s (rest-pose reach, the cover's shell material) -- the
+client's live rig is gone by the time the host builds it. The host draws a
+handed-out creature through the client's look key, which it never baked: its
+producer falls back to the bare look. A client's own save writes its waiting
+room (its save is not the world's; the host's in-transit list is).

@@ -93,6 +93,44 @@
 //     line (Stats::flipWaits) until the oldest flip ages out, which bounds a
 //     creature pacing the edge to kDistantMaxFlips flips per window.
 //
+// D7a THE TIER ACROSS MACHINES (docs/PLAN_distant_npcs.md 8.3 / 8.6; the wire
+// is net/distantsync.h). THE DISTANT WORLD IS THE HOST'S: in a two-player game
+// one machine -- the host, whose ChunkStore is the world's -- holds every
+// distant creature, steps, retires, activates and saves them. Every "the
+// window" in the borders above becomes "a window of the game", W = the host's
+// window plus each connected peer's (DistantPeerWindow, the very origins
+// net::Authority reads):
+//   * demote   the host's park rule, the host's window; the RADIUS is against
+//              the nearest window centre in W;
+//   * retire   only past radius + hysteresis of EVERY centre in W;
+//   * activate within the radius of ANY centre in W, beyond the host window's
+//              pad -- so a record parked inside a PEER's window activates too
+//              (nothing else would ever unpark it there) and is handed in;
+//   * promote  over the host's line -> local, as before; over a PEER's line ->
+//              a REMOTE PROMOTION (a DistantHandIn: the patched record, the
+//              brain, the steer, the look key) when only that peer's line has
+//              it or the ownership rule names that peer for its feet where
+//              both lines do; served nearest to that peer's window first, at
+//              most EntityParking::kUnparkPerCall per peer per tick, under the
+//              peer's reported room (livingFree) minus what is in transit and
+//              the flip bound. The creature leaves the tier into an IN-TRANSIT
+//              list (kept until the peer's DistantHandInDone, restored at a
+//              disconnect, saved with the tier);
+//   * hold     at the promotion line of every window it waits on (the drive's
+//              box test walks the list).
+// A CLIENT holds none of its own. Its park rule HANDS OUT a creature leaving
+// its window (DistantHandOut: the SaveOne record, the brain, the steer and
+// velocity, the statuses, the look it bakes now from the live rig) instead of
+// erasing it; the host makes it a distant creature under the SAME id
+// (DistantFromRecord), or parks it -- never loses it. A hand-in lands in the
+// client's WAITING ROOM (its own DistantMobs, `DistantMob::handIn`): never
+// stepped, retired or activated here; promoted by the client's own pass (the
+// distant half of EntityParking::Unpark, run although its parking is off)
+// under its own waits, or given back after kHandInMaxWaitTicks. The client's
+// edge band and statues come from the host's DistantView of it (DistantViewMob,
+// below). Nothing of this runs unconnected: with no role the code above is
+// exactly the single-player tier.
+//
 // D8 CAP OVERFLOW (fights larger than 64; MobSystem::OverflowSwaps, called once
 // from EntityParking::Unpark before its promotion pass). While the LIVING cap
 // binds -- more living distant creatures wait over the promotion line than
@@ -640,6 +678,14 @@ struct DistantMob {
   // ActivateParked), not demoted from a rig. Diagnostic; nothing branches on
   // it but the counters.
   bool activated = false;
+  // D7a: IN A CLIENT'S WAITING ROOM -- a DistantHandIn the host sent, held
+  // here until this machine's promotion pass places it (EntityParking::Unpark's
+  // waiting-room branch) or gives it back. Never stepped (TickDistant), never
+  // published to the near band, never retired or activated: the distant world
+  // is the host's, and the host keeps the in-transit copy that is its truth.
+  // `handInTick` is the tick it arrived (the give-back clock).
+  bool handIn = false;
+  uint32_t handInTick = 0;
 
   Vec3 Centre() const {
     return Vec3{origin.x + worldSize.x * 0.5f, origin.y + worldSize.y * 0.5f,
@@ -1006,6 +1052,28 @@ class DistantMobs {
     uint64_t nearPastFace = 0;      // near creature-ticks with the footprint centre past the face
     uint64_t walkedOut = 0;         // demotions of a near creature that walked / swam over the pad
                                     // line (on its feet, <= kPad + 4 out: not a window move's)
+    // ---- D7a: THE TIER ACROSS MACHINES (net/distantsync.h) -----------------
+    // The client's side: creatures handed to the host at its park rule, and
+    // the hand-ins it took into its waiting room and what became of each.
+    uint64_t handOutsSent = 0;       // client: park rule -> DistantHandOut (not erased)
+    uint64_t handInsReceived = 0;    // client: hand-ins taken into the waiting room
+    uint64_t handInsPromoted = 0;    // ...promoted here (Done: promoted)
+    uint64_t handInsReturned = 0;    // ...given back (Done: returned): the wait ran out, a refusal
+    uint64_t handInGroundWaits = 0;  // a waiting-room promotion held: its ground not in the fetch cache
+    // The host's side: hand-outs it took (or parked), remote promotions it
+    // sent and the waits that held them, the answers, the disconnects.
+    uint64_t handOutsTaken = 0;      // host: hand-outs made distant creatures under their own id
+    uint64_t handOutsParked = 0;     // ...parked instead (no room, outside every radius, unreadable)
+    uint64_t handOutsRefused = 0;    // ...refused: a disagreement (the id is live here), or no role
+    uint64_t handInsSent = 0;        // host: remote promotions (the creature now in transit)
+    uint64_t handInRoomWaits = 0;    // ...held: the peer reported no room (minus what is in transit)
+    uint64_t handInBudgetWaits = 0;  // ...held: this tick's per-peer budget was spent
+    uint64_t handInFlipWaits = 0;    // ...held: the thrash bound
+    uint64_t donesPromoted = 0;      // host: transits closed, promoted on the peer
+    uint64_t donesReturned = 0;      // ...returned: the in-transit copy back in the tier
+    uint64_t donesUnknown = 0;       // ...for an id not in transit (counted, ignored)
+    uint64_t transitRestored = 0;    // ...put back in the tier (or parked) at a disconnect
+    uint64_t transitPeak = 0;        // the most creatures in transit at once
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 
@@ -1157,6 +1225,73 @@ class DistantMobs {
 // for build/last_run.json's "distant" block: like the op stream's refusals,
 // a demotion that parked for want of room is a number, not a missing NPC.
 const DistantMobs::Stats& DistantRunTotals();
+
+// ============================================================================
+// D7a: THE TIER ACROSS MACHINES (the header's D7a paragraph; net/distantsync.h)
+// ============================================================================
+
+// Which side of a two-player game this MobSystem's tier is on. OFF in single
+// player, in every gate that does not set it, and after a disconnect: then
+// nothing below runs and the tier is exactly D0..D9's.
+enum class DistantNetRole : uint8_t { Off = 0, Host, Client };
+
+// ONE PEER'S WINDOW, as the host's tier rules read it: the peer's id, the
+// origin of its residency window (chunks; PlayerState.windowOrigin, the very
+// number net::Authority reads), and the room it last reported for promotions
+// (its living cap minus its living near creatures minus its waiting room).
+// `haveFree` false: it has not reported yet, so no LIVING creature is handed
+// to it (a corpse needs no room). Set every tick before the tick by the net
+// layer (net::EntitySync::ScanHandoffs).
+struct DistantPeerWindow {
+  uint32_t playerId = 0;
+  IVec3 windowOrigin{};
+  uint32_t livingFree = 0;
+  bool haveFree = false;
+};
+
+// A hand-in a client holds this long without placing it (its ground not
+// fetched, its cap full, the creature not over its line any more because its
+// window moved) is GIVEN BACK: the host puts its in-transit copy back in its
+// tier. 5 s: a fetch is K = 4 ticks plus the queue, so a hand-in that waits
+// this long is waiting on something that will not come soon.
+constexpr uint32_t kHandInMaxWaitTicks = 150;
+// How often a view entry that did not change is sent anyway (the shape with
+// it): the keyframe that lets a client re-learn a creature it lost, and the
+// whole cost of an asleep one. 1 s.
+constexpr uint32_t kDistantViewKeyframeTicks = 30;
+// How many of its own baked looks a client remembers, by id (the creatures it
+// handed out: their statues in the host's view draw as the body the client
+// last saw, not the def's bare look). Oldest forgotten first.
+constexpr size_t kHandedLooksMax = 1024;
+
+// ONE HOST CREATURE AS A CLIENT SEES IT (the mirror a DistantView keeps up):
+// the statue (def, look, draw state) and, inside the edge band of this
+// client's window, the actor its near creatures see and the body box its
+// arrows test. Plain data, rebuilt from the wire only.
+struct DistantViewMob {
+  uint64_t id = 0;
+  bool haveShape = false;      // the def name and look have arrived (first sight / keyframe)
+  std::string defName;
+  DistantLookKey look;
+  Vec3 origin{};               // the statue's origin (a corpse: its rest height)
+  float heading = 0.0f;
+  float gaitPhase = 0.0f;
+  DistantDrawState state = DistantDrawState::Idle;
+  bool dead = false;
+  bool band = false;           // `actor` is live (in this window's edge band)
+  ai::Actor actor;
+  bool box = false;            // `boxLo/boxHi` reach into this window
+  Vec3 boxLo{}, boxHi{};
+};
+
+// A HOST CREATURE IN TRANSIT to a peer (a remote promotion not yet answered):
+// the whole DistantMob as it left the tier -- the truth the host puts back if
+// the peer returns it or drops -- and to whom, since when.
+struct DistantTransit {
+  DistantMob d;
+  uint32_t peer = 0;
+  uint32_t sentTick = 0;
+};
 
 // THE STATUES' ITEM LIST (D4a's seam, game/distant_draw.h): one DistantDrawItem
 // per distant creature that has a baked look -- STRIKE while an abstract

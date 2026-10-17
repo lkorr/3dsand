@@ -60,6 +60,7 @@
 #include "game/meleehit.h"
 #include "net/authority.h"
 #include "net/debrissync.h"
+#include "net/distantsync.h"
 #include "net/mobsync.h"
 
 class MobSystem;
@@ -78,7 +79,15 @@ namespace net {
 //     to MobSystem and applied inside the tick (ApplyRemoteMeleeHits).
 //   4 (2026-10-08): `playerBodies` after them -- the sender's own player's
 //     pose and gear (net::PlayerBody), for its ghost avatar here.
-inline constexpr uint32_t kEntityBatchVersion = 4;
+//   5 (2026-10-16, D7a; net/distantsync.h): THE DISTANT TIER ACROSS
+//     MACHINES after `playerBodies`, in apply order -- `distantHandOuts`
+//     (client -> host), `distantDones` (client -> host), `distantHandIns`
+//     (host -> client), `distantView` (host -> client), then `livingFree`
+//     (client -> host; kNoLivingFree = nothing to report). Hand-ins before
+//     the view (the view's GONE for a creature handed in this batch must
+//     not leave a gap the waiting room fills a batch later), the view
+//     before the tick's band (it is applied before the tick at all).
+inline constexpr uint32_t kEntityBatchVersion = 5;
 
 // How often the sender's player gear rides its PlayerBody when it has not
 // changed: the keyframe that dresses a ghost avatar the receiver rebuilt (a
@@ -173,12 +182,22 @@ struct EntityBatch {
   // machine in M9).
   std::vector<PlayerBody> playerBodies;
 
+  // ---- D7a: THE DISTANT TIER ACROSS MACHINES (net/distantsync.h) ----------
+  std::vector<DistantHandOut> distantHandOuts;   // client -> host
+  std::vector<DistantHandInDone> distantDones;   // client -> host
+  std::vector<DistantHandIn> distantHandIns;     // host -> client
+  DistantView distantView;                       // host -> client
+  uint32_t livingFree = kNoLivingFree;           // client -> host
+
   bool Empty() const {
     return mobHandoffs.empty() && mobAnnounces.empty() &&
            mobStates.empty() && mobPoses.empty() &&
            mobGones.empty() && bodyHandoffs.empty() && bodyAnnounces.empty() &&
            bodyPoses.empty() && bodyGones.empty() && itemTakes.empty() &&
-           itemGrants.empty() && meleeHits.empty() && playerBodies.empty();
+           itemGrants.empty() && meleeHits.empty() && playerBodies.empty() &&
+           distantHandOuts.empty() && distantDones.empty() &&
+           distantHandIns.empty() && distantView.Empty() &&
+           livingFree == kNoLivingFree;
   }
   void Clear();
   size_t RecordCount() const {
@@ -186,7 +205,9 @@ struct EntityBatch {
            mobPoses.size() +
            mobGones.size() + bodyHandoffs.size() + bodyAnnounces.size() +
            bodyPoses.size() + bodyGones.size() + itemTakes.size() +
-           itemGrants.size() + meleeHits.size() + playerBodies.size();
+           itemGrants.size() + meleeHits.size() + playerBodies.size() +
+           distantHandOuts.size() + distantDones.size() + distantHandIns.size() +
+           distantView.entries.size() + distantView.gones.size();
   }
 
   void Encode(std::vector<uint8_t>& out) const;
@@ -261,6 +282,10 @@ class EntitySync {
   // BEFORE the tick, because a handoff must be built while I still own the
   // creature: `MobSystem::TakeHandoff` refuses a mob that is already a ghost,
   // and `RefreshOwnership` inside `PreTick` would have made it one.
+  // D7a: and, first (connected, peer view or not), the distant tier's own
+  // before-the-tick step (PrepareDistant): the incumbents of every id that
+  // entered a tier here are forgotten, and a host's tier is told the peer's
+  // window and its reported room.
   void ScanHandoffs(MobSystem& mobs, DebrisSystem& debris, uint32_t tick);
 
   // AFTER the tick, with the label the peer will apply it at. Drains the
@@ -317,6 +342,16 @@ class EntitySync {
     uint32_t ghostsNow = 0;     // ghost mobs + ghost bodies at the last apply
     uint32_t ghostsMax = 0;
     uint64_t expired = 0;       // ghosts dropped by the 3 s rule
+    // D7a: THE DISTANT TIER ACROSS MACHINES (net/distantsync.h). The records
+    // each way, and the view's cost: entries sent (of which with the shape),
+    // gones, and the view's encoded bytes -- "wire bytes per tick for the
+    // view" is viewBytesOut over the batches that carried one.
+    uint64_t handOutsOut = 0, handOutsIn = 0, handInsOut = 0, handInsIn = 0;
+    uint64_t donesOut = 0, donesIn = 0;
+    uint64_t viewEntriesOut = 0, viewShapesOut = 0, viewGonesOut = 0;
+    uint64_t viewBytesOut = 0, viewBatchesOut = 0;
+    uint64_t viewEntriesIn = 0, viewGonesIn = 0;
+    uint64_t freeReportsOut = 0;
   };
   const Counters& Stats() const { return c_; }
   // Folded into main.cpp's running totals before Disconnect() clears them,
@@ -380,6 +415,32 @@ class EntitySync {
   bool gearEverSent_ = false;
   PlayerBody peerBody_;
   bool havePeerBody_ = false;
+
+  // ---- D7a: the distant tier across machines --------------------------------
+  // A HOST's memory of the view it sent the peer: per creature id, a hash of
+  // the entry it last sent and that label (a changed entry goes again; an
+  // unchanged one only on kDistantViewKeyframeTicks -- the whole cost of an
+  // asleep creature -- and an id that left the set goes as a GONE).
+  struct ViewSent {
+    uint64_t hash = 0;
+    uint32_t label = 0;
+  };
+  std::unordered_map<uint64_t, ViewSent> viewSent_;
+  // A HOST's copy of the room the peer last reported (EntityBatch::livingFree)
+  // -- handed to MobSystem with the peer's window every tick.
+  uint32_t peerLivingFree_ = 0;
+  bool havePeerFree_ = false;
+  // A CLIENT's last report and when it went (sent again on change and on the
+  // keyframe, kDistantViewKeyframeTicks).
+  uint32_t freeSent_ = kNoLivingFree;
+  uint32_t freeLabel_ = 0;
+  // Before the tick (ScanHandoffs' first act while connected): the ids that
+  // entered a tier on this machine lose their incumbent here (`mobMem_`), and
+  // the peer's window and room go to the host's tier rules.
+  void PrepareDistant(MobSystem& mobs);
+  // After the tick (Build): the host's view for the peer, as the difference
+  // against `viewSent_`.
+  void BuildDistantView(MobSystem& mobs, uint32_t label, DistantView& out);
 
   Counters c_{};
 };
