@@ -1522,19 +1522,56 @@ fn nightGlow(rd : vec3f) -> SkyLayer {
   let d = rd * ca + cross(axis, rd) * sa + axis * dot(axis, rd) * (1.0 - ca);
   let galNormal = normalize(TUNE_GALAXY_NORMAL);
   let bandDist = abs(dot(normalize(d), galNormal));
-  let bandWidth = TUNE_GALAXY_WIDTH * (1.0 + 0.59 * fbm(d * 3.1, 3u));
+  // THE SEVEN fbm SAMPLES, ONE CALL SITE (2026-10-17, shader slimming). This
+  // function is inlined ~33 times into the fragment shader (every applyAerial
+  // and every reflected sky), and as seven straight-line fbm calls each copy
+  // was ~4.9k instructions of which ~4.6k were fbm. Now one loop asks them in
+  // the old order -- the band's width (k 0), its dust lanes (1), its body (2),
+  // the two nebulae (3, 4) and, only where the old aurora block ran, its two
+  // curtain fields (5, 6) -- each with exactly the old point and octave count,
+  // and the answers land in fa (0..3) and fb (4..6) for the code below.
+  let auroraOn = TUNE_AURORA_STRENGTH > 0.0 && rd.y > 0.0;
+  var fa = vec4f(0.0);
+  var fb = vec3f(0.0);
+  for (var k = 0u; k < select(5u, 7u, auroraOn); k++) {
+    var fp = vec3f(0.0);
+    var fo = 3u;
+    switch (k) {
+      case 0u: { fp = d * 3.1; fo = 3u; }
+      case 1u: { fp = d * 7.5 + vec3f(11.0, 3.0, 7.0); fo = 4u; }
+      case 2u: { fp = d * 4.5; fo = 4u; }
+      case 3u: { fp = d * 2.2 + vec3f(31.0, 17.0, 5.0); fo = 5u; }
+      case 4u: { fp = d * 1.7 + vec3f(-9.0, 23.0, 41.0); fo = 5u; }
+      case 5u: {
+        let t = TUNE_AURORA_HEIGHT / max(rd.y, 0.06);
+        let pp = vec3f(rd.x, 0.0, rd.z) * t;
+        fp = vec3f(pp.x * 0.010, R.time * 0.021, pp.z * 0.010) * 3.0;
+        fo = 4u;
+      }
+      default: {
+        let t = TUNE_AURORA_HEIGHT / max(rd.y, 0.06);
+        let pp = vec3f(rd.x, 0.0, rd.z) * t;
+        fp = vec3f(pp.x * 0.021 + 5.0, R.time * 0.013, pp.z * 0.021 - 3.0) * 3.0;
+        fo = 3u;
+      }
+    }
+    let v = fbm(fp, fo);
+    fa = select(fa, vec4f(v), vec4<u32>(k) == vec4<u32>(0u, 1u, 2u, 3u));
+    fb = select(fb, vec3f(v), vec3<u32>(k) == vec3<u32>(4u, 5u, 6u));
+  }
+  let bandWidth = TUNE_GALAXY_WIDTH * (1.0 + 0.59 * fa.x);
   let band = 1.0 - smoothstep(0.0, bandWidth, bandDist);
   // Dust lanes: dark filaments cutting through the band, which is what makes
   // it read as a galaxy rather than a painted smear.
-  let dust = fbm(d * 7.5 + vec3f(11.0, 3.0, 7.0), 4u);
-  let bandBody = band * band * (0.55 + 0.75 * fbm(d * 4.5, 4u));
+  let dust = fa.y;
+  let bandBody = band * band * (0.55 + 0.75 * fa.z);
   c += TUNE_MILKYWAY_COLOR * bandBody * TUNE_MILKYWAY_STRENGTH *
        smoothstep(0.62, 0.28, dust);
 
   // Nebulae: two tinted fbm masses, one cool one warm, confined mostly to the
   // band so they read as part of the galaxy.
-  let n1 = fbm(d * 2.2 + vec3f(31.0, 17.0, 5.0), 5u);
-  let n2 = fbm(d * 1.7 + vec3f(-9.0, 23.0, 41.0), 5u);
+  let n1 = fa.w;
+  let n2 = fb.x;
   let nebMask = 0.35 + 0.65 * band;
   let neb1 = smoothstep(0.52, 0.86, n1) * nebMask;
   let neb2 = smoothstep(0.58, 0.92, n2) * nebMask;
@@ -1554,16 +1591,13 @@ fn nightGlow(rd : vec3f) -> SkyLayer {
   // Aurora: vertical curtains that ripple. Modelled as a height-banded noise
   // field in the horizontal plane, faded in above the horizon and out toward
   // the zenith, with the classic green base / magenta tip gradient.
-  if (TUNE_AURORA_STRENGTH > 0.0 && rd.y > 0.0) {
-    // Project onto a plane well above the camera: curtains converge toward a
-    // vanishing region the way real aurora do near magnetic north.
-    let t = TUNE_AURORA_HEIGHT / max(rd.y, 0.06);
-    let pp = vec3f(rd.x, 0.0, rd.z) * t;
-    // Two scrolling noise fields multiplied: the product is thin and filament-
-    // like where a single field would be blobby.
-    let a1 = fbm(vec3f(pp.x * 0.010, R.time * 0.021, pp.z * 0.010) * 3.0, 4u);
-    let a2 = fbm(vec3f(pp.x * 0.021 + 5.0, R.time * 0.013,
-                       pp.z * 0.021 - 3.0) * 3.0, 3u);
+  if (auroraOn) {
+    // Projected onto a plane well above the camera (k 5 / 6 above): curtains
+    // converge toward a vanishing region the way real aurora do near magnetic
+    // north. Two scrolling noise fields multiplied: the product is thin and
+    // filament-like where a single field would be blobby.
+    let a1 = fb.y;
+    let a2 = fb.z;
     var curtain = smoothstep(0.48, 0.86, a1) * smoothstep(0.35, 0.80, a2);
     // Fade in just off the horizon, out before the zenith.
     curtain *= smoothstep(0.02, 0.22, rd.y) * (1.0 - smoothstep(0.35, 0.85, rd.y));
