@@ -10759,6 +10759,131 @@ fn slopeFlowFrom(cell : vec3<i32>, hx0 : f32, hx1 : f32, hz0 : f32, hz1 : f32,
   return select(v, v * (SLOPE_FLOW_MAX / l), l > SLOPE_FLOW_MAX);
 }
 
+// ---- THE FAR FIELD'S CURRENT (2026-10-16, ticket 2026-10-16_11-05-33) ------
+// currentAt reads the WINDOW's grid of the solved terrain field (common.wgsl
+// flowGridAt), which ends ~26 m out on the window's square edge. Far water
+// shaded with it had a current only inside that square, so a river seen from
+// the air lost its streaks, boils and foam lines on one hard line across it.
+// The far grid (flowfield.h kFlowFarBase: the same solved field, the same
+// cached blocks, a node every 16 cells over +-205 m, in the same buffer) takes
+// over past the window grid, eased in over the window grid's outer nodes, and
+// fades out over its own outer FLOW_FAR_FADE_NODES (where the footprint has
+// already taken the streaks: ~0.3 m a pixel at 150 m from the air).
+//
+// gFlowSlack < 0 is a WINDOW hit: waterCurrentAt IS currentAt, the near
+// field's arithmetic untouched. >= 0 is a far hit, set by shadeFarWater for
+// its duration: the slack (fine voxels, the hit level's cell) by which the
+// cascade's water top may stand over the true surface, so the grids' vertical
+// gate (surf + 1.5) does not refuse a coarse cell's top.
+// Must match flowfield.h kFlowFarBase (check_invariants.py pins it).
+const FLOW_FAR_BASE : u32 = 8982u;
+const FLOW_FAR_FADE_NODES : f32 = 16.0;
+var<private> gFlowSlack : f32 = -1.0;
+// flowGridAt over either grid (`base` = 0: the window's, FLOW_FAR_BASE: the
+// far one, its step in header word 3), with the vertical gate widened by
+// `slack`. Same words, same bilinear weights, same profile.
+fn flowSolvedAt(base : u32, p : vec3f, slack : f32) -> vec3f {
+  if (!FLOW_BOUND) { return vec3f(0.0); }
+  let n = i32(flowWord(base + 2u));
+  if (n == 0) { return vec3f(0.0); }
+  let step = select(FLOW_STEP, f32(flowWord(base + 3u)), base != 0u);
+  let fx = (p.x - f32(bitcast<i32>(flowWord(base)))) / step;
+  let fz = (p.z - f32(bitcast<i32>(flowWord(base + 1u)))) / step;
+  let ix = i32(floor(fx));
+  let iz = i32(floor(fz));
+  if (ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1) { return vec3f(0.0); }
+  let tx = fx - f32(ix);
+  let tz = fz - f32(iz);
+  var v = vec2f(0.0);
+  var surf = -1e9;
+  var bed = 1e9;
+  for (var c = 0; c < 4; c++) {
+    let dx = c & 1;
+    let dz = c >> 1u;
+    let k = base + FLOW_HEADER + 2u * u32((iz + dz) * n + (ix + dx));
+    let w1 = flowWord(k + 1u);
+    let s = flowI16Lo(w1);
+    if (s == FLOW_DRY) { continue; }
+    let w0 = flowWord(k);
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));
+    surf = max(surf, f32(s));
+    bed = min(bed, f32(flowI16Hi(w1)));
+  }
+  if (surf < -1e8 || p.y > surf + 1.5 + slack || p.y < bed - 0.5) { return vec3f(0.0); }
+  let hz = clamp((p.y - bed) / max(surf - bed, 1.0), 0.0, 1.0);
+  var prof = (0.75 + 0.25 * sqrt(hz)) / FLOW_VEL_Q;
+  if (base != 0u) {
+    let e = min(min(fx, f32(n - 1) - fx), min(fz, f32(n - 1) - fz));
+    prof *= clamp(e / FLOW_FAR_FADE_NODES, 0.0, 1.0);
+  }
+  return vec3f(v.x * prof, 0.0, v.y * prof);
+}
+// How much of the solved field at `p` the WINDOW grid serves: 1 from four
+// nodes inside its edge, 0 from one node inside it (the window's own face)
+// out, linear between; the far grid serves the rest.
+fn flowNearCover(p : vec3f) -> f32 {
+  if (!FLOW_BOUND) { return 0.0; }
+  let n = f32(flowWord(2u));
+  if (n == 0.0) { return 0.0; }
+  let fx = (p.x - f32(bitcast<i32>(flowWord(0u)))) / FLOW_STEP;
+  let fz = (p.z - f32(bitcast<i32>(flowWord(1u)))) / FLOW_STEP;
+  let e = min(min(fx, n - 1.0 - fx), min(fz, n - 1.0 - fz));
+  return clamp((e - 1.0) / 3.0, 0.0, 1.0);
+}
+// THE current every water term draws (waterWaveNormal, flowFoamLines,
+// waterFoam): currentAt on a window hit, the window grid handing over to the
+// far grid on a far one. The primitives and the measured flow are the same
+// terms currentAt adds (they bound themselves).
+//
+// THE FAR DEADBAND, and why it is the far side's alone. A sea or a lake far
+// from its mouths holds a solved current of a few mm/s, which buys nothing
+// visible -- the flow marks start at FLOW_MARK_LO (4 cm/s), a 4 cm/s drift of
+// the chop is not seen past the handoff -- but every such pixel paid
+// waveSlope's two-copy advection and the convergence's four taps of two
+// grids. Measured (--render-budget, worktree exe, both arms back to back, GPU
+// lock only): peaksea (the sea from 3 m: far water to the horizon) 8.55 ->
+// 10.04 ms without it. Under FLOW_MARK_LO a far hit's current is zero and the
+// one-copy wave field stands, as it did before the far grid existed. The
+// centre current of a far pixel is asked three times (the wave normal, the
+// foam lines, the convergence gate) and computed once (gFarCurP).
+var<private> gFarCurP : vec3f = vec3f(-1e30);
+var<private> gFarCurV : vec3f = vec3f(0.0);
+fn waterCurrentAt(p : vec3f) -> vec3f {
+  if (gFlowSlack < 0.0) { return currentAt(p, &R); }
+  if (R.currentRenderOn == 0u) { return vec3f(0.0); }
+  if (all(p == gFarCurP)) { return gFarCurV; }
+  let wN = flowNearCover(p);
+  var solved = vec3f(0.0);
+  if (wN > 0.0) { solved += flowSolvedAt(0u, p, gFlowSlack) * wN; }
+  if (wN < 1.0) { solved += flowSolvedAt(FLOW_FAR_BASE, p, gFlowSlack) * (1.0 - wN); }
+  var v = currentPrimAt(p, &R) + flowBlend(solved, flowMeasAt(p) * TUNE_CURRENT_MEASURED);
+  if (dot(v.xz, v.xz) * (VOXEL_METERS * VOXEL_METERS) < FLOW_MARK_LO * FLOW_MARK_LO) {
+    v = vec3f(0.0);
+  }
+  // The first far ask of a pixel is its centre (shadeFarWater resets this).
+  if (gFarCurP.x == -1e30) {
+    gFarCurP = p;
+    gFarCurV = v;
+  }
+  return v;
+}
+// currentConvergeAt over waterCurrentAt (the same central difference); on a
+// far pixel whose own current is in the deadband, none (no flow, no foam to
+// gather).
+fn waterConvergeAt(p : vec3f) -> f32 {
+  if (gFlowSlack < 0.0) { return currentConvergeAt(p, &R); }
+  if (R.currentRenderOn == 0u || !FLOW_BOUND) { return 0.0; }
+  let c = waterCurrentAt(p);
+  if (c.x == 0.0 && c.z == 0.0) { return 0.0; }
+  let e = 1.5;
+  let vx1 = waterCurrentAt(p + vec3f(e, 0.0, 0.0)).x;
+  let vx0 = waterCurrentAt(p - vec3f(e, 0.0, 0.0)).x;
+  let vz1 = waterCurrentAt(p + vec3f(0.0, 0.0, e)).z;
+  let vz0 = waterCurrentAt(p - vec3f(0.0, 0.0, e)).z;
+  return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);
+}
+
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
   gRainSplash = 0.0;
@@ -10832,7 +10957,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 fn waterWaveNormal(hitP : vec3f, macroSlope : vec2f, depthM : f32, openness : f32,
                    flux : vec2f) -> vec3f {
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
-  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS + gSlopeFlow;
+  let flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
   var slope = macroSlope +
               waveSlope(pm, R.time, waterRippleFootprint(hitP), depthM, flowMS) * openness;
   slope += flux * TUNE_WAVE_SIM_SLOPE;
@@ -10910,7 +11035,7 @@ fn waterGlintVis(hitP : vec3f, cell : vec3<i32>, tSurf : f32) -> f32 {
 // 0 where there is no record), masked by the ripple field.
 fn waterFoam(hitP : vec3f, pathM : f32, simFoam : f32) -> f32 {
   let shallow = 1.0 - smoothstep(0.0, TUNE_FOAM_DEPTH, pathM);
-  let conv = currentConvergeAt(hitP, &R) * VOXEL_METERS;   // per second
+  let conv = waterConvergeAt(hitP) * VOXEL_METERS;   // per second
   let flowFoam = clamp((conv - TUNE_WAVE_FOAM_THRESHOLD) * TUNE_WAVE_FOAM_GAIN, 0.0, 1.0);
   let amount = max(max(shallow, flowFoam), simFoam);
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
@@ -10936,7 +11061,7 @@ const FLOW_FOAM_WIDTH : f32 = 0.16; // m across it
 // drawn out into dashes, never round blobs.
 const FLOW_FLECK : vec2f = vec2f(0.45, 0.06);
 fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
-  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS + gSlopeFlow;
+  let flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
   let speed = length(flowMS);
   let st = flowMarkStrength(speed);
   if (st <= 0.0) { return 0.0; }
@@ -10945,8 +11070,8 @@ fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   // The shear across the flow, per second: the along-flow speed 0.6 m to
   // either side. Two more taps of a bilinear grid.
   let e = 0.6;
-  let aL = dot(currentAt(hitP + vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS), &R).xz, dir);
-  let aR = dot(currentAt(hitP - vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS), &R).xz, dir);
+  let aL = dot(waterCurrentAt(hitP + vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS)).xz, dir);
+  let aR = dot(waterCurrentAt(hitP - vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS)).xz, dir);
   let shear = abs(aL - aR) * VOXEL_METERS / (2.0 * e);
   let density = clamp(0.45 * st * st + shear * 2.0, 0.0, 1.0);
   if (density <= 0.02) { return 0.0; }
@@ -11093,6 +11218,13 @@ fn fallCrestDepthM(cell : vec3<i32>, hitY : f32) -> f32 {
 // on a top or bottom face of water in flight (`axis` 1) the same white water
 // seen end-on: a churning mottle, no direction to streak along.
 fn fallingSheet(hitP : vec3f, axis : i32, cell : vec3<i32>, base : f32) -> f32 {
+  var d = 0.0;
+  if (axis != 1) { d = fallCrestDepthM(cell, hitP.y); }
+  return fallingSheetAt(hitP, axis, d, base);
+}
+// The same sheet for a known depth under the crest `d` (metres): the far
+// field's (farFallingSheet), which has no voxels to walk up.
+fn fallingSheetAt(hitP : vec3f, axis : i32, d : f32, base : f32) -> f32 {
   let pm = hitP * VOXEL_METERS;
   var n1 : f32;
   var n2 : f32;
@@ -11102,7 +11234,6 @@ fn fallingSheet(hitP : vec3f, axis : i32, cell : vec3<i32>, base : f32) -> f32 {
     n2 = vnoise(vec3f(pm.x * 23.0, pm.z * 23.0, c * 2.3 + 7.3));
   } else {
     let u = select(pm.x, pm.z, axis == 0);   // along the face
-    let d = fallCrestDepthM(cell, hitP.y);
     let T = (sqrt(FALL_SHEET_V0 * FALL_SHEET_V0 + 2.0 * FALL_SHEET_G * d) - FALL_SHEET_V0) /
             FALL_SHEET_G;
     let v = (R.time - T) * FALL_SHEET_TEX;
@@ -11126,6 +11257,8 @@ fn openBelow(c : vec3<i32>) -> bool {
 // The sheet is thin and aerated, so it is lit THROUGH as well: a face turned
 // down (the underside of water in flight) takes the side-on sky, not the
 // ground bounce, and a little of the key light from behind.
+// ONE function for the near sheet (shadeWater) and the far one (fs's cascade
+// water), so the two cannot drift apart across the handoff.
 // NOT times mediaLightK: these are already the absolute lights, and scaling
 // them by the light-fraction a second time (as the first cut did) squared the
 // night -- moonlit white water came out near black, darker than the scene
@@ -11135,6 +11268,84 @@ fn whiteWaterLight(n : vec3f) -> vec3f {
   let open = ambientAt(vec3f(n.x, max(n.y, 0.0), n.z)) * 1.1 +
              keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0));
   return mix(TUNE_ENCLOSED_AMBIENT, open, fogSkyK()) * WATER_FOAM_COLOR;
+}
+
+// ---- FALLING WATER PAST THE HANDOFF (2026-10-16, ticket 2026-10-16_11-13-31)
+// waterSideKind on the CASCADE. A far cell is a whole cell of water and its
+// top is quantised to the level's cell, so a one-cell step is ambiguous --
+// the handoff sphere's step (a coarser level's top a cell higher), a held
+// ramp's quantisation, a bank the centre sample missed -- and the near field
+// draws none of those as falling water. What it does draw is water standing
+// over a DROP, and at a level that is at least two cells: this cell plus the
+// water over it, plus the open cell under the one in front. So:
+//   SIDE_RISER  only one cell exposed: the surface (the existing rule for the
+//               handoff step);
+//   SIDE_SHEET  air or gas in front and two cells or more exposed;
+//   SIDE_WALL   a solid in front (glass, ice, a bank).
+// LIQUID in front cannot be seen from the air in one level's data: the ray
+// crossed into this level there, out of a finer one whose water outside sat
+// lower (the coarser level rounds the pool at the foot of a fall up a cell).
+// Under more water with air in front of THAT, the face is the foot of a
+// sheet, the near field's sheet down to its pool -- drawn as the surface it
+// was a lit band across the bottom of every far fall; otherwise it is the
+// handoff step: the surface.
+// A cell outside the level's valid box is unknown, and unknown is the surface.
+// Up to five byte reads, on far water side faces only.
+fn farWaterSideKind(level : u32, cell : vec3<i32>, out : vec3<i32>) -> u32 {
+  let box = farBox(level);
+  let f = cell + out;
+  if (!farInValid(f, box)) { return SIDE_RISER; }
+  let up = cell + vec3<i32>(0, 1, 0);
+  var upWet = false;
+  if (farInValid(up, box)) {
+    let um = farMatAt(level, up);
+    upWet = um != 0u && materials[um].klass == CLASS_LIQUID;
+  }
+  // The BLOCKER flag in front is open: a flag with no material (the surface
+  // band a pool's top sits in, anything the centre sample missed) is not a
+  // primary hit (render.farBlockerHitLevel 0), so the ray came through it --
+  // it is what stood in front of the foot of every far fall, which drew as a
+  // flat wall band while it read as a solid.
+  let fb = farByteAt(level, f);
+  if (fb != 0u && fb != FAR_PAL_BLOCKER) {
+    let k = materials[farPalMat(&materials, farCellSlot(fb))].klass;
+    if (k != CLASS_GAS) {
+      // Not open in front: the level-crossing case above.
+      let fu = f + vec3<i32>(0, 1, 0);
+      if (upWet && farInValid(fu, box) && farByteAt(level, fu) == 0u) { return SIDE_SHEET; }
+      return select(SIDE_WALL, SIDE_RISER, k == CLASS_LIQUID);
+    }
+  }
+  var exposed = 1;
+  if (upWet) { exposed += 1; }
+  let b = f - vec3<i32>(0, 1, 0);
+  if (farInValid(b, box)) {
+    let bb = farByteAt(level, b);
+    if (bb == 0u) {
+      exposed += 1;
+    } else if (bb != FAR_PAL_BLOCKER &&
+               materials[farPalMat(&materials, farCellSlot(bb))].klass == CLASS_GAS) {
+      exposed += 1;
+    }
+  }
+  return select(SIDE_RISER, SIDE_SHEET, exposed >= 2);
+}
+// How far under its crest the far sheet is read as falling: the cascade has no
+// crest to walk up to, and at the distance it is drawn the streaks' speed is
+// all that the depth decides -- a mid-fall 2 m (~6 m/s).
+const FAR_SHEET_DEPTH_M : f32 = 2.0;
+// fallingSheet's mean cover, the streak term's expectation over its two vnoise
+// octaves (a Monte Carlo of exactly that noise and smoothstep: 0.28).
+const FALL_SHEET_STREAK_MEAN : f32 = 0.28;
+// The far sheet: fallingSheet, its streaks (11 cm and 4 cm across) eased to
+// that mean as a pixel grows past them -- from 3 cm a pixel (~23 m at 1080p,
+// so the near side of the handoff is the unfiltered sheet) to 12 cm.
+fn farFallingSheet(hitP : vec3f, axis : i32, tVox : f32) -> f32 {
+  let foot = tVox * VOXEL_METERS * (R.tanHalfFov * 2.0 / max(R.viewPx, 1.0));
+  let mean = (FALL_SHEET_BASE + (1.0 - FALL_SHEET_BASE) * FALL_SHEET_STREAK_MEAN) * FALL_SHEET_WHITE;
+  let w = smoothstep(0.03, 0.12, foot);
+  if (w >= 1.0) { return mean; }
+  return mix(fallingSheetAt(hitP, axis, FAR_SHEET_DEPTH_M, FALL_SHEET_BASE), mean, w);
 }
 
 // THE STAR FIELD'S MEAN RADIANCE, analytically: what starField averages to
@@ -12014,6 +12225,13 @@ fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
     let s = traceOpaque(hitP + kd * 1.5, kd, 24, 1e30, &occupancy, &materials);
     lit = select(1.0, 0.0, s.hit);
   }
+  return mistOverlay(base, rd, tHit, cue, mat, lit);
+}
+// The plume itself, for a cue and a sun visibility `lit` (0..1): the near
+// field's (waterfallMist above) and the cascade's falling sheets (fs, past the
+// handoff, where the cue is the far sheet's own) draw ONE plume.
+fn mistOverlay(base : vec3f, rd : vec3f, tHit : f32, cue : FallCue, mat : u32,
+               lit : f32) -> vec3f {
   // Vapour has no albedo — there is no material here — so it is lit like a
   // cloud: sky ambient from above plus whatever sun reaches it. It keeps a
   // little of the parent liquid's colour, because aerated blood is pink foam
@@ -16227,6 +16445,11 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
 fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
                  bed : FarBed, level : u32, cell : vec3<i32>) -> vec3f {
   let up = nFace.y > 0.5;
+  // No columns out here, so no macro slope and none of its current
+  // (gSlopeFlow); the solved current is waterCurrentAt's (gFlowSlack), its
+  // centre value cached from the first ask on (gFarCurP).
+  gSlopeFlow = vec2f(0.0);
+  gFarCurP = vec3f(-1e30);
   var n = nFace;
   if (up) {
     // The near field's waterNormal on open water: no macro slope, full fetch,
@@ -17970,6 +18193,10 @@ fn fs(in : VSOut) -> FSOut {
       }
       let m = materials[far.mat];
       var n = axisVec(far.axis, -far.sgn);
+      // A far falling sheet's plume cue (set by the far water block below).
+      var farMistCue : FallCue;
+      farMistCue.fall = 0.0;
+      farMistCue.impact = 0.0;
       // The level, and whether the hit came from the surface map's refine
       // (FAR_HIT_REFINED rides the level word so FarHit stays the same size
       // across everything fs runs after traceFar).
@@ -18546,20 +18773,57 @@ fn fs(in : VSOut) -> FSOut {
         // SIDE face, and shadeFarWater's side-wall rule (no waves, half
         // Fresnel) drew it as a thin dark circle on open water, one per
         // level. A liquid column's top cell seen from the side with air
-        // over it is that step — real far water walls (a waterfall, a
-        // terraced spill) have liquid above — so it shades as the surface.
-        // Every level, every handoff, one rule.
+        // over it is that step — so it shades as the surface. Every level,
+        // every handoff, one rule.
+        // ...AND A SIDE FACE OVER A DROP IS FALLING WATER (2026-10-16, ticket
+        // 2026-10-16_11-13-31: "waterfall shader disappears at the lod
+        // seam"). The rule above sent every other side face to the flat
+        // side-wall shade, so a held curtain or a fall turned from the near
+        // field's whitewater sheet into a flat blue wall on the handoff
+        // sphere. farWaterSideKind is waterSideKind on the cascade: a face
+        // whose water stands two cells or more over what is in front of it
+        // is a falling sheet, drawn with the near field's sheet
+        // (farFallingSheet, whiteWaterLight); a one-cell step is the
+        // surface (the handoff step above, a ramp's quantisation, a bank
+        // the centre sample missed).
         var nW = n;
+        var sheetA = 0.0;
         if (abs(n.y) < 0.5 && !fFeat) {
-          let upC = far.cell + vec3<i32>(0, 1, 0);
-          var above = 0u;
-          if (farInValid(upC, farBox(flv))) { above = farMatAt(flv, upC); }
-          if (above == 0u || materials[above].klass != CLASS_LIQUID) {
+          let sk = farWaterSideKind(flv, far.cell, vec3<i32>(n));
+          if (sk == SIDE_RISER) {
             nW = vec3f(0.0, 1.0, 0.0);
+          } else if (sk == SIDE_SHEET) {
+            sheetA = farFallingSheet(hitP, far.axis, far.t);
+            // ...and the held curtain's plume (fallCueAt's HELD CURTAIN
+            // branch: a sheet is cells wide, so its veil is the full
+            // HELD_SHEET_MIST; its foot, something under the open cell in
+            // front, throws the spray -- over the bottom fine voxel of that
+            // cell only, the near foot's height: over the whole cell it was a
+            // band of speckle a coarse cell tall). Drawn after the aerial.
+            farMistCue.fall = HELD_SHEET_MIST;
+            let bf = far.cell + vec3<i32>(n) - vec3<i32>(0, 1, 0);
+            if (hitP.y - f32(far.cell.y) * sL < 1.0 && farInValid(bf, farBox(flv)) &&
+                farByteAt(flv, bf) != 0u) {
+              farMistCue.impact = 1.0;
+            }
+          } else {
+            // A solid in front (glass, ice, a bank the trace crossed into): the
+            // rule above as it stood.
+            let upC = far.cell + vec3<i32>(0, 1, 0);
+            var above = 0u;
+            if (farInValid(upC, farBox(flv))) { above = farMatAt(flv, upC); }
+            if (above == 0u || materials[above].klass != CLASS_LIQUID) {
+              nW = vec3f(0.0, 1.0, 0.0);
+            }
           }
         }
+        // The far current (waterCurrentAt): this level's cell is the slack
+        // its water top may stand over the true surface.
+        gFlowSlack = sL;
         color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd, far.t, far.mat),
                               flv, far.cell);
+        gFlowSlack = -1.0;
+        if (sheetA > 0.0) { color = mix(color, whiteWaterLight(nW), sheetA); }
         if (SEAM_DBG >= 5u) { gDbgW0.x = 1.0; gDbgW0.y = far.t; }
       }
       if (SEAM_DBG == 8u) {
@@ -18619,6 +18883,15 @@ fn fs(in : VSOut) -> FSOut {
       }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
+      // A far falling sheet's plume, after the aerial as the near one is
+      // (vapour hangs between the eye and the face). The sun's visibility is
+      // the terrain-scale ridge's: the near plume's one sun ray reads the
+      // window's voxels, which a cascade hit is past.
+      if (farMistCue.fall > 0.0 || farMistCue.impact > 0.0) {
+        var litM = 0.0;
+        if (keyLightDir().y > 0.02) { litM = clamp(hzSunShade(hitP), 0.0, 1.0); }
+        color = mistOverlay(color, rd, far.t, farMistCue, far.mat, litM);
+      }
     } else if (hz.hit) {
       // The map past the cascades (shadeHorizon: lit and fogged there).
       color = shadeHorizon(hz, rd);

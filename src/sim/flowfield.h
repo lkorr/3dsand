@@ -96,8 +96,34 @@ constexpr int kFlowWinNodes = (int)kWorldN / kFlowStep + 3;        // 67
 //     w0 = vx | vz << 16      i16 each, 1/kFlowVelQ cells/s
 //     w1 = surf | bed << 16   i16 each, world cells; surf = kFlowDry for land
 constexpr uint32_t kFlowHeaderWords = 4;
-constexpr uint32_t kFlowWords =
+constexpr uint32_t kFlowNearWords =
     kFlowHeaderWords + (uint32_t)(kFlowWinNodes * kFlowWinNodes * 2);
+// THE FAR GRID (render only; 2026-10-16, ticket 2026-10-16_11-05-33). The
+// window grid ends ~26 m out, and the far field's water used to have no current
+// past it: the flow streaks, boils and foam lines of a river stopped on the
+// window's square edge, seen from the air as a hard line across every river.
+// The far grid is the SAME solved field (the same cached blocks, the same tent
+// blend) sampled every kFlowFarStep cells over +-kFlowFarHalf around the
+// window, re-composed when the window has moved kFlowFarSnap cells and when
+// blocks it was missing land. It never solves synchronously: a block it needs
+// and does not have is solved in the background (kFlowFarPending at once,
+// nearest first) and its nodes read dry until then -- a render-only field may
+// fill in late, a tick may not wait for it. Nothing on the CPU samples it
+// (Sample() reads the window grid only), so it carries no sim licence and
+// needs none. Layout: kFlowHeaderWords + nodes, at word kFlowFarBase of the
+// same buffer, header [3] = kFlowFarStep. raymarch.wgsl FLOW_FAR_BASE is
+// pinned to kFlowFarBase by check_invariants.py.
+constexpr int kFlowFarStep = 2 * kFlowStep;                          // 16 cells
+constexpr int kFlowFarHalf = 4 * kFlowBlock;                         // 2048 cells
+constexpr int kFlowFarNodes = 2 * kFlowFarHalf / kFlowFarStep + 1;   // 257
+constexpr int kFlowFarSnap = kFlowBlock / 4;                         // 128 cells
+constexpr size_t kFlowFarPending = 2;
+constexpr uint32_t kFlowFarBase = kFlowNearWords;
+constexpr uint32_t kFlowFarWords =
+    kFlowHeaderWords + (uint32_t)(kFlowFarNodes * kFlowFarNodes * 2);
+constexpr uint32_t kFlowWords = kFlowFarBase + kFlowFarWords;
+static_assert(kFlowFarStep % kFlowStep == 0 && kFlowFarSnap % kFlowFarStep == 0,
+              "far nodes must land on block nodes");
 constexpr int kFlowVelQ = 128;
 constexpr int kFlowDry = -32768;
 
@@ -167,8 +193,10 @@ class WaterFlowField {
   Vec3 Sample(Vec3 posVox) const;
 
   const std::vector<uint32_t>& Words() const { return words_; }
-  // Bumped every time Words() changes; the uploader compares it.
+  // Bumped every time the window grid (the first kFlowNearWords of Words())
+  // changes; the uploader compares it. FarVersion() is the far grid's.
   uint32_t Version() const { return version_; }
+  uint32_t FarVersion() const { return farVersion_; }
   // Blocks solved since the last Clear, for traces and gates.
   uint32_t BlocksSolved() const { return solved_; }
 
@@ -180,10 +208,21 @@ class WaterFlowField {
   // Start a background solve for every block of the ring the window would
   // need half a block from here, up to kFlowMaxPending at once.
   void Prefetch(int ox, int oz, uint32_t seed);
-  void Harvest();
+  // Moves finished background solves into blocks_; returns how many landed.
+  size_t Harvest();
+  // The far grid (kFlowFarBase): recentre / re-compose when due, and keep its
+  // missing blocks solving in the background.
+  void UpdateFar(uint32_t seed);
+  void ComposeFar();
 
   std::vector<uint32_t> words_;
   uint32_t version_ = 0;
+  uint32_t farVersion_ = 0;
+  bool farBuilt_ = false;
+  int farCx_ = 0, farCz_ = 0;   // the far grid's centre, world cells
+  uint32_t farMissing_ = 0;     // nodes composed dry for want of a block
+  size_t farLanded_ = 0;        // blocks landed since the last far composition
+  uint32_t farTicks_ = 0;       // updates since the last far composition
   uint32_t solved_ = 0;
   bool built_ = false;
   int baseX_ = 0, baseZ_ = 0;
@@ -193,6 +232,9 @@ class WaterFlowField {
   std::shared_ptr<Net> net_;
   std::map<std::pair<int, int>, std::shared_ptr<Block>> blocks_;
   std::map<std::pair<int, int>, std::future<std::shared_ptr<Block>>> pending_;
+  // The far grid's background solves, kept apart so they never take a slot
+  // the window's own ring prefetch needs.
+  std::map<std::pair<int, int>, std::future<std::shared_ptr<Block>>> farPending_;
 };
 
 // THE field, for the same reason CurrentPrims() is a global: SubmitTick
