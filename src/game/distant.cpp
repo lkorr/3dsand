@@ -1790,7 +1790,9 @@ bool MobSystem::DistantReachable() const {
   // out would be deletion. The switch off is the old behaviour, all of it
   // (section 1 goal 6): with `distant.enabled` false nobody walks out either.
   // D7a: a client handing its leavers to the host's tier joins this test.
-  return CurrentTuning().distant.enabled && (bool)parkFn_;
+  // D7a: a CLIENT whose leavers go to the host's tier (DistantHandOutLive:
+  // connected, the tier on) keeps them too -- its park rule hands them out.
+  return CurrentTuning().distant.enabled && ((bool)parkFn_ || DistantHandOutLive());
 }
 
 DistantGround* MobSystem::OutsideGroundFor(const Mob& m) {
