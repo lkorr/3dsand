@@ -449,6 +449,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // `mark` pass adds its particles. Render-only. 61 is the first free
         // slot of this dense 0..60 layout.
         entry(61, T::Storage),         // flowMeasure (ACC | STATE | GRID)
+        // THE CONDUIT'S LEDGER (sim_step.wgsl; docs/PLAN_running_water.md
+        // phase 3): the SAME buffer as 58, bound again so the CA can
+        // atomicAdd / atomicSub the ledger words after the column records
+        // while its table reads through 58 stay plain loads. simBGL_ only.
+        // 62 is the first free slot of this dense 0..61 layout.
+        entry(62, T::Storage),         // stillLedger (= stillWater)
     };
     simBGL_ =device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -988,7 +994,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // `rivers` gate reads a stream's words back (StillWaterBuffer()), and a
     // copy out of a buffer without TRANSFER_SRC is a validation error
     // (vk_record.cpp's [copy-src] line named it on the gate's first readback).
-    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u;
+    // ...plus FOUR words after them (2026-10-16, phase 3): THE CONDUIT's
+    // ledger (sim_step.wgsl), [0] the live balance, [1] its snapshot, [2] /
+    // [3] the eighths deposited / withdrawn so far (diagnostic: the
+    // `stream-pool` gate reads them, the sim never does). The dense worldgen
+    // Fill clears them with the table.
+    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
                                       rhi::BufferUsage::CopySrc,
@@ -1536,6 +1547,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(59, world_->farMap),
         b(60, world_->farUBO),
         b(61, flowMeasBuf_),
+        b(62, stillWaterBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 

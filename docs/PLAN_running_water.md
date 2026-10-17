@@ -270,3 +270,227 @@ are unchanged. Termination: SUM mass x rank strictly falls with every carry
 (full argument: `docs/PLAN_solutes.md` §3.5). Gate: `rivers` V.
 
 **The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted (`rivers` V, first run: 13 chunks awake at tick 4600, MOVE+equalize+bridge). Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
+
+## Phase 3 — a stream from a FINITE source sleeps too (THE CONDUIT)
+
+Tickets 2026-10-16_11-14-41 (a big pour run down a hill: 60 -> 25 fps) and
+11-16-43 (the owner: *make these chunks fall asleep while still having the
+illusion of running; they'll wake up when the chunks up top start to run
+out*). Phase 2 adopts a stream only when a hop chain roots it on the map's
+water, whose reservoir is infinite. A stream whose source is finite (a pour, a
+pool, a broken tank) was never adopted: every chunk along it stayed awake
+until the source was empty.
+
+### What is built (`sim_stream.wgsl` + `sim_step.wgsl` THE CONDUIT)
+
+* **POOL streams.** An adopted column's [3] bit 24 (`STREAM_POOL_BIT` /
+  `STILL_POOL_BIT`) says its stream is rooted on a finite source. The still
+  table's per-column layout is otherwise unchanged (bits 24..29 were spare;
+  the liquid is still [3]'s low 12 bits, the flood count bits 12..23). A
+  pending POOL adopt is action 3 (`STREAM_ACT_ADOPT_POOL`): no bit of the
+  pending word was free, the action field had one value left.
+* **Rooting** (`scan`, unadopted branch). A steady column with outflow whose
+  held feeders fail may be fed by a LIVE SOURCE (`liveSource(.., true)`): an
+  UNHELD lateral neighbour whose water stands `STREAM_POUR` (2, the CA's own
+  equalize threshold) or more eighths over it, that can actually pour
+  (`sideSurface`: its top cell can split, or there is water under it, so a
+  stranded one-eighth film is not a source), with an open way in, and that is
+  a ROOT (`isRoot`): nothing stands `STREAM_POUR` over IT beside it, no held
+  column beside it has a target at or over its surface (a column a held body
+  can feed is that body's), and it is a POOL -- `STREAM_ROOT_DEPTH` (3) cells
+  of the liquid deep (`sourceDeep`). Without the depth, the flat stretches of
+  a shallow stream on a gentle slope all passed as roots: measured on `rivers`
+  S, 131 of the lake-fed stream's 152 adopted columns came out POOL, so the
+  map stream ran as a conduit (4 of 6 chunks awake) and its plugged leftover
+  was re-adopted and held (123 of 153 columns 900 ticks on). A root also
+  needs `STREAM_ADOPT_TICKS_ROOT` (240) steady visits, twice the map's, so a
+  map chain coming down the same water is there first (S again: 78 of the
+  first 87 adopted columns were POOL, rooted on the deep flat top of the
+  lake-fed channel). And every POOL candidate needs a STRICT outflow --
+  somewhere 2 eighths lower or air, a held neighbour only if its target is 2
+  eighths under: a flat pool beside a held column at its own level otherwise
+  has both a feed and an outflow, and the short window flood-filled the
+  source from the head (measured, `stream-pool`: 319 reservoir columns
+  adopted, the source frozen, the conduit stalled at the cap). And a root is
+  WIDE (`sourceWide`): 29 of the 48 cells round it at its surface row hold the
+  liquid -- depth did not tell a pool from the deep, flat top of a channel a
+  lake feeds through water not yet adopted (S: 56 of 120 adopted columns POOL
+  at tick 600, discharging into the map chain beside them), and NOT A SINK: no
+  POOL stream's column among those 48 (the mound under a POOL mouth's
+  waterfall is deep and wide; rooted, the basin became a second conduit fed by
+  the first, ~300 basin columns, churning the ledger to its cap and holding the
+  real head back). And A FALL ENDS A
+  CONDUIT: a POOL feeder counts only within a voxel over the candidate
+  (`streamSupportTo`), so the basin under a waterfall at a POOL mouth is never
+  adopted (it was: ~105 basin columns, the mouth emitting into its own held
+  sink, the conduit stalled at the cap). Every
+  column of a running stream is fed by the unheld column upstream of it; only
+  the top of the slope (the pool's edge, beside the pool at its own level) is
+  fed by one nothing higher feeds. So POOL adoption starts at the source with
+  hop 1 and walks down exactly as a map stream does (hop h + 1 from a held
+  feeder of hop h; a POOL feeder makes a POOL column; an equal hop prefers the
+  map's feeder). A column fed by a held POOL column needs only
+  `STREAM_ADOPT_TICKS_POOL` (24) steady visits, not 120: the ledger refills an
+  adopted column to its target whatever it stood at, and the long window left
+  the thin, flickering tail of a finite stream unadopted for good (the first
+  diagnosed run: the last ~15 of 80 columns never adopted, their gaps kept the
+  middle awake). A root keeps the 120.
+* **RETARGET** (`scan` adopted branch, `lowerFeed`; `commit`): a POOL column
+  whose feed now stands LOWER -- the pool it drains has fallen, or the column
+  above it was lowered -- has its target lowered to that level (at most
+  `STREAM_RETARGET_MAX`, a voxel, a step; the excess it then stands over is
+  deposited) instead of being released. Released, its water drained into the
+  next column, which lost its feed too: the whole stream let go from the top
+  every time the source fell two eighths and re-adopted 120 visits later
+  (measured on `stream-pool`: 209, 134, 99, 15, 49, 115, 205 ... columns
+  adopted, the middle awake through every cycle). The pending word keeps the
+  liquid and POOL bit where neighbours read them; the drop rides in the flood
+  bits (action 3 on an adopted column). Targets only ever fall: bounded.
+* **Release with hysteresis** (`scan`, adopted branch). A POOL column with no
+  held feeder of smaller hop stays held while ANY unheld neighbour still
+  pours into it (`liveSource(.., false)`, no root test). So when the source
+  falls below the head's target the head is released, its own water (unheld
+  now) still pours into the column below, which is the head from then on, and
+  the held stream RETREATS from the top as the source runs out instead of
+  cascading. Plus STARVED: a POOL column under its target while the ledger
+  snapshot is empty counts +1 a visit on the flood count, so a mouth waiting
+  on a source that stopped pouring is let go in bounded time.
+* **The ledger** (`sim_step.wgsl`). Two words after the column records
+  (`STILL_LEDGER` = `WORLD_N * WORLD_N * STILL_WORDS`: [0] the live balance in
+  eighths, i32; [1] its snapshot; the buffer grew by four words). The CA adds
+  through binding 62 (`stillLedger`, the SAME buffer as 58, bound again as
+  atomics so the table's hot reads stay plain loads); `sim_stream.wgsl
+  commit`'s workgroup 0 copies live -> snapshot after the CA, every tick the
+  CA ran.
+  * DEPOSIT: a free-surface cell of a POOL column OVER its target gives ALL its
+    excess, unrolled, at STAGE 0 (beside the TAKE). Left to stage 5 the excess
+    split into the next held column's air first and ran down the whole stream.
+    Refused while the snapshot is at `STILL_LEDGER_CAP` (512 eighths); then
+    the head's over-target cells count as AT REST (`heldRest`), so the head
+    holds the source back instead of spilling down the stream (CAPPED).
+  * WITHDRAW: TAKE / GROW of a POOL cell refill from the ledger, refused while
+    the snapshot is <= 0. A POOL TAKE does NOT spend the visit: the refilled
+    cell goes on and makes the move it would have made (the mouth emits at
+    the rate the CA gave it before it was held, not half of it).
+  * NO FLOW INSIDE A CONDUIT (`heldBlocks`, `HELD_REST_POOL`): a cell at rest
+    in a POOL column never pours into another POOL column, even one under its
+    target -- the ledger refills that one. Measured without it: the ledger
+    turned over ~19 eighths a tick against a real throughput of ~3.5, a
+    conveyor of refill-and-pour INSIDE the held stream that kept the middle
+    awake. The one exception is a cell holding none of the liquid (a column
+    gone DRY has no cell to take a refill; refused its neighbour's water it
+    cut the conduit, measured: five dry adopted columns stopped the stream).
+  * STARVED, part 1 (`heldBlocks` / `heldBlocksAt`): while the snapshot is
+    empty a POOL column under its target is FULL to any held neighbour at
+    rest, so the deficit stays at the mouth instead of running up the stream.
+  * STARVED, part 2 — the CLOSED VALVE (`stepLiquid` after stage 1b): a cell at
+    rest in a POOL column while the snapshot is empty moves nothing sideways
+    or diagonally; it keeps its chunk awake (`DIRTY_R_REACT`) while it has
+    somewhere to go or a refill it wants. Without it the mouth would spill its
+    own column empty, an empty column has no liquid cell to take the refill,
+    and nothing would wake it when the ledger came back: the mouth would sleep
+    while the head filled the ledger to the cap. The middle has nowhere to go
+    (its neighbours are held and full, or starved and so full) and sleeps.
+  * `canFlowAnywhere` and the valve ask ONE function, `liquidSideWork`
+    (stages 2-4, split out of the mirror), so they cannot drift.
+* **WAKE ON RELEASE** (`commit`): a released column's chunk is marked for the
+  next tick, so the columns that rested on it are looked at again even when
+  the released water does not move. Once per adoption.
+* **A REGEN CLEARS THE TABLE** (`SubmitWorldgen`, paged path). The dense path
+  always cleared it (`wg_fill_stillWater`, `C_DENSEWG`), but the paged path
+  never ran that row and `cols` keeps a stream while its column's tag is
+  unchanged -- which a regeneration of the same window always is. So a paged
+  regen kept the old world's streams (a phase-2 bug) and now the ledger's
+  balance: `stream-pool` E caught it (two runs of the same pour from fresh
+  worldgens differed from the first sample; the control with the feature off
+  did not). The whole table is zeroed by a WriteBuffer before the regen.
+* **Map-rooted streams are unchanged**: the infinite reservoir, the rolled
+  GIVE, no ledger, the 120-visit window. Every new branch is behind
+  `stillPool` (a POOL record).
+* **Still-table layout**: per-column words unchanged and backward compatible
+  (the POOL flag is [3] bit 24, previously always 0; a reader masking the
+  liquid with `& 0xFFF` and the flood count with `>> 12 & 4095` is
+  unaffected); the ledger is four words AFTER the column records, so any
+  reader indexing by `stillIndex` never sees them.
+
+### Determinism, termination, mass
+
+* Rule 1: deposits and withdrawals are `atomicAdd` / `atomicSub` whose
+  results are never read (order-free integer sums). Every decision — the
+  refusals, `heldBlocks`' starved rule, the valve, `scan`'s starved count —
+  reads the SNAPSHOT, written once per tick by one thread after the barrier
+  that ends the CA rows. One writer per column for the table, as before.
+* Rule 2: the new writes are a deposit (moves a POOL surface DOWN to its
+  target) and a withdrawal (UP to it); both stop at the target, and every
+  eighth withdrawn was deposited. The source loses water monotonically
+  (nothing pours back into it from a lower held column), so it stops pouring
+  in finite time; then the head is released, the retreat runs to the mouth,
+  and every column is ordinary water that settles. Hard bounds where that
+  argument has holes: the flood count (an over-target column — a capped
+  head) and the starved count (a mouth waiting on an empty ledger), both
+  STREAM_FLOOD_COUNT visits.
+* MASS: voxels + MPM particles + the live ledger is EXACT (each write moves
+  the eighths it adds to or takes from the ledger). What can be STRANDED in
+  the ledger when no POOL column is left: at most the cap plus one tick's
+  deposits, and at least minus one tick's withdrawals (each cell decides on
+  the snapshot, not on what the others took: the OVERDRAFT). A load clears it
+  (`clearStreams`), a dense worldgen clears it (the Fill); a window shift
+  that drops the columns strands it. All bounded by the cap.
+* ONE GLOBAL LEDGER for the window (the approximation): two finite-source
+  streams running at once share it, so water poured into one can leave by
+  the other's mouth (never more than the cap in transit). Per-stream ledgers
+  need a stream identity no column holds today (the hop chain carries no root
+  id, and a head several columns wide is several roots).
+
+* **A CONDUIT DISCHARGES INTO MAP WATER** (`heldBlocks`): a cell at rest in a
+  POOL column is never refused by a NON-POOL held column; the map's reservoir
+  takes the excess back (GIVE). Refused, a finite stream that ran into a river
+  could never empty its ledger and stood held for good -- measured on
+  `rivers` S: the plugged channel's leftover water was re-adopted as a POOL
+  stream draining into main, and 121 of 153 columns were still held 900 ticks
+  after the plug (the gate wants <= 20%). And the mirror REFUSAL: a cell at
+  rest in a non-POOL held column never pours into a POOL column. With the
+  permission alone, a POOL segment between two map-rooted runs of one stream
+  was refilled by the map above and discharged into the map below -- a
+  source-and-sink conveyor (measured, `rivers` S running: 4 of 6 chunks awake,
+  the flood count climbing). Refused, such a segment is fed only by the ledger
+  and unheld water, so it starves and rests.
+
+### Measured (gate `stream-pool`, 2026-10-17)
+
+A stone reservoir 32 x 32, 4 layers deep (32,768 eighths) on the harness pad,
+draining through a 2-cell gate into a channel 3 wide and 80 long falling a
+voxel every 4 columns, into a 40 x 40 basin 10 voxels under its last floor;
+MPM excitation and water-body discovery off (their own systems), dim dawn and
+a clear sky pinned. `--verify stream-pool,rivers,lake-settle,sleep,determinism`:
+
+* A: 236 of the channel's 240 columns POOL-adopted (all 240 at times).
+* B: the 4 middle chunks asleep for 8 samples in a row (ticks 2101-3151)
+  while the reservoir still drained (~3.6 eighths a tick); awake meanwhile
+  only the head (the reservoir and the first 12 columns) and the mouth.
+* C: voxels + MPM + ledger == the pour at every sample (worst error 0).
+* D: the source stopped at tick 5551 (40% of it below the channel's first
+  tread, a pool no stream can carry); 1,500 ticks on 0 POOL columns, 0
+  fixture chunks awake, 516 eighths (1.6% of the pour) stranded in the ledger
+  (bounded by the 512 cap + one tick).
+* E: three runs of the same pour from fresh worldgens identical (and the
+  control pair with the feature off), after the paged-regen clear.
+* `rivers` (S: 153/153 adopted, 0 of 6 chunks awake, 0 POOL; plugged, 6 left),
+  `lake-settle`, `sleep` pass; `determinism` 4993b9b0, the pinned value
+  (unchanged: the harness's determinism scenario has no finite stream).
+
+Unverified: the owner's actual scene (a wide shallow sheet poured down a
+heather hill, ticket 11-14-41 -- sheet flow, not a channel; whether its source
+passes the 3-deep / 29-of-48 root test depends on where the pour pools); a
+POOL stream discharging into a map river (the permission is exercised only by
+S's absence of regressions); two finite streams sharing the ledger.
+
+### Known limits
+
+* A basin that rises to the mouth (drowned): the mouth cannot emit, the ledger
+  fills to the cap, the head holds the source back and waits, awake, until the
+  flood count releases it (bounded: STREAM_FLOOD_COUNT visits, the capped head
+  counting +1 a visit). Up to the cap is stranded in the ledger.
+* A pour into map water empties into the map's reservoir at the reservoir's
+  rolled-GIVE rate, not the CA's: slower than the same water running into an
+  unheld basin.
