@@ -1328,8 +1328,8 @@ void VerifyPour(Scene& s) {
 constexpr float kSlopeEyeX = -7342.28f, kSlopeEyeY = 681.40f, kSlopeEyeZ = -38840.83f;
 constexpr float kSlopeYawDeg = 70.0f, kSlopePitchDeg = -7.9f;
 constexpr uint32_t kSlopeTicketTick = 31558;   // the ticket's sim tick: its night
-constexpr uint32_t kSlopeFeedEvery = 3;
-constexpr int kSlopeSrcR = 3;
+constexpr uint32_t kSlopeFeedEvery = 2;
+constexpr int kSlopeSrcR = 4;
 constexpr int kSlopeDist[3] = {110, 170, 230};     // voxels along the view
 constexpr int kSlopeLateral[5] = {-80, -40, 0, 40, 80};
 
@@ -1346,15 +1346,48 @@ void SlopeEye(Scene& s) {
   s.cam.pitch = kSlopePitchDeg * 0.0174532925f;
 }
 // Source i of 15 (line-major): a cell over the ground at distance / lateral
-// offset from the eye along the view's horizontal heading.
-IVec3 SlopeSource(int i) {
+// offset from the eye along the view's horizontal heading. The ground is
+// READ, not World::TerrainHeight'd: the first cut stood the sources on the
+// noise height, and on this hill the poured water then appeared nowhere in
+// view. SlopeFindGround fills g_slopeGround from the voxels once the window
+// is settled.
+std::array<int, 15> g_slopeGround{};
+bool g_slopeGroundValid = false;
+IVec3 SlopeColumn(int i) {
   const float yaw = kSlopeYawDeg * 0.0174532925f;
   const float fx = std::cos(yaw), fz = std::sin(yaw);   // forward (xz)
   const float lx = -fz, lz = fx;                        // left (xz)
   const float d = (float)kSlopeDist[i / 5], l = (float)kSlopeLateral[i % 5];
   const int x = (int)std::floor(kSlopeEyeX + fx * d + lx * l);
   const int z = (int)std::floor(kSlopeEyeZ + fz * d + lz * l);
-  return {x, World::TerrainHeight(x, z, kDefaultSeed) + kSlopeSrcR + 1, z};
+  return {x, World::TerrainHeight(x, z, kDefaultSeed), z};
+}
+IVec3 SlopeSource(int i) {
+  IVec3 c = SlopeColumn(i);
+  if (g_slopeGroundValid) c.y = g_slopeGround[i];
+  c.y += 2;   // the sphere sits on the cover: its lower half fills the air between plants
+  return c;
+}
+// The highest non-air cell of each source column (plants included: the
+// sphere is painted over the cover and the water falls through it), read from
+// the window's voxels in the 8 chunks over and 4 under the noise height.
+void SlopeFindGround(Scene& s) {
+  std::vector<uint32_t> buf(kChunkVol);
+  for (int i = 0; i < 15; i++) {
+    const IVec3 c = SlopeColumn(i);
+    g_slopeGround[i] = c.y;
+    bool found = false;
+    for (int cy = (c.y >> 4) + 8; cy >= (c.y >> 4) - 4 && !found; cy--) {
+      const IVec3 wc{c.x >> 4, cy, c.z >> 4};
+      if (!s.world.ChunkInWindow(wc)) continue;
+      ReadVoxelsSync(s.ctx, s.world, World::SlotChunkIndex(wc), 1, buf.data(), "slopeGround");
+      for (int ly = 15; ly >= 0 && !found; ly--) {
+        const uint32_t li = (uint32_t)((c.x & 15) + 16 * (ly + 16 * (c.z & 15)));
+        if ((buf[li] & 0xFFFu) != 0u) { g_slopeGround[i] = cy * 16 + ly; found = true; }
+      }
+    }
+  }
+  g_slopeGroundValid = true;
 }
 void SlopeTickOps(const Scene& s, uint32_t i, TickOps& out) {
   out.particlesActive = true;
@@ -1371,9 +1404,11 @@ void SlopeTickOps(const Scene& s, uint32_t i, TickOps& out) {
 std::string SlopeProfile() {
   char buf[160];
   const int ge = World::TerrainHeight((int)kSlopeEyeX, (int)kSlopeEyeZ, kDefaultSeed);
-  std::snprintf(buf, sizeof buf, "ground y %d under the eye, %d / %d / %d at %d / %d / %d m",
-                ge, SlopeSource(2).y - kSlopeSrcR - 1, SlopeSource(7).y - kSlopeSrcR - 1,
-                SlopeSource(12).y - kSlopeSrcR - 1, kSlopeDist[0] / 10,
+  std::snprintf(buf, sizeof buf, "noise ground y %d under the eye; read ground %d / %d / %d "
+                "(noise %d / %d / %d) at %d / %d / %d m",
+                ge, SlopeSource(2).y - 2, SlopeSource(7).y - 2,
+                SlopeSource(12).y - 2, SlopeColumn(2).y, SlopeColumn(7).y,
+                SlopeColumn(12).y, kSlopeDist[0] / 10,
                 kSlopeDist[1] / 10, kSlopeDist[2] / 10);
   return buf;
 }
@@ -1384,8 +1419,10 @@ std::string SlopeCensus(Scene& s) {
   const uint32_t water = MatId(s.mats, "water");
   const IVec3 org = s.world.WindowOrigin();
   const int ecy = (int)std::floor(kSlopeEyeY) >> 4;
-  uint64_t full = 0, part = 0;
+  uint64_t full = 0, part = 0, fan = 0;
   uint32_t chunksWet = 0;
+  const float yaw = kSlopeYawDeg * 0.0174532925f;
+  const float fx = std::cos(yaw), fz = std::sin(yaw);
   std::vector<uint32_t> row((size_t)kNChunk * kChunkVol);
   for (int cy = std::max(org.y, ecy - 3); cy <= std::min(org.y + (int)kNChunk - 1, ecy + 3); cy++)
     for (int cz = org.z; cz < org.z + (int)kNChunk; cz++) {
@@ -1397,17 +1434,24 @@ std::string SlopeCensus(Scene& s) {
         for (uint32_t li = 0; li < kChunkVol; li++) {
           if ((c[li] & 0xFFFu) != water) continue;
           wet = true;
-          if (((c[li] >> 12) & 15u) >= 8u) full++; else part++;
+          // State nibble = fullness - 1: 7 is a full cell.
+          if (((c[li] >> 12) & 15u) >= 7u) full++; else part++;
+          const IVec3 wc = s.world.SlotToWorldChunk(first + sx);
+          const float dx = (float)(wc.x * 16 + (int)(li % 16)) - kSlopeEyeX;
+          const float dz = (float)(wc.z * 16 + (int)(li / 256)) - kSlopeEyeZ;
+          const float ahead = dx * fx + dz * fz, side = -dx * fz + dz * fx;
+          if (ahead > 0.0f && ahead < 260.0f && std::fabs(side) < 110.0f) fan++;
         }
         chunksWet += wet;
       }
     }
   char buf[200];
   std::snprintf(buf, sizeof buf,
-                "%llu water cells on the hill (%llu partial = %.0f%%) in %u chunks",
+                "%llu water cells in the eye's +-3 chunk layers (%llu partial = %.0f%%) in "
+                "%u chunks, %llu of them on the poured slope ahead",
                 (unsigned long long)(full + part), (unsigned long long)part,
                 full + part ? 100.0 * (double)part / (double)(full + part) : 0.0,
-                chunksWet);
+                chunksWet, (unsigned long long)fan);
   return buf;
 }
 
@@ -1418,9 +1462,10 @@ bool SetupSlope(Scene& s, std::string& why) {
   SlopeEye(s);
   s.stream.OnRegen();
   CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
+  SlopeFindGround(s);
   s.fireTick = 0;
   s.note = "ticket 11-14-41's hill (default map, its --at pose), water fed on "
-           "15 sources 11-23 m up the slope every 3 ticks; " + SlopeProfile();
+           "15 sources 11-23 m up the slope every 2 ticks; " + SlopeProfile();
   return true;
 }
 void DriveSlope(Scene& s, uint32_t, TickOps& out) {
@@ -1432,6 +1477,42 @@ void VerifySlope(Scene& s) {
     std::string why;
     if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
       std::fprintf(stderr, "slope: could not restore map '%s': %s\n",
+                   s.prevMap.c_str(), why.c_str());
+  }
+}
+
+// THE SILVERRUN FALL (2026-10-17, ticket 2026-10-16_23-58-24: "this scene
+// tanks performance ... doesn't sit at like 20fps when looking at the
+// water"). The default map's river_silverrun at its waterfall (14192,-11604):
+// the ticket's --at pose, 14 m from the water looking down at the fall and the
+// plunge reach below it. Nothing is poured: the river as the map makes it
+// (held reaches, the curtain, the stream adoption) IS the scene. Budget camera
+// `silverrun` (the ticket's tick) and --perf scenario `silverrun` (the tick
+// under that view).
+constexpr float kRunEyeX = 14381.63f, kRunEyeY = 588.08f, kRunEyeZ = -11552.33f;
+constexpr float kRunYawDeg = -167.6f, kRunPitchDeg = -31.8f;
+constexpr uint32_t kRunTicketTick = 7838;
+void RunEye(Scene& s) {
+  s.eye = {kRunEyeX, kRunEyeY, kRunEyeZ};
+  s.cam.yaw = kRunYawDeg * 0.0174532925f;
+  s.cam.pitch = kRunPitchDeg * 0.0174532925f;
+}
+bool SetupSilverrun(Scene& s, std::string& why) {
+  std::string prev;
+  if (!SlopeEnterMap(s, &prev, why)) return false;
+  s.prevMap = prev;
+  RunEye(s);
+  s.stream.OnRegen();
+  CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
+  s.note = "ticket 23-58-24's view of river_silverrun's waterfall (default map, its --at pose)";
+  return true;
+}
+void DriveSilverrun(Scene&, uint32_t, TickOps& out) { out.particlesActive = true; }
+void VerifySilverrun(Scene& s) {
+  if (!s.prevMap.empty()) {
+    std::string why;
+    if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
+      std::fprintf(stderr, "silverrun: could not restore map '%s': %s\n",
                    s.prevMap.c_str(), why.c_str());
   }
 }
@@ -1774,6 +1855,14 @@ const Scenario kScenarios[] = {
      "raymarch of it.",
      "caLoop;fluidSys;waterBodies;renderPass", 300, 300, SetupSlope, DriveSlope,
      VerifySlope},
+
+    {"silverrun", "The silverrun waterfall (ticket 23-58-24)",
+     "The default map's river_silverrun at its waterfall, from ticket "
+     "2026-10-16_23-58-24's pose: the held river, its curtain and the plunge "
+     "reach, nothing poured. 60 warm ticks, 300 frames: what the river costs a "
+     "tick beside what it costs to draw.",
+     "caLoop;fluidSys;waterBodies;renderPass", 60, 300, SetupSilverrun,
+     DriveSilverrun, VerifySilverrun},
 
     {"surface-sprint", "Surface sprint (the tail)",
      "The game's own --autofly-surface: sprint flight over the terrain at 10.6 "
@@ -3296,11 +3385,20 @@ bool CamPourBlood(Scene& s, uint32_t& tick, std::string& why) {
 // and glints on the sheet). Loads the DEFAULT map and leaves it loaded with
 // the window relocated: list after every harness camera.
 constexpr uint32_t kSlopeBudgetTicks = 420;
+// SANDVOX_BUDGET_TICK=<celestial tick> re-times the ticket cameras (slope,
+// slopenoon, silverrun) without a rebuild: the same world under another sky
+// (a night arm of a day ticket, or the reverse). Unset, each camera's own.
+uint32_t BudgetTickOr(uint32_t dflt) {
+  if (const char* e = std::getenv("SANDVOX_BUDGET_TICK"); e && *e)
+    return (uint32_t)std::strtoul(e, nullptr, 10);
+  return dflt;
+}
 bool CamSlopeImpl(Scene& s, uint32_t& tick, std::string& why, bool night) {
   if (!SlopeEnterMap(s, nullptr, why)) return false;
   SlopeEye(s);
   s.stream.OnRegen();
   CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
+  SlopeFindGround(s);
   const IVec3 pc{(int)std::floor(s.eye.x) >> 4, (int)std::floor(s.eye.y) >> 4,
                  (int)std::floor(s.eye.z) >> 4};
   s.fluidLive = 0;
@@ -3325,7 +3423,7 @@ bool CamSlopeImpl(Scene& s, uint32_t& tick, std::string& why, bool night) {
            std::to_string(s.fluidLive) + " MPM particles live" +
            (night ? "; the ticket's tick (night)" : "; noon");
   std::printf("  slope: %s\n", s.note.c_str());
-  tick = night ? kSlopeTicketTick : FindNoonTick(CurrentTuning());
+  tick = BudgetTickOr(night ? kSlopeTicketTick : FindNoonTick(CurrentTuning()));
   return true;
 }
 bool CamSlope(Scene& s, uint32_t& tick, std::string& why) {
@@ -3333,6 +3431,27 @@ bool CamSlope(Scene& s, uint32_t& tick, std::string& why) {
 }
 bool CamSlopeNoon(Scene& s, uint32_t& tick, std::string& why) {
   return CamSlopeImpl(s, tick, why, false);
+}
+// The silverrun fall (SetupSilverrun), 120 ticks after the window settles so
+// the river's chunks have done whatever a freshly generated reach does, at the
+// ticket's tick.
+bool CamSilverrun(Scene& s, uint32_t& tick, std::string& why) {
+  if (!SlopeEnterMap(s, nullptr, why)) return false;
+  RunEye(s);
+  s.stream.OnRegen();
+  CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
+  const IVec3 pc{(int)std::floor(s.eye.x) >> 4, (int)std::floor(s.eye.y) >> 4,
+                 (int)std::floor(s.eye.z) >> 4};
+  for (uint32_t i = 0; i < 120; i++) {
+    SubmitTick(s.ctx, s.world, s.sim, 6000 + i, kDefaultSeed, {}, {}, {}, false, pc,
+               false, true);
+    if ((i & 15u) == 0u) s.ctx.WaitIdle();
+  }
+  s.ctx.WaitIdle();
+  s.note = "ticket 23-58-24: river_silverrun's waterfall from the ticket's --at pose "
+           "(default map), 120 ticks after settle, the ticket's tick";
+  tick = BudgetTickOr(kRunTicketTick);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3984,6 +4103,9 @@ const BudgetCam kBudgetCams[] = {
               "harness camera)",
      CamSlope, kArmsSlope},
     {"slopenoon", "the same running sheet at noon", CamSlopeNoon, kArmsSlope},
+    {"silverrun", "ticket 23-58-24: river_silverrun's waterfall from 14 m, looking "
+                  "down at the fall (loads the default map)",
+     CamSilverrun, kArmsSlope},
     {"summit", "on the peaks map's 1,400 m summit looking out: cascade, "
                "horizon and height fog (loads peaks; last)",
      CamSummit, kArmsSummit},

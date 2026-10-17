@@ -851,3 +851,165 @@ hashed. The `--verify` result is in the commit message.
   is not where the cost is.
 - On the harness lake, shading the bed under > 2 m of water (§6: 1.79 ms) is
   untouched. That is general opaque shading, not the march.
+
+## 9. Handoff 2026-10-17: water down a hill, and the silverrun fall (tickets 11-14-41, 23-58-24)
+
+Two owner tickets on the default map:
+
+- 2026-10-16_11-14-41: "pouring a ton of water and having it run down this
+  hill tanks fps from 60 to 25". Night, 41.6 ms at 0.88 scale. The owner's
+  inference was "staring at the ground gives 70-90 fps, so it is rendering".
+- 2026-10-16_23-58-24: river_silverrun's waterfall at 20 fps (49.0 ms), from
+  a frame taken BEFORE the held-river overhaul.
+
+**The scenes, permanent** (perfsuite.cpp; each loads the `default` map and
+leaves it loaded, so list them after every harness camera):
+
+- `--render-budget --budget-cams slope` (night: the ticket's tick 31558),
+  `slopenoon`, and `--perf --scenario slope`. This is the ticket's --at pose.
+  Water is painted every 2 ticks into the air over 15 brush sources (r 4), 11,
+  17 and 23 m up the slope along the view. The sources stand on the ground
+  READ from the voxels (World::TerrainHeight is only the noise). The budget
+  camera feeds for 420 ticks and freezes while the sheet is still running. The
+  setup's note prints a water census: total, partial, and how many cells are on
+  the poured slope ahead.
+- `--budget-cams silverrun` and `--perf --scenario silverrun`. This is the
+  ticket's --at pose at its tick 7838 (sun at 20 deg). Nothing is poured: the
+  river as the map makes it.
+- `SANDVOX_BUDGET_TICK=<tick>` re-times all three cameras without a rebuild.
+- Put `silverrun` BEFORE `slope` in `--budget-cams`. The slope camera's feed
+  reads `fluidLive` back, so the MPM water it leaves behind differs from boot
+  to boot. A camera listed after it inherits that water. Measured: silverrun
+  run after slope drew different water in two boots (354k px over 2, max 197);
+  run first, it was identical.
+
+### What each frame costs (RTX 3060 Ti, 1080p)
+
+**slope** (night): raymarch 15.9 ms. `nomicro` saves 9.3 ms: the heather is
+the frame. The water arms are small:
+
+| part | ms |
+|---|---|
+| water as air on the primary ray (all water work on water pixels) | 1.0 |
+| shadeWater skipped | 0.95 |
+| water side kind + falling sheet | 0.5 |
+| bed caustics (waterAbove walk) | 0.3 |
+| everything else water (each) | <= 0.15 |
+| noshadow | 1.6 |
+| nofar | 0.2 |
+
+The sheet in this scene is thinner than the owner's: rmPxWater 1.2%, with
+7-12k cells on the slope ahead. The rest runs off downhill (about 417k cells
+lie in the eye's band).
+
+`--perf slope` (one tick per frame, fed): GPU 26.2 ms per frame. The render
+side is about 16.4 ms (raymarch 15.4, plus shadow cache, clouds, openness).
+**The sim tick is 9.6 ms**: caLoop 6.2, farField 2.2 (farDown + farDownFeat
+re-downsample the chunks the water keeps changing), MLS-MPM 0.7.
+
+So the owner's "it is rendering" does not follow, as §7 already found for the
+pour. Ticks run at 30 Hz on the same queue as the frames, so GPU time per
+second is 30 x tick + fps x render. The owner's two readings (24 fps on the
+hill, 80 fps on the ground) give 30 T + 24 R_hill = 30 T + 80 R_ground =
+1000 ms. With R_hill = 12 ms (this camera at 0.88 scale), that solves to
+**T = 24 ms per tick** and R_ground = 3.6 ms. The flood's tick takes about 70%
+of the GPU while the owner stares at the hill. Water shading is about 1 ms of
+the hill's render, and the heather is 9 ms.
+
+The lever is the tick: the CA over a running sheet, plus the far downsample it
+keeps dirty. That is the sim side, and the conduit agent is on it.
+
+**silverrun** (sun at 20 deg): raymarch 20.5 ms. `--perf silverrun`: caLoop
+0.01 ms. **The held river is asleep, so this scene is all render.** The 49 ms
+in the ticket was taken before the overhaul. It does not reproduce on this
+tree: raymarch is 26 ms in the perf scenario's dawn sky, and 20.5 at the
+ticket's tick.
+
+Attribution (`debug.perfExp` arms, one process, ms off a 20.5 baseline; the
+base2 drift was 0.55):
+
+| part | ms |
+|---|---|
+| shadeWater whole (skipped) | 9.0 |
+| . waterNormal whole (flat normal) | 4.2 |
+| . . the flowing two-copy wave field (flowing -> still branch) | 3.6 |
+| . . . of it, the streaks (24 flowNoised a pixel) | 2.8 |
+| . . . of it, the boils | 0.3 |
+| . . the macro slope (4 liquidColumns + slopeFlowFrom) | 1.7 |
+| . . openness taps / depth probe | 0.5 / 0.3 |
+| . foam whole | 2.6 |
+| . . flowFoamLines (3 currentAt + 4 noises) | 1.6 |
+| . . convergence (4 currentAt, waterConvergeAt) | 1.3 |
+| . traced reflection (`noreflect`) | 1.3 |
+| . caustic curvature / solPathLook / glint | 0.9 / 0.65 / 0.56 |
+| bed caustics on the bed under water (waterAbove walk) | 1.2 |
+| waterfall mist on liquid pixels | 1.1 |
+| far cascade (`nofar`: the lake above the fall, 38% far pixels) | 4.9 |
+| noshadow | 1.75 |
+
+### LANDED (raymarch.wgsl, near-field water only; exact up to float rounding)
+
+1. `waveSlope`'s flowing branch evaluates both advected copies in ONE pass:
+   `waveBands2` (the per-band tanh, dispersion sqrt, shoaling gain and
+   footprint fade computed once for both points) and `flowStreakSlope2` (the
+   flow frame and the octave fades computed once). The streaks are skipped
+   when `st == 0`, where they are exactly zero (a pond's drift, a slow margin).
+2. `flowFoamLines`:
+   - the near current is handed over from `waterWaveNormal` (`gWaveFlow`,
+     window hits only), where it used to sample currentAt again at the same
+     point;
+   - the distance fade is asked first;
+   - one flow frame serves all four noises (`flowNoiseAlongF`);
+   - the fleck noises run only where the line noise is over its threshold. The
+     lines are sparse, and off a line the result was 0 anyway.
+3. `shadeWater`: `waterReflBlur`'s 12 openness taps run only at night, since
+   the blur is 0 by day whatever their answer.
+
+**What it bought, and why it is more than the work removed.** `--shader-stats`
+on the merge base: raymarch fs **168 registers / 80 B local**. This tree:
+**128 registers / 112 B local**. Main's fragment shader had crossed the 128
+cliff that §4 and the trace() header document (168 is 12 warps per SM against
+16). These edits bring it back under. The work they remove is worth about 0.3
+ms (an in-process perfExp A/B of old vs new paths on silverrun: 17.45 -> 17.16).
+The rest is occupancy, paid by every pixel, which is why the slope camera
+gains with 1% water pixels.
+
+Exclusive, interleaved boots in both orders, merge-base assets vs this tree,
+same exe, `SANDVOX_BUDGET_REPEAT=3`:
+
+| camera | control | final | change |
+|---|---|---|---|
+| silverrun (pair 1: ctl, then fin) | 20.43-20.58 | 17.48-17.62 | -2.95 |
+| silverrun (pair 2: fin, then ctl; silverrun listed first) | 19.73-19.92 | 16.96-17.11 | **-2.8 (-14%)** |
+| slope (pair 1) | 15.72-15.87 | 14.85-14.98 | -0.9 |
+| slope (pair 2) | 15.53-15.61 | 14.60-14.72 | **-0.9 (-6%)** |
+
+Pair 1's silverrun world differed (it ran after slope; see above), so pair 2
+is the number to quote.
+
+Pictures (bmpdiff, pair 2): silverrun has 1,468 px over 2, max 18. They lie
+on the cliff face and the grass bank (the GI / shadow cache warm noise §6
+measured), none on the water. slope has 2 px over 2, max 3.
+
+**FRAGILE.** The occupancy half of this is a register-allocation outcome, not
+a property of the water code. The next edit anywhere in fs() can put it back
+over 128. Check `--shader-stats` (raymarch fragment Register Count) on every
+raymarch change. It went to 168 between §8 (128) and af1c7311 without anybody
+noticing.
+
+### Left, ranked
+
+1. **The tick under a running sheet** (slope): CA 6.2 + farDown 2.2 ms on
+   this thin pour, about 24 ms on the owner's. That is the sim lane.
+2. **silverrun's far cascade**, 4.9 ms. That is the near/far water LOD lane.
+3. The flow marks, 3.6 + 1.6 ms. They are look-defining. What is left in them
+   is noise taps: 24 per pixel for the streaks, 4 for the foam lines. Cutting
+   them needs an owner call, for example dropping the 6 mm streak octave or
+   evaluating the marks at half rate.
+4. The convergence, 1.3 ms: 4 currentAt, each with two bilinear grids. Inside
+   one grid cell the central difference IS the bilinear patch's derivative, so
+   about 39% of pixels (taps inside one node cell on both axes, measured grid
+   dry) could take one 4-node fetch. That needs a transcription of flowGridAt
+   in raymarch (drift risk) and is not done.
+5. The macro slope's 1.7 ms is mostly the flow it switches on (gSlopeFlow),
+   not its reads.
