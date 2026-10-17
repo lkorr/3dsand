@@ -1554,6 +1554,12 @@ TP_F(player, grabStiffness, NO_WGSL, 9.0f, 0.5f, 40.0f)
 TP_F(player, grabCarrySpeed, NO_WGSL, 9.0f, 0.5f, 40.0f)
 TP_F(player, grabBreakDistance, NO_WGSL, 2.5f, 0.2f, 10.0f)
 TP_F(player, grabSpinDamp, NO_WGSL, 0.80f, 0.0f, 1.0f)
+// G's forgiving pick (game/lookpick.h): the cone around the reticle a
+// pickable may sit in, a wider one for a thin thing (box middle extent under
+// pickSmallSize voxels: an arrow, a blade lying flat).
+TP_F(player, pickConeDeg, NO_WGSL, 6.0f, 0.0f, 30.0f)
+TP_F(player, pickConeSmallDeg, NO_WGSL, 10.0f, 0.0f, 30.0f)
+TP_F(player, pickSmallSize, NO_WGSL, 3.0f, 0.0f, 16.0f)
 
 
 // ==== camera ====

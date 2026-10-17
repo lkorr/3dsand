@@ -69,6 +69,7 @@
 #include "game/pierce.h"  // pierce: PierceAlongRay, the projectile entry point
 #include "game/arrows.h"  // arrow: the bow, the flights, the embed
 #include "game/worlditems.h"  // arrow: a stuck arrow is a ground item
+#include "game/lookpick.h"    // look-pick: the forgiving pick under the reticle
 #include "game/itemcoat.h"   // poison-arrow: an arrow's own lattice and coat
 #include "game/itemstage.h"  // poison-arrow: brush one, copy to N
 #include "game/quiver.h"     // poison-arrow: the quiver
@@ -13238,6 +13239,366 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// look-pick — G TAKES WHAT THE RETICLE IS ON, WITH WIGGLE ROOM (game/lookpick.h)
+// ============================================================================
+//
+// Owner ticket 2026-10-16_11-00-17: "picking up items off of the floor can be
+// a nightmare, same with targeting/picking up arrows ... give it a little bit
+// of wiggle room". The take used to be one pixel-thin Jolt ray; this asserts
+// the cone that replaced it, on REAL bodies (registered ground items, a real
+// arrow slot on a real creature) through the one function main.cpp's prompt
+// and press both read. Terrain is a synthetic kindAt (a flat floor, and a wall
+// when a scene asks for one): the subject is the picker's rule, not the mirror.
+//
+//   S1 a chunky item half a cone off the reticle: the bare ray misses it, the
+//      pick takes it.
+//   S2 ...the same item past the cone: nothing.
+//   S3 a THIN arrow lying on the floor, between the two cones: taken (and
+//      only because it is thin).
+//   S4 two items both in the cone: the one nearer the reticle wins, both ways.
+//   S5 a stone wall between the eye and an item aimed dead on: refused, and
+//      the same aim without the wall takes it (the control arm).
+//   S6 an arrow STANDING in the ground (stuck, kinematic, its point in the
+//      floor), aimed at the floor beside it: taken.
+//   S7 an arrow hidden behind a creature's body, aimed dead on: refused; the
+//      same arrow moved out of its shadow: taken.
+//   S8 an arrow EMBEDDED in that creature, half a thin cone off: the arrow
+//      (EmbeddedArrow, IsEmbeddedArrowBody), not the body it stands in.
+//   S9 a corpse-with-loot exactly under the reticle (exactActionable) beats an
+//      item a few degrees off; without the predicate the item wins.
+Status GateLookPick(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  const int human = mobs.FindDef("human");
+  const ItemDef* arrowDef = c.items.Named("arrow");
+  const ItemDef* chunkyDef = c.items.Named("iron_helm");
+  if (!chunkyDef) chunkyDef = c.items.Named("flask");
+  const ItemDef* chunky2Def = c.items.Named("flask");
+  if (human < 0 || !arrowDef || !chunkyDef || !chunky2Def) {
+    detail = "no `human` def, or no arrow / iron_helm / flask in the item library";
+    return Status::Fail;
+  }
+  int torso = -1;
+  {
+    const auto& L = mobs.Defs()[human].limbs;
+    for (size_t i = 0; i < L.size(); i++)
+      if (L[i].name == "torso") torso = (int)i;
+  }
+  if (torso < 0) {
+    detail = "the human has no torso";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  Target t;
+  t.defIndex = human;
+  t.limb = 0;
+  IVec3 chunk{};
+  const uint64_t mobId = SpawnTarget(c, t, 170, chunk);
+  if (!mobId) {
+    detail = "the fixture human did not spawn";
+    return Status::Fail;
+  }
+  // The registry the game binds: a destroyed body leaves it.
+  WorldItems ground;
+  c.debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  struct Unhook {
+    DebrisSystem& d;
+    ~Unhook() { d.SetOnBodyGone(nullptr); }
+  } unhook{c.debris};
+
+  Vec3 torsoC{};
+  for (uint32_t k = 0; k < 512; k++) torsoC += mobs.LimbVoxelPos(mobId, torso, k * 7919u);
+  torsoC = torsoC * (1.0f / 512.0f);
+
+  const Tuning::Player& tp = CurrentTuning().player;
+  lookpick::Params pp;
+  pp.coneDeg = tp.pickConeDeg;
+  pp.coneSmallDeg = tp.pickConeSmallDeg;
+  pp.smallSize = tp.pickSmallSize;
+  if (!(pp.coneSmallDeg > pp.coneDeg + 1.0f)) {
+    detail = Format("player.pickConeSmallDeg %.1f is not wider than pickConeDeg %.1f: "
+                    "S3 cannot tell the thin cone from the plain one",
+                    pp.coneSmallDeg, pp.coneDeg);
+    return Status::Fail;
+  }
+
+  // ---- the scene's terrain: a floor, and a wall when a scene asks ----------
+  const Vec3 S = torsoC + Vec3{40.0f, -8.0f, 0.0f};   // the item floor, clear of the creature
+  const int floorY = ifloor(S.y);
+  bool wallOn = false;
+  IVec3 wlo{}, whi{};
+  auto kindAt = [&](IVec3 cc) {
+    if (wallOn && cc.x >= wlo.x && cc.x <= whi.x && cc.y >= wlo.y && cc.y <= whi.y &&
+        cc.z >= wlo.z && cc.z <= whi.z)
+      return CellKind::Solid;
+    return cc.y < floorY ? CellKind::Solid : CellKind::Air;
+  };
+
+  bool ok = true;
+  std::string why, lines;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    why += " | " + s;
+  };
+
+  // ---- items, kinematic so nothing moves between the aim and the pick ------
+  auto place = [&](const ItemDef& d, Vec3 at, Quat q = Quat{}) {
+    BodyTransform xf{};
+    xf.pos = at;
+    xf.quat[0] = q.x;
+    xf.quat[1] = q.y;
+    xf.quat[2] = q.z;
+    xf.quat[3] = q.w;
+    ItemInstance inst;
+    return DropItemToWorldXf(d, inst, xf, Vec3{}, c.phys, c.debris, nullptr, ground,
+                             nullptr, /*stuck=*/true);
+  };
+  auto centreOf = [&](uint64_t b) {
+    BodyTransform xf{};
+    Vec3 lo, hi;
+    if (!c.phys.GetTransform(b, xf) || !c.phys.GetLocalBounds(b, lo, hi)) return Vec3{};
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+    return xf.pos + QuatRotate(q, (lo + hi) * 0.5f);
+  };
+  // The angle (deg) of body `b`'s own box off the ray from `from` along `dir`:
+  // the measure lookpick uses, re-derived here from its exposed primitive.
+  auto angleTo = [&](uint64_t b, Vec3 from, Vec3 dir) {
+    BodyTransform xf{};
+    Vec3 lo, hi, qL;
+    if (!c.phys.GetTransform(b, xf) || !c.phys.GetLocalBounds(b, lo, hi)) return 999.0f;
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+    return lookpick::BoxAngleDeg(QuatRotateInv(q, from - xf.pos), QuatRotateInv(q, dir),
+                                 200.0f, lo, hi, qL);
+  };
+  constexpr float kDeg = 0.0174532925f;
+  const Vec3 up{0, 1, 0};
+  // A look `deg` degrees off body `b` (by its box), yawed toward `away`.
+  auto aimOff = [&](uint64_t b, Vec3 from, float deg, Vec3 away) {
+    const Vec3 base = (centreOf(b) - from).normalized();
+    const float s =
+        (QuatRotate(QuatAxisAngle(up, kDeg), base) - base).dot(away) >= 0.0f ? 1.0f : -1.0f;
+    Vec3 d = base;
+    for (float th = 0.0f; th < 60.0f; th += 0.05f) {
+      d = QuatRotate(QuatAxisAngle(up, s * th * kDeg), base);
+      if (angleTo(b, from, d) >= deg) break;
+    }
+    return d;
+  };
+  auto pick = [&](Vec3 from, Vec3 dir,
+                  std::function<bool(uint64_t)> actionable = nullptr) {
+    lookpick::Query q;
+    q.from = from;
+    q.dir = dir;
+    q.hand = from;
+    q.kindAt = kindAt;
+    q.exactActionable = std::move(actionable);
+    return lookpick::Pick(q, pp, c.phys, mobs, ground);
+  };
+  auto kindName = [](lookpick::Kind k) {
+    switch (k) {
+      case lookpick::Kind::GroundItem: return "item";
+      case lookpick::Kind::EmbeddedArrow: return "embedded arrow";
+      case lookpick::Kind::Exact: return "exact";
+      default: return "none";
+    }
+  };
+  auto line = [&](const char* tag, const lookpick::Result& r, uint64_t want) {
+    lines += Format("%s: %s %s at %.1f deg (bare ray %s; reach %d, cone %d, occluded %d) | ",
+                    tag, r.body == want && want ? "PICKED" : (r.body ? "other" : "nothing"),
+                    kindName(r.kind), r.angleDeg,
+                    r.exactBody == want && want ? "on it" : (r.exactBody ? "elsewhere" : "none"),
+                    r.inReach, r.inCone, r.occluded);
+  };
+  // The long axis of the arrow's own box, from an unrotated probe.
+  auto arrowAxis = [&](Vec3& ctrL) {
+    const uint64_t probe = place(*arrowDef, S);
+    Vec3 lo, hi;
+    c.phys.GetLocalBounds(probe, lo, hi);
+    c.debris.DestroyBody(probe);
+    ctrL = (lo + hi) * 0.5f;
+    const Vec3 ext = hi - lo;
+    return ext.x >= ext.y && ext.x >= ext.z ? Vec3{1, 0, 0}
+           : ext.y >= ext.z                 ? Vec3{0, 1, 0}
+                                            : Vec3{0, 0, 1};
+  };
+  const Vec3 eye = S + Vec3{0.0f, 14.0f, -8.0f};
+  const float midDeg = 0.5f * (pp.coneDeg + pp.coneSmallDeg);
+
+  // ======== S1 / S2: a chunky item off the reticle ===========================
+  {
+    const uint64_t h = place(*chunkyDef, S + Vec3{-4.0f, 0.0f, 0.0f});
+    if (!h) {
+      detail = "the chunky item would not go down";
+      return Status::Fail;
+    }
+    const lookpick::Result r1 = pick(eye, aimOff(h, eye, 0.5f * pp.coneDeg, Vec3{-1, 0, 0}));
+    line("S1 half a cone off", r1, h);
+    if (r1.exactBody == h) fail("S1: the bare ray hit the item: not an off-centre aim");
+    if (r1.body != h) fail("S1: an item half a cone off the reticle was not picked");
+    const lookpick::Result r2 = pick(eye, aimOff(h, eye, pp.coneDeg + 3.0f, Vec3{-1, 0, 0}));
+    line("S2 past the cone", r2, h);
+    if (r2.body != 0) fail("S2: an item 3 deg past the cone was still picked");
+    c.debris.DestroyBody(h);
+  }
+  // ======== S3: a thin arrow on the floor, between the cones =================
+  {
+    const uint64_t h = place(*arrowDef, S + Vec3{0.0f, 0.0f, 6.0f});
+    Vec3 lo, hi;
+    c.phys.GetLocalBounds(h, lo, hi);
+    float e[3] = {hi.x - lo.x, hi.y - lo.y, hi.z - lo.z};
+    std::sort(e, e + 3);
+    lines += Format("arrow box %.1f x %.1f x %.1f | ", e[0], e[1], e[2]);
+    if (!(e[1] < pp.smallSize)) fail("S3: the arrow does not read as thin");
+    const lookpick::Result r = pick(eye, aimOff(h, eye, midDeg, Vec3{1, 0, 0}));
+    line("S3 thin, between the cones", r, h);
+    if (r.exactBody == h) fail("S3: the bare ray hit the arrow");
+    if (r.body != h) fail("S3: a thin arrow inside the thin cone was not picked");
+    c.debris.DestroyBody(h);
+  }
+  // ======== S4: two in the cone, the nearer the reticle wins =================
+  {
+    const uint64_t ha = place(*chunkyDef, S + Vec3{-3.0f, 0.0f, 2.0f});
+    const uint64_t hb = place(*chunky2Def, S + Vec3{3.0f, 0.0f, 2.0f});
+    const Vec3 ca = centreOf(ha), cb = centreOf(hb);
+    // Slide the aim from one centre toward the other until the far one is
+    // inside the plain cone too (half a degree in), the near one still the
+    // nearer: both are candidates and the angle has to decide.
+    auto between = [&](uint64_t hn, Vec3 cn, uint64_t hf, Vec3 cf) {
+      Vec3 d = (cn - eye).normalized();
+      for (float s = 0.0f; s < 0.5f; s += 0.01f) {
+        d = (cn + (cf - cn) * s - eye).normalized();
+        const float an = angleTo(hn, eye, d), af = angleTo(hf, eye, d);
+        if (af <= pp.coneDeg - 0.5f && an < af) break;
+      }
+      return d;
+    };
+    const lookpick::Result ra = pick(eye, between(ha, ca, hb, cb));
+    const lookpick::Result rb = pick(eye, between(hb, cb, ha, ca));
+    line("S4 nearer A", ra, ha);
+    line("S4 nearer B", rb, hb);
+    if (ra.inCone < 2 || rb.inCone < 2) fail("S4: the two items were not both in the cone");
+    if (ra.body != ha || rb.body != hb) fail("S4: the item nearer the reticle did not win");
+    c.debris.DestroyBody(ha);
+    c.debris.DestroyBody(hb);
+  }
+  // ======== S5: a wall in the way, and the control =============================
+  {
+    const uint64_t h = place(*chunkyDef, S + Vec3{0.0f, 0.0f, 3.0f});
+    const Vec3 ctr = centreOf(h);
+    const Vec3 dir = (ctr - eye).normalized();
+    const lookpick::Result open = pick(eye, dir);
+    const Vec3 mid = eye + (ctr - eye) * 0.5f;
+    wlo = IVec3{ifloor(mid.x) - 4, ifloor(mid.y) - 4, ifloor(mid.z) - 1};
+    whi = IVec3{ifloor(mid.x) + 4, ifloor(mid.y) + 4, ifloor(mid.z) + 1};
+    wallOn = true;
+    const lookpick::Result walled = pick(eye, dir);
+    wallOn = false;
+    line("S5 open", open, h);
+    line("S5 behind a wall", walled, h);
+    if (open.body != h) fail("S5: aimed dead on with nothing in the way, not picked");
+    if (walled.body == h) fail("S5: picked THROUGH a stone wall");
+    if (walled.occluded < 1) fail("S5: the wall refusal was not counted as occluded");
+    c.debris.DestroyBody(h);
+  }
+  // ======== S6: an arrow standing in the ground ==============================
+  {
+    // Turned to point DOWN, centred two voxels above the floor so the point
+    // is in it.
+    Vec3 ctrL;
+    const Quat q = QuatFromTo(arrowAxis(ctrL), Vec3{0, -1, 0});
+    const Vec3 want = S + Vec3{-4.0f, 2.0f, 6.0f};
+    const uint64_t h = place(*arrowDef, want - QuatRotate(q, ctrL), q);
+    const lookpick::Result r = pick(eye, aimOff(h, eye, midDeg, Vec3{-1, 0, 0}));
+    line("S6 standing in the ground", r, h);
+    if (r.exactBody == h) fail("S6: the bare ray hit the arrow");
+    if (r.body != h) fail("S6: an arrow standing in the ground beside the reticle was not picked");
+    c.debris.DestroyBody(h);
+  }
+  // ======== S7: behind a body, and out of its shadow ============================
+  const Vec3 eye2 = torsoC + Vec3{-14.0f, 0.0f, 0.0f};
+  {
+    Vec3 ctrL;
+    const Quat q = QuatFromTo(arrowAxis(ctrL), Vec3{1, 0, 0});   // along the view
+    const uint64_t h = place(*arrowDef, torsoC + Vec3{7.0f, 0.0f, 0.0f} - QuatRotate(q, ctrL), q);
+    const lookpick::Result hid = pick(eye2, (centreOf(h) - eye2).normalized());
+    line("S7 behind the body", hid, h);
+    if (hid.body == h) fail("S7: picked an arrow THROUGH a creature's body");
+    c.debris.DestroyBody(h);
+    const uint64_t h2 =
+        place(*arrowDef, torsoC + Vec3{7.0f, 0.0f, 9.0f} - QuatRotate(q, ctrL), q);
+    const lookpick::Result seen = pick(eye2, (centreOf(h2) - eye2).normalized());
+    line("S7 out of its shadow", seen, h2);
+    if (seen.body != h2) fail("S7: the same arrow out of the body's shadow was not picked");
+    c.debris.DestroyBody(h2);
+  }
+  // ======== S8: an arrow embedded in the creature ===============================
+  {
+    Mob* m = mobs.FindCreature(mobId);
+    const int slot = m ? m->EmbedArrow(*arrowDef, torso, torsoC, Vec3{1, 0, 0}) : -1;
+    const uint64_t ab = slot >= 0 ? mobs.LimbBody(mobId, slot) : 0;
+    if (!ab) {
+      fail("S8: the arrow would not embed in the torso");
+    } else {
+      const lookpick::Result r =
+          pick(eye2, aimOff(ab, eye2, 0.5f * pp.coneSmallDeg, Vec3{0, 0, 1}));
+      line("S8 embedded, half a thin cone off", r, ab);
+      if (r.exactBody == ab) fail("S8: the bare ray hit the arrow");
+      if (r.body != ab || r.kind != lookpick::Kind::EmbeddedArrow ||
+          !IsEmbeddedArrowBody(mobs, r.body))
+        fail("S8: the embedded arrow beside the reticle was not picked");
+      m->PullArrow(slot);
+    }
+  }
+  // ======== S9: a corpse with loot under the reticle =============================
+  {
+    // The look stays dead on the torso; the item floats seven voxels out
+    // along it, raised until its box is `wantDeg` off the ray (placed by its
+    // unrotated box, measured before it exists), so the bare ray passes under
+    // it and lands on the creature.
+    const Vec3 dir = (torsoC - eye2).normalized();
+    const float wantDeg = std::min(pp.coneDeg - 0.5f, pp.exactBiasDeg + 2.5f);
+    Vec3 lo, hi;
+    {
+      const uint64_t probe = place(*chunkyDef, S);
+      c.phys.GetLocalBounds(probe, lo, hi);
+      c.debris.DestroyBody(probe);
+    }
+    const Vec3 ctrL = (lo + hi) * 0.5f;
+    Vec3 at = eye2 + dir * 7.0f - ctrL;
+    bool setUp = false;
+    for (float dy = 0.0f; dy < 12.0f && !setUp; dy += 0.05f) {
+      at = eye2 + dir * 7.0f + up * dy - ctrL;
+      Vec3 q;
+      setUp = lookpick::BoxAngleDeg(eye2, dir, 200.0f, at + lo, at + hi, q) >= wantDeg;
+    }
+    const uint64_t h = place(*chunkyDef, at);
+    auto onMob = [&](uint64_t b) {
+      const Mob* o = mobs.FindOwner(b);
+      return o != nullptr && o->Id() == mobId;
+    };
+    const lookpick::Result withCorpse = pick(eye2, dir, onMob);
+    const lookpick::Result itemOnly = pick(eye2, dir);
+    line("S9 corpse under the reticle", withCorpse, withCorpse.exactBody);
+    line("S9 no corpse rule", itemOnly, h);
+    if (!setUp || !onMob(withCorpse.exactBody)) {
+      fail(Format("S9: could not set up a look on the creature with the item %.1f deg off",
+                  wantDeg));
+    } else {
+      if (withCorpse.kind != lookpick::Kind::Exact)
+        fail("S9: a lootable body under the reticle lost to an item a few degrees off");
+      if (itemOnly.body != h) fail("S9: without the corpse rule the item was not picked");
+    }
+    c.debris.DestroyBody(h);
+  }
+
+  mobs.Reset();
+  c.debris.Reset();
+  detail = lines + why;
+  std::printf("look-pick: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateArcher(Ctx& c, std::string& detail);   // selftest_archer.cpp
 
 const std::vector<Gate>& WoundGates() {
@@ -13265,6 +13626,10 @@ const std::vector<Gate>& WoundGates() {
       // on, stick in the ground, pull out, flat damage only when it got in, a
       // volley twice, and the draw/release input path.
       {"arrow", "mob", {}, false, GateArrow, false},
+      // G's pick under the reticle (game/lookpick.h, ticket 2026-10-16_11-00-17):
+      // a cone, not a ray -- off-centre items and arrows (on the floor, in the
+      // ground, in a body) are taken, nothing through a wall or a body.
+      {"look-pick", "mob", {}, false, GateLookPick, false},
       // ...and NPC ARCHERS (game/mob_archery.h, selftest_archer.cpp): an
       // `archer` draws, looses through the same flights and gets into a
       // dummy; backs off from one inside its minRange; stops at 0 arrows and

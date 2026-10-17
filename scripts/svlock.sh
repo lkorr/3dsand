@@ -188,8 +188,16 @@ svlock_acquire() {
       else
         ticket=""; start=""          # no queue dir (read-only C:?): wait the old way
       fi
-    else
+    elif [ -s "$ticket" ]; then
       touch "$ticket" 2>/dev/null || true
+    else
+      # Our ticket was reaped as stale (a touch that lagged past
+      # SVLOCK_TICKET_STALE_SEC, e.g. under fork failures) -- a bare `touch`
+      # recreated it EMPTY, which every other waiter skips as unreadable, so
+      # each newcomer went ahead of us for ever (2026-10-16: builds starved
+      # for an hour behind nameless "queued" entries). Write it back whole,
+      # with the ORIGINAL start, so our place in the queue is kept.
+      echo "$start $who" > "$ticket.tmp" 2>/dev/null && mv -f "$ticket.tmp" "$ticket" 2>/dev/null || true
     fi
     if [ "$waited" -eq 0 ]; then
       echo "$SVLOCK_TAG: waiting for $(basename "$dir") (held by: $(cat "$dir/who" 2>/dev/null || echo unknown))..."

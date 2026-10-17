@@ -543,6 +543,7 @@ add_library(sandvox_core OBJECT
   # The bow and its arrows: the draw's numbers, the kit's ammunition, and the
   # arrows in flight (docs/PLAN_projectiles.md C).
   src/game/arrows.cpp
+  src/game/lookpick.cpp
   src/game/quiver.cpp
   src/game/mob_archery.cpp
   src/game/mob_shield.cpp
