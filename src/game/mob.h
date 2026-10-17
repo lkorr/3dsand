@@ -8640,6 +8640,13 @@ class MobSystem {
   // that peer for its feet (where only the host's line has it, the host
   // promotes it, as before). Always false with no peers.
   bool DistantGoesToPeer(const DistantMob& d);
+  // TEST SEAMS (distant-mp's attribution): the ownership rule's answer for an
+  // id at `feet` (kLocalOwner with no rule) and how many peer windows the
+  // host's tier was told.
+  uint32_t OwnershipAnswerForTest(uint64_t id, Vec3 feet) {
+    return ownershipFn_ ? ownershipFn_(id, feet) : 0u;
+  }
+  size_t DistantPeerCountForTest() const { return peers_.size(); }
   // ---- the client's waiting room (EntityParking::Unpark's client branch) ---
   // Anything waiting (a hand-in, connected or not: after a disconnect the
   // room is still promoted, never given back).

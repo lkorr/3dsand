@@ -479,6 +479,9 @@ MpRun RunMp(Ctx& c) {
         break;
       }
     }
+    // B's "promoted" answer rides B's batch of that step and is applied by A
+    // at the top of the next one: the transit closes a step after B placed it.
+    for (int i = 0; i < 2; i++) step();
     check(out.hRoundTrip > 0 && c.mobs.Distant().Find(hId) == nullptr &&
               !InTransit(c.mobs, hId),
           Format("H: the round trip -- back near on B after %d ticks (max %d), off A's tier %d, "
@@ -563,7 +566,35 @@ MpRun RunMp(Ctx& c) {
           if (isW(t.d)) wId = t.d.id;
       }
       if (wId != 0 && wHandedAt < 0 && InTransit(c.mobs, wId)) wHandedAt = stepNo;
-      if (const Mob* m = c.mobs.FindMobById(pId); m != nullptr && !m->IsGhost()) pLocalOnA = true;
+      // ATTRIBUTION for "near on A": the walker's last state in A's tier, the
+      // answers the remote-promotion choice reads, and the host pass's
+      // counters, printed once at the tick it turned up near on A.
+      static DistantMob pLast;
+      static bool pLastValid = false;
+      if (const DistantMob* d = c.mobs.Distant().Find(pId)) {
+        pLast = *d;
+        pLastValid = true;
+      }
+      if (const Mob* m = c.mobs.FindMobById(pId); m != nullptr && !m->IsGhost()) {
+        if (!pLocalOnA && pLastValid) {
+          const Vec3 feet{pLast.origin.x + pLast.worldSize.x * 0.5f, pLast.origin.y,
+                          pLast.origin.z + pLast.worldSize.z * 0.5f};
+          const uint32_t own = c.mobs.OwnershipAnswerForTest(pId, feet);
+          std::printf("distant-mp: P near on A at step %d: last distant origin (%.1f,%.1f,%.1f) "
+                      "chunk (%d,%d,%d), A wo (%d,%d,%d), B wo (%d,%d,%d); owner answer %u; goes to "
+                      "peer %d; A promoted +%llu handInsSent +%llu overflowFilled +%llu peers %zu "
+                      "peerView %d\n",
+                      stepNo, (double)pLast.origin.x, (double)pLast.origin.y, (double)pLast.origin.z,
+                      (int)std::floor(feet.x / 16), (int)std::floor(feet.y / 16),
+                      (int)std::floor(feet.z / 16), Awo.x, Awo.y, Awo.z, Bwo.x, Bwo.y, Bwo.z, own,
+                      c.mobs.DistantGoesToPeer(pLast) ? 1 : 0,
+                      (unsigned long long)(aSt.promoted - a0.promoted),
+                      (unsigned long long)(aSt.handInsSent - a0.handInsSent),
+                      (unsigned long long)(aSt.overflowFilled - a0.overflowFilled),
+                      c.mobs.DistantPeerCountForTest(), entA.HavePeerView() ? 1 : 0);
+        }
+        pLocalOnA = true;
+      }
     };
     preA = [&]() {
       // W comes back: A's apply of B's "returned" just put it in the tier.
@@ -654,7 +685,10 @@ MpRun RunMp(Ctx& c) {
 
   // ======== D: a disconnect with a creature in transit =========================
   {
-    const int xx = vox(Awo.x + 26) + 8 - (int)(hs.x * 0.5f);
+    // x chunk 30: in the overlap's far half (B nearer), and two chunks clear
+    // of P's creature, which stands near on B at x chunk 28 by now -- at 26
+    // the walker spent 300 ticks trying to get round it at the face.
+    const int xx = vox(Awo.x + 30) + 8 - (int)(hs.x * 0.5f);
     const int xz0 = vox(Awo.z + (int)kNChunk) + 20;
     const uint64_t xId = makeDistant("duelist", xx, xz0);
     goTo(xId, Vec3{(float)xx + hs.x * 0.5f, 0.0f, (float)vox(Awo.z + 27)});
@@ -690,6 +724,24 @@ MpRun RunMp(Ctx& c) {
     const int dMax = (int)BaselineNumber("distantMp.disconnectPromoteMaxTicks", 60);
     for (stepNo = 1; stepNo <= maxSteps; stepNo++) {
       step();
+      // ATTRIBUTION while it has not been handed in: where it is, in which
+      // list, and the waits the host's hand-in pass counted.
+      if (droppedAt < 0 && stepNo % 50 == 0) {
+        const DistantMob* d = c.mobs.Distant().Find(xId);
+        const Mob* na = c.mobs.FindMobById(xId);
+        const Mob* nb = far.FindMobById(xId);
+        const auto& pw = c.mobs.DistantPeers();
+        std::printf("distant-mp: D step %d: tier %d at (%.1f,%.1f,%.1f) asleep %d goal %d, transit %d, "
+                    "near A %d (ghost %d), near B %d (ghost %d); A waits room %llu budget %llu flip %llu, "
+                    "peer free %u (have %d), sent %llu\n",
+                    stepNo, d != nullptr, d ? (double)d->origin.x : 0.0, d ? (double)d->origin.y : 0.0,
+                    d ? (double)d->origin.z : 0.0, d ? (int)d->asleep : -1,
+                    d ? (int)d->brain.routine.active : -1, InTransit(c.mobs, xId), na != nullptr,
+                    na && na->IsGhost(), nb != nullptr, nb && nb->IsGhost(),
+                    (unsigned long long)aSt.handInRoomWaits, (unsigned long long)aSt.handInBudgetWaits,
+                    (unsigned long long)aSt.handInFlipWaits, pw.empty() ? 0u : pw[0].livingFree,
+                    pw.empty() ? -1 : (int)pw[0].haveFree, (unsigned long long)aSt.handInsSent);
+      }
       if (droppedAt > 0) {
         const Mob* m = far.FindMobById(xId);
         if (m != nullptr && !m->IsGhost()) {

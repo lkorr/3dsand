@@ -1996,7 +1996,7 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       // stay 0: OutsideGroundFor is single-threaded).
       << ", \"outsideGrounds\": " << ds.outsideGrounds
       << ", \"nearPastFace\": " << ds.nearPastFace << ", \"walkedOut\": " << ds.walkedOut
-      << ", \"outsideTaskRefusals\": " << MobSystem::OutsideGroundTaskRefusals() << "},\n";
+      << ", \"outsideTaskRefusals\": " << MobSystem::OutsideGroundTaskRefusals()
       // D7a: THE TIER ACROSS MACHINES -- a client's hand-outs and what became
       // of the hand-ins its waiting room took; the host's hand-outs taken or
       // parked, its remote promotions and the waits that held them, the

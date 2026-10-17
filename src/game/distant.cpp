@@ -5389,10 +5389,25 @@ bool MobSystem::ApplyDistantHandOut(const ::net::DistantHandOut& h, uint32_t tic
 
 // ---- the host's remote promotion: HAND IT IN ----------------------------------
 
+// WHERE THE OWNERSHIP RULE IS ASKED for a creature over two promotion lines.
+// The lines test the body box's MIN CORNER (PromoBoxOf, the parked record's
+// test), the authority rule a point's CHUNK with one chunk of margin -- and
+// the feet (the box's centre column) of a creature just over a line can still
+// stand in a window's OUTERMOST chunk plane, where net::Authority names
+// nobody and MobOwner falls back to "mine". Measured (distant-mp P): over
+// both lines with its feet in z chunk 31, the walker was promoted on the host
+// although the client was 8 chunks nearer. So the question is asked at the
+// min corner's own column -- the very point both lines admitted, resident
+// with margin in each window that has it over its line -- and the arithmetic
+// answers "nearest" there. Once it is near, RefreshOwnership asks at the feet
+// as always, and the handoff path moves it if that differs.
+static Vec3 LineOwnershipPoint(const DistantMob& d) {
+  return d.origin;   // exactly the point PromoBoxOf::Inside tested (not +0.5: that can cross a chunk)
+}
+
 bool MobSystem::DistantGoesToPeer(const DistantMob& d) {
   if (netRole_ != DistantNetRole::Host || peers_.empty() || !ownershipFn_) return false;
-  const Vec3 feet{d.origin.x + d.worldSize.x * 0.5f, d.origin.y,
-                  d.origin.z + d.worldSize.z * 0.5f};
+  const Vec3 feet = LineOwnershipPoint(d);
   for (const DistantPeerWindow& p : peers_) {
     if (!PromoBoxOf(p.windowOrigin).Inside(d.origin)) continue;
     // Over this peer's line AND the host's (the caller's candidates are over
@@ -5430,9 +5445,7 @@ uint32_t MobSystem::RemotePromotions(uint32_t tick) {
       // host's line too: the ownership rule decides (DistantGoesToPeer's
       // question); otherwise the host's own pass promotes it.
       if (hostBox.Inside(d->origin)) {
-        const Vec3 feet{d->origin.x + d->worldSize.x * 0.5f, d->origin.y,
-                        d->origin.z + d->worldSize.z * 0.5f};
-        if (!ownershipFn_ || ownershipFn_(cid, feet) != p.playerId) continue;
+        if (!ownershipFn_ || ownershipFn_(cid, LineOwnershipPoint(*d)) != p.playerId) continue;
       }
       // THE WAITS, in the host pass's order: the budget, the room (a corpse
       // never waits on the living cap), the thrash bound. A held one stays
