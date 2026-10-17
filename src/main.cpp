@@ -11245,6 +11245,13 @@ int main(int argc, char** argv) {
     mobs.SetIdBand(netMyId);
     mobs.SetLocalPlayerId(netMyId);
     debris.SetLocalPlayerId(netMyId);
+    // ---- D7a: THE DISTANT TIER ACROSS MACHINES (game/distant.h) ----------
+    // The host's tier is the world's (it steps, retires, activates and saves
+    // every distant creature, for every window of the game); a client hands
+    // out what leaves its window and promotes what the host hands in. Off
+    // until here -- and back Off in netDrop -- so nothing of it runs alone.
+    mobs.SetDistantNetRole(netRoleBoot == NetRole::Host ? DistantNetRole::Host
+                                                        : DistantNetRole::Client);
     mobs.SetOwnershipFn([&entities](uint64_t id, Vec3 feet) {
       return entities.MobOwner(id, feet);
     });
@@ -11396,6 +11403,16 @@ int main(int argc, char** argv) {
       t.batchesOut += s.batchesOut;       t.batchesIn += s.batchesIn;
       t.applyMisses += s.applyMisses;     t.expired += s.expired;
       t.ghostsMax = std::max(t.ghostsMax, s.ghostsMax);
+      // D7a: the distant tier's records and the view's cost.
+      t.handOutsOut += s.handOutsOut;     t.handOutsIn += s.handOutsIn;
+      t.handInsOut += s.handInsOut;       t.handInsIn += s.handInsIn;
+      t.donesOut += s.donesOut;           t.donesIn += s.donesIn;
+      t.viewEntriesOut += s.viewEntriesOut;
+      t.viewShapesOut += s.viewShapesOut;
+      t.viewGonesOut += s.viewGonesOut;   t.viewBytesOut += s.viewBytesOut;
+      t.viewBatchesOut += s.viewBatchesOut;
+      t.viewEntriesIn += s.viewEntriesIn; t.viewGonesIn += s.viewGonesIn;
+      t.freeReportsOut += s.freeReportsOut;
       return t;
     }();
     netGhostsMax = std::max(netGhostsMax, netEnt.ghostsMax);
@@ -11409,6 +11426,10 @@ int main(int argc, char** argv) {
     // clue that it was a reporting defect and not a protocol one.
     entities.ResetStats();
     entities.Disconnect();
+    // D7a: the host's creatures in transit to the peer come back into its
+    // tier (never lost); a client keeps its waiting room and goes on placing
+    // it. The role goes Off: from here this is single player again.
+    mobs.DistantNetDisconnect(tick);
     // The op exchange goes with the peer. Its counters are harvested FIRST:
     // Disconnect() clears the queue, and the delay queue's labels are this
     // session's and no other -- a rejoin restarts the host's clock, and a
@@ -21462,10 +21483,15 @@ int main(int argc, char** argv) {
           distantDrawTest.Fill(distantDraw, mobs.Defs(), mbSet, player.pos,
                                NowSeconds(), kDefaultSeed);
         else
+        {
           // D1: one statue per distant creature with a baked look, walking
           // while it walks (FillDistantDrawItems, game/distant.h).
           FillDistantDrawItems(mobs.Distant(), tick, CurrentTuning().distant.idleStride,
                                distantDraw.Items());
+          // D7a: ...and on a CLIENT, the host's tier as its view shows it
+          // (nothing without a role: the mirror is empty).
+          mobs.AppendDistantViewDrawItems(distantDraw.Items());
+        }
         const uint32_t used = bodyReg.RealSlots() + (uint32_t)flightBodies.size();
         DistantView dv;
         dv.eye = eye;
@@ -22972,6 +22998,36 @@ int main(int argc, char** argv) {
           (unsigned long long)(netEnt.applyMisses + s.applyMisses),
           (unsigned long long)(netEnt.batchesOut + s.batchesOut),
           (unsigned long long)(netEnt.batchesIn + s.batchesIn));
+      // ---- D7a: THE DISTANT LINE (docs/PLAN_distant_npcs.md 8.3 / 8.6) ----
+      // "Did a creature that left one player's window stay in the world, and
+      // did the other player see the host's distant tier?" The records each
+      // way, the view's cost (entries, of which with the shape, gones, and
+      // its bytes per batch that carried one), and the tier's own verdicts
+      // from DistantRunTotals: hand-outs the host took or parked, hand-ins
+      // promoted or given back, transits restored -- and `lost`, the tier's
+      // `failed`, which must stay 0.
+      const DistantMobs::Stats& dt = DistantRunTotals();
+      const uint64_t vb = netEnt.viewBatchesOut + s.viewBatchesOut;
+      std::printf(
+          "net: distant: handOuts out=%llu in=%llu (taken %llu, parked %llu) | handIns "
+          "out=%llu in=%llu (promoted %llu, returned %llu) | dones out=%llu in=%llu | "
+          "view entries=%llu shapes=%llu gones=%llu bytes=%llu (%.1f per batch) in=%llu | "
+          "transit restored=%llu | lost=%llu\n",
+          (unsigned long long)(netEnt.handOutsOut + s.handOutsOut),
+          (unsigned long long)(netEnt.handOutsIn + s.handOutsIn),
+          (unsigned long long)dt.handOutsTaken, (unsigned long long)dt.handOutsParked,
+          (unsigned long long)(netEnt.handInsOut + s.handInsOut),
+          (unsigned long long)(netEnt.handInsIn + s.handInsIn),
+          (unsigned long long)dt.handInsPromoted, (unsigned long long)dt.handInsReturned,
+          (unsigned long long)(netEnt.donesOut + s.donesOut),
+          (unsigned long long)(netEnt.donesIn + s.donesIn),
+          (unsigned long long)(netEnt.viewEntriesOut + s.viewEntriesOut),
+          (unsigned long long)(netEnt.viewShapesOut + s.viewShapesOut),
+          (unsigned long long)(netEnt.viewGonesOut + s.viewGonesOut),
+          (unsigned long long)(netEnt.viewBytesOut + s.viewBytesOut),
+          vb > 0 ? (double)(netEnt.viewBytesOut + s.viewBytesOut) / (double)vb : 0.0,
+          (unsigned long long)(netEnt.viewEntriesIn + s.viewEntriesIn),
+          (unsigned long long)dt.transitRestored, (unsigned long long)dt.failed);
     }
     // ---- M9.5-B: THE STORE LINE -----------------------------------------
     //

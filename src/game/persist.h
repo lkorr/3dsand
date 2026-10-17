@@ -373,12 +373,22 @@ class EntityParking {
   // to any peer whose window holds it), and main enables it only on a machine
   // whose store is the world's -- single player and the host. A client's
   // store is not what the host saves, so a client that parked would hide the
-  // thing from the world file; a client keeps the pre-S5b despawn (and its
-  // MobGone / BodyGone), which is no worse than before.
-  // KNOWN GAP: a creature or item the host parked comes back only when the
-  // HOST's window reaches it; a client walking into that region alone does
-  // not see it (that needs the host to unpark on the client's behalf and
-  // hand off).
+  // thing from the world file; a client keeps the pre-S5b despawn for ITEMS
+  // (and their BodyGone), which is no worse than before.
+  // CREATURES ON A CLIENT ARE NOT DESPAWNED any more (D7a, docs/PLAN_distant_
+  // npcs.md 8.3 / 8.6): with the distant tier on, a client's creature leaving
+  // its window is HANDED OUT to the host (MobSystem::HandOutToHost, the park
+  // rule's client branch), which keeps it -- in its distant tier under the
+  // same id, or parked here. And a CREATURE the host parked is no longer
+  // reachable only by the host's window: the host ACTIVATES parked records
+  // within distant.radius of ANY window of the game -- inside a peer's window
+  // too -- and hands IN the ones over a peer's promotion line (MobSystem::
+  // RemotePromotions); the client places them in its own Unpark (the waiting
+  // room branch: it runs although this machine's parking is off).
+  // KNOWN GAP (what is left of the old one): ITEMS. A ground item the host
+  // parked comes back only when the HOST's window reaches it; a client
+  // walking into that region alone does not see it, and an item leaving a
+  // client's window is still released.
   void Bind(MobSystem& mobs, ChunkStore& store, bool enabled,
             const WorldItemRefs* ground = nullptr);
   // See the class comment. `tick` is the sim tick being run (phase H) or just
@@ -416,4 +426,10 @@ class EntityParking {
   std::unordered_map<uint64_t, Wait> waits_;
   Stats stats_;
   bool GroundKnown(World& world, IVec3 wc, uint32_t tick);
+  // The ground under a body whose min corner is `p`, known in the fetch cache
+  // (the chunks under the corner and half a chunk on, at the feet and below).
+  bool FootprintGround(World& world, Vec3 p, uint32_t tick);
+  // D7a: a CLIENT's pass (parking off): the waiting room's promotions, under
+  // this machine's own waits, and the hand-ins it gives back (persist.cpp).
+  uint32_t PromoteWaitingRoom(MobSystem& mobs, World& world, uint32_t tick, uint32_t budget);
 };

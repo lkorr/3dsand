@@ -4147,6 +4147,19 @@ void MobSystem::Reset(bool rewindIds) {
   edgeShotsOut_.clear();
   shotEvents_.clear();
   overflowLog_.clear();
+  // ...D7a's: the creatures in transit to a peer and the three outboxes (the
+  // world they belonged to is going), the client's view of a host tier and
+  // the looks it remembered. The ROLE and the peers stay: they are the
+  // connection's, not the world's (the net layer sets the peers every tick).
+  inTransit_.clear();
+  handOutsOut_.clear();
+  handInsOut_.clear();
+  donesOut_.clear();
+  viewMobs_.clear();
+  handedLooks_.clear();
+  handedOrder_.clear();
+  tierEntries_.clear();
+  retirePeersGen_ = actPeersGen_ = ~0ull;
   bodyFx_.clear();
   // ...and the corpses that were going to get up do not, because the world
   // they were lying in is gone: a booked rising names a place and a handful of
@@ -4786,6 +4799,16 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   mob.gore_ = Mob::MakeGoreProfile(mob.id_);
   mob.defIndex_ = defIndex;
   mob.def_ = &def;
+  // BORN THIS TICK (mob.h `ownLatch_`): the first RefreshOwnership keeps it
+  // this machine's, so a handoff -- if it belongs to a peer -- is built by the
+  // next ScanHandoffs rather than skipped. Read only while connected. And it
+  // IS this machine's from birth: `owner_` the local player id (0 in single
+  // player, as before; a client's spawns used to be born owner 0 -- a ghost
+  // of the HOST's on the client -- until the next RefreshOwnership said
+  // otherwise). The two spawn paths that make somebody else's creature
+  // (ApplyAnnounce, ApplyHandoff) set the owner themselves right after.
+  mob.ownLatch_ = true;
+  mob.owner_ = localPlayerId_;
   // Resolve the sidecar's AI profile by name, here rather than at def load: the
   // behaviour library reloads independently (R), so an index baked into the def
   // would rot the moment a profile was inserted above it. -1 = no AI, and the
@@ -9655,7 +9678,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // DecayHitFlash for why it is not on the frame clock — the short version is
   // that a gate damages limbs and never runs a frame.
   DecayHitFlash(dt);
-  IVec3 wo = world.WindowOrigin();
+  // The window THIS machine's tier borders use: the World's, except under
+  // distant-mp's machine B, which simulates a second machine on the one World
+  // with its own displaced window (SetTierWindowForTest). Read only by the
+  // retire scan, the edge band and the park rule below.
+  IVec3 wo = TierWindowOrigin(world);
   Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
            (float)(wo.z * (int)kChunk)};
   int bleedOps = 0;
@@ -9977,8 +10004,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // debris (that would be local bodies for a corpse the peer still keeps).
     // It takes the ghost's exit below -- released, not parked -- and the
     // owner's own window rule decides what becomes of the real one.
+    // D7a: a CLIENT keeps its corpses too -- handed to the host's tier as a
+    // dead distant creature (HandOutToHost below) rather than decayed here.
     if (out && !mob.alive_ && !mob.IsGhost() &&
-        !(parkFn_ && SavesAsRecord(mob))) {
+        !((parkFn_ || DistantHandOutLive()) && SavesAsRecord(mob))) {
       // A CORPSE THAT LEAVES THE WINDOW AND CANNOT BE PARKED (no park
       // function, or nothing left of it) decays to debris, which is what
       // every corpse did before it was a Mob: DebrisSystem's own window rule
@@ -10020,6 +10049,30 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           gone = true;
         }
         if (gone && !mob.alive_)
+          for (size_t k = 0; k < rises_.size();)
+            if (rises_[k].mobId == mob.id_) {
+              rises_[k] = std::move(rises_.back());
+              rises_.pop_back();
+            } else {
+              k++;
+            }
+      } else if (DistantHandOutLive() && !mob.IsGhost() && !mob.PlayerControlled() &&
+                 mob.defIndex_ >= 0 && mob.defIndex_ < (int)defs_.size()) {
+        // ...OR, ON A CLIENT, IT GOES TO THE HOST (D7a; game/distant.h). A
+        // client has no store of its own to park in and no tier of its own
+        // (the distant world is the host's), and this branch used to RELEASE
+        // the creature -- every NPC that walked away from the second player
+        // was gone for good. Now its SaveOne record, its brain, its steer and
+        // statuses and the look baked from this very rig go to the host as a
+        // DistantHandOut, and the host keeps it (in its tier under the same
+        // id, or parked). A rising booked on a corpse is withdrawn as a park
+        // withdraws it: the record carries it.
+        std::vector<uint8_t> rec;
+        {
+          ByteWriter w{rec};
+          mob.SaveOne(w);
+        }
+        if (HandOutToHost(mob, rec) && !mob.alive_)
           for (size_t k = 0; k < rises_.size();)
             if (rises_[k].mobId == mob.id_) {
               rises_[k] = std::move(rises_.back());
@@ -33359,6 +33412,16 @@ void MobSystem::RefreshOwnership() {
     // measured as 187 + 157 poses for the same three humans with zero
     // handoffs between them.
     if (m.announceOnly_) continue;
+    // BORN THIS TICK, NOT YET OFFERED TO A HANDOFF (mob.h `ownLatch_`, D7a):
+    // a creature made live inside the tick (a promotion or an unpark in phase
+    // H, a rising) keeps the owner it was born with -- this machine -- for the
+    // one tick it takes the next ScanHandoffs to hand it over WITH its record.
+    // Answering the ownership function now could make it a ghost here that the
+    // peer was never told about (no handoff is built inside the tick).
+    if (m.ownLatch_) {
+      m.ownLatch_ = false;
+      continue;
+    }
     // THE FEET, not the origin corner and not the centre: net::Authority keys
     // an entity on the chunk it stands in, and a tall creature's centre is up
     // to a chunk above the ground it is standing on.

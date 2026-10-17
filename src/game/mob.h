@@ -29,6 +29,7 @@
 #include "phys/physics.h"
 #include "sim/materials.h"
 #include "net/mobsync.h"    // the four records mob ownership exchanges
+#include "net/distantsync.h"  // D7a: the distant tier's four records (hand-out / -in / done / view)
 #include "sim/bytestream.h"  // ByteWriter/ByteReader: the per-mob record
 #include "sim/microbody.h"
 #include "sim/voxload.h"
@@ -6082,6 +6083,21 @@ class Mob {
   // a peer's blow waits for the record instead of being wiped by it
   // (game/meleehit.h rule 3). 0 = nothing pending.
   uint32_t handoffDueTick_ = 0;
+  // ---- BORN THIS TICK: NOT YET OFFERED TO A HANDOFF (D7a, 2026-10-16) -----
+  //
+  // Set by MobSystem::Spawn, cleared by the first RefreshOwnership that sees
+  // it -- which keeps `owner_` as it is (local, for anything this machine
+  // spawned) instead of asking the ownership function. WHY: a creature made
+  // live DURING a tick (a promotion or an unpark in phase H, a rising, a
+  // spawn) gets its first ownership answer at the top of mobs.PreTick, and
+  // net::EntitySync::ScanHandoffs -- the only place a MobHandoff is BUILT --
+  // ran before that tick began and never saw it. Asked then, an answer naming
+  // the peer made it a ghost here with no record on the wire: the peer never
+  // received it and the ghost expired (kGhostExpiryTicks) -- a creature lost
+  // at a peer's window. Held local for that one tick, the next tick's
+  // ScanHandoffs (before the tick) hands it over properly, record and all.
+  // No effect unconnected (RefreshOwnership returns before reading it).
+  bool ownLatch_ = true;
   // A GHOST'S BLADE IS LIVE: its owner's MobPose says the held item is
   // cutting or held in guard (MobPose::kBladeLive). FindParry reads it in
   // place of `swinging_` / the stroke phase, which a ghost does not run.
@@ -8503,6 +8519,106 @@ class MobSystem {
   // What the tier's arrows did (bounded at kDistantLogMax, oldest dropped).
   const std::vector<DistantShotEvent>& DistantShotEvents() const { return shotEvents_; }
   void ClearDistantShotEvents() { shotEvents_.clear(); }
+  // ---- D7a: THE TIER ACROSS MACHINES (game/distant.h's D7a paragraph; the
+  // records are net/distantsync.h's; docs/PLAN_distant_npcs.md 8.3, 8.6) ----
+  //
+  // THE ROLE, set by the net layer at connect (main.cpp netStartPacing: the
+  // host Host, a client Client) and dropped at a disconnect. Off -- every
+  // single-player run and every gate that does not set it -- and nothing of
+  // what follows runs: the tier is D0..D9's exactly.
+  void SetDistantNetRole(DistantNetRole r);
+  DistantNetRole GetDistantNetRole() const { return netRole_; }
+  // THE PEERS' WINDOWS (W minus the host's own) and the room each reported,
+  // every tick before the tick (net::EntitySync::ScanHandoffs). Read only by a
+  // Host's tier rules; a change of any window re-arms the border scans.
+  void SetDistantPeers(std::span<const DistantPeerWindow> peers);
+  const std::vector<DistantPeerWindow>& DistantPeers() const { return peers_; }
+  // A CLIENT HANDS OUT what leaves its window (instead of erasing it): the
+  // role is Client and the tier is enabled. The one predicate D11's
+  // `DistantReachable()` must OR in on a client, where no park function exists
+  // but a creature walking out of the window is kept all the same (the host
+  // takes it).
+  bool DistantHandOutLive() const;
+  // THE PEER WENT AWAY. A host puts every creature in transit back in its tier
+  // (or parks it: never lost) and forgets the peers; a client forgets the view
+  // and keeps its waiting room, which its own promotion pass still places
+  // (there is nobody to give it back to). The role goes Off.
+  void DistantNetDisconnect(uint32_t tick);
+  // OUTGOING, drained by net::EntitySync::Build after the tick: a client's
+  // hand-outs and its answers to hand-ins, a host's hand-ins. Moved out.
+  void TakeDistantOutgoing(std::vector<::net::DistantHandOut>& handOuts,
+                           std::vector<::net::DistantHandIn>& handIns,
+                           std::vector<::net::DistantHandInDone>& dones);
+  // A CLIENT's room for promotions: kMaxMobs minus its living near creatures
+  // minus the living creatures in its waiting room (never below 0).
+  uint32_t DistantLivingFree() const;
+  // INCOMING, applied by net::EntitySync::ApplyForTick (before the tick,
+  // field order: hand-outs, dones, hand-ins, the view). Each answers false
+  // when it did nothing; none ever loses a creature (a hand-out it cannot
+  // take is parked; a hand-in it cannot hold is given back).
+  bool ApplyDistantHandOut(const ::net::DistantHandOut& h, uint32_t tick);
+  bool ApplyDistantDone(const ::net::DistantHandInDone& d, uint32_t tick);
+  bool ApplyDistantHandIn(const ::net::DistantHandIn& h, uint32_t tick);
+  void ApplyDistantView(const ::net::DistantView& v);
+  // THE VIEW A HOST SENDS ONE PEER: every tier creature within distant.radius
+  // of the peer's window centre (`peerWo`, chunks), ascending id, every entry
+  // WHOLE (the shape included; net::EntitySync sends what changed). Band
+  // members (within kDistantEdgeBandVox of the peer's window box) carry their
+  // tick-start actor -- the function the host's own band uses -- and those
+  // whose body box reaches into that window the box.
+  void BuildDistantView(IVec3 peerWo, uint32_t tick,
+                        std::vector<::net::DistantViewEntry>& out);
+  // The client's mirror of the host's view (ascending id).
+  const std::vector<DistantViewMob>& DistantViewMobs() const { return viewMobs_; }
+  // THE CLIENT'S STATUES from the view: one item per mirrored creature with a
+  // shape that is not in this machine's own tier (the waiting room draws
+  // itself), its look this machine's own key for that id if it baked one
+  // (a creature it handed out), else the host's. Appended to `out`.
+  void AppendDistantViewDrawItems(std::vector<DistantDrawItem>& out) const;
+  // The host's creatures in transit (id order), for the save ('MOBS'
+  // saveRecords writes each as its patched record, like the tier) and gates.
+  const std::vector<DistantTransit>& DistantInTransit() const { return inTransit_; }
+  // THE REMOTE PROMOTIONS (a Host's; called by EntityParking::Unpark right
+  // after its own distant pass): every peer's candidates over that peer's
+  // line, nearest to its window centre first, handed in under the peer's
+  // room, the flip bound and kUnparkPerCall a peer a tick. Returns hand-ins.
+  uint32_t RemotePromotions(uint32_t tick);
+  // Does the host's own promotion pass leave distant creature `d` to a PEER?
+  // True when it is over a peer's promotion line and the ownership rule names
+  // that peer for its feet (where only the host's line has it, the host
+  // promotes it, as before). Always false with no peers.
+  bool DistantGoesToPeer(const DistantMob& d);
+  // ---- the client's waiting room (EntityParking::Unpark's client branch) ---
+  // Anything waiting (a hand-in, connected or not: after a disconnect the
+  // room is still promoted, never given back).
+  bool HasWaitingRoom() const;
+  // Hand-ins held kHandInMaxWaitTicks or longer go back (connected only):
+  // erased here, DistantHandInDone{returned} queued. Returns how many.
+  uint32_t ReturnStaleHandIns(uint32_t tick);
+  // The pass's answer for hand-in `id`: promoted, or let go (a permanent
+  // refusal that PromoteDistant already dropped). Queued while connected.
+  void NoteWaitingRoomResult(uint64_t id, bool promoted);
+  // ---- ownership's memory (net::EntitySync) --------------------------------
+  // The ids that ENTERED a tier on this machine since the last call (a host
+  // demotion, a hand-out sent, a hand-in or hand-out received, a transit
+  // restored): EntitySync forgets their incumbent (mobMem_), so a stale
+  // owner cannot ghost one when it comes back near. Recorded only with a role.
+  void TakeTierEntries(std::vector<uint64_t>& out) {
+    out.swap(tierEntries_);
+    tierEntries_.clear();
+  }
+  // ---- TEST SEAM (distant-mp): the window THIS tier's borders use --------
+  // Every border rule above asks TierWindowOrigin: the World's window, or --
+  // set by a gate that simulates a SECOND machine in one process on the one
+  // World (machine B of distant-mp) -- the override, B's own displaced
+  // window. Null restores the World's. Never set by the game.
+  void SetTierWindowForTest(const IVec3* wo) {
+    tierWindowOverride_ = wo != nullptr;
+    if (wo != nullptr) tierWindow_ = *wo;
+  }
+  IVec3 TierWindowOrigin(const World& w) const {
+    return tierWindowOverride_ ? tierWindow_ : w.WindowOrigin();
+  }
   // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
   // `kMaxMobs` counts the LIVING; the dead have their own count and a body
   // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
@@ -10697,6 +10813,43 @@ class MobSystem {
   // its footprint, from the fetch cache, searching up out of matter when
   // TerrainHeight disagreed, within distant.promoteMaxDropVox. Counted.
   void SnapPromotionGround(DistantMob& d);
+  // ---- D7a: the tier across machines (distant.cpp) --------------------------
+  DistantNetRole netRole_ = DistantNetRole::Off;
+  std::vector<DistantPeerWindow> peers_;
+  // Bumped whenever a peer window (or the set of them) changes: the retire and
+  // activation scans' "has W moved" memory (rule 2).
+  uint64_t peersGen_ = 0;
+  uint64_t retirePeersGen_ = ~0ull, actPeersGen_ = ~0ull;
+  // The host's creatures in transit (id order) and the three outboxes.
+  std::vector<DistantTransit> inTransit_;
+  std::vector<::net::DistantHandOut> handOutsOut_;
+  std::vector<::net::DistantHandIn> handInsOut_;
+  std::vector<::net::DistantHandInDone> donesOut_;
+  // The client's mirror of the host's view (ascending id), and the looks it
+  // baked for the creatures it handed out (id -> key, oldest forgotten first).
+  std::vector<DistantViewMob> viewMobs_;
+  std::unordered_map<uint64_t, DistantLookKey> handedLooks_;
+  std::deque<uint64_t> handedOrder_;
+  // Ids that entered a tier here since EntitySync last asked (TakeTierEntries).
+  std::vector<uint64_t> tierEntries_;
+  void NoteTierEntry(uint64_t id) {
+    if (netRole_ != DistantNetRole::Off) tierEntries_.push_back(id);
+  }
+  // distant-mp's machine B (SetTierWindowForTest).
+  bool tierWindowOverride_ = false;
+  IVec3 tierWindow_{};
+  // THE CLIENT'S PARK RULE (D7a): `mob` leaves this machine's window and goes
+  // to the host as a DistantHandOut (its SaveOne `record`, consumed). The
+  // caller releases the rig after, as for a park. False: nothing was sent
+  // (the caller releases it anyway -- today's rule for a client).
+  bool HandOutToHost(Mob& mob, std::vector<uint8_t>& record);
+  // The window centres of W (the host's first, then each peer's), world voxels.
+  void WindowCentres(Vec3 hostWlo, std::vector<Vec3>& out) const;
+  // The squared distance from `p` to the nearest of them.
+  float NearestCentreDistSq(Vec3 hostWlo, Vec3 p) const;
+  // A distant creature back in this host's tier from transit (a Done returned,
+  // a disconnect): inserted awake, or parked when the tier has no room.
+  void RestoreFromTransit(DistantMob&& d, uint32_t tick);
   uint64_t aiSteps_ = 0;
   // The drip pot taken in turns (Mob::BleedTick): creatures that wanted a
   // drip this tick / last tick, and the refusals. Not hashed, not saved --

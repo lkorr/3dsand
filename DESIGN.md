@@ -1205,13 +1205,56 @@ the edge, outcomes resolved before any is applied, ground and ChunkStore reads
 latency-fixed. Mob state is not in `determinismHash`; twice-run digests hold
 it (`distant-walk`, `distant-fight`, `distant-edge`, `distant-schedule`).
 
+**Across machines** (D7a, 2026-10-16; `docs/PLAN_distant_npcs.md` 8.3 / 8.6,
+`net/distantsync.h`, gate `distant-mp`). THE DISTANT WORLD IS THE HOST'S: one
+machine -- the host, whose `ChunkStore` is the world's -- holds, steps,
+retires, activates and saves every distant creature, and every "the window"
+above becomes "a window of the game", W = the host's window plus each
+connected peer's (the `PeerView` origins `net::Authority` reads, handed to the
+tier as `DistantPeerWindow`s every tick). The radius tests (demotion,
+activation) are against the NEAREST centre in W, retirement is past radius +
+hysteresis of EVERY centre, activation also takes records inside a peer's
+window (the old "the host parked it, only the host's window brings it back"
+gap), and the drive holds a waiting creature at the promotion line of every
+window it is over. A creature over a PEER's line -- alone, or where both lines
+have it and the ownership rule names the peer for its feet -- is a REMOTE
+PROMOTION: the host sends a `DistantHandIn` (the patched record with its
+status tail, the brain on the wire, the steer, whether it walked, the look
+key), keeps the creature whole in an IN-TRANSIT list (saved with the tier,
+put back at a disconnect or on a "returned" answer), served nearest to that
+peer's window first, `kUnparkPerCall` a peer a tick, under the room the peer
+reports (`livingFree`) minus what is in transit and the flip bound. A CLIENT
+holds no tier of its own: its park rule HANDS OUT a creature leaving its
+window (`DistantHandOut`: SaveOne record, brain, steer, velocity, statuses,
+the look baked now from the live rig) where it used to erase it, and the host
+makes it a distant creature under the SAME id (`DistantFromRecord`) or parks
+it -- never loses it; a hand-in waits in the client's WAITING ROOM (never
+stepped, retired, activated or published) until the client's own promotion
+pass places it (`EntityParking::Unpark`'s branch for a machine whose parking
+is off: its cap, its fetch cache, the snap) and answers `DistantHandInDone`
+promoted -- or gives it back after `kHandInMaxWaitTicks` (150). The client's
+edge band and statues come from the host's `DistantView` of its window
+(every tier creature within the radius of the peer's window centre: the shape
+on first sight and a 1 s keyframe, the statue state on change, the tick-start
+actor and body box inside the edge band of the peer's window, a gone when it
+leaves the set). `EntityBatch` v5 carries the four records after
+`playerBodies`. Ownership: an id that enters a tier on either machine loses its
+incumbent in `EntitySync`'s memory, and a creature made live inside a tick is
+held by its maker for one tick (`Mob::ownLatch_`) so the next `ScanHandoffs`
+hands it over WITH its record (the latent "promoted near a peer, ghosted with
+no handoff, expired" case, for every path). Nothing of it runs unconnected:
+the role is Off outside a two-player session. D7b (the edge across a peer's
+window: blows and arrows between the client's near creatures and the host's
+distant ones) is the open half.
+
 **Off** (`distant.enabled = false`): the park rule exactly as S5b ran it; the
 gates that test the PARK path pin it off (`DistantSwitchScope`: `mob-park`
 A-F, `corpse-save`, `npc-catchup`, `refs-npc-identity` A-E; C2 runs the tier).
 Counters: `build/last_run.json` -> `distant`. Gates `distant-roundtrip`,
 `distant-walk`, `distant-sleep`, `distant-fight`, `distant-calibrate`,
 `distant-calib-matrix`, `distant-look`, `distant-edge`, `distant-schedule`,
-`distant-save`, `distant-overflow`, `distant-arrow`. Planned: D7 (multiplayer).
+`distant-save`, `distant-overflow`, `distant-arrow`, `distant-mp` (D7a, the
+tier across machines). Planned: D7b (the edge across a peer's window).
 
 ---
 
@@ -30089,6 +30132,29 @@ a `switch` whose empty labels were separated from their target; and
 `SaveWorld`'s untagged resident flush erased the tags it existed to keep.
 Smoke: a flying, painting client put 2,163 chunks; the host received, saved
 and a fresh process loaded exactly 2,163 tagged chunks at the saved tick.
+
+**The distant tier across machines (D7a, 2026-10-16; `net/distantsync.h`,
+"Distant creatures" -> "Across machines", gate `distant-mp`).** Before D7a a
+creature that walked out of the CLIENT's window was released and erased (a
+client has no park function), and the host's distant tier knew only the
+host's window. Now the distant world is the HOST'S, over every window of the
+game: a client HANDS OUT what leaves its window (`DistantHandOut`, the same
+SaveOne record a park writes plus the brain, steer and statuses), the host
+keeps it under its id, steps it, retires it past every window's reach,
+activates parked records near any window, and HANDS IN to a peer what reaches
+that peer's promotion line (`DistantHandIn`, answered by `DistantHandInDone`:
+promoted, or returned to the host's in-transit copy); every batch it sends
+the peer a `DistantView` of the tier near the peer's window, from which the
+client draws statues and publishes its edge band. Four records in
+`EntityBatch` v5 after `playerBodies`, plus the client's `livingFree` room
+report. A disconnect puts the host's in-transit creatures back in its tier;
+a client keeps and still promotes its waiting room. Two ownership fixes rode
+along: an id that enters a tier loses its `EntitySync` incumbent, and a
+creature made live inside a tick (promotion, unpark, rising, spawn) is its
+maker's for that one tick (`Mob::ownLatch_`), so the next `ScanHandoffs`
+hands it over with its record instead of the old silent ghost-and-expire.
+Measured by `distant-mp` (two machines in one process, bytes both ways): see
+`docs/PLAN_distant_npcs.md` 8.6.
 
 **What is still not multiplayer, stated plainly.** Two players, one host,
 direct IP over TCP; no lobby, NAT traversal or third peer; melee hits on a
