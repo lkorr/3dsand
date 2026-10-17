@@ -2995,8 +2995,95 @@ struct WaterCol {
   bool wet;
   int gap;        // eighths the top water cell lacks (a river's ramp), 0 = full
 };
+// One river piece seen from column (x, z) -- the shader's RivPM / rivPieceAt:
+// the membership tests and every quantity waterApply's walks read.
+struct RivPM {
+  bool ok = false;
+  int d2 = 0, hw = 0, s8 = 0, s = 0, m = 1, strip = 0, lipV = 0, edgeT8 = 0, floorY = 0, bank = 0, tq = 0;
+  uint32_t bed = 0u;
+};
+// THE BRINK (the shader's brinkDraw8 / fallDrop8 and their note): the
+// reach above a fall draws down over its last kRiverDraw voxels and the
+// crest and curtain carry on down the curve.
+static constexpr int kRiverDraw = 6;
+static int brinkDraw8(int e) {
+  if (e >= kRiverDraw * 1024) return 0;
+  const int k = std::max(e, 0) / 1024;
+  return k == 0 ? 7 : 6 - k;
+}
+static int fallDrop8(int cd) {
+  const int k = (cd - 1) / 1024;
+  return k <= 0 ? 9 : k == 1 ? 12 : k == 2 ? 16 : 24;
+}
+static RivPM rivPieceAt(const worldmap::WorldMapData::StampSite& st, int x, int z) {
+  using namespace worldmap;
+  RivPM p;
+  const int hwA = st.radius, hwB = st.hwB, bank = st.padMargin;
+  const int reach = std::max(hwA, hwB) + std::max(bank, (int)kRiverLip);
+  const int ax = st.x, az = st.z, bx = st.x1, bz = st.z1;
+  if (x < std::min(ax, bx) - reach || x > std::max(ax, bx) + reach ||
+      z < std::min(az, bz) - reach || z > std::max(az, bz) + reach) return p;
+  const uint32_t fl = (uint32_t)st.wflags;
+  // 0 = no strip, 1 = a waterfall's CREST, 2 = its CURTAIN, 3 = the bank
+  // band past it (the shader's).
+  int strip = 0, cd = 0, draw = 0;
+  if ((fl & kRivFlatA) != 0u) {
+    const IV2 c = rivCut(st.cutA);
+    cd = (x - ax) * c.x + (z - az) * c.y;
+    if (cd <= 0) return p;
+    if (cd <= (int)kRiverCrest * 1024) strip = 1;
+    else if (cd <= ((int)kRiverCrest + (int)kRiverCurtain) * 1024) strip = 2;
+    else if (cd <= ((int)kRiverCrest + (int)kRiverCurtain + 2) * 1024) strip = 3;
+  }
+  if ((fl & kRivFlatB) != 0u) {
+    const IV2 c = rivCut(st.cutB);
+    const int e = -((x - bx) * c.x + (z - bz) * c.y);
+    if (e < 0) return p;
+    draw = brinkDraw8(e);
+  }
+  const int vx = bx - ax, vz = bz - az;
+  const int l2 = std::max(vx * vx + vz * vz, 1);
+  const int t = std::clamp((x - ax) * vx + (z - az) * vz, 0, l2);
+  const int tq = (t * 256) / l2;
+  const int dx = x - (ax + (vx * t) / l2);
+  const int dz = z - (az + (vz * t) / l2);
+  const int d2 = dx * dx + dz * dz;
+  const int hw = std::max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
+  const int o = hw + std::max(bank, (int)kRiverLip);
+  if (d2 >= o * o) return p;
+  // The packed words exactly as the shader reads them (worldmap.cpp
+  // PackWorldMap): the lip Y as an i16, the fall A -> B in eighths above it.
+  const uint32_t lw = (static_cast<uint32_t>(st.lipY) & 0xFFFFu) |
+                      (static_cast<uint32_t>(std::clamp(st.surf - st.surfB, 0, 65535)) << 16);
+  const int fall8 = (int)(lw >> 16u);
+  // The piece's steepness M, from the packed length (kS_RivBed bits 16..25).
+  const int plen = std::max(std::clamp(st.len, 0, 1023), 1);
+  p.ok = true;
+  p.d2 = d2;
+  p.hw = hw;
+  p.tq = tq;
+  const int s8 = st.surf - ((fall8 * tq) >> 8);
+  p.s8 = s8 - draw;   // THE BRINK: only the water draws down
+  p.s = (s8 - 1) >> 3;
+  p.m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
+  p.strip = strip;
+  p.lipV = (int32_t)(lw << 16u) >> 16;
+  p.edgeT8 = 8 * p.lipV + 8 - fallDrop8(cd);
+  p.floorY = p.s;
+  if (d2 < hw * hw) {
+    const int dep = st.depthA + (((st.depthB - st.depthA) * tq) >> 8u);
+    int drop = (dep * (hw * hw - d2)) / (hw * hw);
+    if ((fl & kRivProfileV) != 0u) drop = (dep * (hw - isqrtLe(d2, hw))) / hw;
+    p.floorY = p.s - drop;
+  }
+  p.bank = std::max(bank, (int)kRiverLip);
+  p.bed = st.bed & 0xFFFu;
+  return p;
+}
 // `trace`, when given, collects one line per river piece the column is a
 // member of (the `rivers` gate prints it beside a leak it finds).
+// ANOTHER WATER: the shader's RIVER_FOREIGN block (worldgen.wgsl), with
+// kRiverWaterfall as its height.
 static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::string* trace = nullptr) {
   using namespace worldmap;
   WaterCol out{h0, -1, 0u, false, 0};
@@ -3006,7 +3093,8 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
   if (n == 0u) return out;
   bool inCh = false;
   int w8Min = 1 << 28, floorMin = 1048576, outS = -1048576, lipY = -1048576, chD2 = -1;
-  int crestY = -1048576, curtY = -1048576, mCh = 1;
+  int crest8 = -8388608, curt8 = -8388608, mCh = 1, mNear = 1;
+  int hiFS = -1048576, loFS = 1048576;
   bool nearR = false;
   int nd2 = 0, nS = 0, nM = 1, nHw = 0, nBank = 0;
   uint32_t nBed = 0u;
@@ -3028,100 +3116,87 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
       continue;
     }
     if ((uint32_t)st.kind != kSiteRiver) continue;
-    const int hwA = st.radius, hwB = st.hwB, bank = st.padMargin;
-    const int reach = std::max(hwA, hwB) + std::max(bank, (int)kRiverLip);
-    const int ax = st.x, az = st.z, bx = st.x1, bz = st.z1;
-    if (x < std::min(ax, bx) - reach || x > std::max(ax, bx) + reach ||
-        z < std::min(az, bz) - reach || z > std::max(az, bz) + reach) continue;
-    const uint32_t fl = (uint32_t)st.wflags;
-    // 0 = no strip, 1 = a waterfall's CREST, 2 = its CURTAIN, 3 = the bank
-    // band past it (the shader's).
-    int strip = 0;
-    if ((fl & kRivFlatA) != 0u) {
-      const IV2 c = rivCut(st.cutA);
-      const int cd = (x - ax) * c.x + (z - az) * c.y;
-      if (cd <= 0) continue;
-      if (cd <= (int)kRiverCrest * 1024) strip = 1;
-      else if (cd <= ((int)kRiverCrest + (int)kRiverCurtain) * 1024) strip = 2;
-      else if (cd <= ((int)kRiverCrest + (int)kRiverCurtain + 2) * 1024) strip = 3;
-    }
-    if ((fl & kRivFlatB) != 0u) {
-      const IV2 c = rivCut(st.cutB);
-      if ((x - bx) * c.x + (z - bz) * c.y > 0) continue;
-    }
-    const int vx = bx - ax, vz = bz - az;
-    const int l2 = std::max(vx * vx + vz * vz, 1);
-    const int t = std::clamp((x - ax) * vx + (z - az) * vz, 0, l2);
-    const int tq = (t * 256) / l2;
-    const int dx = x - (ax + (vx * t) / l2);
-    const int dz = z - (az + (vz * t) / l2);
-    const int d2 = dx * dx + dz * dz;
-    const int hw = std::max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
-    const int o = hw + std::max(bank, (int)kRiverLip);
-    if (d2 >= o * o) continue;
-    // The packed words exactly as the shader reads them (worldmap.cpp
-    // PackWorldMap): the lip Y as an i16, the fall A -> B in eighths above it.
-    const uint32_t lw = (static_cast<uint32_t>(st.lipY) & 0xFFFFu) |
-                        (static_cast<uint32_t>(std::clamp(st.surf - st.surfB, 0, 65535)) << 16);
-    const int lipV = (int32_t)(lw << 16u) >> 16;
-    const int fall8 = (int)(lw >> 16u);
-    const int s8 = st.surf - ((fall8 * tq) >> 8);
-    const int s = (s8 - 1) >> 3;
-    // The piece's steepness M, from the packed length (kS_RivBed bits 16..25).
-    const int plen = std::max(std::clamp(st.len, 0, 1023), 1);
-    const int m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
-    if (strip != 0 && d2 >= hw * hw && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, lipV);
+    const RivPM p = rivPieceAt(st, x, z);
+    if (!p.ok) continue;
+    const int d2 = p.d2, hw = p.hw;
+    // The channel counts too (the shader's note: a DRY channel column beside
+    // a curtain's end must hold it).
+    if (p.strip != 0 && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, p.lipV);
     if (trace) {
       char b[200];
-      std::snprintf(b, sizeof b, " [%s d2 %d hw %d tq %d s8 %d m %d strip %d%s]", st.id.c_str(), d2, hw, tq, s8, m, strip,
+      std::snprintf(b, sizeof b, " [%s d2 %d hw %d tq %d s8 %d m %d strip %d%s]", st.id.c_str(), d2, hw, p.tq, p.s8, p.m, p.strip,
                     d2 < hw * hw ? " CH" : "");
       *trace += b;
     }
     if (d2 < hw * hw) {
       inCh = true;
-      if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = s8; }
-      mCh = std::max(mCh, m);
-      const int dep = st.depthA + (((st.depthB - st.depthA) * tq) >> 8u);
-      int drop = (dep * (hw * hw - d2)) / (hw * hw);
-      if ((fl & kRivProfileV) != 0u) drop = (dep * (hw - isqrtLe(d2, hw))) / hw;
-      floorMin = std::min(floorMin, s - drop);
-      if (strip == 1) crestY = std::max(crestY, lipV);
-      if (strip == 2) curtY = std::max(curtY, lipV);
+      if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = p.s8; mNear = p.m; }
+      mCh = std::max(mCh, p.m);
+      floorMin = std::min(floorMin, p.floorY);
+      loFS = std::min(loFS, p.s + p.m);
+      if (p.strip == 1) crest8 = std::max(crest8, p.edgeT8);
+      if (p.strip == 2) curt8 = std::max(curt8, p.edgeT8);
     }
-    if (d2 < (hw + (int)kRiverLip) * (hw + (int)kRiverLip)) outS = std::max(outS, s + m - 1);
+    if (d2 < (hw + (int)kRiverLip) * (hw + (int)kRiverLip)) {
+      outS = std::max(outS, p.s + p.m - 1);
+      hiFS = std::max(hiFS, p.s - p.m);
+    }
     if (!nearR || d2 < nd2) {
       nearR = true;
       nd2 = d2;
-      nS = s;
-      nM = m;
+      nS = p.s;
+      nM = p.m;
       nHw = hw;
-      nBank = std::max(bank, (int)kRiverLip);
-      nBed = st.bed & 0xFFFu;
+      nBank = p.bank;
+      nBed = p.bed;
     }
   }
   if (!nearR && lake == 0u) return out;
+  bool foreignHi = false;
+  if (inCh) {
+    const int wv = (w8Min - 1) >> 3;
+    const int tol = (int)kRiverWaterfall + mNear;
+    foreignHi = hiFS > wv + tol;
+    if (loFS < wv - tol) {
+      floorMin = 1048576;
+      mCh = 1;
+      crest8 = -8388608;
+      curt8 = -8388608;
+      for (uint32_t k = 0u; k < n; k++) {
+        const WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
+        if ((uint32_t)st.kind != kSiteRiver) continue;
+        const RivPM p = rivPieceAt(st, x, z);
+        if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol) continue;
+        mCh = std::max(mCh, p.m);
+        floorMin = std::min(floorMin, p.floorY);
+        if (p.strip == 1) crest8 = std::max(crest8, p.edgeT8);
+        if (p.strip == 2) curt8 = std::max(curt8, p.edgeT8);
+      }
+    }
+  }
   int h = h0, water = -1, gap = 0;
   uint32_t bed = 0u;
   const int sea = seaLevelY();
   if (inCh) {
     const int wv = (w8Min - 1) >> 3;
     int top = wv, wg = 8 * wv + 8 - w8Min;
-    if (crestY > wv) {
-      h = crestY - 1;
-      top = crestY;
-      wg = 0;
+    const int crestTop = (crest8 - 1) >> 3, curtTop = (curt8 - 1) >> 3;
+    if (crestTop > wv) {
+      h = crestTop - 1;
+      top = crestTop;
+      wg = 8 * crestTop + 8 - crest8;
     } else {
       h = floorMin;
-      if (curtY > wv) {
-        top = curtY;
-        wg = 0;
+      if (curtTop > wv) {
+        top = curtTop;
+        wg = 8 * curtTop + 8 - curt8;
       } else if (roaded) {
         h = std::max(h, std::min(hRoad, wv - 1));
       }
     }
     bed = nBed;
-    if (h < top) { water = top; gap = wg; }
-    else h = std::max(h, std::max(wv + mCh, outS + 1));
+    if (h < top && !foreignHi) { water = top; gap = wg; }
+    else h = std::max(h, std::max(wv + mCh, std::max(outS, lipY) + 1));
   } else if (nearR) {
     const int tgt = nS + nM;
     const int inner = nHw + (int)kRiverLip;

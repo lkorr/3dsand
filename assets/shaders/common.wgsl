@@ -826,10 +826,16 @@ struct TickParams {
   // old CPU append base is gone with it.
   fluidExciteEnable : u32,
   fluidSpawnCount   : u32,
-  // PADDING (was the per-species splash material table, retired by W1-B2: a
-  // particle splashes as its own material). Kept so mirrorBase stays at the
-  // same offset; world.h TickParams::_padSplash is its twin. Nothing reads it.
-  _padSplash      : vec4<u32>,
+  // sim.soluteDrift, /256 a visit: what a held river carries dissolved drifts
+  // downstream on a level reach this fast (sim_solute.wgsl THE DRIFT); 0 off.
+  // Then three words of PADDING (the four were the per-species splash table,
+  // retired by W1-B2), so mirrorBase stays at the same offset; world.h
+  // TickParams::soluteDrift / _padSplash0..2 are the twins. Four u32, not a
+  // vec4, so nothing after them moves.
+  soluteDrift     : u32,
+  _padSplash0     : u32,
+  _padSplash1     : u32,
+  _padSplash2     : u32,
   // WORLD chunk coord of the 3x3x3 CPU-mirror corner (the same clamp the
   // readback uses). The seam's mirrorFold packs excited-fluid occupancy for
   // these 27 chunks — the swimming query's view of the particles.

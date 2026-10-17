@@ -1057,6 +1057,20 @@ def check_flow_measure():
                                 f"{mw.group(1)}, kFlowStep {ms.group(1)})")
     if len(bias) > 1:
         problems.append(f"measured flow: FLOWM_Y_BIAS differs between shaders ({sorted(bias)})")
+    # The solved field's FAR grid sits after the window grid in the same
+    # buffer (flowfield.h kFlowFarBase = kFlowNearWords); raymarch.wgsl reads
+    # it at FLOW_FAR_BASE.
+    if not re.search(r"constexpr\s+uint32_t\s+kFlowFarBase\s*=\s*kFlowNearWords\s*;", ff):
+        problems.append("flow far grid: flowfield.h kFlowFarBase is no longer kFlowNearWords; "
+                        "update this check and raymarch.wgsl FLOW_FAR_BASE")
+    rm = read("assets/shaders/raymarch.wgsl")
+    mf = re.search(r"const\s+FLOW_FAR_BASE\s*:\s*u32\s*=\s*(\d+)u", rm or "")
+    near_words = int(mh.group(1)) + slots * 2
+    if not mf:
+        problems.append("flow far grid: raymarch.wgsl declares no FLOW_FAR_BASE")
+    elif int(mf.group(1)) != near_words:
+        problems.append(f"flow far grid: raymarch.wgsl FLOW_FAR_BASE = {mf.group(1)} but "
+                        f"flowfield.h kFlowNearWords = {near_words}")
     if int(mh.group(1)) != 4:
         problems.append("measured flow: common.wgsl's FLOW_HEADER is 4 words; "
                         f"flowfield.h kFlowHeaderWords = {mh.group(1)}")
@@ -3250,6 +3264,66 @@ def check_solute_mirror():
                         f"kMaxSolutePourOpsPerTick = {cv}")
 
 
+# assets/shaders/sim_solute.wgsl  <->  sim_step.wgsl: THE STILL TABLE'S READER.
+# The solute pair exchange carries dissolved mass down the held flow
+# (sim_solute.wgsl "THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT") and must
+# agree with the held rule about which columns are held and where their
+# surfaces stand, so it carries sim_step's STILL_WORDS / stillIndex /
+# stillTag / STILL_UNHELD / stillLevel8 text-identical (comments and blank
+# lines aside). sim_step is the reference: a change there (a new word, a
+# ledger) must be copied, or the carry runs on a different map of the river
+# than the CA holds still.
+_STILL_ITEMS = [("const", "STILL_WORDS"), ("fn", "stillIndex"), ("fn", "stillTag"),
+                ("const", "STILL_UNHELD"), ("fn", "stillLevel8")]
+
+
+def _wgsl_item(text, kind, name):
+    """The source of one top-level `const NAME ...;` or `fn NAME(...) {...}`,
+    comments stripped and whitespace collapsed, or None."""
+    m = re.search(r"^\s*" + kind + r"\s+" + name + r"\b", text, re.M)
+    if not m:
+        return None
+    i = m.start()
+    if kind == "const":
+        j = text.index(";", i) + 1
+    else:
+        j = text.index("{", i)
+        depth = 0
+        while True:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+    body = re.sub(r"//[^\n]*", "", text[i:j])
+    return " ".join(body.split())
+
+
+def check_still_level():
+    step = read("assets/shaders/sim_step.wgsl")
+    sol = read("assets/shaders/sim_solute.wgsl")
+    if not step or not sol:
+        return
+    if "stillLevel8" not in sol:
+        return
+    checked.append("stilllevel")
+    for kind, name in _STILL_ITEMS:
+        a, b = _wgsl_item(step, kind, name), _wgsl_item(sol, kind, name)
+        if a is None or b is None:
+            problems.append(f"stilllevel: `{kind} {name}` missing from "
+                            f"{'sim_step.wgsl' if a is None else 'sim_solute.wgsl'}")
+        elif a != b:
+            problems.append(
+                f"stilllevel: sim_solute.wgsl's `{name}` differs from "
+                "sim_step.wgsl's -- the solute carry and the held rule read "
+                "the still table differently; copy sim_step's.\n"
+                f"      sim_step  : {a[:160]}\n"
+                f"      sim_solute: {b[:160]}")
+
+
 def check_react_fx():
     """The reaction-effect record (docs/PLAN_alchemy_chemistry.md A): sim_step's
     RFX_* constants <-> world.h kPageFaultReactFx* / kReactFx* and materials.h
@@ -3678,6 +3752,7 @@ def check_dungeon_mirror():
 
 ALL = {
     "solute": check_solute_mirror,
+    "stilllevel": check_still_level,
     "heat": check_heat_mirror,
     "elec": check_elec_mirror,
     "ticket": check_ticket_record,
@@ -3781,7 +3856,8 @@ RELEVANT = {
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
     "src/sim/materials.h": ["reactgate", "coatflame", "reactfx"],
-    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx", "capool"],
+    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx", "capool", "stilllevel"],
+    "assets/shaders/sim_solute.wgsl": ["stilllevel"],
     "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror", "drafts"],
     "src/sim/windfield.cpp": ["windmirror"],
     "assets/shaders/wind_streak.wgsl": ["windstreak"],

@@ -44,6 +44,9 @@ const std::vector<Gate>& RiverGates();
 // The lake reservoir (sim_step.wgsl stage 5): a synthetic map lake, disturbed
 // and ticked flat. The `rivers` seam and exit.
 const std::vector<Gate>& LakeSettleGates();
+// A stream from a finite source sleeps while it runs (docs/PLAN_running_water.md
+// phase 3, THE CONDUIT): a stone reservoir + channel + basin on the pad.
+const std::vector<Gate>& StreamPoolGates();
 // Locales (docs/PLAN_map_v2.md L1): CPU only, a synthetic map in a temp dir.
 const std::vector<Gate>& LocaleGates();
 // Dungeons (docs/PLAN_dungeons.md D1): the asset format (CPU) and the fixture
@@ -1003,6 +1006,10 @@ const char* const kOrder[] = {
     // every item in the library, and a gate that equips things perturbs the
     // id-keyed draws of anything after it, so it goes after the two that do not.
     "ragdoll-dress",
+    // ...and the held item equipped into a limp hand. Same self-contained
+    // shape (resets mobs + debris, regenerates worldgen both ways); after
+    // ragdoll-dress because it EQUIPS (the id-keyed draws note above).
+    "ragdoll-equip",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.
@@ -1090,6 +1097,11 @@ const char* const kOrder[] = {
     // pull-out, the flat damage, a volley twice, the draw/release input path.
     // Fresh spawns on pristine ground; regenerates it on the way out.
     "arrow",
+    // ...and G's PICK of an item or an arrow under the reticle (game/
+    // lookpick.h): a cone, line of sight, the nearer-the-reticle rule. One
+    // fresh spawn on pristine ground, kinematic items, never ticks; resets
+    // the creatures and debris on the way out and edits no terrain.
+    "look-pick",
     // ...and NPC ARCHERS (docs/PLAN_projectiles.md E): an `archer` draws,
     // looses and gets into a dummy, backs off from one too close, stops at 0
     // arrows and draws its sidearm, and replays bit for bit. Every scene
@@ -1527,6 +1539,11 @@ const char* const kOrder[] = {
     // (a synthetic map, regenerated, TICKED -- blasts included -- the real
     // environment back), so it runs right after `rivers` for the same reason.
     "lake-settle",
+    // A stream from a finite source (docs/PLAN_running_water.md phase 3): it
+    // regenerates the window on entry, builds a stone reservoir + channel +
+    // basin on the pad, ticks thousands of ticks of running water and
+    // regenerates again on exit -- the `lake-settle` exit, so right after it.
+    "stream-pool",
     // What the infection pass COSTS: eight bitten humans ticked four times
     // over (the whole-lattice sweep against the limb's cell list -- identical
     // outcome, a fraction of the time). LATE on purpose: the crowd bleeds over
@@ -1566,7 +1583,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &StreamPoolGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

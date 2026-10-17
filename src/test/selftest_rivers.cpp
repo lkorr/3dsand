@@ -55,6 +55,10 @@
 //   S. A STREAM IS HELD, after R: a channel dug from the lake down to main
 //      runs as water, is adopted column by column (sim_stream.wgsl) and
 //      sleeps; its mouth plugged with stone, it is released and drains.
+//   V. SOLUTE IS CARRIED, after S: ink poured above `falls`' first waterfall
+//      goes down the curtain into the reach below (sim_solute.wgsl THE HELD
+//      FLOW CARRIES WHAT IS DISSOLVED IN IT), the ledger balances and its
+//      chunks fall asleep (PassSoluteCarried).
 //   I. CURRENT: the map-river arm of the current field puts several stream
 //      primitives on main and the field there runs downstream.
 //   H. THE SITE INDEX on `default` with a 10 km test river + a lake: loads,
@@ -71,6 +75,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -81,6 +86,7 @@
 #include "sim/currentprim.h"
 #include "sim/flowfield.h"
 #include "sim/horizon.h"
+#include "sim/solutes.h"
 #include "sim/treeatlas.h"
 #include "sim/weather.h"
 #include "sim/world.h"
@@ -147,6 +153,597 @@ bool CheckSplineVectors(std::string& why, int& cases, int& points) {
     }
   }
   return cases > 0;
+}
+
+// ---- V. THE HELD FLOW CARRIES SOLUTE (ticket 2026-10-16_11-11-51) ----------------
+// sim_solute.wgsl "THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT": a held
+// river does not move, so the CA never carried what was dissolved in it --
+// blood poured at the top of a waterfall stayed at the top. Pass V pours INK
+// (conserved: no halfLife, density 0 so nothing sinks it, diffusivity 8 so
+// diffusion alone would not get it far) into `falls` just above its first
+// waterfall, and asserts
+//   (a) CARRIED: after rivers.soluteCarryTicks, at least rivers.soluteBelowMin
+//       of what was poured stands in columns whose held surface is more than
+//       4 voxels under the upper reach's -- it went down the curtain and out
+//       into the reach below (and on into main);
+//   (b) CONSERVED: the layer's mass moved by exactly what the ledger says
+//       (poured - discarded - precipitated - converted), and the floor
+//       discarded at most rivers.soluteDiscardMax of it;
+//   (c) SETTLED: within rivers.soluteSettleTicks either no awake chunk carries
+//       solute (held at 0 for two samples), or (rivers.soluteRequireSleep 0)
+//       the carry has TERMINATED -- no carried pair has work left anywhere:
+//       it ran down to where nothing lower has room and stopped (the
+//       potential argument in the shader).
+// A failure names the awake solute chunks, their mass, stall clocks, dirty
+// reasons and the CPU oracle's pending pairs by kind; a CONTROL counts the
+// awake chunks with moving water and no solute at all.
+struct SolLayerR {
+  std::vector<uint32_t> table, pool, hdr, stall;
+  uint32_t Value(uint32_t slot, uint32_t local) const {
+    const uint32_t e = table[slot];
+    if (e == 0u) return 0u;
+    if (e & kSolUniformBit) return e & 0xFFFFu;
+    const uint32_t w = pool[size_t(e & kSolPageMask) * kSolWordsPerPage + (local >> 1)];
+    return (w >> ((local & 1u) * 16u)) & 0xFFFFu;
+  }
+};
+void ReadSolLayerR(Ctx& c, SolLayerR& L) {
+  c.ctx.WaitIdle();
+  L.table.assign(kNumSlots, 0u);
+  L.pool.assign(size_t(kSolutePoolPages) * kSolWordsPerPage, 0u);
+  L.hdr.assign(kSolMetaHdrWords, 0u);
+  L.stall.assign(kNumSlots, 0u);
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solTable, 0, L.table.data(), L.table.size() * 4, "rvSolTable");
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solPool, 0, L.pool.data(), L.pool.size() * 4, "rvSolPool");
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solMeta, 0, L.hdr.data(), L.hdr.size() * 4, "rvSolMeta");
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solMeta, uint64_t(kSolMStall) * 4, L.stall.data(),
+                        L.stall.size() * 4, "rvSolStall");
+}
+
+// THE CPU ORACLE for an awake solute chunk (CLAUDE.md verification rule 6: a
+// bare "13 chunks awake" names no cause). It re-evaluates, from the read-back
+// voxels, solute layer and still table, every pair sim_solute.wgsl's
+// solPairExchange could see with its lower cell in the chunk -- 3 axes x 4
+// strides, both parities -- and counts those with work left by KIND: a CARRY
+// (both held, ranks differ), a level DIFFUSION (|d| >= 1), a one-way held ->
+// unheld diffusion. The rank is the shader's (stillLevel8 / solDropDist /
+// solHeldOrder, written out again here as the test's own oracle); the solvent
+// test is "water" (the fixture holds no other liquid). "carry 0" with the
+// chunk still awake means the carry has finished and what is left is the
+// diffusion's own pace or the CA.
+struct SolOracle {
+  Ctx& c;
+  const SolLayerR& L;
+  std::vector<uint32_t> still;
+  std::map<uint32_t, std::vector<uint32_t>> vox;
+  uint32_t mWater = 0, cap8 = 80;
+  IVec3 org{};
+  int relax = 1;
+  uint32_t Word(int x, int y, int z) {
+    const uint32_t s = World::SlotChunkIndex(IVec3{x >> 4, y >> 4, z >> 4});
+    auto it = vox.find(s);
+    if (it == vox.end()) {
+      std::vector<uint32_t> v(kChunkVol);
+      sandvox::ReadVoxelsSync(c.ctx, c.world, s, 1, v.data(), "rvSolOracle");
+      it = vox.emplace(s, std::move(v)).first;
+    }
+    return it->second[(uint32_t(z & 15) * kChunk + uint32_t(y & 15)) * kChunk + uint32_t(x & 15)];
+  }
+  bool InWin(int x, int y, int z) const {
+    const int n = int(kWorldN);
+    const int dx = x - org.x * 16, dy = y - org.y * 16, dz = z - org.z * 16;
+    return dx >= 0 && dy >= 0 && dz >= 0 && dx < n && dy < n && dz < n;
+  }
+  uint32_t Mass(int x, int y, int z) const {
+    return L.Value(World::SlotChunkIndex(IVec3{x >> 4, y >> 4, z >> 4}),
+                   (uint32_t(z & 15) * kChunk + uint32_t(y & 15)) * kChunk + uint32_t(x & 15)) & 0xFFu;
+  }
+  static constexpr int kUnheld = -1073741824;
+  int Level8(int x, int z) const {
+    if (relax == 0) return kUnheld;
+    const int sh = std::countr_zero(kWorldN);
+    const size_t si = (size_t(uint32_t(z) & (kWorldN - 1)) * kWorldN + size_t(uint32_t(x) & (kWorldN - 1))) * 4u;
+    const uint32_t tag = 1u | ((uint32_t(x >> sh) & 0x7FFFu) << 1) | ((uint32_t(z >> sh) & 0x7FFFu) << 16);
+    if (still[si] != tag) return kUnheld;
+    const uint32_t v = still[si + 1];
+    if (v != 0u) return (v >> 20) != mWater ? kUnheld : int32_t(v << 12) >> 12;
+    const uint32_t d = still[si + 2];
+    if (d == 0u || (still[si + 3] & 0xFFFu) != mWater) return kUnheld;
+    return int32_t(d << 12) >> 12;
+  }
+  int DropDist(int x, int z, int t8, int reach) const {
+    int best = reach + 1;
+    const int dd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (const auto& d : dd)
+      for (int j = 1; j < best; j++) {
+        const int t = Level8(x + d[0] * j, z + d[1] * j);
+        if (t == kUnheld) break;
+        if (t <= t8 - 8) { best = j; break; }
+        if (t != t8) break;
+      }
+    return best;
+  }
+  int Order(int ax, int ay, int az, int bx, int by, int bz) const {
+    const int tA = Level8(ax, az), tB = Level8(bx, bz);
+    if (tA == kUnheld && tB == kUnheld) return 0;
+    if (tB == kUnheld) return 1;
+    if (tA == kUnheld) return -1;
+    if (tA != tB) return tA > tB ? 2 : -2;
+    if (ax == bx && az == bz) return DropDist(ax, az, tA, 1) == 1 ? -2 : 0;
+    const int rA = DropDist(ax, az, tA, 4), rB = DropDist(bx, bz, tB, 4);
+    return rA == rB ? 0 : (rA > rB ? 2 : -2);
+  }
+  // Pending pairs whose LOWER cell is in chunk `wc`: carry / diffuse / one-way.
+  void Pending(IVec3 wc, int& carry, int& diff, int& oneway) {
+    carry = diff = oneway = 0;
+    for (int lz = 0; lz < 16; lz++)
+      for (int ly = 0; ly < 16; ly++)
+        for (int lx = 0; lx < 16; lx++) {
+          const int x = wc.x * 16 + lx, y = wc.y * 16 + ly, z = wc.z * 16 + lz;
+          const uint32_t wA = Word(x, y, z);
+          // sim_solute.wgsl solStepCarry: a stride-1 lateral pair, one wet and
+          // one dry, carries from the wet cell into the cell under the dry one
+          // when the wet cell stands on a non-liquid and outranks it.
+          for (int axis = 0; axis < 3; axis += 2) {
+            const int bx = x + (axis == 0 ? 1 : 0), bz = z + (axis == 2 ? 1 : 0);
+            if (!InWin(bx, y, bz)) continue;
+            const bool aWet = (wA & 0xFFFu) == mWater, bWet = (Word(bx, y, bz) & 0xFFFu) == mWater;
+            if (aWet == bWet) continue;
+            const int hx = aWet ? x : bx, hz = aWet ? z : bz, dx = aWet ? bx : x, dz = aWet ? bz : z;
+            if (!InWin(dx, y - 1, dz) || (Word(dx, y - 1, dz) & 0xFFFu) != mWater) continue;
+            if (InWin(hx, y - 1, hz) && (Word(hx, y - 1, hz) & 0xFFFu) == mWater) continue;
+            if (Order(hx, y, hz, dx, y - 1, dz) != 2) continue;
+            const uint32_t xh = Mass(hx, y, hz), xl = Mass(dx, y - 1, dz);
+            const uint32_t fl = ((Word(dx, y - 1, dz) >> 12) & 7u) + 1u;
+            if (xh > 0 && xl < std::min(cap8 * fl / 8u, 255u)) carry++;
+          }
+          if ((wA & 0xFFFu) != mWater) continue;
+          const uint32_t xA = Mass(x, y, z);
+          for (int axis = 0; axis < 3; axis++)
+            for (int k = 1; k <= 8; k <<= 1) {
+              const int bx = x + (axis == 0 ? k : 0), by = y + (axis == 1 ? k : 0), bz = z + (axis == 2 ? k : 0);
+              if (!InWin(bx, by, bz)) continue;
+              const uint32_t wB = Word(bx, by, bz);
+              if ((wB & 0xFFFu) != mWater) continue;
+              const uint32_t xB = Mass(bx, by, bz);
+              if (xA == 0 && xB == 0) continue;
+              bool through = true;
+              for (int i = 1; i < k && through; i++)
+                through = (Word(x + (axis == 0 ? i : 0), y + (axis == 1 ? i : 0), z + (axis == 2 ? i : 0)) & 0xFFFu) == mWater;
+              if (!through) continue;
+              const uint32_t fA = ((wA >> 12) & 7u) + 1u, fB = ((wB >> 12) & 7u) + 1u;
+              const int ord = Order(x, y, z, bx, by, bz);
+              if (ord == 2 || ord == -2) {
+                const uint32_t xh = ord > 0 ? xA : xB, xl = ord > 0 ? xB : xA, fl = ord > 0 ? fB : fA;
+                const uint32_t cap = std::min(cap8 * fl / 8u, 255u);
+                if (xh > 0 && xl < cap) carry++;
+                continue;
+              }
+              const int num = int(xA * fB) - int(xB * fA), den = int(fA + fB);
+              int d = (2 * std::abs(num) + den - 1) / (2 * den);
+              if (num < 0) d = -d;
+              if (d == 0) continue;
+              if (ord != 0) {
+                if ((d > 0) == (ord > 0)) oneway++;
+              } else {
+                diff++;
+              }
+            }
+        }
+  }
+};
+
+// ---- X. dissolved mass drifts downstream on a level reach ------------------
+// Ticket 2026-10-17_00-01-44: "blood solute in water should also slowly
+// drift in the direction of water current". THE DRIFT (sim_solute.wgsl): at
+// one (T8, drop distance) the column nearer the river's mouth (the still
+// table's MOUTH words, worldgen `cols`) ranks lower. Ink poured on main an
+// eighth of the way down; the mass-weighted network distance to the mouth of
+// the ink near the pour must fall by rivers.driftMin voxels in driftTicks.
+// Measured over a disc round the pour only, so V's ink further down is not
+// counted.
+bool PassSoluteDrift(Ctx& c, sandvox::support::TickCursor& tick, const worldmap::WorldMapData::River& main,
+                     std::vector<std::string>& problems) {
+  const SoluteDef* ink = CurrentSoluteNamed("ink");
+  if (!ink || main.line.size() < 16) {
+    problems.push_back("X: needs the `ink` species and main's line");
+    std::printf("rivers: X solute drift: FAIL (no ink or no line)\n");
+    return false;
+  }
+  const auto& P = main.line[main.line.size() / 8];
+  const int px = P[0], pz = P[1], py = P[2];
+  const int radius = static_cast<int>(BaselineNumber("rivers.driftRadius", 90));
+  const size_t L = size_t(kWorldN) * kWorldN * 4u + 4u;
+  std::vector<uint32_t> tab(L + size_t(kWorldN) * kWorldN);
+  auto census = [&](double& mean, uint64_t& mass, int& mouthCols) {
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), 0, tab.data(), tab.size() * 4,
+                          "rvDriftStill");
+    SolLayerR S;
+    ReadSolLayerR(c, S);
+    double sum = 0;
+    mass = 0;
+    mouthCols = 0;
+    for (int dz = -radius; dz <= radius; dz += 4)
+      for (int dx = -radius; dx <= radius; dx += 4) {
+        const size_t ci = size_t((pz + dz) & int(kWorldN - 1)) * kWorldN + size_t((px + dx) & int(kWorldN - 1));
+        if (tab[L + ci] != 0u) mouthCols++;
+      }
+    for (uint32_t sl = 0; sl < kNumSlots; sl++) {
+      if (S.table[sl] == 0u) continue;
+      const IVec3 wc = c.world.SlotToWorldChunk(sl);
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t m = S.Value(sl, k) & 0xFFu;
+        if (m == 0u) continue;
+        const int x = wc.x * 16 + int(k % 16), z = wc.z * 16 + int(k / 256);
+        if ((x - px) * (x - px) + (z - pz) * (z - pz) > radius * radius) continue;
+        const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
+        const uint32_t mo = tab[L + ci];
+        if (mo == 0u) continue;
+        sum += double(m) * double(mo - 1u);
+        mass += m;
+      }
+    }
+    mean = mass ? sum / double(mass) : 0.0;
+  };
+  const uint32_t units = static_cast<uint32_t>(BaselineNumber("rivers.soluteUnits", 1600));
+  sandvox::support::TickOps pour;
+  pour.cells.push_back(CellOp{World::SlotCellIndex(IVec3{px, py + 2, pz}), CellOpSolute(ink->species, units)});
+  tick(pour);
+  for (int k = 0; k < 30; k++) tick();
+  double m0 = 0, m1 = 0;
+  uint64_t mass0 = 0, mass1 = 0;
+  int cols0 = 0, cols1 = 0;
+  census(m0, mass0, cols0);
+  const int driftTicks = static_cast<int>(BaselineNumber("rivers.driftTicks", 900));
+  std::string curve;
+  for (int k = 1; k <= driftTicks; k++) {
+    tick();
+    if (k % 300 == 0) {
+      double mk = 0;
+      uint64_t massk = 0;
+      int colsk = 0;
+      census(mk, massk, colsk);
+      curve += Format(" %d:%.1f/%llu", k, mk, (unsigned long long)massk);
+    }
+  }
+  census(m1, mass1, cols1);
+  const double driftMin = BaselineNumber("rivers.driftMin", 8.0);
+  const bool xOk = cols0 > 0 && mass0 > 0 && m0 - m1 >= driftMin;
+  std::printf("rivers: X solute drift: %s (ink at main's eighth (%d,%d) y%d, %d river columns with a mouth word in "
+              "the disc; mean distance to the mouth %.1f -> %.1f after %d ticks (fell %.1f >= %.1f), mass in the disc "
+              "%llu -> %llu; tick:mean/mass%s)\n",
+              xOk ? "PASS" : "FAIL", px, pz, py, cols0, m0, m1, driftTicks, m0 - m1, driftMin,
+              (unsigned long long)mass0, (unsigned long long)mass1, curve.c_str());
+  RecordObserved("rivers.observedDrift", Format("%.1f", m0 - m1));
+  if (!xOk) problems.push_back(Format("X: drift %.1f voxels (>= %.1f), %d mouth columns", m0 - m1, driftMin, cols0));
+  return xOk;
+}
+
+bool PassSoluteCarried(Ctx& c, sandvox::support::TickCursor& tick, const worldmap::WorldMapData::River& falls,
+                       std::vector<std::string>& problems) {
+  const SoluteDef* ink = CurrentSoluteNamed("ink");
+  if (!ink || falls.falls.empty()) {
+    problems.push_back("V: needs the `ink` species and a waterfall on `falls`");
+    std::printf("rivers: V solute carried: FAIL (no `ink` species or no waterfall)\n");
+    return false;
+  }
+  // V measures the CARRY: the drift (sim.soluteDrift, pass X) is a long-running
+  // current by design -- ink keeps moving downstream until it reaches the
+  // window's face -- so with it on, (c)'s "the carry has terminated" can never
+  // be read. Off for this pass, restored on the way out.
+  struct DriftOff {
+    Tuning saved = CurrentTuning();
+    DriftOff() { Tuning t = saved; t.sim.soluteDrift = 0; SetCurrentTuning(t); }
+    ~DriftOff() { SetCurrentTuning(saved); }
+  } driftOff;
+  // The first fall: its sample is the first of the reach BELOW (worldwater.cpp
+  // step 9); the one before it is the upper reach's last.
+  const auto& F = falls.falls[0];
+  size_t iF = 0;
+  for (size_t i = 1; i < falls.line.size(); i++)
+    if (falls.line[i][0] == F[0] && falls.line[i][1] == F[1]) { iF = i; break; }
+  if (iF == 0) {
+    problems.push_back("V: the first waterfall is not on falls' baked line");
+    std::printf("rivers: V solute carried: FAIL (fall not on the line)\n");
+    return false;
+  }
+  const auto& up = falls.line[iF - 1];
+  const auto& dn = falls.line[iF];
+  const int yU = up[2], yL = dn[2];
+  // "Below the fall": a column whose held surface stands more than 4 voxels
+  // under the upper reach's (the reach below it, and main past the junction).
+  auto below = [&](int x, int z) {
+    const worldmap::WaterColumn wc = worldmap::WaterColumnAt(x, z, kDefaultSeed);
+    return wc.water >= 0 && wc.water < yU - 4;
+  };
+  struct Census { uint64_t mass = 0, under = 0; };
+  auto census = [&](const SolLayerR& L) {
+    Census r;
+    for (uint32_t s = 0; s < kNumSlots; s++) {
+      const uint32_t e = L.table[s];
+      if (e == 0u) continue;
+      const IVec3 wc = c.world.SlotToWorldChunk(s);
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t m = L.Value(s, k) & 0xFFu;
+        if (m == 0u) continue;
+        r.mass += m;
+        if (below(wc.x * 16 + int(k % 16), wc.z * 16 + int(k / 256))) r.under += m;
+      }
+    }
+    return r;
+  };
+  // The awake chunks that carry solute (the claim of (c)), and who they are:
+  // the chunk, its mass and stall clock, its dirty REASONS, and the oracle's
+  // pending pairs (carry / diffuse / one-way). `totals` = the oracle's sums.
+  const uint32_t mWaterId = [&] {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "water") return static_cast<uint32_t>(i);
+    return 0u;
+  }();
+  auto makeOracle = [&](const SolLayerR& L) {
+    std::unique_ptr<SolOracle> orc(new SolOracle{c, L, {}, {}, mWaterId, ink->saturation, c.world.WindowOrigin(),
+                                                 CurrentTuning().sim.stillWaterRelax});
+    orc->still.assign(size_t(kWorldN) * kWorldN * 4u, 0u);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), 0, orc->still.data(),
+                          orc->still.size() * 4, "rvSolStill");
+    return orc;
+  };
+  // The oracle over EVERY chunk that holds solute, awake or not: pending
+  // carry / diffuse / one-way pairs, and the carry pairs left in chunks over
+  // columns ABOVE the fall (not `below`). A chunk asleep with a carry left
+  // would be the sleep mirror disagreeing with the work test.
+  struct Pend { int carry = 0, diff = 0, oneway = 0, carryAbove = 0; };
+  auto pendingAll = [&](const SolLayerR& L) {
+    Pend r;
+    auto orc = makeOracle(L);
+    for (uint32_t s = 0; s < kNumChunks; s++) {
+      if (L.table[s] == 0u) continue;
+      const IVec3 wc = c.world.SlotToWorldChunk(s);
+      int pc = 0, pd = 0, po = 0;
+      orc->Pending(wc, pc, pd, po);
+      r.carry += pc;
+      r.diff += pd;
+      r.oneway += po;
+      if (!below(wc.x * 16 + 8, wc.z * 16 + 8)) r.carryAbove += pc;
+    }
+    return r;
+  };
+  // Awake solute chunks whose WATER is moving (the CA's MOVE bit), counted by
+  // the last awakeSol call that asked for `who`: ink on a river that is not at
+  // rest is stirred by the CA, which no potential argument covers.
+  int movingAwake = 0;
+  auto awakeSol = [&](const SolLayerR& L, std::string* who, std::string* totals) {
+    std::vector<uint32_t> fl(kNumSlots, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl.data(), kNumSlots * 4, "rvSolAwake");
+    std::unique_ptr<SolOracle> orc;
+    if (who) orc = makeOracle(L);
+    int n = 0, tc = 0, td = 0, to = 0;
+    movingAwake = 0;
+    for (uint32_t s = 0; s < kNumChunks; s++) {
+      if (fl[s] == 0u || L.table[s] == 0u) continue;
+      n++;
+      if (fl[s] & DirtyReasonBit("MOVE")) movingAwake++;
+      if (!who) continue;
+      uint64_t m = 0;
+      uint32_t cells = 0, hi = 0;
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t v = L.Value(s, k) & 0xFFu;
+        m += v;
+        cells += v != 0u;
+        hi = std::max(hi, v);
+      }
+      const IVec3 wc = c.world.SlotToWorldChunk(s);
+      int pc = 0, pd = 0, po = 0;
+      orc->Pending(wc, pc, pd, po);
+      tc += pc;
+      td += pd;
+      to += po;
+      std::string why;
+      for (int b = 0; b < kDirtyReasonBits; b++)
+        if (fl[s] & (1u << b)) why += std::string(why.empty() ? "" : "+") + kDirtyReasonName[b];
+      if (who->size() < 1400)
+        *who += Format(" (%d,%d,%d)%s mass %llu in %u cells (max %u) stall %u [%s] pending carry %d diffuse %d one-way %d;",
+                       wc.x, wc.y, wc.z, below(wc.x * 16 + 8, wc.z * 16 + 8) ? " below" : "", (unsigned long long)m,
+                       cells, hi, L.stall[s], why.c_str(), pc, pd, po);
+    }
+    if (totals)
+      *totals = Format("pending pairs in the awake solute chunks: carry %d, diffuse %d, one-way %d; %d of them with "
+                       "their water moving", tc, td, to, movingAwake);
+    return n;
+  };
+  SolLayerR L;
+  ReadSolLayerR(c, L);
+  const Census c0 = census(L);
+  const uint32_t poured0 = L.hdr[kSolMPoured], powder0 = L.hdr[kSolMPourPowder], lost0 = L.hdr[kSolMPourLost],
+                 disc0 = L.hdr[kSolMDiscarded], prec0 = L.hdr[kSolMPrecip], conv0 = L.hdr[kSolMConverted];
+  // THE FALL AS THE CARRY SEES IT: along the line through the fall's sample,
+  // from 8 voxels upstream to 10 down, each column's held target T8, its drop
+  // distance r (the shader's rank, from the oracle) and the mirror's water
+  // top. A crest that stood over the reach above it (a higher T8) would carry
+  // backwards; this line says so without a second run.
+  {
+    auto orc = makeOracle(L);
+    const double fx = dn[0] - up[0], fz = dn[1] - up[1];
+    const double fl = std::max(std::hypot(fx, fz), 1e-6);
+    std::string prof;
+    for (int t = -8; t <= 10; t++) {
+      const int x = dn[0] + static_cast<int>(std::lround(fx / fl * t));
+      const int z = dn[1] + static_cast<int>(std::lround(fz / fl * t));
+      const int t8 = orc->Level8(x, z);
+      const int r = t8 == SolOracle::kUnheld ? -1 : orc->DropDist(x, z, t8, 4);
+      prof += Format(" %d:%s/%d/y%d", t, t8 == SolOracle::kUnheld ? "-" : std::to_string(t8).c_str(), r,
+                     worldmap::WaterColumnAt(x, z, kDefaultSeed).water);
+    }
+    std::printf("rivers:   V the fall along its line (offset:T8/drop distance/water top):%s\n", prof.c_str());
+  }
+  // Two pours, on the upper reach's last sample and half way to the fall's:
+  // the pour patch (5 x 5, 3 deep) reaches the crest.
+  const uint32_t units = static_cast<uint32_t>(BaselineNumber("rivers.soluteUnits", 1600));
+  sandvox::support::TickOps pour;
+  pour.cells.push_back(CellOp{World::SlotCellIndex(IVec3{up[0], yU + 2, up[1]}), CellOpSolute(ink->species, units)});
+  pour.cells.push_back(CellOp{World::SlotCellIndex(IVec3{(up[0] + dn[0]) / 2, yU + 2, (up[1] + dn[1]) / 2}),
+                              CellOpSolute(ink->species, units)});
+  tick(pour);
+  const int carryTicks = static_cast<int>(BaselineNumber("rivers.soluteCarryTicks", 600));
+  std::string curve;
+  for (int k = 1; k <= carryTicks; k++) {
+    tick();
+    if (k % 150 == 0) {
+      ReadSolLayerR(c, L);
+      const Census ck = census(L);
+      curve += Format(" %d:%llu/%llu", k, (unsigned long long)(ck.under - std::min(ck.under, c0.under)),
+                      (unsigned long long)(ck.mass - std::min(ck.mass, c0.mass)));
+    }
+  }
+  ReadSolLayerR(c, L);
+  const Census c1 = census(L);
+  const uint32_t poured = L.hdr[kSolMPoured] - poured0;
+  const uint32_t disc1 = L.hdr[kSolMDiscarded] - disc0, prec1 = L.hdr[kSolMPrecip] - prec0,
+                 conv1 = L.hdr[kSolMConverted] - conv0;
+  const int64_t moved1 = int64_t(c1.mass) - int64_t(c0.mass);
+  const int64_t ledger1 = int64_t(poured) - int64_t(disc1) - int64_t(prec1) - int64_t(conv1);
+  const uint64_t under1 = c1.under - std::min(c1.under, c0.under);
+  const double fracBelow = poured ? double(under1) / poured : 0.0;
+  // (c): tick on until no awake chunk carries solute, twice in a row. Every
+  // 500 ticks the oracle's pending pairs over all solute chunks go on the
+  // curve too (awake/carry/diffuse), so a chunk that will not sleep says
+  // whether the carry or the diffusion is what is left.
+  const int settleMax = static_cast<int>(BaselineNumber("rivers.soluteSettleTicks", 4000));
+  int settledAt = -1, zeros = 0, k = 0;
+  std::string curve2;
+  for (; k < settleMax && zeros < 2; k++) {
+    tick();
+    if (k % 100 == 99) {
+      ReadSolLayerR(c, L);
+      const int n = awakeSol(L, nullptr, nullptr);
+      if ((k + 1) % 500 == 0) {
+        const Pend p = pendingAll(L);
+        curve2 += Format(" %d:%d/%d/%d/%d", carryTicks + k + 1, n, movingAwake, p.carry, p.diff);
+      }
+      if (n == 0) {
+        if (zeros++ == 0) settledAt = carryTicks + k + 1;
+      } else {
+        zeros = 0;
+        settledAt = -1;
+      }
+    }
+  }
+  ReadSolLayerR(c, L);
+  std::string who, totals;
+  const int awakeEnd = awakeSol(L, &who, &totals);
+  // THE CONTROL INSIDE THE RUN (CLAUDE.md verification rule 6): is the water
+  // under the ink moving because of the ink? Every awake chunk of the window,
+  // split by "carries solute" and "its water is MOVING" (the CA's MOVE bit),
+  // and a 20-tick voxel diff of the awake solute chunks by FIELD -- material
+  // pairs that changed, fullness-only words, stain-only words. Moving water
+  // in chunks with NO solute is the fixture's own motion, not the carry's.
+  std::string control;
+  {
+    std::vector<uint32_t> fl(kNumSlots, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl.data(), kNumSlots * 4, "rvSolCtl");
+    int all = 0, sol = 0, solMove = 0, cleanMove = 0;
+    std::vector<uint32_t> slots;
+    std::string cleanWhere;
+    for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+      if (fl[sl] == 0u) continue;
+      all++;
+      const bool mv = (fl[sl] & DirtyReasonBit("MOVE")) != 0u;
+      if (L.table[sl] != 0u) {
+        sol++;
+        solMove += mv;
+        if (slots.size() < 24) slots.push_back(sl);
+      } else if (mv) {
+        cleanMove++;
+        if (cleanWhere.size() < 300) {
+          const IVec3 wc = c.world.SlotToWorldChunk(sl);
+          cleanWhere += Format(" (%d,%d,%d)", wc.x, wc.y, wc.z);
+        }
+      }
+    }
+    auto grab = [&](std::vector<uint32_t>& out) {
+      out.assign(slots.size() * kChunkVol, 0u);
+      for (size_t q = 0; q < slots.size(); q++)
+        sandvox::ReadVoxelsSync(c.ctx, c.world, slots[q], 1, out.data() + q * kChunkVol, "rvSolDiff");
+    };
+    std::vector<uint32_t> va, vb;
+    grab(va);
+    for (int q = 0; q < 20; q++) tick();
+    c.ctx.WaitIdle();
+    grab(vb);
+    std::map<std::pair<uint32_t, uint32_t>, int> pairs;
+    int fullOnly = 0, stainOnly = 0;
+    for (size_t q = 0; q < va.size(); q++) {
+      const uint32_t wa = va[q] & ~0x00FF0000u, wb = vb[q] & ~0x00FF0000u;
+      if (wa == wb) continue;
+      if ((wa & 0xFFFu) != (wb & 0xFFFu)) pairs[{wa & 0xFFFu, wb & 0xFFFu}]++;
+      else if ((wa & 0xF000u) != (wb & 0xF000u)) fullOnly++;
+      else stainOnly++;
+    }
+    std::string mp;
+    for (const auto& [k2, v2] : pairs)
+      if (mp.size() < 300)
+        mp += Format(" %s->%s x%d", k2.first < c.mats.size() ? c.mats[k2.first].name.c_str() : "?",
+                     k2.second < c.mats.size() ? c.mats[k2.second].name.c_str() : "?", v2);
+    control = Format("; CONTROL: %d chunks awake in the window, %d carry solute (%d of them MOVING), %d MOVING with "
+                     "no solute%s; the awake solute chunks over 20 ticks: %zu material pairs changed%s, %d "
+                     "fullness-only, %d stain-only words",
+                     all, sol, solMove, cleanMove, cleanWhere.c_str(), pairs.size(), mp.c_str(), fullOnly, stainOnly);
+  }
+  const Pend pEnd = pendingAll(L);
+  const Census c2 = census(L);
+  const uint32_t powder = L.hdr[kSolMPourPowder] - powder0, lost = L.hdr[kSolMPourLost] - lost0,
+                 disc = L.hdr[kSolMDiscarded] - disc0, prec = L.hdr[kSolMPrecip] - prec0,
+                 conv = L.hdr[kSolMConverted] - conv0, poured2 = L.hdr[kSolMPoured] - poured0;
+  const int64_t moved = int64_t(c2.mass) - int64_t(c0.mass);
+  const int64_t ledger = int64_t(poured2) - int64_t(disc) - int64_t(prec) - int64_t(conv);
+  const double discMax = BaselineNumber("rivers.soluteDiscardMax", 0.05);
+  const double belowMin = BaselineNumber("rivers.soluteBelowMin", 0.5);
+  // 1: (c) is "every solute chunk asleep"; 0: asleep, OR THE CARRY HAS
+  // TERMINATED: no carried pair (step-downs included) has work left anywhere,
+  // awake chunk or asleep -- the claim this pass makes about the carry. What
+  // may still be awake is then the LEVEL diffusion at the species' own pace
+  // (ink's diffusivity is 8/256, set by the owner so a cloud hangs; it ends by
+  // solDiffuse's own d == 0 argument) and the fixture's water itself: the
+  // CONTROL in the report counts awake chunks with moving water and NO solute.
+  // Measured 2026-10-17: ~4,100 ticks into V the falls reach and main woke on
+  // their own (73 chunks moving with no solute in them, evaporation and steam
+  // in the diff), so a strict sleep claim there measures the fixture's clock,
+  // not the carry.
+  const bool needSleep = BaselineNumber("rivers.soluteRequireSleep", 0) != 0;
+  const double fracBelow2 = poured2 ? double(c2.under - std::min(c2.under, c0.under)) / poured2 : 0.0;
+  const bool aOk = poured == 2u * units && powder == 0 && lost == 0 && fracBelow >= belowMin;
+  // (b) at the end of the carry: the layer moved by exactly the ledger and the
+  // floor had taken at most discMax of it; at the end, still exact.
+  const bool bOk = moved1 == ledger1 && disc1 <= discMax * poured && moved == ledger;
+  const bool asleep = settledAt >= 0 && awakeEnd == 0;
+  // A few carried pairs may be left where the fixture's own water is still
+  // moving (it re-ranks cells it stirs: measured 0 and 2 of the 746 at the
+  // start, on two trees whose solute code is identical), never over the fall.
+  const int carryLeftMax = static_cast<int>(BaselineNumber("rivers.soluteCarryLeftMax", 4));
+  const bool cOk = asleep || (!needSleep && pEnd.carry <= carryLeftMax && pEnd.carryAbove == 0);
+  const bool vOk = aOk && bOk && cOk;
+  std::printf("rivers: V solute carried: %s (ink poured %u units at (%d,%d) y%d over a %d-voxel fall to y%d (%u as "
+              "powder, %u lost); (a) after %d ticks %llu units (%.2f >= %.2f) stand below the fall, tick:below/total%s; "
+              "(b) at tick %d the layer moved %lld, ledger %lld (poured %u - discarded %u - precipitated %u - converted "
+              "%u), discarded %.3f <= %.2f; at the end moved %lld, ledger %lld (discarded %u, precipitated %u); (c) %s: "
+              "solute chunks asleep from tick %d (%d awake at the end), carried pairs with work left %d (%d over or above "
+              "the fall), level diffusion %d, one-way %d; %.2f below by then%s%s%s%s%s)\n",
+              vOk ? "PASS" : "FAIL", poured, up[0], up[1], yU, yU - yL, yL, powder, lost, carryTicks,
+              (unsigned long long)under1, fracBelow, belowMin, curve.c_str(), carryTicks, (long long)moved1,
+              (long long)ledger1, poured, disc1, prec1, conv1, poured ? double(disc1) / poured : 0.0, discMax,
+              (long long)moved, (long long)ledger, disc, prec, asleep ? "ASLEEP" : (cOk ? "carry TERMINATED (level diffusion and the fixture's own water still awake)" : "NOT settled"), settledAt,
+              awakeEnd, pEnd.carry, pEnd.carryAbove, pEnd.diff, pEnd.oneway, fracBelow2,
+              curve2.empty() ? "" : "; tick:awake/moving/carry/diffuse", curve2.c_str(), totals.empty() ? "" : "; awake ",
+              (totals + control).c_str(), who.empty() ? "" : (" -- awake:" + who).c_str());
+  RecordObserved("rivers.observedSoluteBelow", Format("%.3f", fracBelow));
+  RecordObserved("rivers.observedSoluteSettledAt", std::to_string(settledAt));
+  if (!vOk)
+    problems.push_back(Format("V: solute below the fall %.2f (>= %.2f), ledger %lld vs %lld (end %lld vs %lld), "
+                              "discarded %u of %u by tick %d, settled at %d (%d awake), carry left %d (%d above)",
+                              fracBelow, belowMin, (long long)moved1, (long long)ledger1, (long long)moved,
+                              (long long)ledger, disc1, poured, carryTicks, settledAt, awakeEnd, pEnd.carry,
+                              pEnd.carryAbove));
+  return vOk;
 }
 
 }  // namespace
@@ -1047,16 +1644,30 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // a bare drop in the adopted count).
         const rhi::Buffer& still = c.sim.StillWaterBuffer();
         uint32_t floodMax = 0;
+        // ATTRIBUTION (phase 3, CLAUDE.md rule 6): how many of the adopted
+        // columns are POOL streams' ([3] bit 24: rooted on a finite source,
+        // THE CONDUIT), and the most-flooded column's record -- where it is,
+        // its hop, POOL or map, its target and the flood count.
+        int poolN = 0;
+        std::string floodWho;
         auto adoptedCount = [&]() {
           std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
           int k = 0;
           floodMax = 0;
+          poolN = 0;
+          floodWho.clear();
           for (const auto& xz : byCols) {
             const size_t si = (size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1))) * 4u;
             if (tab[si + 2] != 0u) {
               k++;
-              floodMax = std::max(floodMax, (tab[si + 3] >> 12) & 4095u);
+              if (tab[si + 3] & (1u << 24)) poolN++;
+              const uint32_t fl = (tab[si + 3] >> 12) & 4095u;
+              if (fl > floodMax || floodWho.empty()) {
+                floodWho = Format("(%d,%d) hop %u %s t8 %d", xz.first, xz.second, tab[si + 2] >> 20,
+                                  (tab[si + 3] & (1u << 24)) ? "POOL" : "map", static_cast<int>(tab[si + 2] << 12) >> 12);
+              }
+              floodMax = std::max(floodMax, fl);
             }
           }
           return k;
@@ -1068,12 +1679,17 @@ Status GateRivers(Ctx& c, std::string& detail) {
             if (vox(xz.first, floorOf[xz], xz.second) == mWater) k++;
           return k;
         };
+        uint32_t awakeWhy = 0;   // the dirty reasons of the awake channel chunks (OR)
         auto awakeOn = [&]() {
           std::vector<uint32_t> fl2(kNumSlots, 0);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl2.data(), kNumSlots * 4, "riversActiveS");
           int k = 0;
+          awakeWhy = 0;
           for (uint32_t ci : byChunks)
-            if (ci < kNumSlots && fl2[ci] != 0u) k++;
+            if (ci < kNumSlots && fl2[ci] != 0u) {
+              k++;
+              awakeWhy |= fl2[ci];
+            }
           return k;
         };
         sandvox::support::TickOps byLining;
@@ -1103,13 +1719,16 @@ Status GateRivers(Ctx& c, std::string& detail) {
             adopted = adoptedCount();
             lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            curve += Format(" %d:%d/%d/%d/%u", k, wet, adopted, awake, floodMax);
+            curve += Format(" %d:%d/%d(%dP)/%d/%u", k, wet, adopted, poolN, awake, floodMax);
           }
         }
         c.ctx.WaitIdle();
         wet = wetCount();
         adopted = adoptedCount();
         awake = awakeOn();
+        std::string runWho = Format("; %d POOL; the most flooded: %s; awake by", poolN, floodWho.c_str());
+        for (int b = 0; b < kDirtyReasonBits; b++)
+          if ((awakeWhy >> b) & 1u) runWho += Format(" %s", kDirtyReasonName[b]);
         const int nBy = static_cast<int>(byCols.size());
         // (c) the plug: stone over the mouth, from below the channel floor up.
         std::vector<CellOp> plug;
@@ -1125,7 +1744,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
           tick();
           if (k % 150 == 0) {
             c.ctx.WaitIdle();
-            curve2 += Format(" %d:%d/%d", k, wetCount(), adoptedCount());
+            const int wc2 = wetCount(), ac2 = adoptedCount();
+            curve2 += Format(" %d:%d/%d(%dP)", k, wc2, ac2, poolN);
           }
         }
         c.ctx.WaitIdle();
@@ -1139,13 +1759,64 @@ Status GateRivers(Ctx& c, std::string& detail) {
                          lost <= static_cast<int>(flapMax * nBy) && adoptedAfter <= static_cast<int>(releaseMax * nBy);
         std::printf("rivers: S stream held: %s (channel %d columns: after %d ticks %d wet, %d adopted (>= %.2f), %d of its "
                     "%zu chunks awake (<= %d), %d released while running (<= %.2f); plugged, %d ticks on: %d adopted "
-                    "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s; after the plug tick:wet/adopted%s)\n",
+                    "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
-                    flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), curve2.c_str());
+                    flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
         RecordObserved("rivers.observedStreamAdopted", std::to_string(adopted));
         if (!sOk)
           problems.push_back(Format("S: channel %d cols, %d wet, %d adopted, %d awake, %d released while running; after plug "
                                     "%d adopted", nBy, wet, adopted, awake, lost, adoptedAfter));
+      }
+      // ---- V. the held flow carries solute (sim_solute.wgsl), after S ----
+      PassSoluteCarried(c, tick, *rFalls, problems);
+      // ---- X. ... and drifts downstream on a level reach ----
+      PassSoluteDrift(c, tick, *rMain, problems);
+      // ---- W. gravel poured into the river does not lift it onto the pile ----
+      // (After S: a pile in main beside S's mouth floods the stream's mouth.)
+      // Ticket 2026-10-17_00-02-59: a grain sinking into held water swapped
+      // that water UP onto the pile, over the target, where nothing takes it
+      // back, while the reservoir refilled the river -- a sheet of water
+      // climbed every pile poured into a river. A 5 x 5 column of gravel 14
+      // cells tall dropped half on main's bank, half in it, at a quarter of
+      // its length; after the pile settles, count the water standing ON
+      // gravel above main's own surface there.
+      {
+        const auto& Lm = rMain->line;
+        const auto& pg = Lm[Lm.size() / 4];
+        const auto& pg0 = Lm[Lm.size() / 4 - 2];
+        const auto& pg1 = Lm[Lm.size() / 4 + 2];
+        double tx = pg1[0] - pg0[0], tz = pg1[1] - pg0[1];
+        const double tl = std::max(std::hypot(tx, tz), 1e-6);
+        const double nx = -tz / tl, nz = tx / tl;
+        const int gx = pg[0] + static_cast<int>(std::lround(nx * pg[3])), gz = pg[1] + static_cast<int>(std::lround(nz * pg[3]));
+        const int gTop = pg[2];
+        const uint32_t mGravel = matIdOf("gravel");
+        std::vector<CellOp> pour;
+        for (int dz = -2; dz <= 2; dz++)
+          for (int dx = -2; dx <= 2; dx++)
+            for (int y = gTop + 2; y <= gTop + 15; y++)
+              pour.push_back(CellOp{World::SlotCellIndex(IVec3{gx + dx, y, gz + dz}), mGravel | 0x80000000u});
+        sandvox::support::TickOps gops;
+        gops.cells = pour;
+        tick(gops);
+        const int gTicks = static_cast<int>(BaselineNumber("rivers.gravelTicks", 400));
+        for (int k = 1; k < gTicks; k++) tick();
+        c.ctx.WaitIdle();
+        rows.clear();
+        int onPile = 0, pileCells = 0;
+        for (int dz = -10; dz <= 10; dz++)
+          for (int dx = -10; dx <= 10; dx++)
+            for (int y = gTop + 1; y <= gTop + 16; y++) {
+              const uint32_t m = vox(gx + dx, y, gz + dz);
+              if (m == mGravel) pileCells++;
+              if (m == mWater && vox(gx + dx, y - 1, gz + dz) == mGravel) onPile++;
+            }
+        const int onPileMax = static_cast<int>(BaselineNumber("rivers.gravelWaterMax", 4));
+        const bool wOk = pileCells > 20 && onPile <= onPileMax;
+        std::printf("rivers: W gravel into the river: %s (%d gravel cells over main's surface after %d ticks; %d water "
+                    "cells standing on gravel over it (<= %d))\n",
+                    wOk ? "PASS" : "FAIL", pileCells, gTicks, onPile, onPileMax);
+        if (!wOk) problems.push_back(Format("W: %d water cells on the gravel pile (%d gravel over the surface)", onPile, pileCells));
       }
       weather::SetOverride(prevPin);
       if (!gOk) problems.push_back(Format("G: %u chunks awake after %d ticks (%d at the water)", active, ticks, nearWater));
@@ -1195,6 +1866,64 @@ Status GateRivers(Ctx& c, std::string& detail) {
     RecordObserved("rivers.defaultWorstCell", std::to_string(d1.siteCellWorst));
     if (!hOk) problems.push_back("H: default " + std::string(ok0 ? "" : "REFUSED: " + l0.substr(0, 200)) +
                                  (ok1 ? "" : " with a river REFUSED: " + l1.substr(0, 300)));
+
+    // ---- L. default's waterfalls contained (CPU twin; 2026-10-16) ----
+    // E holds the fixture's ONE fall; the shipped map has hundreds, in every
+    // shape the bake makes, and two classes of leak got past E there: a dry
+    // channel edge beside a curtain's END stood at the lower reach's level
+    // (every curtain of Hollowcrown Beck spilled down its cliff for ever, a
+    // breach that never slept), and two rivers' overlapping channels stood
+    // one's water on the other's floor (66-voxel slabs). A LEAK here = a
+    // water column standing over a DRY 4-neighbour whose ground is under that
+    // water's top: air beside held water with no held column under it. Every
+    // fall of every river, a box around it, waterApply's own answer per
+    // column (no GPU).
+    if (ok0) {
+      worldmap::SetCurrentWorldMap(d0);
+      const int halfBox = static_cast<int>(BaselineNumber("rivers.fallBoxHalf", 20));
+      const int fallStride = std::max(1, static_cast<int>(BaselineNumber("rivers.fallStride", 1)));
+      int fallsSeen = 0, leaks = 0, leakFalls = 0;
+      std::string firstLeaks;
+      const auto tl = std::chrono::steady_clock::now();
+      for (const auto& rv : d0.rivers) {
+        for (size_t fi = 0; fi < rv.falls.size(); fi += static_cast<size_t>(fallStride)) {
+          const int fx = rv.falls[fi][0], fz = rv.falls[fi][1];
+          const int n = 2 * halfBox + 1;
+          std::vector<worldmap::WaterColumn> box(static_cast<size_t>(n * n));
+          for (int dz = 0; dz < n; dz++)
+            for (int dx = 0; dx < n; dx++)
+              box[static_cast<size_t>(dz * n + dx)] = worldmap::WaterColumnAt(fx - halfBox + dx, fz - halfBox + dz, kDefaultSeed);
+          int here = 0;
+          for (int dz = 1; dz + 1 < n; dz++) {
+            for (int dx = 1; dx + 1 < n; dx++) {
+              const worldmap::WaterColumn& a = box[static_cast<size_t>(dz * n + dx)];
+              if (a.water < 0 || a.water <= a.h) continue;
+              static constexpr int kN[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+              for (const auto& d : kN) {
+                const worldmap::WaterColumn& b = box[static_cast<size_t>((dz + d[1]) * n + dx + d[0])];
+                // The sea holds a fall into it (water -1 = none above the sea's own).
+                if (b.water >= 0 || b.h >= a.water || b.h < d0.seaLevelY) continue;
+                here++;
+                if (firstLeaks.size() < 400)
+                  firstLeaks += Format(" [%s (%d,%d) water %d over (%d,%d) ground %d]", rv.id.c_str(), fx - halfBox + dx,
+                                       fz - halfBox + dz, a.water, fx - halfBox + dx + d[0], fz - halfBox + dz + d[1], b.h);
+              }
+            }
+          }
+          fallsSeen++;
+          leaks += here;
+          if (here) leakFalls++;
+        }
+      }
+      const double msL = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl).count();
+      const int leakMax = static_cast<int>(BaselineNumber("rivers.fallLeakMax", 0));
+      const bool lOk = fallsSeen > 0 && leaks <= leakMax;
+      std::printf("rivers: L default falls contained: %s (%d falls, a %d-column box round each: %d leaking faces at %d "
+                  "falls (<= %d), %.0f ms)%s\n",
+                  lOk ? "PASS" : "FAIL", fallsSeen, 2 * halfBox + 1, leaks, leakFalls, leakMax, msL, firstLeaks.c_str());
+      RecordObserved("rivers.observedFallLeaks", std::to_string(leaks));
+      if (!lOk) problems.push_back(Format("L: %d leaking faces at %d of %d default falls", leaks, leakFalls, fallsSeen));
+    }
   }
 
   // ---- the pristine world back ----
@@ -1216,7 +1945,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
     std::printf("rivers: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
-  detail = "spline, load, bake, lake, CPU == GPU, contained + held, far + horizon, sleep, running, stream held, site index";
+  detail = "spline, load, bake, lake, CPU == GPU, contained + held, far + horizon, sleep, running, stream held, solute carried, site index";
   std::printf("rivers: PASS\n");
   return Status::Pass;
 }

@@ -42,6 +42,12 @@ constexpr float kFlowPinArc = 24.0f;
 constexpr float kFlowMinDepth = 3.0f;
 float Tr(float h) { return std::pow(std::max(h, kFlowMinDepth), 5.0f / 3.0f); }
 
+// A velocity (cells/s) as the grids' i16, 1/kFlowVelQ cells/s.
+uint32_t QVel(float v) {
+  const float s = v * (float)kFlowVelQ;
+  return (uint32_t)(uint16_t)(int16_t)std::clamp((int)std::lround(s), -32767, 32767);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -523,11 +529,13 @@ std::shared_ptr<WaterFlowField::Block> SolveBlock(WaterFlowField::Net& net, int 
 const WaterFlowField::Block& WaterFlowField::BlockAt(int bx, int bz, uint32_t seed) {
   auto it = blocks_.find({bx, bz});
   if (it != blocks_.end()) return *it->second;
-  auto pit = pending_.find({bx, bz});
-  if (pit != pending_.end()) {
-    auto b = pit->second.get();
-    pending_.erase(pit);
-    return *blocks_.emplace(std::make_pair(bx, bz), std::move(b)).first->second;
+  for (auto* pend : {&pending_, &farPending_}) {
+    auto pit = pend->find({bx, bz});
+    if (pit != pend->end()) {
+      auto b = pit->second.get();
+      pend->erase(pit);
+      return *blocks_.emplace(std::make_pair(bx, bz), std::move(b)).first->second;
+    }
   }
   const auto t0 = std::chrono::steady_clock::now();
   auto b = SolveBlock(*net_, bx, bz, seed);
@@ -541,20 +549,27 @@ const WaterFlowField::Block& WaterFlowField::BlockAt(int bx, int bz, uint32_t se
   return *blocks_.emplace(std::make_pair(bx, bz), std::move(b)).first->second;
 }
 
-void WaterFlowField::Harvest() {
-  for (auto it = pending_.begin(); it != pending_.end();) {
-    if (it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-      blocks_[it->first] = it->second.get();
-      it = pending_.erase(it);
-    } else {
-      ++it;
+size_t WaterFlowField::Harvest() {
+  size_t landed = 0;
+  for (auto* pend : {&pending_, &farPending_}) {
+    for (auto it = pend->begin(); it != pend->end();) {
+      if (it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        blocks_[it->first] = it->second.get();
+        it = pend->erase(it);
+        landed++;
+      } else {
+        ++it;
+      }
     }
   }
+  return landed;
 }
 
 void WaterFlowField::Quiesce() {
-  for (auto& [key, f] : pending_) blocks_[key] = f.get();
-  pending_.clear();
+  for (auto* pend : {&pending_, &farPending_}) {
+    for (auto& [key, f] : *pend) blocks_[key] = f.get();
+    pend->clear();
+  }
 }
 
 void WaterFlowField::Prefetch(int ox, int oz, uint32_t seed) {
@@ -567,7 +582,8 @@ void WaterFlowField::Prefetch(int ox, int oz, uint32_t seed) {
   for (int bz = bz0; bz <= bz1; bz++)
     for (int bx = bx0; bx <= bx1; bx++) {
       if (pending_.size() >= kFlowMaxPending) return;
-      if (blocks_.count({bx, bz}) || pending_.count({bx, bz})) continue;
+      if (blocks_.count({bx, bz}) || pending_.count({bx, bz}) || farPending_.count({bx, bz}))
+        continue;
       std::shared_ptr<Net> net = net_;
       pending_.emplace(std::make_pair(bx, bz),
                        std::async(std::launch::async, [net, bx, bz, seed] {
@@ -582,7 +598,11 @@ void WaterFlowField::Clear() {
   blocks_.clear();
   net_.reset();
   built_ = false;
+  farBuilt_ = false;
+  farMissing_ = 0;
+  farLanded_ = 0;
   version_++;
+  farVersion_++;
   solved_ = 0;
   scale_ = -1.0f;
 }
@@ -595,7 +615,7 @@ void WaterFlowField::UpdateAt(int baseX, int baseZ, uint32_t seed) {
   const float scale = CurrentTuning().sim.currentStreamScale;
   const uint32_t mapHash = worldmap::CurrentWorldMap().contentHash;
   const bool netStale = !net_ || mapHash != mapHash_ || scale != scale_ || seed != seed_;
-  Harvest();
+  farLanded_ += Harvest();
   if (netStale) {
     Quiesce();
     blocks_.clear();
@@ -604,6 +624,7 @@ void WaterFlowField::UpdateAt(int baseX, int baseZ, uint32_t seed) {
     scale_ = scale;
     seed_ = seed;
     built_ = false;
+    farBuilt_ = false;
   }
   const int ox = baseX - kFlowStep, oz = baseZ - kFlowStep;
   const int far = ox + (kFlowWinNodes - 1) * kFlowStep;
@@ -614,24 +635,32 @@ void WaterFlowField::UpdateAt(int baseX, int baseZ, uint32_t seed) {
     // Holding still: keep the background solves of the ring the window
     // would need half a block from here going, so the move finds them.
     Prefetch(ox, oz, seed);
+    UpdateFar(seed);
     return;
   }
   baseX_ = baseX;
   baseZ_ = baseZ;
   built_ = true;
 
-  // Evict what the window has left well behind.
+  // Evict what the window has left well behind. The far grid's blocks reach
+  // kFlowFarHalf + kFlowFarSnap + one tent block past the window's centre:
+  // kEvictBlocks keeps all of them (and evicts nothing the window needs).
+  constexpr int kEvictBlocks = (kFlowFarHalf + kFlowFarSnap) / kFlowBlock + 2;
+  static_assert(kEvictBlocks >= 3, "the window's own ring needs +-3");
   const int cbx = FloorDiv(baseX + (int)kWorldN / 2, kFlowBlock);
   const int cbz = FloorDiv(baseZ + (int)kWorldN / 2, kFlowBlock);
   for (auto it = blocks_.begin(); it != blocks_.end();) {
-    if (std::abs(it->first.first - cbx) > 3 || std::abs(it->first.second - cbz) > 3)
+    if (std::abs(it->first.first - cbx) > kEvictBlocks ||
+        std::abs(it->first.second - cbz) > kEvictBlocks)
       it = blocks_.erase(it);
     else
       ++it;
   }
   Prefetch(ox, oz, seed);
 
-  words_.assign(kFlowWords, 0u);
+  // The window's part only: the far grid (kFlowFarBase on) is UpdateFar's.
+  if (words_.size() != kFlowWords) words_.assign(kFlowWords, 0u);
+  std::fill(words_.begin(), words_.begin() + kFlowNearWords, 0u);
   words_[0] = (uint32_t)ox;
   words_[1] = (uint32_t)oz;
   words_[2] = (uint32_t)kFlowWinNodes;
@@ -665,12 +694,8 @@ void WaterFlowField::UpdateAt(int baseX, int baseZ, uint32_t seed) {
           surf = b.surf[k];   // the same probe in every block
           bed = b.bed[k];
         }
-      auto q = [](float v) {
-        const float s = v * (float)kFlowVelQ;
-        return (uint32_t)(uint16_t)(int16_t)std::clamp((int)std::lround(s), -32767, 32767);
-      };
       uint32_t* n = &words_[kFlowHeaderWords + 2 * ((size_t)j * kFlowWinNodes + i)];
-      n[0] = surf == kFlowDry ? 0u : (q(vx) | (q(vz) << 16));
+      n[0] = surf == kFlowDry ? 0u : (QVel(vx) | (QVel(vz) << 16));
       n[1] = (uint32_t)(uint16_t)(int16_t)surf | ((uint32_t)(uint16_t)(int16_t)bed << 16);
     }
   }
@@ -680,13 +705,134 @@ void WaterFlowField::UpdateAt(int baseX, int baseZ, uint32_t seed) {
     char name[512];
     std::snprintf(name, sizeof name, "%s_%d_%d.bin", dp, baseX, baseZ);
     if (FILE* f = std::fopen(name, "wb")) {
-      std::fwrite(words_.data(), 4, words_.size(), f);
+      std::fwrite(words_.data(), 4, kFlowNearWords, f);
       std::fclose(f);
     }
   }
   if (std::getenv("SANDVOX_FLOW_TRACE"))
     std::fprintf(stderr, "flow: window (%d,%d) composed, %zu blocks cached, %u solved\n", baseX,
                  baseZ, blocks_.size(), solved_);
+  UpdateFar(seed);
+}
+
+// THE FAR GRID (flowfield.h kFlowFarBase). Recentred on the window when it has
+// moved more than kFlowFarSnap cells (hysteresis: a window stepping back and
+// forth over one chunk does not re-upload the grid each time); re-composed
+// when blocks it composed dry have landed, at most every kFarRecomposeTicks
+// updates so the startup fill is a handful of uploads, not one per block.
+void WaterFlowField::UpdateFar(uint32_t seed) {
+  constexpr uint32_t kFarRecomposeTicks = 8;
+  const int wcx = baseX_ + (int)kWorldN / 2, wcz = baseZ_ + (int)kWorldN / 2;
+  const bool recentre = !farBuilt_ || std::abs(wcx - farCx_) > kFlowFarSnap ||
+                        std::abs(wcz - farCz_) > kFlowFarSnap;
+  if (recentre) {
+    farCx_ = FloorDiv(wcx + kFlowFarSnap / 2, kFlowFarSnap) * kFlowFarSnap;
+    farCz_ = FloorDiv(wcz + kFlowFarSnap / 2, kFlowFarSnap) * kFlowFarSnap;
+  }
+  farLanded_ += Harvest();
+  farTicks_++;
+  if (recentre || (farMissing_ > 0 && farLanded_ > 0 && farTicks_ >= kFarRecomposeTicks))
+    ComposeFar();
+  if (farMissing_ == 0 || farPending_.size() >= kFlowFarPending) return;
+  // The blocks the far grid lacks, nearest its centre first: the river under
+  // the camera fills in before the one on the horizon.
+  const int h = kFlowBlock / 2;
+  const int bx0 = FloorDiv(farCx_ - kFlowFarHalf - h, kFlowBlock);
+  const int bx1 = FloorDiv(farCx_ + kFlowFarHalf - h, kFlowBlock) + 1;
+  const int bz0 = FloorDiv(farCz_ - kFlowFarHalf - h, kFlowBlock);
+  const int bz1 = FloorDiv(farCz_ + kFlowFarHalf - h, kFlowBlock) + 1;
+  std::vector<std::pair<long long, std::pair<int, int>>> want;
+  for (int bz = bz0; bz <= bz1; bz++)
+    for (int bx = bx0; bx <= bx1; bx++) {
+      const std::pair<int, int> key{bx, bz};
+      if (blocks_.count(key) || pending_.count(key) || farPending_.count(key)) continue;
+      const long long dx = (long long)bx * kFlowBlock + h - farCx_;
+      const long long dz = (long long)bz * kFlowBlock + h - farCz_;
+      want.push_back({dx * dx + dz * dz, key});
+    }
+  std::sort(want.begin(), want.end());
+  for (const auto& w : want) {
+    if (farPending_.size() >= kFlowFarPending) break;
+    std::shared_ptr<Net> net = net_;
+    const int bx = w.second.first, bz = w.second.second;
+    farPending_.emplace(w.second, std::async(std::launch::async, [net, bx, bz, seed] {
+                          return SolveBlock(*net, bx, bz, seed);
+                        }));
+  }
+}
+
+// The window composition's arithmetic over the far lattice, from the cached
+// blocks only: a node whose blend wants a block that is not here yet is
+// composed dry and counted in farMissing_.
+void WaterFlowField::ComposeFar() {
+  if (words_.size() != kFlowWords) words_.assign(kFlowWords, 0u);
+  const int ox = farCx_ - kFlowFarHalf, oz = farCz_ - kFlowFarHalf;
+  uint32_t* hdr = &words_[kFlowFarBase];
+  hdr[0] = (uint32_t)ox;
+  hdr[1] = (uint32_t)oz;
+  hdr[2] = (uint32_t)kFlowFarNodes;
+  hdr[3] = (uint32_t)kFlowFarStep;
+  // The blocks the lattice can ask for, looked up once.
+  const int h = kFlowBlock / 2;
+  const int bx0 = FloorDiv(ox - h, kFlowBlock), bz0 = FloorDiv(oz - h, kFlowBlock);
+  const int nbx = FloorDiv(ox + 2 * kFlowFarHalf - h, kFlowBlock) + 2 - bx0;
+  const int nbz = FloorDiv(oz + 2 * kFlowFarHalf - h, kFlowBlock) + 2 - bz0;
+  std::vector<const Block*> blk((size_t)nbx * nbz, nullptr);
+  for (int j = 0; j < nbz; j++)
+    for (int i = 0; i < nbx; i++) {
+      auto it = blocks_.find({bx0 + i, bz0 + j});
+      if (it != blocks_.end()) blk[(size_t)j * nbx + i] = it->second.get();
+    }
+  constexpr int NB = kFlowBlockNodes;
+  uint32_t missing = 0;
+  for (int j = 0; j < kFlowFarNodes; j++) {
+    const int z = oz + j * kFlowFarStep;
+    const int bz = FloorDiv(z - h, kFlowBlock);
+    const int cz = bz * kFlowBlock + h;
+    const float tz = (float)(z - cz) / (float)kFlowBlock;
+    for (int i = 0; i < kFlowFarNodes; i++) {
+      const int x = ox + i * kFlowFarStep;
+      const int bx = FloorDiv(x - h, kFlowBlock);
+      const int cx = bx * kFlowBlock + h;
+      const float tx = (float)(x - cx) / (float)kFlowBlock;
+      float vx = 0.0f, vz = 0.0f;
+      int surf = kFlowDry, bed = 0;
+      bool ok = true;
+      for (int dz = 0; dz < 2 && ok; dz++)
+        for (int dx = 0; dx < 2; dx++) {
+          const float w = (dx ? tx : 1.0f - tx) * (dz ? tz : 1.0f - tz);
+          if (w <= 0.0f) continue;
+          const Block* b = blk[(size_t)(bz + dz - bz0) * nbx + (bx + dx - bx0)];
+          if (b == nullptr) {
+            ok = false;
+            break;
+          }
+          const int ccx = cx + dx * kFlowBlock, ccz = cz + dz * kFlowBlock;
+          const int ii = (x - (ccx - kFlowBlock)) / kFlowStep;
+          const int jj = (z - (ccz - kFlowBlock)) / kFlowStep;
+          const size_t k = (size_t)jj * NB + ii;
+          vx += w * b->vx[k];
+          vz += w * b->vz[k];
+          surf = b->surf[k];   // the same probe in every block
+          bed = b->bed[k];
+        }
+      if (!ok) {
+        missing++;
+        surf = kFlowDry;
+      }
+      uint32_t* n = &words_[kFlowFarBase + kFlowHeaderWords + 2 * ((size_t)j * kFlowFarNodes + i)];
+      n[0] = surf == kFlowDry ? 0u : (QVel(vx) | (QVel(vz) << 16));
+      n[1] = (uint32_t)(uint16_t)(int16_t)surf | ((uint32_t)(uint16_t)(int16_t)bed << 16);
+    }
+  }
+  farMissing_ = missing;
+  farLanded_ = 0;
+  farTicks_ = 0;
+  farBuilt_ = true;
+  farVersion_++;
+  if (std::getenv("SANDVOX_FLOW_TRACE"))
+    std::fprintf(stderr, "flow: far grid (%d,%d) composed, %u nodes waiting on a block, %zu solving\n",
+                 farCx_, farCz_, missing, farPending_.size());
 }
 
 // TRANSCRIBED in common.wgsl flowGridAt, line for line: same words, same
@@ -729,11 +875,13 @@ namespace flowfield {
 namespace {
 const rhi::Buffer* gBuf = nullptr;
 uint32_t gUploaded = 0xFFFFFFFFu;
+uint32_t gUploadedFar = 0xFFFFFFFFu;
 }  // namespace
 
 void SetBuffer(const rhi::Buffer* buf) {
   gBuf = buf;
   gUploaded = 0xFFFFFFFFu;
+  gUploadedFar = 0xFFFFFFFFu;
 }
 
 Vec3 SampleMeasured(const uint32_t* grid, Vec3 p) {
@@ -793,13 +941,23 @@ Vec3 BlendMeasured(Vec3 solved, Vec3 measured) {
 void Upload(const rhi::Queue& queue) {
   if (gBuf == nullptr) return;
   const WaterFlowField& f = WaterFlow();
-  if (f.Version() == gUploaded) return;
-  gUploaded = f.Version();
-  if (f.Words().size() >= kFlowWords) {
-    queue.WriteBuffer(*gBuf, 0, f.Words().data(), (size_t)kFlowWords * 4);
-  } else {
-    const uint32_t zero[kFlowHeaderWords] = {0u, 0u, 0u, 0u};
-    queue.WriteBuffer(*gBuf, 0, zero, sizeof zero);
+  const bool have = f.Words().size() >= kFlowWords;
+  const uint32_t zero[kFlowHeaderWords] = {0u, 0u, 0u, 0u};
+  // The window grid and the far grid upload apart: the window's moves every
+  // chunk, the far one every kFlowFarSnap cells.
+  if (f.Version() != gUploaded) {
+    gUploaded = f.Version();
+    if (have) queue.WriteBuffer(*gBuf, 0, f.Words().data(), (size_t)kFlowNearWords * 4);
+    else queue.WriteBuffer(*gBuf, 0, zero, sizeof zero);
+  }
+  if (f.FarVersion() != gUploadedFar) {
+    gUploadedFar = f.FarVersion();
+    if (have) {
+      queue.WriteBuffer(*gBuf, (uint64_t)kFlowFarBase * 4, f.Words().data() + kFlowFarBase,
+                        (size_t)kFlowFarWords * 4);
+    } else {
+      queue.WriteBuffer(*gBuf, (uint64_t)kFlowFarBase * 4, zero, sizeof zero);
+    }
   }
 }
 }  // namespace flowfield

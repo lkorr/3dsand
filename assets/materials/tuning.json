@@ -74,7 +74,10 @@
     "grabStiffness": 9,
     "grabCarrySpeed": 9,
     "grabBreakDistance": 2.5,
-    "grabSpinDamp": 0.8
+    "grabSpinDamp": 0.8,
+    "pickConeDeg": 6,
+    "pickConeSmallDeg": 10,
+    "pickSmallSize": 3
   },
   "camera": {
     "mouseSensitivity": 0.0022,
@@ -725,6 +728,7 @@
     "waterRelevelGain": 8,
     "waterRelevelDepth": 32,
     "stillWaterRelax": 32,
+    "soluteDrift": 24,
     "waveMode": 1,
     "waveGravity": 98,
     "waveDepthCap": 10,

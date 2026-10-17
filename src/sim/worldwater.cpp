@@ -701,6 +701,10 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
     }
     // 7. the level it drains to, and the tail.
     int E = sea, tailFrom = N;
+    // The network distance to the mouth at this river's END: its parent's at
+    // the join (parents bake first: `order`), 0 for a river that ends at the
+    // sea or a lake.
+    int mouthEnd = 0;
     if (rv.joinIdx >= 0) {
       const WorldMapData::River& par = out.rivers[static_cast<size_t>(rv.joinIdx)];
       int64_t best = INT64_MAX;
@@ -709,6 +713,7 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
         const int64_t dx = par.line[k][0] - sm.back().x, dz = par.line[k][1] - sm.back().z;
         if (dx * dx + dz * dz < best) { best = dx * dx + dz * dz; bi = k; }
       }
+      if (bi < par.mouth.size()) mouthEnd = par.mouth[bi];
       if (!par.line.empty()) {
         E = par.line[bi][2];
         const int hwP = par.line[bi][3];
@@ -859,6 +864,8 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
         // kS_RivLipY): waterApply lerps it along the chord.
         st.surf = A.T8;
         st.surfB = t8At(b);
+        st.mouthA = mouthEnd + (sm.back().s - A.s);
+        st.mouthB = mouthEnd + (sm.back().s - B.s);
         st.bed = rv.bedId;
         st.len = static_cast<int>(std::lround(std::hypot(B.x - A.x, B.z - A.z)));
         st.wflags = rv.profile == "V" ? kRivProfileV : 0;
@@ -881,7 +888,11 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
     // line[2] and the profile's y are the top WATER CELL's Y, (T8 - 1) >> 3
     // (the staircase S where no ramp lowered it).
     rv.line.clear();
-    for (const Smp& s : sm) rv.line.push_back({s.x, s.z, (s.T8 - 1) >> 3, s.hw});
+    rv.mouth.clear();
+    for (const Smp& s : sm) {
+      rv.line.push_back({s.x, s.z, (s.T8 - 1) >> 3, s.hw});
+      rv.mouth.push_back(mouthEnd + (sm.back().s - s.s));
+    }
     rv.profS.clear(); rv.profY.clear(); rv.profG.clear();
     const int pk = std::max(1, (N + kRoadProfileMax - 2) / (kRoadProfileMax - 1));
     for (int i = 0; i < N; i += pk) {

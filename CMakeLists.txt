@@ -544,6 +544,7 @@ add_library(sandvox_core OBJECT
   # The bow and its arrows: the draw's numbers, the kit's ammunition, and the
   # arrows in flight (docs/PLAN_projectiles.md C).
   src/game/arrows.cpp
+  src/game/lookpick.cpp
   src/game/quiver.cpp
   src/game/mob_archery.cpp
   src/game/mob_shield.cpp
@@ -683,6 +684,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_mapv2.cpp
   src/test/selftest_rivers.cpp
   src/test/selftest_lakesettle.cpp
+  src/test/selftest_streampool.cpp
   src/test/selftest_locale.cpp
   src/test/selftest_dungeon.cpp
   src/test/selftest_altitude.cpp

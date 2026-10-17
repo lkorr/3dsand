@@ -1372,6 +1372,15 @@ function fillHollows() {
 }
 const cellKm2 = (F.cell / VPM / 1000) ** 2;
 const RIVERS = [], RIVER_LINE = {}, RIVER_CELLS = {}, CROSSED = new Set();
+// cell -> id of the river already built through it (any river, not only a
+// spec's `to` parent): a later trace that reaches one JOINS it, and a source
+// is never picked on one. Without it Merebeck's source landed on Hollowcrown
+// Beck's own channel and the two traced one valley 36 voxels apart for 20 km
+// (ticket 2026-10-16_11-13-31: 66-voxel slabs of water where they overlapped).
+const RIVER_OWNER = new Map();
+// river id -> where its water ends up ('sea' or a lake id), through joins: a
+// trace may join a river on its way only if that river goes where it was sent.
+const RIVER_DEST = {};
 /** Follow the D8 receivers from cell c until the sea, a kept lake (other than
  *  `fromLake`; `target` always stops it), or a cell of `joinSet`.
  *  -> {cells, end: 'sea'|'lake'|'join'|'pit', lake} (crossed droppable lakes noted) */
@@ -1386,6 +1395,7 @@ function traceFrom(c, fromLake, joinSet, target = -1) {
       crossed.add(lk);
     }
     if (joinSet && joinSet.has(c) && g > 2) return {cells, end: 'join', crossed};
+    if (g > 2 && RIVER_OWNER.has(c)) return {cells, end: 'join', joinTo: RIVER_OWNER.get(c), crossed};
     const r = FLOW.rcv[c];
     if (r === c || seen.has(r)) return {cells, end: 'pit', crossed};
     seen.add(r); cells.push(r); c = r;
@@ -1431,13 +1441,17 @@ function buildRivers() {
       for (let j = sj - R; j <= sj + R; j++) for (let i = si - R; i <= si + R; i++) {
         if (i < 0 || j < 0 || i >= F.w || j >= F.hh || (i - si) ** 2 + (j - sj) ** 2 > R * R) continue;
         const n = j * F.w + i;
-        if (F.h[n] > SEA && lakeAtXZ(...fXZ(n)) < 0) cand.push(n);
+        if (F.h[n] > SEA && lakeAtXZ(...fXZ(n)) < 0 && !RIVER_OWNER.has(n)) cand.push(n);
       }
       cand.sort((a, b) => FLOW.A[b] - FLOW.A[a] || a - b);
       let fallback = null;
       for (const c of cand.slice(0, 300)) {
         const t = traceFrom(c, -1, joinSet, target);
-        const ok = S.to === 'sea' ? t.end === 'sea' : parent ? t.end === 'join' : t.end === 'lake' && t.lake === target;
+        // Running into another river first makes a tributary of it -- if that
+        // river takes the water where this one was sent.
+        const ok = S.to === 'sea' ? t.end === 'sea' || (t.end === 'join' && !parent && RIVER_DEST[t.joinTo] === 'sea')
+                 : parent ? t.end === 'join'
+                 : (t.end === 'lake' && t.lake === target) || (t.end === 'join' && RIVER_DEST[t.joinTo] === S.to);
         if (ok && t.cells.length > 8) { tr = t; break; }
         if (!fallback && t.cells.length > 8 && t.end !== 'pit') fallback = t;
       }
@@ -1460,7 +1474,7 @@ function buildRivers() {
       const a = pts[pts.length - 2], b = pts[pts.length - 1], l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
       pts.push([Math.round(b[0] + (b[0] - a[0]) / l * 600), Math.round(b[1] + (b[1] - a[1]) / l * 600), b[2], b[3]]);
     } else if (tr.end === 'join') {
-      const T = SPL.tessellate(RIVER_LINE[parent].map(p => [p[0], p[1]]), {step: 16});
+      const T = SPL.tessellate(RIVER_LINE[tr.joinTo || parent].map(p => [p[0], p[1]]), {step: 16});
       const e = pts[pts.length - 1], c = SPL.closest(T, e[0], e[1]);
       pts[pts.length - 1] = [Math.round(c.x), Math.round(c.z), e[2], e[3]];
     }
@@ -1473,13 +1487,15 @@ function buildRivers() {
       }
     }
     const rec = {id: S.id, ...(S.name ? {name: S.name} : {}), points: pts, smooth: true, bed: S.bed || 'gravel',
-                 ...(parent && tr.end === 'join' ? {joins: parent} : {}), stepVox: S.step, ...(S.about ? {about: S.about} : {})};
+                 ...(tr.end === 'join' ? {joins: tr.joinTo || parent} : {}), stepVox: S.step, ...(S.about ? {about: S.about} : {})};
     RIVERS.push(rec);
     RIVER_LINE[S.id] = pts;
     const set = new Set();
     for (const c of tr.cells) { const ci = c % F.w, cj = (c / F.w) | 0; for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) set.add((cj + dj) * F.w + ci + di); }
     RIVER_CELLS[S.id] = set;
-    log(`river ${S.id}: ${pts.length} knots, ${(WL.polyLength(pts) / KM).toFixed(2)} km, ends ${tr.end}${tr.end === 'lake' ? ' ' + LAKES[tr.lake].id : tr.end === 'join' ? ' ' + parent : ''}`);
+    for (const c of set) if (!RIVER_OWNER.has(c)) RIVER_OWNER.set(c, S.id);
+    RIVER_DEST[S.id] = tr.end === 'join' ? RIVER_DEST[tr.joinTo || parent] : tr.end === 'lake' ? LAKES[tr.lake].id : tr.end;
+    log(`river ${S.id}: ${pts.length} knots, ${(WL.polyLength(pts) / KM).toFixed(2)} km, ends ${tr.end}${tr.end === 'lake' ? ' ' + LAKES[tr.lake].id : tr.end === 'join' ? ' ' + (tr.joinTo || parent) : ''}`);
   }
 }
 /** An INCISED river's record: its drawn course, knots every ~150 m, width and
@@ -1522,6 +1538,8 @@ function authoredRiver(S, parent) {
   const set = new Set();
   for (const p of I.line) { const [i, j] = fIJ(p[0], p[1]); set.add(j * F.w + i); }
   RIVER_CELLS[S.id] = set;
+  for (const c of set) if (!RIVER_OWNER.has(c)) RIVER_OWNER.set(c, S.id);
+  RIVER_DEST[S.id] = parent ? RIVER_DEST[parent] : S.to;
   log(`river ${S.id} (incised): ${pts.length} knots, ${(L / KM).toFixed(2)} km${parent ? ', joins ' + parent : ''}`);
 }
 /** THE TWINMERE: the Amberbrook meets the Silverrun in a pool. A river-to-

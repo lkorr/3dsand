@@ -371,6 +371,18 @@ struct Tuning {
     // had (it windmills, since nothing it touches can slow it while the servo
     // owns its linear velocity); 0 welds it to one orientation.
     float grabSpinDamp = TPD(player, grabSpinDamp);
+    // ---- G's forgiving pick (game/lookpick.h) ----
+    // A pickable (a ground item, an arrow stuck in the ground or in a body)
+    // is taken when the nearest point of it lies within this many DEGREES of
+    // the reticle, not only when the centre ray touches it: the best by angle,
+    // distance breaking near-ties, never through rock or another body. Owner
+    // ticket 2026-10-16_11-00-17, "not reduced to pixel perfect clicks".
+    float pickConeDeg = TPD(player, pickConeDeg);
+    // ...and the wider cone for a THIN thing, whose box's middle extent is
+    // under `pickSmallSize` voxels (an arrow, a blade lying flat): the things
+    // a fixed cone would still leave as a pixel hunt.
+    float pickConeSmallDeg = TPD(player, pickConeSmallDeg);
+    float pickSmallSize = TPD(player, pickSmallSize);   // voxels
   } player;
 
   // ---- camera ----
@@ -3347,6 +3359,12 @@ struct Tuning {
     // authored level with this chance per 1024 per CA visit (two a tick).
     // 32 drains a full eighth-stack cell in ~4 s; 0 turns the stage off.
     int stillWaterRelax = TPD(sim, stillWaterRelax);
+    // What a held river carries dissolved (blood, ink, salt) drifts
+    // downstream along a LEVEL reach -- where the surface does not fall and
+    // so gives no direction of its own -- at this many /256 of the upstream
+    // cell's mass per pair visit (sim_solute.wgsl THE DRIFT). 24 reads as a
+    // slow current; 0 = off (it then only diffuses there).
+    int soluteDrift = TPD(sim, soluteDrift);
 
     // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
     //

@@ -375,7 +375,10 @@ BUF_TO_WGSL = {
     "CaMask": {"caMask"},
     "CaWind": {"caWind"},
     "CaArgs": {"caArgs"},
-    "StillWater": {"stillWater"},
+    # THE CONDUIT (sim_step.wgsl): binding 62 `stillLedger` is the SAME
+    # buffer as 58, bound again as atomics for the ledger words after the
+    # column records. One Buf, two names (the FluidSpawnOps precedent).
+    "StillWater": {"stillWater", "stillLedger"},
     # The temperature layer, bindings 50..52 of simBGL_ (src/sim/heat.h).
     # HeatArgs is indirect-only and never bound, like SolArgs.
     "HeatPool": {"heatPool"},
@@ -479,6 +482,8 @@ _SIM_GROUP0 = {
     # The still-water table, binding 58 (worldgen.wgsl `cols` writes it, the
     # CA's reservoir stage reads it). simBGL_ only.
     "stillWater",
+    # ...and binding 62, the same buffer as atomics (THE CONDUIT's ledger).
+    "stillLedger",
     # The baked tree atlas, binding 26.
     "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).

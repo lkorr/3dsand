@@ -118,6 +118,61 @@ Penetrator ArrowPenetrator(const ItemDef& a, float speedMps, uint32_t seed) {
   return p;
 }
 
+Vec3 BowRestPoint(Vec3 eye, Vec3 fwd, Vec3 right, Vec3 up, bool crouched,
+                  bool leftHand) {
+  const float side = leftHand ? -1.0f : 1.0f;
+  return eye + fwd * (crouched ? 7.85f : 7.6f) +
+         right * (side * (crouched ? 0.34f : -1.46f)) -
+         up * (crouched ? 1.66f : 1.23f);
+}
+
+float BowSightDistance(const WorldSnapshot& snap, const Physics& phys,
+                       const std::vector<uint64_t>& ignore, Vec3 sight,
+                       Vec3 fwd, Vec3 rest, float noHit) {
+  // The rest's plane: a hit nearer than this is between the camera and the
+  // bow (the boom's line in third person starts behind the shooter).
+  const float tRest = std::max(0.0f, (rest - sight).dot(fwd));
+  float best = -1.0f;
+  // THE GRID. Where the line enters the cell (slab test), not the cell's
+  // centre: the face the reticle is on. A line that just misses the cell (the
+  // pick was cast a tick earlier, from a TAA-jittered eye) takes the centre's
+  // projection instead -- the same cell, half a voxel either way. A cell well
+  // OFF the line is not what the reticle is on now (a fast turn since the
+  // pick, or a harness that renders nothing) and is not used at all.
+  const float c[3] = {(float)(int32_t)snap.pick[2], (float)(int32_t)snap.pick[3],
+                      (float)(int32_t)snap.pick[4]};
+  const Vec3 cc{c[0] + 0.5f, c[1] + 0.5f, c[2] + 0.5f};
+  const Vec3 off = cc - sight;
+  const bool onLine = (off - fwd * off.dot(fwd)).len() <= 2.0f;
+  if (snap.valid && snap.pick[0] != 0 && onLine) {
+    const float o[3] = {sight.x, sight.y, sight.z};
+    const float d[3] = {fwd.x, fwd.y, fwd.z};
+    float t0 = -1e30f, t1 = 1e30f;
+    for (int a = 0; a < 3; a++) {
+      if (std::fabs(d[a]) < 1e-8f) {
+        if (o[a] < c[a] || o[a] > c[a] + 1.0f) t0 = 1e30f;   // parallel, outside
+        continue;
+      }
+      float ta = (c[a] - o[a]) / d[a], tb = (c[a] + 1.0f - o[a]) / d[a];
+      if (ta > tb) std::swap(ta, tb);
+      t0 = std::max(t0, ta);
+      t1 = std::min(t1, tb);
+    }
+    const float t = t0 <= t1 ? t0 : off.dot(fwd);
+    if (t > tRest) best = t;
+  }
+  // A BODY, from the rest's plane on, no further than the grid's hit.
+  {
+    const float len = (best > 0.0f ? best : (float)kWorldN) - tRest;
+    float frac = 1.0f;
+    if (len > 0.0f &&
+        phys.CastRayBody(sight + fwd * tRest, fwd, len, frac, ignore) != 0)
+      best = tRest + frac * len;
+  }
+  if (best < 0.0f) best = noHit;
+  return std::max(best, tRest + 1.0f);
+}
+
 float ArrowHeadLength(const ItemDef& a) {
   if (!a.IsAmmo() || a.voxels.empty()) return 0.0f;
   int maxX = -(1 << 20);

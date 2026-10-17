@@ -731,8 +731,9 @@ enum : uint32_t {
   // bank width (both ends). Word 7 (kS_StampOff) stays 0: wmSiteTopAt reads it
   // for every kind.
   kS_RivHwB = 5,        // the channel half-width at end B
-  kS_RivDepthA = 6,     // water depth at the centreline, end A
-  kS_RivDepthB = 8,     // ... end B
+  kS_RivDepthA = 6,     // water depth at the centreline, end A (bits 0..7) | the
+                        // network distance to the mouth there << 8 (StampSite::mouthA)
+  kS_RivDepthB = 8,     // ... end B (and mouthB << 8)
   kS_RivSurf = 9,       // the water surface at end A, EIGHTHS (T8: full cells to
                         // (T8 - 1) >> 3, the top one T8 - 8 * that eighths)
   kS_RivBed = 10,       // bed material (bits 0..11) | kRiv* flags << 12 | length << 16
@@ -1161,6 +1162,9 @@ struct WorldMapData {
     // level, `bed` / `shore` the materials, `bits` a cell's row parity.
     int hwB = 0, depthA = 0, depthB = 0, surf = 0, lipY = 0, len = 0;
     int surfB = 0;                        // a river piece: end B's surface, eighths
+    // A river piece: the network distance to the mouth at A / B (River::mouth),
+    // packed over the depth words' bits 8..31 (depth <= kRiverDepthMax < 256).
+    int mouthA = 0, mouthB = 0;
     int wflags = 0;                       // kRiv* / kLakeCellInside
     int cutA = 0, cutB = 0;               // packed i16 x | i16 z << 16
     uint32_t bed = 0, shore = 0;
@@ -1216,6 +1220,11 @@ struct WorldMapData {
     // The full-resolution baked centreline (every 4 voxels): x, z, surface,
     // half-width. Not reported; the horizon and the gate read it.
     std::vector<std::array<int, 4>> line;
+    // Per `line` sample: the distance ALONG THE NETWORK to its final mouth
+    // (this river's remaining arc + its parent's distance at the join),
+    // voxels. Decreases downstream across every join: the still table's
+    // MOUTH word (worldgen.wgsl STILL_MOUTH) and the solute drift read it.
+    std::vector<int> mouth;
   };
   std::vector<River> rivers;
   // map.json lakes[] (2.2): a polygon filled to `level`. `poly` is the
