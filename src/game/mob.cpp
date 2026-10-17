@@ -34242,6 +34242,15 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   //
   // NOT the inverse form (Inverse(grip) x socket) VR rigs use: that solves for
   // a hand pose given a fixed grip, which is not the question here.
+  //
+  // A LIMP HAND IS WHERE JOLT HAS IT, NOW. Under a ragdoll nothing poses the
+  // hand; its `xf` is whatever the last PostStep read back, and the item is
+  // about to be welded to the body by a Fixed joint that locks the relative
+  // transform the two bodies have AT CREATION. Read it fresh so the weld is
+  // the grip and not the grip plus one tick of the hand's travel.
+  const bool limp = ragdoll_ == RagdollPhase::Limp;
+  if (limp && limbs_[sock.partIndex].body)
+    phys_->GetTransform(limbs_[sock.partIndex].body, limbs_[sock.partIndex].xf);
   const MobLimb& hand = limbs_[sock.partIndex];
 
   // ---- THE LEFT HAND HOLDS THE MIRROR IMAGE --------------------------------
@@ -34418,7 +34427,11 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // the moment this item stops being held, every path that lets go of it
   // (DetachLimb, TickSeveredHolds, DropItemToWorld, StartRagdoll, Die) sets
   // the role it becomes, which is a whole layer.
-  phys_->SetBodyRole(p.body, Physics::BodyRole::HeldProp, CollisionOwner());
+  //
+  // (Under a ragdoll the item is not carried but solved for, and takes the
+  // limp role instead -- see the IN A FALLING BODY block below.)
+  if (!limp)
+    phys_->SetBodyRole(p.body, Physics::BodyRole::HeldProp, CollisionOwner());
 
   // THE GRIP POINT IN THE BODY'S OWN FRAME.
   //
@@ -34437,8 +34450,20 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
     // pop into position on the first tick.
     const Vec3 socketW = hand.xf.pos + QuatRotate(handQ, ap.rest.pos);
     bxf.pos = socketW - QuatRotate(worldQ, hh.gripBody);
-    float bq[4] = {q.x, q.y, q.z, q.w};
-    phys_->MoveKinematicBody(p.body, bxf.pos, bq, 0.0f);
+    // WORLD rotation (the drive loop's itemQ = handQ x rest.rot), and a
+    // TELEPORT, not MoveKinematicBody. Both matter for the joint made right
+    // below: a Fixed joint auto-detects -- it welds whatever relative pose the
+    // two bodies have AT CREATION. This used to pass the hand-relative `q` as
+    // a world rotation and only AIM the body there (MoveKinematic reaches its
+    // target at the end of the next step), so the weld was taken against the
+    // body's creation pose: the blade's local grip angle laid in world axes,
+    // pivoted about a corner. A living hand never shows that (both bodies are
+    // kinematic and posed every tick, the joint is inert), but every path
+    // that hands the item to the solver does -- StartRagdoll, Die, and an
+    // equip mid-ragdoll, where the item is dynamic from the start.
+    bxf.quat[0] = worldQ.x; bxf.quat[1] = worldQ.y;
+    bxf.quat[2] = worldQ.z; bxf.quat[3] = worldQ.w;
+    phys_->SetBodyTransform(p.body, bxf.pos, bxf.quat);
   }
 
   p.xf = bxf;
@@ -34454,6 +34479,37 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   anim_.springs.resize(skel_.parts.size(), SpringState{});
   hh.slot = slot;
   hh.item = item->name;
+  // ---- IN A FALLING BODY: PART OF THE RAGDOLL, NOT A PROP IN THE SKY -------
+  //
+  // Everything above builds the slot the way a LIVING hand carries it: a
+  // kinematic body that SubmitPose's held block re-poses onto the socket every
+  // tick. A limp rig runs no SubmitPose (MobSystem::PreTick's limp branch, the
+  // avatar's PreTick likewise), so an item equipped mid-ragdoll was a
+  // kinematic body nobody ever moved again -- frozen where the hand was on the
+  // equip tick -- with the falling hand welded to it by the Fixed joint. A
+  // kinematic body is infinite mass to the solver, so the whole rig hung from
+  // the weapon and the arm stretched out after the body (owner ticket
+  // 2026-10-16_11-00-57: "the weapon stays stuck in the sky, and the rest of
+  // the body stretches out"). StartRagdoll flips an item that was ALREADY held
+  // with the limbs; one that arrives after the flip has to take the flip
+  // itself: dynamic, moving as the point of the hand it is welded to moves,
+  // and in the limp role (LimbRole: an uncarried weapon needs the floor).
+  // A corpse (EnterDeadRagdoll, also Limp) gets the same, as RigDead.
+  // BeginGetUp makes it kinematic + HeldProp again with the rest of the rig.
+  if (limp) {
+    phys_->SetBodyKinematic(p.body, false);
+    Vec3 hLin{}, hAng{};
+    if (hand.body && phys_->GetBodyVelocities(hand.body, hLin, hAng)) {
+      // Rigid-body velocity of the hand at the item's centre of mass:
+      // v + w x r. The angular velocity is shared by anything welded on.
+      Vec3 hCom{}, iCom{};
+      if (!phys_->BodyCenterOfMass(hand.body, hCom)) hCom = hand.xf.pos;
+      if (!phys_->BodyCenterOfMass(p.body, iCom)) iCom = p.xf.pos;
+      phys_->SetBodyVelocities(p.body, hLin + hAng.cross(iCom - hCom), hAng);
+    }
+    phys_->ActivateBody(p.body);
+    ApplyLimbRole((size_t)slot);
+  }
   // The weapon-arm IK derives the arm from the held part's parent, so the
   // slot is the whole of it; the NAME is kept for a def reload's re-resolve.
   hh.part = ld.name;
@@ -34550,6 +34606,9 @@ void Mob::RemoveAppendedSlots(int first, int count) {
   cut(hidden_);
   cut(anim_.partAlive);
   cut(anim_.springs);
+  // The get-up's "from" poses are per slot too: an item dropped or swapped
+  // mid-get-up must not hand the slot after it the dropped slot's pose.
+  cut(getUpFrom_);
   // model/local are rebuilt from the skeleton every tick, but truncate them
   // too: between here and the next PreTick something could read a stale entry
   // past the end of the rig, and a size mismatch is the cheapest thing to

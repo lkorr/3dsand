@@ -13702,6 +13702,23 @@ The gate asserts the property the feature exists for: the limb under the edge
 loses voxels while a limb on the far side of the *same mob* does not. A
 crosshair-cone hitbox would pass "did it damage something" and fail that.
 
+**An item equipped into a LIMP hand is part of the ragdoll** (2026-10-16, owner
+ticket "the weapon stays stuck in the sky, and the rest of the body stretches
+out"). `EquipItem` builds the slot the way a living hand carries it -- kinematic,
+`HeldProp`, re-posed onto the socket by `SubmitPose` every tick -- but a limp rig
+runs no `SubmitPose`, so a sword equipped mid-fall was a kinematic body nobody
+moved again, welded by its Fixed joint to a falling hand: infinite mass, and the
+rig hung from it. Under `RagdollPhase::Limp` (live or dead) `EquipItem` now
+reads the hand's pose fresh from Jolt, takes the flip `StartRagdoll` would have
+given it (dynamic, the hand's point velocity, `LimbRole` = `RigLimp`/`RigLive`/
+`RigDead`), and `BeginGetUp` makes it kinematic + `HeldProp` again with the rest
+of the rig. The body is placed by TELEPORT at its WORLD pose before the joint is
+made, because a Fixed joint auto-detects -- it welds whatever relative pose the
+pair has at creation; it used to be given the hand-relative grip rotation as a
+world rotation and only aimed (MoveKinematic) at the right pose, which the living
+hand hid and every hand-to-solver path (`StartRagdoll`, `Die`) inherited. Gate
+`ragdoll-equip`.
+
 ### Voxel art pipeline, articulated mobs, and the laser (2026-08-19)
 
 Implemented per `docs/PLAN_voxel_art_and_mobs.md`; the through-line is that
