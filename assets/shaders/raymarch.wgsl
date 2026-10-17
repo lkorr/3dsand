@@ -10208,6 +10208,54 @@ fn flowStreakSlope(pAdv : vec2f, dir : vec2f, strength : f32, footM : f32) -> ve
   return acc * (strength / wl);
 }
 
+// flowStreakSlope at two advected points sharing one flow direction: (slope at
+// pa, slope at pb), each exactly flowStreakSlope's; the frame and the octave
+// fades are computed once. A change to flowStreakSlope is a change here.
+fn flowStreakSlope2(pa : vec2f, pb : vec2f, dir : vec2f, strength : f32,
+                    footM : f32) -> vec4f {
+  let fr = flowFrame(dir);
+  var accA = vec2f(0.0);
+  var accB = vec2f(0.0);
+  for (var f = 0; f < 2; f++) {
+    let w = select(1.0 - fr.y, fr.y, f == 1);
+    if (w <= 0.0) { continue; }
+    let d = flowFrameDir(fr.x + f32(f));
+    let perp = vec2f(-d.y, d.x);
+    let qa = vec2f(dot(pa, d), dot(pa, perp));
+    let qb = vec2f(dot(pb, d), dot(pb, perp));
+    var ga = vec2f(0.0);
+    var gb = vec2f(0.0);
+    for (var o = 0; o < 3; o++) {
+      let L = select(select(FLOW_STREAK_L0, FLOW_STREAK_L1, o == 1), FLOW_STREAK_L2, o == 2);
+      let band = 1.0 - smoothstep(L.y * 0.3, L.y * 0.9, footM);
+      if (band <= 0.0) { continue; }
+      let na = flowNoised(qa / L.xy + vec2f(19.7, 7.3) * f32(o));
+      let nb = flowNoised(qb / L.xy + vec2f(19.7, 7.3) * f32(o));
+      ga += vec2f(na.y / L.x, na.z / L.y) * (L.z * band);
+      gb += vec2f(nb.y / L.x, nb.z / L.y) * (L.z * band);
+    }
+    accA += (d * ga.x + perp * ga.y) * w;
+    accB += (d * gb.x + perp * gb.y) * w;
+  }
+  let wl = length(vec2f(1.0 - fr.y, fr.y));
+  return vec4f(accA * (strength / wl), accB * (strength / wl));
+}
+
+// flowNoiseAlong with the frame already resolved (flowFrame's pair and its two
+// directions): the foam lines ask four of these per pixel along one flow.
+fn flowNoiseAlongF(p : vec2f, fr : vec2f, d0 : vec2f, d1 : vec2f, L : vec2f,
+                   seed : vec2f) -> f32 {
+  var acc = 0.0;
+  for (var f = 0; f < 2; f++) {
+    let w = select(1.0 - fr.y, fr.y, f == 1);
+    if (w <= 0.0) { continue; }
+    let d = select(d0, d1, f == 1);
+    let q = vec2f(dot(p, d), dot(p, vec2f(-d.y, d.x)));
+    acc += (flowNoised(q / L + seed).x - 0.5) * w;
+  }
+  return 0.5 + acc / length(vec2f(1.0 - fr.y, fr.y));
+}
+
 // A scalar noise stretched along the flow by `L` (m along, m across), in the
 // flow's frame (above), blended variance-preserving about its 0.5 mean.
 fn flowNoiseAlong(p : vec2f, dir : vec2f, L : vec2f, seed : vec2f) -> f32 {
@@ -10282,10 +10330,20 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
     let chop = mix(1.0, FLOW_CHOP_KEEP, st);
     let b0 = flowBoils(p0, t, st);
     let b1 = flowBoils(p1, t, st);
-    let s0 = waveBands(p0, t, footM, depthM, shore) * (chop * (1.0 - 0.75 * b0.z)) +
-             flowStreakSlope(p0, dir, st, footM) + b0.xy;
-    let s1 = waveBands(p1, t, footM, depthM, shore) * (chop * (1.0 - 0.75 * b1.z)) +
-             flowStreakSlope(p1, dir, st, footM) + b1.xy;
+    // Both copies' band sums and streaks in ONE pass each (waveBands2,
+    // flowStreakSlope2): the per-band constants (tanh, the dispersion sqrt,
+    // the shoaling gain, the footprint fade) and the flow frame are the same
+    // for both points, and evaluating them twice was a large part of a
+    // flowing pixel's wave cost (2026-10-17, ticket 2026-10-16_23-58-24,
+    // docs/PLAN_frame_perf.md §9). Per point the arithmetic is waveBands' /
+    // flowStreakSlope's, in the same order. Streaks scale with `st`: under
+    // FLOW_MARK_LO (a pond's drift, a slow margin) they are exactly 0, so
+    // their 24 noise taps are skipped.
+    let wb = waveBands2(p0, p1, t, footM, depthM, shore);
+    var fs = vec4f(0.0);
+    if (st > 0.0) { fs = flowStreakSlope2(p0, p1, dir, st, footM); }
+    let s0 = wb.xy * (chop * (1.0 - 0.75 * b0.z)) + fs.xy + b0.xy;
+    let s1 = wb.zw * (chop * (1.0 - 0.75 * b1.z)) + fs.zw + b1.xy;
     slope = (s0 * w0 + s1 * w1) * inverseSqrt(w0 * w0 + w1 * w1);
   }
   // ---- impact ripples ----
@@ -10297,8 +10355,42 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
   return slope;
 }
 
+// waveBands at two points at once (the two advected copies of a flowing
+// surface): (slope at pa, slope at pb). Per point exactly waveBands' sums; the
+// band constants are computed once. A change to waveBands is a change here.
+fn waveBands2(pa : vec2f, pb : vec2f, t : f32, footM : f32, depthM : f32,
+              shore : f32) -> vec4f {
+  var numA = vec2f(0.0);
+  var numB = vec2f(0.0);
+  var sharpA = 0.0;
+  var sharpB = 0.0;
+  var waves = rippleWaves();
+  for (var i = 0; i < RIPPLE_BANDS; i++) {
+    let w = waves[i];
+    let k = 6.28318 / w.len;
+    var amp = w.amp * TUNE_RIPPLE_AMP_SCALE * shore;
+    let omegaFlat = w.speed * k;
+    let th = tanh(clamp(k * depthM, 1e-3, 20.0));
+    let omegaDisp = sqrt(WAVE_G * k);
+    let omega = mix(omegaFlat, omegaDisp, TUNE_WAVE_DISPERSION) *
+                TUNE_RIPPLE_SPEED_SCALE;
+    amp *= mix(1.0, clamp(inverseSqrt(max(th, 0.02)), 1.0, 1.8),
+               TUNE_WAVE_DISPERSION);
+    var band = 1.0;
+    if (footM > 0.0) { band = 1.0 - smoothstep(w.len * 0.28, w.len * 0.85, footM); }
+    let phA = dot(pa, w.dir) * k + t * omega;
+    let phB = dot(pb, w.dir) * k + t * omega;
+    numA += w.dir * (amp * k * cos(phA)) * band;
+    numB += w.dir * (amp * k * cos(phB)) * band;
+    sharpA += TUNE_WAVE_STEEPNESS * amp * k * sin(phA) * band;
+    sharpB += TUNE_WAVE_STEEPNESS * amp * k * sin(phB) * band;
+  }
+  return vec4f(numA / max(1.0 - sharpA, 0.35), numB / max(1.0 - sharpB, 0.35));
+}
+
 // The Gerstner band sum at an (already advected) point. `shore` is
-// waveSlope's shore fade, > 0.
+// waveSlope's shore fade, > 0. (waveBands2 above is this at two points; a
+// change here is a change there.)
 fn waveBands(pAdv : vec2f, t : f32, footM : f32, depthM : f32, shore : f32) -> vec2f {
   var num = vec2f(0.0);   // d(height)/d(position), the plain sinusoid part
   var sharp = 0.0;        // the Gerstner denominator: 1 - sum(Q*k*A*sin)
@@ -10792,6 +10884,11 @@ fn rainRipples(pm : vec2f, t : f32, amount : f32, footM : f32) -> vec2f {
 // surface terms that draw motion (waterWaveNormal's advection and
 // flowFoamLines). Zero on the far field, which has no columns.
 var<private> gSlopeFlow : vec2f = vec2f(0.0);
+// The flow a NEAR surface's waterWaveNormal drew with (xz, m/s; y = 1 when
+// set), handed to flowFoamLines on the same hit: the foam lines asked
+// currentAt at the same point again (a grid sample of two fields). Cleared at
+// waterNormal's entry, set only on a window hit (gFlowSlack < 0).
+var<private> gWaveFlow : vec3f = vec3f(0.0);
 const SLOPE_FLOW_GAIN : f32 = 9.0;   // m/s per unit slope (voxels per voxel)
 const SLOPE_FLOW_MAX : f32 = 3.0;    // m/s, the river envelope's ceiling
 // A lateral neighbour at `n` whose liquidColumn height came out `h` is a BANK:
@@ -10943,6 +11040,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
   gRainSplash = 0.0;
   gSlopeFlow = vec2f(0.0);
+  gWaveFlow.y = 0.0;
   // Side/bottom faces of a liquid volume keep their flat voxel normal: the
   // fullness gradient describes the TOP surface, and applying it to a wall
   // would tilt it into the terrain.
@@ -11013,6 +11111,7 @@ fn waterWaveNormal(hitP : vec3f, macroSlope : vec2f, depthM : f32, openness : f3
                    flux : vec2f) -> vec3f {
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
   let flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
+  if (gFlowSlack < 0.0) { gWaveFlow = vec3f(flowMS.x, 1.0, flowMS.y); }
   var slope = macroSlope +
               waveSlope(pm, R.time, waterRippleFootprint(hitP), depthM, flowMS) * openness;
   slope += flux * TUNE_WAVE_SIM_SLOPE;
@@ -11116,7 +11215,10 @@ const FLOW_FOAM_WIDTH : f32 = 0.16; // m across it
 // drawn out into dashes, never round blobs.
 const FLOW_FLECK : vec2f = vec2f(0.45, 0.06);
 fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
-  let flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
+  var flowMS = gWaveFlow.xz;
+  if (gFlowSlack >= 0.0 || gWaveFlow.y <= 0.0) {
+    flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
+  }
   let speed = length(flowMS);
   let st = flowMarkStrength(speed);
   if (st <= 0.0) { return 0.0; }
@@ -11130,6 +11232,10 @@ fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   let shear = abs(aL - aR) * VOXEL_METERS / (2.0 * e);
   let density = clamp(0.45 * st * st + shear * 2.0, 0.0, 1.0);
   if (density <= 0.02) { return 0.0; }
+  // Faded out with distance: a fleck is a few centimetres wide. Asked FIRST
+  // since it needs nothing below: a pixel past the fade pays no noise.
+  let footFade = 1.0 - smoothstep(0.06, 0.25, waterRippleFootprint(hitP));
+  if (footFade <= 0.0) { return 0.0; }
   let v = flowMS * TUNE_WAVE_FLOW_SCALE;
   let tau = R.time / WAVE_FLOW_CYCLE_S;
   let f0 = fract(tau);
@@ -11139,22 +11245,28 @@ fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   let p0 = pm - v * (f0 * WAVE_FLOW_CYCLE_S);
   let p1 = pm + WAVE_FLOW_LAYER_SHIFT - v * (f1 * WAVE_FLOW_CYCLE_S);
   let L = vec2f(FLOW_FOAM_LEN, FLOW_FOAM_WIDTH);
-  let n0 = flowNoiseAlong(p0, dir, L, vec2f(0.0));
-  let n1 = flowNoiseAlong(p1, dir, L, vec2f(31.1, 5.7));
-  // The break-up so a line is dashes, not a painted stroke. Advected in the
-  // same two-phase frame, so it travels with the line it breaks up.
-  let fine0 = flowNoiseAlong(p0, dir, FLOW_FLECK, vec2f(0.0));
-  let fine1 = flowNoiseAlong(p1, dir, FLOW_FLECK, vec2f(3.3, 9.1));
+  // One flow frame for all four noises (flowNoiseAlong resolved it per call).
+  let fr = flowFrame(dir);
+  let fd0 = flowFrameDir(fr.x);
+  let fd1 = flowFrameDir(fr.x + 1.0);
+  let n0 = flowNoiseAlongF(p0, fr, fd0, fd1, L, vec2f(0.0));
+  let n1 = flowNoiseAlongF(p1, fr, fd0, fd1, L, vec2f(31.1, 5.7));
   // Both crossfades variance-preserving about the 0.5 mean, so the lines do
   // not thin out half way through every cycle.
   let wl = length(vec2f(w0, w1));
-  let fine = 0.5 + ((fine0 - 0.5) * w0 + (fine1 - 0.5) * w1) / wl;
   let n = 0.5 + ((n0 - 0.5) * w0 + (n1 - 0.5) * w1) / wl;
   let thr = mix(0.88, 0.68, density);
-  let line = smoothstep(thr, thr + 0.07, n) * smoothstep(0.35, 0.75, fine);
-  // Faded out with distance: a fleck is a few centimetres wide.
-  let foot = waterRippleFootprint(hitP);
-  return line * (0.22 + 0.38 * density) * (1.0 - smoothstep(0.06, 0.25, foot));
+  // The lines are SPARSE (the threshold sits 0.18..0.38 over the noise's
+  // mean): off a line the result is 0 whatever the flecks say, so they are
+  // evaluated only on one.
+  let lineN = smoothstep(thr, thr + 0.07, n);
+  if (lineN <= 0.0) { return 0.0; }
+  // The break-up so a line is dashes, not a painted stroke. Advected in the
+  // same two-phase frame, so it travels with the line it breaks up.
+  let fine0 = flowNoiseAlongF(p0, fr, fd0, fd1, FLOW_FLECK, vec2f(0.0));
+  let fine1 = flowNoiseAlongF(p1, fr, fd0, fd1, FLOW_FLECK, vec2f(3.3, 9.1));
+  let fine = 0.5 + ((fine0 - 0.5) * w0 + (fine1 - 0.5) * w1) / wl;
+  return lineN * smoothstep(0.35, 0.75, fine) * (0.22 + 0.38 * density) * footFade;
 }
 const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 
@@ -13318,7 +13430,9 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // The reflected lobe's width (waterReflBlur): the sub-pixel wave slopes
     // turn this mirror rough with distance, so the stars in the reflected
     // sky average out instead of landing one crisp pixel each on the lake.
-    let reflBlur = waterReflBlur(hitP, waterOpenness(cell));
+    // waterReflBlur is 0 by day whatever the openness: its 12 taps only at night.
+    var reflBlur = 0.0;
+    if (dayWeight() < 0.999) { reflBlur = waterReflBlur(hitP, waterOpenness(cell)); }
     if (fres > TUNE_REFLECTION_CUTOFF) {
       reflection = traceReflection(hitP, n, rd, reflBlur);
     } else {
