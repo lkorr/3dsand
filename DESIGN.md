@@ -4780,6 +4780,23 @@ bounded by the SCENE, not by `fluidLo/fluidHi`, because the settled water in the
 field extends arbitrarily far past the live particle blocks and clipping there
 made a pour into a lake absorb like a puddle.
 
+THE FAR HIT BOUNDS THE MARCH (2026-10-16, ticket 2026-10-16_00-29-21: "weird
+blue lines" past a lake bank bored through). The fluid lives on window slots
+only, so past the 20.5 m handoff its bound is the WINDOW face, not the fine
+march (`windowExitT`'s note says why) -- but that bound also ignored the
+CASCADE, so a ray the far march stopped on terrain inside the window kept
+marching the fluid through it, and MPM water hidden behind that terrain drew
+over it: the water excited behind a breached bank, seen from 25-30 m, as a
+translucent chunk-edged slab streaked by the thickness walk. `fs` now bounds
+the march by `farHitFluidBoundT`: the EXIT of the far hit's cell, not `far.t`,
+because centre sampling stands a cell's top up to half a cell over the true
+ground or waterline, so a puddle or a raft inside the hit cell is still the
+surface the cascade drew; only the cells behind it are hidden. Repro: the
+harness pour seen from past the handoff, `SANDVOX_MAP=harness
+SANDVOX_POUR_EYE=60,250,420,0,-9 --render-budget --budget-cams pour` (the pit's
+torrent drew through the dune in front of it; `SANDVOX_POUR_FARPROBE=x,z`
+prints the live column beside the level 1-3 cascade bytes).
+
 DRAW MODES — `render.fluidSurface` is a MODE, not a boolean, and it kept its
 name because 0 and 1 still mean what they always did (no `tuning.json`
 migration). `0` = one raster cube per particle, the solver-debug view and the
@@ -13685,6 +13702,23 @@ The gate asserts the property the feature exists for: the limb under the edge
 loses voxels while a limb on the far side of the *same mob* does not. A
 crosshair-cone hitbox would pass "did it damage something" and fail that.
 
+**An item equipped into a LIMP hand is part of the ragdoll** (2026-10-16, owner
+ticket "the weapon stays stuck in the sky, and the rest of the body stretches
+out"). `EquipItem` builds the slot the way a living hand carries it -- kinematic,
+`HeldProp`, re-posed onto the socket by `SubmitPose` every tick -- but a limp rig
+runs no `SubmitPose`, so a sword equipped mid-fall was a kinematic body nobody
+moved again, welded by its Fixed joint to a falling hand: infinite mass, and the
+rig hung from it. Under `RagdollPhase::Limp` (live or dead) `EquipItem` now
+reads the hand's pose fresh from Jolt, takes the flip `StartRagdoll` would have
+given it (dynamic, the hand's point velocity, `LimbRole` = `RigLimp`/`RigLive`/
+`RigDead`), and `BeginGetUp` makes it kinematic + `HeldProp` again with the rest
+of the rig. The body is placed by TELEPORT at its WORLD pose before the joint is
+made, because a Fixed joint auto-detects -- it welds whatever relative pose the
+pair has at creation; it used to be given the hand-relative grip rotation as a
+world rotation and only aimed (MoveKinematic) at the right pose, which the living
+hand hid and every hand-to-solver path (`StartRagdoll`, `Die`) inherited. Gate
+`ragdoll-equip`.
+
 ### Voxel art pipeline, articulated mobs, and the laser (2026-08-19)
 
 Implemented per `docs/PLAN_voxel_art_and_mobs.md`; the through-line is that
@@ -19680,6 +19714,51 @@ where you hear from either (§12b, "The ears are on the character").
     rule off vs on in one binary, every camera within +-0.1 ms (noon 5.83 /
     5.77, seam 5.92 / 5.89, seamveg 9.56 / 9.54, cascade 4.89 / 4.80).
     Render-only; the world hash is unchanged (ef7d9a06).
+  **FAR CROWNS ARE ROUND (2026-10-16; raymarch.wgsl `farRoundCell` /
+  `farRoundNormal`, ticket 2026-10-16_10-58-30).** The cover rule gave a far
+  crown its density, but its SHAPE was still cubes: 20 cm at level 1, 40 at
+  2, 80 at 3, 1.6 m at 4, so at 25-200 m a crown the near field draws as a
+  heap of round lobes read as a tetris piece, and it snapped back to a sphere
+  at the 20.5 m handoff and changed outline again at each level seam. The
+  byte cannot carry more, but the shape inside a cell can be read off its six
+  face neighbours. A primary far hit on a COVER slot (the far palette entry's
+  `tagMask`, the cover rule's own test: every leaf ramp, never bark, rock or
+  ground) at levels 1-4 (`FAR_ROUND_MAX_LEVEL`) is intersected against a
+  ROUNDED BOX inside its cell: flush with every face whose neighbour holds
+  any material, rounded with radius `FAR_ROUND_R` = 0.5 cell toward every
+  face that sees air (Inigo Quilez's analytic intersector, `roundBoxEntry`).
+  A lone cell is a ball, a row a capsule, a crown's outer shell a heap of
+  rounded lobes; a cell with no open face stays the cube. The shape is inside
+  the cube, so a ray that misses it continues the DDA as a refine miss does
+  and nothing it draws can stand in front of what the cube drew. The hit
+  keeps an AXIS face (FarHit is unchanged, so AO taps, the far shadow and GI
+  patch caches and everything else keyed on cell + face are too): the
+  largest normal component among the faces turned toward the ray. The
+  LIGHTING takes the crown's slope instead: `farRoundNormal` is the gradient
+  of the trilinear "open" field over the eight cell centres round the hit
+  (eight byte reads, continuous from cell to cell), fed through the far
+  ground staircase's terms (`lamSm` / `faceSm` / `nSh`) on its ramp (`wLit`:
+  the cube shade at the handoff, the smooth one by 3x the handoff or once a
+  cell is under ~2 px), so the seam rule -- only the cell size changes across
+  it -- holds where the near voxels are still faces. `FAR_HIT_ROUND` (0x1000)
+  in FarHit.level marks the hit for fs. Levels 5+ are untouched (crowns are
+  painted onto the ground there). Measured, `--verify lod-seam` against the
+  same boot on the committed shader: depth-disagree pixels (far silhouette
+  != near) 245,751 -> 215,927 (-12 %), leaf pixels agreeing 698,356 ->
+  721,061; leaf far - near luma noon -0.9 -> -1.2, afternoon -0.9 -> -1.0,
+  dusk -0.8 -> -0.9, overcast -0.6 -> -0.9 (limit 4.0); every other class
+  within 0.1; far-sky pixels 724 -> 1,345 (rays now pass a rounded edge).
+  Cost (`--render-budget` baseline arm, 1080p, NOT under the exclusive lock
+  -- the queue was starving it -- p10 of A/B/A/B boots, committed shader vs
+  this one): noon 11.23/11.24 -> 11.45/11.43 ms, cascade 6.29/6.32 ->
+  6.46/6.46, seamveg 10.67/10.72 -> 11.20/11.14 (an arm with the fs normal
+  block compiled out: 10.96, so about half is traceFar's test and the rays
+  that now pass a rounded edge -- far steps +1.6 % noon, +5 % seamveg -- and
+  half the fs normal). raymarch `fs` stays 128 registers, 112 B local
+  (`--shader-stats`). Cheapest lever if it has to come down: keep the
+  cube where a cell is under ~3 px (the rounding is invisible there).
+  Not done: far SHADOWS are still cast by cube cells (the patch caches are
+  per cell face), and crowns at levels 5+ are the painted canopy proxy.
   **A THIN LAYER KEEPS ITS FOOTPRINT: THE LOOSE TOP (2026-10-10; worldgen.wgsl
   `farRunTop` + the pass in `fardownFeat`, faredits.h `SetLooseSource`; gate
   `far-layer`; ticket 2026-10-10_11-01-58).** The third exception to "a cell
@@ -25224,10 +25303,38 @@ down where a steeper piece's edge passed) with a part-full top cell
 and every bank stand at least S + M over every piece within `RIVER_LIP`, M a
 piece's steepness (1 + its fall per column, whole voxels, rounded up). The weir
 dams are gone except at a waterfall: a CREST (`RIVER_CREST` = 2: a sill one cell
-under the upstream surface, its water over it) and a CURTAIN (`RIVER_CURTAIN` =
-2: the upstream surface's water standing on the lower reach's floor — a held
-sheet against the cliff), one bake sample together so a cascade of falls a
-sample apart keeps every curtain; banks rise to hold both.
+under the water's top cell, its water over it) and a CURTAIN (`RIVER_CURTAIN` =
+2: falling water standing on the lower reach's floor — a held sheet against the
+cliff), one bake sample together so a cascade of falls a sample apart keeps
+every curtain; banks rise to hold both. **THE BRINK** (2026-10-16, ticket
+11-08-20 "instead of a hard 90 degree edge it should flow over the edge"): the
+water ROUNDS over a fall instead of meeting it at a square corner — the reach
+above draws down over its last `RIVER_DRAW` (6) voxels (`brinkDraw8`: 1, 2, 3,
+4, 5, 7 eighths toward the cut), the two crest columns and the two curtain
+columns carry on down (`fallDrop8`: 9, 12, 16, 24 eighths under the upstream
+surface) into the vertical sheet. Every one of those columns is still held at
+its own surface, so the curve rests and sleeps like a ramp. **ANOTHER WATER**
+(`RIVER_FOREIGN` = `kRiverWaterfall`, ticket 11-13-31): two channels claiming
+one column whose surfaces there differ by more than a waterfall (plus the
+nearer piece's steepness) are two rivers — or one river's meander lobes — side
+by side at different levels, never one river at a bend (the bake makes no such
+step inside a reach, and a fall's reaches never claim each other's columns). A
+foreign LOWER channel adds nothing to the column's floor, steepness or strips
+(a second walk over the column's pieces, only where it happens), and a channel
+column within `RIVER_LIP` of foreign HIGHER water is that water's bank wall.
+Before it, lowest-floor + nearest-surface stood one river's water on the other's
+floor: `default`'s Merebeck, traced 36 voxels from Hollowcrown Beck for 20 km,
+made held slabs of water 66 voxels tall with air beside them — every
+"waterfall" in the owner's 10-16 tickets. (The map was fixed too:
+`design_world.mjs` now joins a trace that reaches a river already built, if that
+river goes where it was sent, and never picks a source on one — Merebeck is a
+short tributary of the Beck, the Teethwater one of the Glimmer.) **The
+curtain's ENDS** (same day): a channel column the crest/curtain strips cross
+that is left DRY (the shallow edge of a U, floor over the lower reach) now holds
+the fall (`lipY`, as the bank beside it always did) — it stood at the lower
+reach's level + 1, so both ends of every curtain on `default` spilled down the
+cliff for ever, a breach of held water that never slept (210 leaking faces at
+Hollowcrown Beck's first fall, 0 after).
 
 **Streams become held** (`sim_stream.wgsl` `scan` / `commit`, after the CA over
 the dirty list). The still table grew to four words a column: the map's target,
@@ -25250,15 +25357,27 @@ streamed refill keeps a stream while its column's tag is unchanged).
 
 **The look** (`raymarch.wgsl`): a SIDE face of water where the water outside
 drops away by 0.75 cell or more is a falling sheet (`fallingSheet`: vertical
-whitewater streaks scrolling down at 3.2 m/s) — a held curtain, a rapid's step
-and a CA spill in flight all read as water going down; a smaller step is a
+whitewater streaks in free fall from the crest, v = sqrt(v0² + 2 g d) with
+v0 = 1 m/s and d found up the face's column by `fallCrestDepthM`, so they
+accelerate and draw out into ropes toward the foot) — a held curtain, a rapid's
+step and a CA spill in flight all read as water going down; a smaller step is a
 RISER, lit as top; a face with a solid in front (glass, ice) stays a plain wall
-(`waterSideKind`);
+(`waterSideKind`). Water IN FLIGHT (air or gas under it) is white water on
+every face, its underside and top included, so a falling column seen from
+below or a partial cell in free fall is not a clear pane or a dark glass cube.
+White water is lit by absolute light (`whiteWaterLight`), surface foam by its
+authored colour times `mediaLightK` — the night is then dark water with dim
+white water, not black streaks and glowing flecks (2026-10-16 tickets
+11-08-20 / 11-18-23);
 `fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
 
-**Gate `rivers`** grew: D compares the top cell's eighths, E allows air beside
+**Gate `rivers`** grew: **L** walks every waterfall of the SHIPPED map
+(`default`, CPU twin, a 41-column box round each) and counts leaking faces —
+water over a dry neighbour whose ground is under it, the sea excepted
+(`rivers.fallLeakMax` = 0); E holds only the fixture's one fall and passed both
+leaks above. D compares the top cell's eighths, E allows air beside
 water only over a held column whose surface is below it (and prints every
 piece's view of a leak), **R** scoops a crater out of the river (it refills) and
 cuts a breach through its bank (it floods), **S** digs a channel from the lake
@@ -27256,6 +27375,30 @@ starts at the RENDER eye, with a hit counting only if the point it lands on is
 within reach of the head. It is the one ray that reads the camera: a UI query
 against Jolt bodies, not a sim input, so the "picking rays use `player.EyePos`
 so the camera cannot change what the sim sees" contract does not apply to it.
+
+**It is a cone, not a ray (2026-10-16, owner ticket 2026-10-16_11-00-17:
+"picking up items isn't reduced to pixel perfect clicks").** A sword lying flat
+is a voxel tall and an arrow in the ground a voxel wide; a ray had to touch
+them exactly, and in FIRST person it started at `player.EyePos()` while the
+reticle's picture is drawn from the head-tracked render eye, so it did not even
+run through the screen centre. Now the query starts at last frame's render eye
+in every camera mode (`pourFrom`, the vessel pour's origin) and
+`game/lookpick.h` decides: every ground item and every arrow embedded in a
+creature this machine owns is a candidate; its angle is that of the nearest
+point of its own posed collider box to the centre ray (0 if the ray passes
+through it); it counts within `player.pickConeDeg` (6°), or
+`player.pickConeSmallDeg` (10°) when the box's middle extent is under
+`player.pickSmallSize` voxels (an arrow, a blade lying flat); smallest angle
+wins, distance breaking near-ties; and the best is taken only if one of three
+points on it (nearest the ray, centre, top) can be seen — no Solid cell
+(vegetation and liquid do not block) and no other body in the way, the arrow's
+own host excepted — else the next. The bare ray's body still competes when G
+acts on it and it is not a pickable (a corpse with loot), at 1.5° rather than
+0, so the corpse under the reticle beats a sword beside it but an arrow
+standing out of it is the arrow. With nothing in the cone `lookBody` is the
+bare ray's body, as before (the grab, a looted-out corpse). The prompt and the
+tap both read `lookBody`: one decision per frame. Gate `look-pick`.
+
 E over a corpse opens the
 character screen with a LOOT panel in the SPELLBOOK's place (looting is a
 moment; the words are not going anywhere, and a fourth column would not fit on

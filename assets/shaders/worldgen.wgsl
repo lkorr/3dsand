@@ -2362,6 +2362,130 @@ fn rivCut(w : i32) -> vec2<i32> {
 // piece's fall is < 2^16 eighths, so fall * tq < 2^24.
 const RIVER_CREST : i32 = 2;
 const RIVER_CURTAIN : i32 = 2;
+// ANOTHER WATER (worldmap.h kRiverWaterfall; ticket 2026-10-16_11-13-31). Two
+// channels claiming one column whose surfaces there differ by more than a
+// waterfall's height (plus the nearer piece's steepness) are not one river at
+// a bend -- they are two rivers, or one river's meander lobes, side by side at
+// different levels. The bake never makes such a step inside a reach, and a
+// fall's two reaches never claim each other's columns (the cut). Measured on
+// `default`: Merebeck traced 36 voxels from Hollowcrown Beck for 20 km, and
+// lowest-floor + nearest-surface stood the upper river's water on the lower
+// river's floor -- 66-voxel held slabs of water with air beside them. Now a
+// foreign LOWER channel adds nothing to this water's floor, steepness or
+// strips, and a channel column within RIVER_LIP of foreign HIGHER water is a
+// bank wall holding it (outS).
+const RIVER_FOREIGN : i32 = 20;
+// THE BRINK (ticket 2026-10-16_11-08-20: "instead of a hard 90 degree edge it
+// should flow over the edge ... the top of the waterfall should curve"). Water
+// at a fall draws down and rounds over the lip instead of standing level to a
+// square corner: the last RIVER_DRAW voxels of the reach above sink by
+// brinkDraw8 eighths (1, 2, 3, 4, 5, 7 toward the cut), and past the cut the
+// crest's two columns and the curtain's two carry on down by fallDrop8 (9,
+// 12, 16, 24 under the upstream surface), steepening into the vertical
+// curtain. Every column is still HELD at its own surface (the still table
+// takes its T8 from these), so the curve rests like a ramp and sleeps; only
+// its look moves. `e` and `cd` are the cut normal's (|n| ~ 1024 a voxel).
+const RIVER_DRAW : i32 = 6;
+fn brinkDraw8(e : i32) -> i32 {
+  if (e >= RIVER_DRAW * 1024) { return 0; }
+  let k = max(e, 0) / 1024;
+  return select(6 - k, 7, k == 0);
+}
+fn fallDrop8(cd : i32) -> i32 {
+  let k = (cd - 1) / 1024;
+  return select(select(select(24, 16, k == 2), 12, k == 1), 9, k <= 0);
+}
+// One river piece seen from column (x, z): the membership tests and every
+// quantity waterApply's walks read. `ok` false = not a member.
+struct RivPM {
+  ok : bool,
+  d2 : i32,
+  hw : i32,
+  s8 : i32,
+  s : i32,
+  m : i32,
+  strip : i32,
+  lipV : i32,
+  edgeT8 : i32,
+  floorY : i32,
+  bank : i32,
+  bed : u32,
+}
+fn rivPieceAt(sid : u32, x : i32, z : i32) -> RivPM {
+  var p : RivPM;
+  p.ok = false;
+  let hwA = wmSiteI(sid, WM_S_RADIUS);
+  let hwB = wmSiteI(sid, WM_S_RIV_HW_B);
+  let bank = wmSiteI(sid, WM_S_PAD_MARGIN);
+  let reach = max(hwA, hwB) + max(bank, RIVER_LIP);
+  let ax = wmSiteI(sid, WM_S_X);
+  let az = wmSiteI(sid, WM_S_Z);
+  let bx = wmSiteI(sid, WM_S_BOX_X1);
+  let bz = wmSiteI(sid, WM_S_BOX_Z1);
+  if (x < min(ax, bx) - reach || x > max(ax, bx) + reach ||
+      z < min(az, bz) - reach || z > max(az, bz) + reach) { return p; }
+  let bw = wmSiteI(sid, WM_S_RIV_BED);
+  let fl = u32(bw >> 12u) & 15u;
+  // 0 = no strip, 1 = a waterfall's CREST, 2 = its CURTAIN, 3 = the bank
+  // band just past the curtain that must still hold it.
+  var strip = 0;
+  var cd = 0;
+  var draw = 0;
+  if ((fl & RIV_FLAT_A) != 0u) {
+    let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_A));
+    cd = (x - ax) * c.x + (z - az) * c.y;
+    if (cd <= 0) { return p; }
+    if (cd <= RIVER_CREST * 1024) { strip = 1; }
+    else if (cd <= (RIVER_CREST + RIVER_CURTAIN) * 1024) { strip = 2; }
+    else if (cd <= (RIVER_CREST + RIVER_CURTAIN + 2) * 1024) { strip = 3; }
+  }
+  if ((fl & RIV_FLAT_B) != 0u) {
+    let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_B));
+    let e = -((x - bx) * c.x + (z - bz) * c.y);
+    if (e < 0) { return p; }
+    draw = brinkDraw8(e);
+  }
+  let vx = bx - ax;
+  let vz = bz - az;
+  let l2 = max(vx * vx + vz * vz, 1);
+  let t = clamp((x - ax) * vx + (z - az) * vz, 0, l2);
+  let tq = (t * 256) / l2;
+  let dx = x - (ax + (vx * t) / l2);
+  let dz = z - (az + (vz * t) / l2);
+  let d2 = dx * dx + dz * dz;
+  let hw = max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
+  let o = hw + max(bank, RIVER_LIP);
+  if (d2 >= o * o) { return p; }
+  let lw = bitcast<u32>(wmSiteI(sid, WM_S_RIV_LIP_Y));
+  let fall8 = i32(lw >> 16u);
+  let s8 = wmSiteI(sid, WM_S_RIV_SURF) - ((fall8 * tq) >> 8u);
+  let s = (s8 - 1) >> 3u;
+  // The piece's steepness M (see the header): 1 + its fall per column in
+  // whole voxels, rounded up. The length rides kS_RivBed's top bits.
+  let plen = max(i32((u32(bw) >> 16u) & 1023u), 1);
+  p.ok = true;
+  p.d2 = d2;
+  p.hw = hw;
+  // THE BRINK: only the water draws down; the floor, the banks and the walls
+  // keep the reach's own surface (s).
+  p.s8 = s8 - draw;
+  p.s = s;
+  p.m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
+  p.strip = strip;
+  p.lipV = bitcast<i32>(lw << 16u) >> 16u;
+  p.edgeT8 = 8 * p.lipV + 8 - fallDrop8(cd);
+  p.floorY = s;
+  if (d2 < hw * hw) {
+    let da = wmSiteI(sid, WM_S_RIV_DEPTH_A);
+    let dep = da + (((wmSiteI(sid, WM_S_RIV_DEPTH_B) - da) * tq) >> 8u);
+    var drop = (dep * (hw * hw - d2)) / (hw * hw);
+    if ((fl & RIV_PROFILE_V) != 0u) { drop = (dep * (hw - isqrtLe(d2, hw))) / hw; }
+    p.floorY = s - drop;
+  }
+  p.bank = max(bank, RIVER_LIP);
+  p.bed = u32(bw) & 0xFFFu;
+  return p;
+}
 fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, LandCol>) {
   if (T.labMode != 0u) { return; }
   let lst = wmSiteList(x, z);
@@ -2371,11 +2495,14 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
   var inCh = false;
   var w8Min = 1 << 28u;
   var chD2 = -1;
+  var mNear = 1;
   var floorMin = 1048576;
   var outS = -1048576;
+  var hiFS = -1048576;   // max (s - m) of every piece within RIVER_LIP: ANOTHER WATER above
+  var loFS = 1048576;    // min (s + m) of every channel: ANOTHER WATER below
   var lipY = -1048576;
-  var crestY = -1048576;
-  var curtY = -1048576;
+  var crest8 = -8388608;   // the crest's surface, T8 (THE BRINK)
+  var curt8 = -8388608;    // the curtain's
   var mCh = 1;
   var near = false;
   var nd2 = 0;
@@ -2403,84 +2530,74 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
       continue;
     }
     if (kind != WM_SITE_RIVER) { continue; }
-    let hwA = wmSiteI(sid, WM_S_RADIUS);
-    let hwB = wmSiteI(sid, WM_S_RIV_HW_B);
-    let bank = wmSiteI(sid, WM_S_PAD_MARGIN);
-    let reach = max(hwA, hwB) + max(bank, RIVER_LIP);
-    let ax = wmSiteI(sid, WM_S_X);
-    let az = wmSiteI(sid, WM_S_Z);
-    let bx = wmSiteI(sid, WM_S_BOX_X1);
-    let bz = wmSiteI(sid, WM_S_BOX_Z1);
-    if (x < min(ax, bx) - reach || x > max(ax, bx) + reach ||
-        z < min(az, bz) - reach || z > max(az, bz) + reach) { continue; }
-    let bw = wmSiteI(sid, WM_S_RIV_BED);
-    let fl = u32(bw >> 12u) & 15u;
-    // 0 = no strip, 1 = a waterfall's CREST, 2 = its CURTAIN, 3 = the bank
-    // band just past the curtain that must still hold it.
-    var strip = 0;
-    if ((fl & RIV_FLAT_A) != 0u) {
-      let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_A));
-      let cd = (x - ax) * c.x + (z - az) * c.y;
-      if (cd <= 0) { continue; }
-      if (cd <= RIVER_CREST * 1024) { strip = 1; }
-      else if (cd <= (RIVER_CREST + RIVER_CURTAIN) * 1024) { strip = 2; }
-      else if (cd <= (RIVER_CREST + RIVER_CURTAIN + 2) * 1024) { strip = 3; }
-    }
-    if ((fl & RIV_FLAT_B) != 0u) {
-      let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_B));
-      if ((x - bx) * c.x + (z - bz) * c.y > 0) { continue; }
-    }
-    let vx = bx - ax;
-    let vz = bz - az;
-    let l2 = max(vx * vx + vz * vz, 1);
-    let t = clamp((x - ax) * vx + (z - az) * vz, 0, l2);
-    let tq = (t * 256) / l2;
-    let dx = x - (ax + (vx * t) / l2);
-    let dz = z - (az + (vz * t) / l2);
-    let d2 = dx * dx + dz * dz;
-    let hw = max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
-    let o = hw + max(bank, RIVER_LIP);
-    if (d2 >= o * o) { continue; }
-    let lw = bitcast<u32>(wmSiteI(sid, WM_S_RIV_LIP_Y));
-    let lipV = bitcast<i32>(lw << 16u) >> 16u;
-    let fall8 = i32(lw >> 16u);
-    let s8 = wmSiteI(sid, WM_S_RIV_SURF) - ((fall8 * tq) >> 8u);
-    let s = (s8 - 1) >> 3u;
-    // The piece's steepness M (see the header): 1 + its fall per column in
-    // whole voxels, rounded up. The length rides kS_RivBed's top bits.
-    let plen = max(i32((u32(bw) >> 16u) & 1023u), 1);
-    let m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
+    let p = rivPieceAt(sid, x, z);
+    if (!p.ok) { continue; }
+    let d2 = p.d2;
+    let hw = p.hw;
     // The crest and the curtain hold the reach above across the channel and
     // the bank next to it (water above can touch nothing further out).
     // (A band 2 RIVER_LIP wide beside the channel: the whole bank width at
-    // every fall walled a cascade into a canyon.)
-    if (strip != 0 && d2 >= hw * hw && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, lipV); }
+    // every fall walled a cascade into a canyon.) The CHANNEL counts too: a
+    // channel column the strips cross that is left DRY (the shallow edge of a
+    // U, its floor over the lower reach's surface) stood at that surface + 1
+    // right beside the curtain's end -- measured on `default`'s Hollowcrown
+    // Beck: both ends of every curtain spilled down the cliff for ever, a
+    // breach of held water that never slept. A wet channel column ignores it.
+    if (p.strip != 0 && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, p.lipV); }
     if (d2 < hw * hw) {
       inCh = true;
-      if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = s8; }
-      mCh = max(mCh, m);
-      let da = wmSiteI(sid, WM_S_RIV_DEPTH_A);
-      let dep = da + (((wmSiteI(sid, WM_S_RIV_DEPTH_B) - da) * tq) >> 8u);
-      var drop = (dep * (hw * hw - d2)) / (hw * hw);
-      if ((fl & RIV_PROFILE_V) != 0u) { drop = (dep * (hw - isqrtLe(d2, hw))) / hw; }
-      floorMin = min(floorMin, s - drop);
-      if (strip == 1) { crestY = max(crestY, lipV); }
-      if (strip == 2) { curtY = max(curtY, lipV); }
+      if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = p.s8; mNear = p.m; }
+      mCh = max(mCh, p.m);
+      floorMin = min(floorMin, p.floorY);
+      loFS = min(loFS, p.s + p.m);
+      if (p.strip == 1) { crest8 = max(crest8, p.edgeT8); }
+      if (p.strip == 2) { curt8 = max(curt8, p.edgeT8); }
     }
     // What this column must hold if it ends up dry or a bank: the water any
     // piece within RIVER_LIP of it may stand beside it (channel or not).
-    if (d2 < (hw + RIVER_LIP) * (hw + RIVER_LIP)) { outS = max(outS, s + m - 1); }
+    if (d2 < (hw + RIVER_LIP) * (hw + RIVER_LIP)) {
+      outS = max(outS, p.s + p.m - 1);
+      hiFS = max(hiFS, p.s - p.m);
+    }
     if (!near || d2 < nd2) {
       near = true;
       nd2 = d2;
-      nS = s;
-      nM = m;
+      nS = p.s;
+      nM = p.m;
       nHw = hw;
-      nBank = max(bank, RIVER_LIP);
-      nBed = u32(bw) & 0xFFFu;
+      nBank = p.bank;
+      nBed = p.bed;
     }
   }
   if (!near && lake == 0u) { return; }
+  // ANOTHER WATER (RIVER_FOREIGN) against the surface this column holds (the
+  // nearest channel's). Above it within RIVER_LIP: this column is its wall
+  // (below). Below it, claiming this column too: that channel's floor,
+  // steepness and strips are not this water's, so they are walked again
+  // without it -- only where two rivers' channels overlap, since the first
+  // walk cannot know the winning surface until it has seen every piece.
+  var foreignHi = false;
+  if (inCh) {
+    let wv = (w8Min - 1) >> 3u;
+    let tol = RIVER_FOREIGN + mNear;
+    foreignHi = hiFS > wv + tol;
+    if (loFS < wv - tol) {
+      floorMin = 1048576;
+      mCh = 1;
+      crest8 = -8388608;
+      curt8 = -8388608;
+      for (var k = 0u; k < n; k++) {
+        let sid = wmSiteK(lst, k);
+        if (wmSiteKind(sid) != WM_SITE_RIVER) { continue; }
+        let p = rivPieceAt(sid, x, z);
+        if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol) { continue; }
+        mCh = max(mCh, p.m);
+        floorMin = min(floorMin, p.floorY);
+        if (p.strip == 1) { crest8 = max(crest8, p.edgeT8); }
+        if (p.strip == 2) { curt8 = max(curt8, p.edgeT8); }
+      }
+    }
+  }
   var h = h0;
   var water = -1;
   var gap = 0u;
@@ -2490,19 +2607,21 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     let wv = (w8Min - 1) >> 3u;
     var top = wv;
     var wg = u32(8 * wv + 8 - w8Min);
-    if (crestY > wv) {
-      // THE CREST: a sill of the bed's stone one cell under the upstream
-      // surface, that water running over it.
-      h = crestY - 1;
-      top = crestY;
-      wg = 0u;
+    let crestTop = (crest8 - 1) >> 3u;
+    let curtTop = (curt8 - 1) >> 3u;
+    if (crestTop > wv) {
+      // THE CREST: a sill of the bed's stone one cell under the water's top
+      // cell, that water running over it, already rounding down (THE BRINK).
+      h = crestTop - 1;
+      top = crestTop;
+      wg = u32(8 * crestTop + 8 - crest8);
     } else {
       h = floorMin;
-      if (curtY > wv) {
-        // THE CURTAIN: the upstream surface's water standing on the lower
-        // reach's floor.
-        top = curtY;
-        wg = 0u;
+      if (curtTop > wv) {
+        // THE CURTAIN: the falling water standing on the lower reach's floor,
+        // its top on the brink's curve.
+        top = curtTop;
+        wg = u32(8 * curtTop + 8 - curt8);
       } else if (roaded) {
         // A FORD: the road's deck, kept one voxel under the water so the
         // river runs on over it.
@@ -2510,8 +2629,11 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
       }
     }
     bed = nBed;
-    if (h < top) { water = top; gap = wg; }
-    else { h = max(h, max(wv + mCh, outS + 1)); }
+    // Another water above within RIVER_LIP: this column is its wall. Dry, it
+    // holds whatever stands beside it: the pieces within RIVER_LIP and a
+    // fall's crest and curtain (lipY).
+    if (h < top && !foreignHi) { water = top; gap = wg; }
+    else { h = max(h, max(wv + mCh, max(outS, lipY) + 1)); }
   } else if (near) {
     let tgt = nS + nM;
     let inner = nHw + RIVER_LIP;

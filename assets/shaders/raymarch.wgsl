@@ -6673,6 +6673,195 @@ fn rayStartKey() -> u32 {
           (bitcast<u32>(R.origin.z) << 7u) ^ (bitcast<u32>(R.origin.y) << 14u));
   return h | 1u;
 }
+// ---- ROUND FOLIAGE CELLS (ticket 2026-10-16_10-58-30) ----------------------
+// A crown in the near field is a heap of 10 cm voxels whose lobes read as
+// spheres; past the handoff the same crown is a few dozen cascade CUBES (20 cm
+// at level 1, 40 at 2, 80 at 3, 1.6 m at 4) and its silhouette turned into a
+// tetris piece that snapped back to a sphere as the camera crossed each seam.
+// The cell data cannot carry more (a byte per cell), but the SHAPE inside a
+// cell can be read off its six face neighbours, so a foliage cell (a COVER
+// slot: the far palette entry's tagMask, worldgen.wgsl farCoverWord -- every
+// leaf ramp, never bark, rock or ground) is drawn as a ROUNDED BOX: flush with
+// the cell face toward every occupied neighbour (so a crown's interior stays
+// one continuous mass and two touching leaf cells meet face to face), and
+// rounded with radius FAR_ROUND_R cells on every side that faces air. A lone
+// cell is a ball, a row a capsule, a slab a rounded plate, and a crown's outer
+// shell a heap of rounded lobes whose edges follow the cell lattice no longer.
+//
+// The rounded box is inside the cube, so nothing it draws can stand in front
+// of what the cube drew: a ray that misses the rounded part simply continues
+// the DDA (as a refine miss does) and meets the cell behind. Shadows, AO, the
+// sky fan and the patch caches keep reading cubes; the hit only moves the
+// point and picks the face. The FACE stays an axis (FarHit carries axis + sign,
+// so fs and every patch cache are unchanged): the axis of the rounded surface's
+// normal with the largest component among the faces turned toward the ray --
+// a voxel sphere's own shading, which is what the near crown shows.
+//
+// Cost: only a primary hit on a foliage cell at level <= FAR_ROUND_MAX_LEVEL
+// pays it -- one palette read, six byte reads and an analytic intersection --
+// plus the cells behind a missed corner. Levels 5+ paint crowns onto the
+// ground (farSurfaceMat / the canopy proxy), where a cell is wider than a lobe.
+const FAR_ROUND_MAX_LEVEL : u32 = 4u;
+// Rounding radius in cells, 0..0.5. 0.5 makes a lone cell a ball; 0 is the cube.
+const FAR_ROUND_R : f32 = 0.5;
+struct FarRound { hit : bool, t : f32, axis : i32, sgn : f32 };
+const FAR_HIT_ROUND : u32 = 0x1000u;   // FarHit.level flag: a round foliage hit
+// THE CROWN'S NORMAL at a round hit (fs, for the LIGHTING only -- the face
+// stays the axis, see above): the gradient of the trilinear interpolation of
+// "open" (farRoundOpen) over the eight cell centres around `pL` (level-cell
+// coords). It points out of the leaf mass, it is continuous from cell to cell
+// (the staircase a crown's cells make lights as the slope it stands for, as
+// the far ground's terraces do with farSurfAt's gradient), and eight byte
+// reads buy it, once per pixel. `n` (the face) where the gradient vanishes.
+fn farRoundNormal(level : u32, pL : vec3f, n : vec3f) -> vec3f {
+  let pc = pL - vec3f(0.5);
+  let i0 = vec3<i32>(floor(pc));
+  let f = pc - floor(pc);
+  let v000 = farRoundOpen(level, i0);
+  let v100 = farRoundOpen(level, i0 + vec3<i32>(1, 0, 0));
+  let v010 = farRoundOpen(level, i0 + vec3<i32>(0, 1, 0));
+  let v110 = farRoundOpen(level, i0 + vec3<i32>(1, 1, 0));
+  let v001 = farRoundOpen(level, i0 + vec3<i32>(0, 0, 1));
+  let v101 = farRoundOpen(level, i0 + vec3<i32>(1, 0, 1));
+  let v011 = farRoundOpen(level, i0 + vec3<i32>(0, 1, 1));
+  let v111 = farRoundOpen(level, i0 + vec3<i32>(1, 1, 1));
+  let gx = mix(mix(v100 - v000, v110 - v010, f.y), mix(v101 - v001, v111 - v011, f.y), f.z);
+  let gy = mix(mix(v010 - v000, v110 - v100, f.x), mix(v011 - v001, v111 - v101, f.x), f.z);
+  let gz = mix(mix(v001 - v000, v101 - v100, f.x), mix(v011 - v010, v111 - v110, f.x), f.y);
+  let g = vec3f(gx, gy, gz);
+  let l = length(g);
+  return select(n, g / l, l > 1e-3);
+}
+// 1 where the face neighbour holds no material (air or the blocker flag), 0
+// where it holds anything at all -- leaf, bark, ground: the cell is flush there.
+fn farRoundOpen(level : u32, c : vec3<i32>) -> f32 {
+  return select(0.0, 1.0, farPalAt(level, c) == 0u);
+}
+// Entry t of the ray (ro, rd; rd unit length, ro OUTSIDE the box's bounds)
+// into the rounded box centred at the origin with inner half-size `b` and
+// radius `r`; -1 on a miss. Inigo Quilez's analytic rounded-box intersector
+// (iquilezles.org/articles/intersectors): the bounding box gives the entry; a
+// flat-face entry is the hit, else the corner sphere and the three edge
+// cylinders of the entry point's octant.
+fn roundBoxEntry(roIn : vec3f, rdIn : vec3f, b : vec3f, r : f32) -> f32 {
+  let m = 1.0 / rdIn;
+  let n = m * roIn;
+  let k = abs(m) * (b + vec3f(r));
+  let t1 = -n - k;
+  let t2 = -n + k;
+  let tN = max(max(t1.x, t1.y), t1.z);
+  let tF = min(min(t2.x, t2.y), t2.z);
+  if (tN > tF || tF < 0.0) { return -1.0; }
+  // Fold into the first octant. select, not sign(): a zero component would
+  // zero the ray on that axis.
+  let pos0 = roIn + rdIn * tN;
+  let sg = select(vec3f(1.0), vec3f(-1.0), pos0 < vec3f(0.0));
+  let ro = roIn * sg;
+  let rd = rdIn * sg;
+  var pf = pos0 * sg - b;
+  pf = max(pf, pf.yzx);
+  if (min(min(pf.x, pf.y), pf.z) < 0.0) { return tN; }   // a flat face
+  let oc = ro - b;
+  let dd = rd * rd;
+  let oo = oc * oc;
+  let od = oc * rd;
+  let ra2 = r * r;
+  var t = 1e20;
+  // corner sphere
+  {
+    let bb = od.x + od.y + od.z;
+    let h = bb * bb - (oo.x + oo.y + oo.z - ra2);
+    if (h > 0.0) { t = -bb - sqrt(h); }
+  }
+  // edge along x
+  {
+    let a = dd.y + dd.z;
+    let bb = od.y + od.z;
+    let h = bb * bb - a * (oo.y + oo.z - ra2);
+    if (h > 0.0 && a > 1e-12) {
+      let te = (-bb - sqrt(h)) / a;
+      if (te > 0.0 && te < t && abs(ro.x + rd.x * te) < b.x) { t = te; }
+    }
+  }
+  // edge along y
+  {
+    let a = dd.z + dd.x;
+    let bb = od.z + od.x;
+    let h = bb * bb - a * (oo.z + oo.x - ra2);
+    if (h > 0.0 && a > 1e-12) {
+      let te = (-bb - sqrt(h)) / a;
+      if (te > 0.0 && te < t && abs(ro.y + rd.y * te) < b.y) { t = te; }
+    }
+  }
+  // edge along z
+  {
+    let a = dd.x + dd.y;
+    let bb = od.x + od.y;
+    let h = bb * bb - a * (oo.x + oo.y - ra2);
+    if (h > 0.0 && a > 1e-12) {
+      let te = (-bb - sqrt(h)) / a;
+      if (te > 0.0 && te < t && abs(ro.z + rd.z * te) < b.z) { t = te; }
+    }
+  }
+  return select(t, -1.0, t > 1e19);
+}
+// The ray against foliage cell `vc`'s rounded shape over [tIn, tOut] (level
+// cells, traceFar's units). `entryAxis` = the face the DDA entered by.
+fn farRoundCell(level : u32, vc : vec3<i32>, roL : vec3f, rd : vec3f, tIn : f32,
+                tOut : f32, entryAxis : i32) -> FarRound {
+  var o : FarRound;
+  o.hit = false;
+  o.t = tIn;
+  o.axis = entryAxis;
+  o.sgn = sign(select(select(rd.x, rd.z, entryAxis == 2), rd.y, entryAxis == 1));
+  let openN = vec3f(farRoundOpen(level, vc - vec3<i32>(1, 0, 0)),
+                    farRoundOpen(level, vc - vec3<i32>(0, 1, 0)),
+                    farRoundOpen(level, vc - vec3<i32>(0, 0, 1)));
+  let openP = vec3f(farRoundOpen(level, vc + vec3<i32>(1, 0, 0)),
+                    farRoundOpen(level, vc + vec3<i32>(0, 1, 0)),
+                    farRoundOpen(level, vc + vec3<i32>(0, 0, 1)));
+  // A cell with no open face is the cube (an interior cell a ray reaches
+  // through a neighbour's rounded corner).
+  if (dot(openN + openP, vec3f(1.0)) == 0.0) { o.hit = true; return o; }
+  let r = FAR_ROUND_R;
+  // The INNER box, cell-local (the cell spans -0.5..0.5): pulled in by r on
+  // every open side, so the rounded box's outer face there is the cell face;
+  // at the cell face on every closed side, so it is flush there.
+  let lo = vec3f(-0.5) + r * openN;
+  let hi = vec3f(0.5) - r * openP;
+  let cen = vec3f(vc) + vec3f(0.5) + 0.5 * (lo + hi);
+  let b = 0.5 * (hi - lo);
+  let p0 = roL + rd * tIn - cen;
+  // Already inside at the entry face (the ray came in through a face the
+  // shape fills, or started inside the cell at a seam): the cube's answer.
+  let q0 = abs(p0) - b;
+  if (length(max(q0, vec3f(0.0))) + min(max(q0.x, max(q0.y, q0.z)), 0.0) <= r + 1e-3) {
+    o.hit = true;
+    return o;
+  }
+  // Outside at the entry and the shape is convex: the entry, if any, is
+  // ahead. The intersector wants an origin outside the shape's bounds (at
+  // most 1 cell from its centre on any axis), so it starts 3.5 cells back.
+  // A face-flush entry a rounding error behind tIn counts as at tIn.
+  let te = roundBoxEntry(p0 - rd * 3.5, rd, b, r) - 3.5;
+  if (te < -1e-3 || tIn + te > tOut) { return o; }
+  let q = p0 + rd * te;
+  // The face: the largest component of the surface normal (sign(q) *
+  // max(|q| - b, 0), whose ranking |q| - b keeps on a flat face too) among
+  // the axes turned toward the ray, so a grazing hit never shades a face
+  // that looks away from the eye.
+  let fr = q * rd < vec3f(0.0);
+  let sc = select(vec3f(-1e9), abs(q) - b, fr);
+  var ax = 0;
+  if (sc.y > sc.x && sc.y >= sc.z) { ax = 1; }
+  else if (sc.z > sc.x && sc.z > sc.y) { ax = 2; }
+  o.hit = true;
+  o.t = tIn + max(te, 0.0);
+  o.axis = ax;
+  o.sgn = sign(select(select(rd.x, rd.z, ax == 2), rd.y, ax == 1));
+  return o;
+}
+
 // The start distance (fine voxels) for the pixel at `px`: 0 = unknown, march
 // from the camera; RS_NONE = no sample in reach saw anything, near or far.
 // Called twice by fs() — before trace() and after it — rather than carried
@@ -7021,6 +7210,26 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
               // (THE FEATURES are drawn after the march: farFeatMarch, fs. A
               // cactus stalk is not a feature any more but part of the surface
               // map, refined like the ground -- see farmap in worldgen.wgsl.)
+              // ---- ROUND FOLIAGE (farRoundCell) ----
+              // A cover slot (its far palette entry's tagMask) is a leaf cell:
+              // draw its rounded shape; a ray past it continues the march.
+              if (mat != 0u && level <= FAR_ROUND_MAX_LEVEL &&
+                  materials[FAR_PALETTE_BASE + farCellSlot(cellByte)].tagMask != 0u) {
+                let rc = farRoundCell(level, vc, roL, rd, vCur,
+                                      min(vMax.x, min(vMax.y, vMax.z)), axis);
+                if (!rc.hit) {
+                  mat = 0u;
+                } else {
+                  out.hit = true;
+                  out.t = rc.t * s;
+                  out.axis = rc.axis;
+                  out.sgn = rc.sgn;
+                  out.mat = mat;
+                  out.cell = vc;
+                  out.level = level | FAR_HIT_ROUND;
+                  return out;
+                }
+              }
               if (mat != 0u) {
                 out.hit = true;
                 out.t = vCur * s;   // back to fine-voxel units
@@ -10829,13 +11038,34 @@ const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 // on a running surface, or the CA's own spill in flight. All of them are water
 // going DOWN, and a clear glassy wall is the one thing none of them looks like
 // -- so the face is drawn as a falling sheet: white water in vertical streaks
-// that scroll down at a fall speed, two octaves so it breaks up into ropes
-// rather than stripes. Metres in, so the look does not depend on voxel size.
-// Returns the whitewater cover 0..1. Two vnoise taps, on side-face water
-// pixels only.
-const FALL_SHEET_SPEED : f32 = 3.2;   // m/s the streaks fall
+// that FALL, two octaves so it breaks up into ropes rather than stripes.
+// Metres in, so the look does not depend on voxel size. Returns the whitewater
+// cover 0..1. Two vnoise taps, on side-face water pixels only.
+//
+// FREE FALL, NOT A CONVEYOR (ticket 2026-10-16_11-08-20: "moves
+// unrealistically slowly"). The streaks used to scroll at one 3.2 m/s from
+// lip to foot; water leaves a crest at about a metre a second and then
+// accelerates, v = sqrt(v0^2 + 2 g d) at d metres under the crest (4.5 m/s
+// one metre down, 7.7 m/s three metres down). The texture is advected
+// exactly: a feature is a parcel of water that left the crest at time t0 and
+// is now d(t - t0) below it, so the conserved coordinate is
+// s = t - T(d), T(d) = (sqrt(v0^2 + 2 g d) - v0) / g, the time a parcel takes
+// to fall d. A streak therefore speeds up AND stretches as it falls -- short
+// flecks at the lip drawn out into long ropes at the foot, which is what a
+// real fall looks like. `d` is measured up the face's own column
+// (fallCrestDepthM).
+const FALL_SHEET_V0 : f32 = 1.0;      // m/s over the crest
+const FALL_SHEET_G : f32 = 9.81;      // m/s^2
+// The noise's vertical scale, in metres of fall at this speed: at the crest a
+// streak is FALL_SHEET_V0 / FALL_SHEET_TEX of the old one's length.
+const FALL_SHEET_TEX : f32 = 3.2;
 const FALL_SHEET_WHITE : f32 = 0.9;   // the cover at a streak's core
 const FALL_SHEET_BASE : f32 = 0.22;   // the cover between streaks (aerated, never clear)
+// The same for water IN FLIGHT (openBelow): a spill or a pour broken into
+// cells with air between them is spray, not a glassy sheet over a cliff, and
+// at 0.22 the cells behind the first one showed through it as a stack of
+// translucent cube shells (looking up at it, ticket 2026-10-16_11-18-23).
+const FALL_FLIGHT_BASE : f32 = 0.6;
 // Only where the water really DROPS AWAY beside the face: at least
 // FALL_SHEET_MIN_DROP cells from this cell's surface down to the water level
 // outside it (that cell's fullness, or the one under it, one cell lower). A
@@ -10888,14 +11118,78 @@ fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
   }
   return select(SIDE_RISER, SIDE_SHEET, liquidFullnessAt(cell) - level >= FALL_SHEET_MIN_DROP);
 }
-fn fallingSheet(hitP : vec3f, axis : i32) -> f32 {
+// How far under its crest a falling face is, in metres: up the face's own
+// column while it stays liquid, in strides of FALL_CREST_STRIDE cells (a held
+// curtain is solid water to the lip; a CA spill in flight has gaps, and a
+// stride steps over a short one), then cell by cell to the top cell, whose
+// fullness is the crest. Capped at FALL_CREST_STRIDES strides (6.4 m): past
+// that the fall is read as starting at the cap, a seam in the streaks every
+// 6.4 m of a taller fall and nothing else. At most 19 voxel reads, on falling
+// face pixels only.
+const FALL_CREST_STRIDE : i32 = 4;
+const FALL_CREST_STRIDES : i32 = 16;
+fn fallCrestDepthM(cell : vec3<i32>, hitY : f32) -> f32 {
+  var top = cell;
+  for (var i = 0; i < FALL_CREST_STRIDES; i++) {
+    let c = top + vec3<i32>(0, FALL_CREST_STRIDE, 0);
+    if (liquidFullnessAt(c) <= 0.0) { break; }
+    top = c;
+  }
+  var f = liquidFullnessAt(top);
+  for (var j = 0; j < FALL_CREST_STRIDE - 1; j++) {
+    let fu = liquidFullnessAt(top + vec3<i32>(0, 1, 0));
+    if (fu <= 0.0) { break; }
+    top.y += 1;
+    f = fu;
+  }
+  return max(f32(top.y) + f - hitY, 0.0) * VOXEL_METERS;
+}
+// `face` = the cover on a SIDE face (vertical streaks advected in free fall);
+// on a top or bottom face of water in flight (`axis` 1) the same white water
+// seen end-on: a churning mottle, no direction to streak along.
+fn fallingSheet(hitP : vec3f, axis : i32, cell : vec3<i32>, base : f32) -> f32 {
   let pm = hitP * VOXEL_METERS;
-  let u = select(pm.x, pm.z, axis == 0);   // along the face
-  let v = pm.y + R.time * FALL_SHEET_SPEED;
-  let n1 = vnoise(vec3f(u * 9.0, v * 0.9, 0.0));
-  let n2 = vnoise(vec3f(u * 23.0, v * 2.3, 7.3));
+  var n1 : f32;
+  var n2 : f32;
+  if (axis == 1) {
+    let c = R.time * 2.5;
+    n1 = vnoise(vec3f(pm.x * 9.0, pm.z * 9.0, c));
+    n2 = vnoise(vec3f(pm.x * 23.0, pm.z * 23.0, c * 2.3 + 7.3));
+  } else {
+    let u = select(pm.x, pm.z, axis == 0);   // along the face
+    let d = fallCrestDepthM(cell, hitP.y);
+    let T = (sqrt(FALL_SHEET_V0 * FALL_SHEET_V0 + 2.0 * FALL_SHEET_G * d) - FALL_SHEET_V0) /
+            FALL_SHEET_G;
+    let v = (R.time - T) * FALL_SHEET_TEX;
+    n1 = vnoise(vec3f(u * 9.0, v * 0.9, 0.0));
+    n2 = vnoise(vec3f(u * 23.0, v * 2.3, 7.3));
+  }
   let streak = smoothstep(0.42, 0.80, n1 * 0.65 + n2 * 0.35);
-  return (FALL_SHEET_BASE + (1.0 - FALL_SHEET_BASE) * streak) * FALL_SHEET_WHITE;
+  return (base + (1.0 - base) * streak) * FALL_SHEET_WHITE;
+}
+// Air or a gas under the cell (or the window's edge): liquid there is in
+// flight. One voxel read.
+fn openBelow(c : vec3<i32>) -> bool {
+  let b = c - vec3<i32>(0, 1, 0);
+  if (!inBounds(b)) { return true; }
+  let m = voxMat(voxWordAt(b));
+  return m == MAT_AIR || materials[m].klass == CLASS_GAS;
+}
+// What lights white water (a falling sheet, foam on a surface is the authored
+// colour times mediaLightK instead): the sky and key light by the face's own
+// normal where the sky reaches it, the enclosure's ambient where it does not.
+// The sheet is thin and aerated, so it is lit THROUGH as well: a face turned
+// down (the underside of water in flight) takes the side-on sky, not the
+// ground bounce, and a little of the key light from behind.
+// NOT times mediaLightK: these are already the absolute lights, and scaling
+// them by the light-fraction a second time (as the first cut did) squared the
+// night -- moonlit white water came out near black, darker than the scene
+// behind it, so every streak of a curtain at night was a BLACK streak
+// (ticket 2026-10-16_11-08-20).
+fn whiteWaterLight(n : vec3f) -> vec3f {
+  let open = ambientAt(vec3f(n.x, max(n.y, 0.0), n.z)) * 1.1 +
+             keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0));
+  return mix(TUNE_ENCLOSED_AMBIENT, open, fogSkyK()) * WATER_FOAM_COLOR;
 }
 
 // THE STAR FIELD'S MEAN RADIANCE, analytically: what starField averages to
@@ -11791,8 +12085,14 @@ fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
   let clarity = clamp((1.0 - f32(materials[mat].opacity) / 255.0) * 1.5,
                       0.0, 1.0);
   let tint = mix(lmc, vec3f(1.0), 0.65 * clarity);
-  let col = (ambientAt(vec3f(0.0, 1.0, 0.0)) + keyLightColor() * lit)
-            * (0.25 + 0.75 * lit) * tint * TUNE_MIST_BRIGHTNESS;
+  // The key light's shadow takes the KEY light, not the sky: this used to
+  // scale the ambient by (0.25 + 0.75 lit) too, so mist out of the sun -- and
+  // ALL mist with the moon down -- was a quarter of the sky light, darker than
+  // the shaded rock and water it hangs in front of: dark smudges drifting down
+  // every fall at night (ticket 2026-10-16_11-08-20). A sunlit plume is what
+  // it always was. Enclosed, the enclosure's ambient (THE MEDIUM'S SKY).
+  let col = (mix(TUNE_ENCLOSED_AMBIENT, ambientAt(vec3f(0.0, 1.0, 0.0)), fogSkyK()) +
+             keyLightColor() * lit) * tint * TUNE_MIST_BRIGHTNESS;
 
   var out = base;
   if (TUNE_MIST_DENSITY > 0.0 && cue.fall > 0.0) {
@@ -12816,13 +13116,31 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
 
   // ---- falling water: a side face is a falling sheet (fallingSheet) ----
   // Lit like the rain splash below (sky + key light by the face's own
-  // normal); no shadow ray, the sheet is a thin bright layer and the scene
-  // behind it already carries the shadows. Never behind glass (SIDE_WALL).
-  if (side == SIDE_SHEET) {
-    let a = fallingSheet(hitP, axis);
-    let sheetLit = (ambientAt(n) * 1.1 + keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0))) *
-                   WATER_FOAM_COLOR * mediaLightK(fogSkyK());
-    color = mix(color, sheetLit, a);
+  // normal, whiteWaterLight); no shadow ray, the sheet is a thin bright layer
+  // and the scene behind it already carries the shadows. Never behind glass
+  // (SIDE_WALL).
+  // WATER IN FLIGHT IS WHITE WATER ON EVERY FACE (ticket 2026-10-16_11-18-23:
+  // "looking up at falling water, only the top of its shell renders"). A cell
+  // with open air under it is falling, whichever face the ray met. Its
+  // underside -- always the face a ray from below meets, since that ray came
+  // up through the air under it -- was a flat, near-clear pane (normal down,
+  // the sky reflection clamped to the horizon, 2-8% Fresnel, a few cm of
+  // water to tint), so from below a falling column was invisible except for
+  // the top faces seen THROUGH it; and from above or beside, a partial cell
+  // in free fall was a dark glassy cube. Both now draw the sheet: the
+  // underside and the top as end-on white water, the sides as streaks. A
+  // top face reads the cell under it (one voxel read); an underside needs
+  // none; a lake's surface (liquid under it) is untouched.
+  // A falling SIDE face of a cell that is itself in flight takes the
+  // in-flight cover too; a held curtain's face (liquid under it) keeps the
+  // sheet's.
+  var inFlight = false;
+  if (!underwater && (axis == 1 || side == SIDE_SHEET)) {
+    inFlight = (axis == 1 && sgn > 0.0) || openBelow(cell);
+  }
+  if (inFlight || side == SIDE_SHEET) {
+    let a = fallingSheet(hitP, axis, cell, select(FALL_SHEET_BASE, FALL_FLIGHT_BASE, inFlight));
+    color = mix(color, whiteWaterLight(n), a);
     gVK *= 1.0 - a;
   }
 
@@ -12884,7 +13202,10 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let simFoam = clamp(length(waveFluxAt(cell)) * TUNE_WAVE_SIM_FOAM, 0.0, 1.0);
     let foamA = waterFoam(hitP, depthM, simFoam);
     if (foamA > 0.0) {
-      color = mix(color, WATER_FOAM_COLOR, foamA);
+      // Foam is white MATTER, lit by what lights the water (THE MEDIUM'S
+      // SKY): the authored colour is its noon look. Unlit, it glowed at full
+      // daylight white on a river at midnight (ticket 2026-10-16_11-08-20).
+      color = mix(color, WATER_FOAM_COLOR * mediaLightK(fogSkyK()), foamA);
       gVK *= 1.0 - foamA;
       if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
     }
@@ -14869,6 +15190,33 @@ fn windowExitT(ro : vec3f, rdIn : vec3f) -> f32 {
   return select(0.0, tExit, tExit > tEnter);
 }
 
+// ---- THE FAR HIT BOUNDS THE FLUID TOO (ticket 2026-10-16_00-29-21) ----
+// windowExitT's note is why the fluid's bound past the handoff is the WINDOW
+// and not the fine march -- but the window is only the bound when the cascade
+// found nothing either. A ray the far march stopped on terrain inside the
+// window (the handoff is 20.5 m, the window face ~25 m and more) used to keep
+// marching the fluid to the window face, through that terrain: a lake
+// breached through its bank, seen from past the handoff, drew the excited
+// water BEHIND the bank as a translucent chunk-edged slab over it, streaked
+// by the thickness walk (the owner's "weird blue lines"; the harness pour seen
+// from 28 m drew the pit's torrent through the dune in front of it). The bound
+// is the far hit's CELL EXIT, not far.t: a coarse cell's top stands up to half
+// a cell over the true ground or water line (centre sampling), so a puddle or
+// a raft of particles inside the hit cell is still the surface the cascade
+// drew; only the cells behind it are hidden. Never short of far.t (a refined
+// or feature hit lies inside its cell; a ticket hit is past the window face).
+fn farHitFluidBoundT(ro : vec3f, rdIn : vec3f, far : FarHit) -> f32 {
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let s = f32(1u << farCellShift(far.level & 0xFFu));
+  let lo = vec3f(far.cell) * s;
+  let tf = max((lo - ro) * inv, (lo + vec3f(s) - ro) * inv);
+  return max(far.t, min(tf.x, min(tf.y, tf.z)));
+}
+
 // ---- LIVE BLOCK BOX: the exact world-chunk bounds of this tick's blocks ----
 // RENDER-ONLY derived data, read by no sim kernel. Six words after the two
 // kNumSlots halves of fluidBlockMap: min chunk xyz, then max chunk xyz, each
@@ -15975,7 +16323,8 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
     color += gl;
     let foamA = waterFoam(hitP, depthM, 0.0);
     if (foamA > 0.0) {
-      color = mix(color, WATER_FOAM_COLOR, foamA);
+      // Lit as the near field lights it (shadeWater's foam), or the seam shows.
+      color = mix(color, WATER_FOAM_COLOR * mediaLightK(fogSkyK()), foamA);
       if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
     }
   }
@@ -17566,8 +17915,12 @@ fn fs(in : VSOut) -> FSOut {
   var mfLake = false;   // the hit surface is settled lake water (see below)
   if (SPEC_FLUID && R.fluidCount > 0u) {
     // windowExitT, NOT h.tExit — the fine march's stop is not the extent of
-    // the sim-resident data the fluid lives in. See windowExitT's note.
-    let sceneT = select(windowExitT(R.camPos, rd), h.t, h.hit || h.saturated);
+    // the sim-resident data the fluid lives in. See windowExitT's note. And
+    // no further than the cell the cascade stopped on (farHitFluidBoundT).
+    var sceneT = select(windowExitT(R.camPos, rd), h.t, h.hit || h.saturated);
+    if (!h.hit && !h.saturated && far.hit) {
+      sceneT = min(sceneT, farHitFluidBoundT(R.camPos, rd, far));
+    }
     let mode = i32(round(TUNE_FLUID_SURFACE));
     if (mode == 1) {
       mf = fluidMarch(R.camPos, rd, sceneT);
@@ -17918,6 +18271,20 @@ fn fs(in : VSOut) -> FSOut {
             coverEmis = vec3f(0.0);
           }
         }
+      }
+      // A ROUND FOLIAGE hit (farRoundCell) lights as the CROWN, not the cell:
+      // farRoundNormal's slope through the same terms and on the same ramp
+      // (wLit: the cube shade at the handoff, the smooth one by 3x it or once
+      // a cell is under ~2 px) as the far ground's staircase above. A normal
+      // turned away from the eye (a silhouette) is laid back onto the view
+      // plane. The face `n` keeps the geometry (AO taps, shadow patch).
+      if ((far.level & FAR_HIT_ROUND) != 0u && wLit > 0.0) {
+        var nS = farRoundNormal(flv, hitP / sL, n);
+        let away = dot(nS, rd);
+        if (away > 0.0) { nS = normalize(nS - rd * (away + 0.05)); }
+        lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
+        faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
+        nSh = normalize(mix(n, nS, wLit));
       }
       // Clear, non-viscous liquid seen through open air takes shadeFarWater
       // (the near field's surface law) below and skips the lit-rock terms —
