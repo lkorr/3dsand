@@ -981,6 +981,10 @@ const char* const kOrder[] = {
     // every item in the library, and a gate that equips things perturbs the
     // id-keyed draws of anything after it, so it goes after the two that do not.
     "ragdoll-dress",
+    // ...and the held item equipped into a limp hand. Same self-contained
+    // shape (resets mobs + debris, regenerates worldgen both ways); after
+    // ragdoll-dress because it EQUIPS (the id-keyed draws note above).
+    "ragdoll-equip",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.
@@ -1068,6 +1072,11 @@ const char* const kOrder[] = {
     // pull-out, the flat damage, a volley twice, the draw/release input path.
     // Fresh spawns on pristine ground; regenerates it on the way out.
     "arrow",
+    // ...and G's PICK of an item or an arrow under the reticle (game/
+    // lookpick.h): a cone, line of sight, the nearer-the-reticle rule. One
+    // fresh spawn on pristine ground, kinematic items, never ticks; resets
+    // the creatures and debris on the way out and edits no terrain.
+    "look-pick",
     // ...and NPC ARCHERS (docs/PLAN_projectiles.md E): an `archer` draws,
     // looses and gets into a dummy, backs off from one too close, stops at 0
     // arrows and draws its sidearm, and replays bit for bit. Every scene

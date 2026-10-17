@@ -114,7 +114,32 @@ in eighths (u16).
   so a mountain river whose falls come one a sample (the default map's
   `river_redrun` has 164) keeps a curtain on every fall;
 * banks from the cut to `RIVER_CREST + RIVER_CURTAIN + 2` past it hold the
-  upstream surface, so the curtain's corners are walled.
+  upstream surface, so the curtain's corners are walled;
+* **the brink** (2026-10-16, ticket 11-08-20): the water rounds over a fall.
+  The last `RIVER_DRAW` (6) voxels upstream of a fall's cut sink by
+  `brinkDraw8` (1, 2, 3, 4, 5, 7 eighths toward the cut; distance along the
+  piece's B cut normal); the crest's two columns stand `fallDrop8` = 9 and 12
+  eighths under the upstream surface (top cell one under it, sill under that),
+  the curtain's two 16 and 24 (full to 2 and 3 cells under it). The slope
+  steepens 1, 1, 1, 1, 2, 2 | 2, 3, 4, 8 eighths a voxel into the sheet. Only
+  the WATER draws down: floors, banks and walls keep the reach's own surface;
+* **the curtain's ends** (2026-10-16): a channel column the crest/curtain
+  strips cross that is left dry (the shallow edge of a U) holds the fall
+  (`lipY`) like the bank beside it; it stood at the lower reach's level + 1,
+  and both ends of every curtain on `default` spilled down the cliff for ever.
+  `rivers` L walks every waterfall of `default` (CPU twin) for such leaks;
+* **another water** (2026-10-16, ticket 11-13-31; `RIVER_FOREIGN` =
+  `kRiverWaterfall`): a channel claiming the column whose surface differs from
+  the nearest channel's by more than a waterfall plus the nearer piece's
+  steepness is another river (or a meander lobe of this one). A lower one adds
+  nothing to the floor / steepness / strips (a second walk over the pieces,
+  only where it happens); a higher one within `RIVER_LIP` makes the column
+  its bank wall. Measured before: `default`'s Merebeck (a trace whose source
+  landed on Hollowcrown Beck's channel) ran 36 voxels from it for 20 km and
+  the lowest-floor rule stood the upper river's water on the lower river's
+  floor: held slabs 66 voxels tall. The map is fixed as well
+  (`design_world.mjs` joins a trace to a river it reaches, if that river goes
+  where it was sent, and never picks a source on one).
 
 The top cell's missing eighths travel as `LandCol/Col.fluidGap` (zero-init =
 full; colCache `CCW_WP` bits 25..27) into `genCellIn`.
@@ -126,11 +151,31 @@ full; colCache `CCW_WP` bits 25..27) into `genCellIn`.
   glass or ice: the plain flat face it always was), a RISER when the water
   outside stands less than 0.75 cell below this cell's surface (a step of a
   running surface: lit as top), else a FALLING SHEET — vertical whitewater
-  streaks scrolling down at 3.2 m/s. A held curtain, a rapid's step and the
-  CA's own spill all read as water going down. Water stepping off onto a
-  floor drops by its own depth (a puddle's 2/8 edge is not a waterfall).
+  streaks in FREE FALL: advected exactly from the crest (a parcel d metres
+  under it has fallen for T(d) = (sqrt(v0² + 2 g d) - v0) / g, v0 = 1 m/s,
+  so 4.5 m/s a metre down, 7.7 m/s three metres down; the streaks speed up
+  and draw out into ropes toward the foot). `fallCrestDepthM` finds d up the
+  face's own column (strides of 4 cells, then cell by cell, capped at
+  6.4 m). Was a constant 3.2 m/s (ticket 2026-10-16_11-08-20: "moves
+  unrealistically slowly"). A held curtain, a rapid's step and the CA's own
+  spill all read as water going down. Water stepping off onto a floor drops
+  by its own depth (a puddle's 2/8 edge is not a waterfall).
+* WATER IN FLIGHT (air or a gas under the cell) draws the sheet on EVERY
+  face: its underside — the face any ray from below meets — and its top as
+  end-on churning white water (ticket 2026-10-16_11-18-23: seen from below,
+  a falling column was a near-clear pane with only the tops of its cells
+  visible through it; a partial cell in free fall was a dark glass cube).
+* White water is lit by `whiteWaterLight`: sky by the face's normal (a face
+  turned down takes the side-on sky: the sheet is lit through) plus the key
+  light, the enclosure's ambient where the sky cannot reach. NOT times
+  `mediaLightK`, which the first cut applied on top of those absolute lights
+  and so squared the night: every streak of a curtain at night came out
+  black. Surface foam (authored colour) IS times `mediaLightK`; it used to
+  glow full daylight white at midnight.
 * `fallCueAt`: a held curtain (liquid over liquid, air in front, liquid along
-  it) throws the waterfall mist and spray, its foot is the plunge.
+  it) throws the waterfall mist and spray, its foot is the plunge. The mist's
+  key-light shadow darkens the key light only (it scaled the sky ambient too,
+  so mist with the moon down was darker than what it hangs in front of).
 * `gSlopeFlow`: the surface's own macro slope is a current (downhill, 9 m/s
   per unit slope, capped at 3 m/s), added to the flow grid where the two
   surface terms that draw motion read it — a held ramp, a rapid and an adopted
