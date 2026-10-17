@@ -268,3 +268,5 @@ columns, y in a fall column), unheld lowest; down a ramp, over the brink, down t
 below. Equal ranks still only diffuse, so a lake, the sea and a flat reach
 are unchanged. Termination: SUM mass x rank strictly falls with every carry
 (full argument: `docs/PLAN_solutes.md` §3.5). Gate: `rivers` V.
+
+**The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted (`rivers` V, first run: 13 chunks awake at tick 4600, MOVE+equalize+bridge). Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.

@@ -25305,11 +25305,14 @@ then its y in a fall column). Equal ranks
 diffuse as before (a lake, the sea, a flat reach); unequal ranks move mass one
 way, high to low -- two held cells are CARRIED (96/256 of the upper cell's mass
 a visit, up to the lower one's saturation: down a ramp, over the brink, down
-the curtain, out into the reach below), held over unheld diffuses only out.
+the curtain, out into the reach below; and across a one-cell STEP on a sill --
+the crest over the curtain's top -- from the wet cell into the cell under the
+dry one, `solStepCarry`), held over unheld diffuses only out.
 SUM mass x rank strictly falls with every one-way move, so it cannot cycle and
 its chunks stall and sleep when nothing lower has room (`docs/PLAN_solutes.md`
 §3.5 has the argument and the limits: a flat reach only diffuses, the window's
 downstream face is no sink).
+**The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted. Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
 
 **Gate `rivers`** grew: **L** walks every waterfall of the SHIPPED map
 (`default`, CPU twin, a 41-column box round each) and counts leaking faces —

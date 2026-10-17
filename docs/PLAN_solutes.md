@@ -336,15 +336,48 @@ end) moves mass only by diffusion until it is within a stride pair of a
 lower-ranked column -- in practice the last ~12 voxels before a brink (the
 drop distance's 4 plus a stride of 8) are carried, the rest of a flat reach
 only diffuses. A wider drop reach costs four still-table lookups a column for
-every pair with mass at one T8 (a blood cloud in a lake pays it). A stream one cell deep stepping down a voxel a column has no
-axis-aligned liquid pair between its columns at all, so it carries nothing (as
-before). There is no sink at the window's downstream face: what a river
+every pair with mass at one T8 (a blood cloud in a lake pays it). A surface that steps down a whole cell ON A SILL -- the
+waterfall's crest (one cell of water on stone; since THE BRINK the curtain's
+top is a cell lower), a stream one cell deep -- has no axis-aligned liquid pair
+across the step, so a stride-1 lateral pair with one cell wet and one dry
+carries from the wet cell into the cell UNDER the dry one when the wet cell
+stands on a non-liquid and outranks it (`solStepCarry`; the single-owner
+argument is in its header: the only other pair that could touch either cell
+is the one a row down, which is inert or would need the opposite rank order).
+Measured before it: on main's brink geometry ink poured above the fall stayed
+above it for 3,600 ticks (0 of 3,200 units below). There is no sink at the window's downstream face: what a river
 carries out of view piles there up to saturation (blood fades away there like
 anywhere; ink and salt stay until the window moves).
 
 Gate: `rivers` pass V (`PassSoluteCarried`): ink poured above `falls`' first
 waterfall must reach the reach below, balance the ledger and sleep
 (`tests/baseline.json` `rivers.solute*`).
+
+**The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted (`rivers` V, first run: 13 chunks awake at tick 4600, MOVE+equalize+bridge). Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
+
+**Next: drift on a FLAT reach (owner ticket 2026-10-17_00-01-44, NOT built).**
+"Blood in water should also slowly drift in the direction of the current" --
+on a level reach the still table has no direction, so the carry above leaves
+it to diffusion. The clean way is a fourth term in the rank, between r and h:
+the column's ARC TO THE MOUTH, baked with the target. `waterApply` already
+knows, per column, the nearest claiming piece and `tq` (the position along
+it); the bake knows each piece's arc offset along its river (pieces are
+emitted in order, `st.len`). So `cols` can write arc8 = (arc of the piece's
+end A + tq * len / 256), monotone increasing downstream across the whole river
+(a tributary's continues from its join), into a FIFTH still word (STILL_WORDS 4
+-> 5: worldgen.wgsl `cols` + `wg_fill_stillWater`, sim_stream.wgsl's copy,
+sim_step's and this file's copies, the 4 MiB -> 5 MiB buffer, the `rivers` S
+readback). Equal (T8, r) then ranks by arc: a slow one-way DRIFT (a small
+SOL_HELD_DRIFT, a few /256, so it reads as a current, not a slug) toward the
+larger arc. Termination is unchanged -- arc is a function of the column, so the
+rank stays a total preorder and SUM mass x rank still falls with every move;
+lakes and the sea carry arc 0 (level, diffusion only), and an adopted stream
+inherits the arc of the hop-0 column it was fed from + its hop. Rejected: the
+render flow field (`flowfield.*`, `flowGridAt`) is float, solved on the CPU
+for the look -- the sim may not read it (rule 1); a look-ahead scan for the
+nearest lower T8 is O(reach) still-table reads per pair and arbitrary in
+reach. Ramps already drift: a stride-8 pair spans the eighth-steps of any
+ramp of up to 1 voxel per 48 columns once in a few pairs.
 
 ## 4. Concentration-dependent behaviour
 

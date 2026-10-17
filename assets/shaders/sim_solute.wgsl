@@ -508,6 +508,54 @@ fn solCarry(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32, write : b
   return 3u;
 }
 
+// THE STEP DOWN. A held surface that falls a whole cell from one column to the
+// next ON A SILL -- a waterfall's crest (one cell of water on the stone, the
+// curtain's top a cell lower: worldgen THE BRINK), the step of an adopted
+// stream one cell deep -- has no axis-aligned liquid pair across it: beside
+// the wet cell is air, and under it is the sill. Mass there would stall at the
+// lip for ever. So a stride-1 LATERAL pair with one cell wet (hi) and one dry
+// carries from hi into the cell UNDER the dry one (lo), when
+//   * lo is the same liquid and hi outranks it (a carry, THE POTENTIAL),
+//   * the cell under hi is NOT liquid (the sill).
+// SINGLE OWNER, still. lo is the partner cell of the pair one row down,
+// (hi - y, lo) along the same axis -- and that pair is inert, because its
+// other cell (under hi) is not liquid: it may only try a step itself, from lo
+// into the cell under hi's under-cell, which needs lo's column to outrank
+// hi's -- the opposite of ours, so at most one of them fires. The row above
+// may step INTO hi only from the dry cell's column over it, which needs that
+// column to outrank hi's: again the opposite. Values are read only after the
+// order test, so a pair that will not fire reads nothing another thread
+// writes. A lo in another chunk (the row below crosses a chunk face) is woken.
+// The move is a carry to a strictly lower rank: the termination argument
+// above covers it unchanged.
+fn solStepCarry(cA : vec3<i32>, cB : vec3<i32>, wA : u32, wB : u32, aWet : bool, write : bool) -> u32 {
+  let hi = select(cB, cA, aWet);
+  let dry = select(cA, cB, aWet);
+  let mh = voxMat(select(wB, wA, aWet));
+  let down = vec3<i32>(0, 1, 0);
+  let lo = dry - down;
+  if (!cellResident(lo, T.origin)) { return 0u; }
+  let wl = voxWordAt(lo);
+  if (voxMat(wl) != mh) { return 0u; }
+  let under = hi - down;
+  if (cellResident(under, T.origin) && solIsLiquidMat(voxMat(voxWordAt(under)))) { return 0u; }
+  if (solHeldOrder(hi, mh, lo, mh) != 2) { return 0u; }
+  let vh = solValueAt(hi);
+  if (vh == 0u) { return 0u; }
+  let vl = solValueAt(lo);
+  let sh = solSpeciesOf(vh);
+  let sl = solSpeciesOf(vl);
+  if (sl != 0u && sl != sh) { return 0u; }
+  if (!solIsSolvent(mh, sh)) { return 0u; }
+  let r = solCarry(hi, lo, vec3<i32>(0), 1u, write, sh, true, voxState(select(wB, wA, aWet)) + 1u,
+                   voxState(wl) + 1u, solMassOf(vh), solMassOf(vl));
+  if (r == 3u) {
+    let ls = chunkSlotOf(worldChunkOf(lo), T.origin);
+    if (ls != SLOT_NONE) { atomicOr(&dirtyOut[ls], DIRTY_R_SOLUTE); }
+  }
+  return r;
+}
+
 // ============================================================================
 // solDiffuse: PAIR-EXCHANGE diffusion (PLAN_solutes §3.3), at FOUR STRIDES.
 //
@@ -567,7 +615,13 @@ fn solPairExchange(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32,
   let wB = voxWordAt(cB);
   let mA = voxMat(wA);
   let mB = voxMat(wB);
-  if (!solIsLiquidMat(mA) || !solIsLiquidMat(mB)) { return 0u; }
+  let lA = solIsLiquidMat(mA);
+  let lB = solIsLiquidMat(mB);
+  if (!lA || !lB) {
+    // One wet, one dry, side by side: perhaps a STEP DOWN (solStepCarry).
+    if (k == 1u && step.y == 0 && lA != lB) { return solStepCarry(cA, cB, wA, wB, lA, write); }
+    return 0u;
+  }
   let vA = solValueAt(cA);
   let vB = solValueAt(cB);
   if (vA == 0u && vB == 0u) { return 0u; }

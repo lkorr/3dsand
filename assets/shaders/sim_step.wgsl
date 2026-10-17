@@ -4548,16 +4548,25 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   let b = c - vec3<i32>(0, 1, 0);
   if (!inBounds(a) || !inBounds(b)) { return STILL_NONE; }
   if (voxMat(voxWordAt(a)) != MAT_AIR) { return STILL_NONE; }
-  // Dissolved mass would need a home when its solvent shrinks; a lake's own
-  // water carries none, and a brine slick is left to the CA.
-  if (solValueAt(c) != 0u) { return STILL_NONE; }
+  // DISSOLVED MASS needs a home only when its solvent VANISHES: a GIVE that
+  // takes the cell's last eighth (f <= 1) would strand it on air, so that one
+  // is refused. Every other branch keeps the cell, and the mass with it
+  // (TAKE / GROW dilute it, a GIVE from f > 1 concentrates it). This used to
+  // refuse ALL of them for a cell carrying solute, and since the held flow
+  // carries solute down a whole river (sim_solute.wgsl THE HELD FLOW CARRIES
+  // WHAT IS DISSOLVED IN IT) that was a river surface the reservoir no longer
+  // held: an inked surface cell evaporated an eighth, was never refilled, its
+  // held neighbours poured into it, and the CA ran there -- and stirred the
+  // ink back upstream -- for as long as the ink lasted (`rivers` V, ticket
+  // 2026-10-16_11-11-51: 13 chunks awake at tick 4600, MOVE+equalize+bridge).
+  let carries = solValueAt(c) != 0u;
   // A sentinel chunk has no word to write (a whole-water chunk whose top row
   // is this cell): leave it, rather than fault the store.
   if (voxWordIndex(c) == PT_NO_WORD) { return STILL_NONE; }
   let bm = voxMat(voxWordAt(b));
   if (dy > 0) {
     // Standing on the lake itself, not on a pier, a raft or a bank.
-    return select(STILL_NONE, STILL_GIVE, bm == mat);
+    return select(STILL_NONE, STILL_GIVE, bm == mat && !(carries && f <= 1u));
   }
   if (dy == 0 && f > ft) { return STILL_GIVE; }
   // At or under the level, resting on something (the lake or its bed).
