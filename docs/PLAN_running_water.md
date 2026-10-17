@@ -210,3 +210,16 @@ Measured (`rivers` S: a channel dug from the lake ~12 voxels down to main, 153
 columns of its own): 153 wet by tick 300, all 153 adopted by tick 1050, its
 chunks 6 -> 0 awake by tick 1350; plugged, 147 released within 150 ticks (the
 6 left stand level with main, which supports them as its own).
+
+## Solute rides the held flow (`sim_solute.wgsl`, landed 2026-10-16)
+
+Ticket 2026-10-16_11-11-51: held water never moves, so nothing dissolved in it
+travelled -- blood poured at the top of a waterfall stayed there. The solute
+pair exchange now reads the still table (binding 58, `R(StillWater)` on
+`solDiffuse`, a text-identical copy of `stillLevel8` held to sim_step's by
+`check_invariants.py stilllevel`) and CARRIES mass one way across the held
+flow's potential: rank (T8, distance to a drop of a voxel or more within 4
+columns, y in a fall column), unheld lowest; down a ramp, over the brink, down the curtain, out into the reach
+below. Equal ranks still only diffuse, so a lake, the sea and a flat reach
+are unchanged. Termination: SUM mass x rank strictly falls with every carry
+(full argument: `docs/PLAN_solutes.md` §3.5). Gate: `rivers` V.

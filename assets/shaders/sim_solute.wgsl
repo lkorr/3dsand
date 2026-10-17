@@ -328,6 +328,187 @@ fn solAlloc(@builtin(workgroup_id) wg : vec3<u32>,
 }
 
 // ============================================================================
+// THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT (ticket 2026-10-16_11-11-51;
+// docs/PLAN_solutes.md §3.5, DESIGN.md §5b.13).
+//
+// A map river, a waterfall's crest and curtain and an adopted stream are HELD
+// water (sim_step.wgsl HELD WATER): real voxels at rest, which the CA never
+// moves. The CA is what carries solute (every liquid move takes its mass
+// along), so mass dissolved in a held river only DIFFUSED -- blood poured at
+// the top of a waterfall stayed at the top. Here the pair exchange learns
+// which way the held water is going and moves mass that way.
+//
+// THE POTENTIAL. Every liquid cell gets a place in one total preorder:
+//   * a cell of a column with no held target for its liquid (STILL_UNHELD:
+//     no record, another liquid, the reservoir off) is LOWEST of all;
+//   * a held cell ranks by (T8, r, h), lexicographically: T8 its column's
+//     target; r its column's DROP DISTANCE (solDropDist) -- how many columns
+//     along an axis, through held columns at its own T8, to one that stands
+//     SOL_FALL_DROP8 or more eighths under it: 1 for a FALL column (the
+//     curtain's outer strip against the reach below, a stream's step), 2..
+//     SOL_DROP_REACH for the inner curtain strip, the crest and the last
+//     voxels of the reach above it, SOL_DROP_REACH + 1 for every other
+//     column (a lake, the sea, the middle of a reach); h its own y in a fall
+//     column and 0 in any other.
+// A pair whose two cells rank EQUAL exchanges by plain diffusion, as it always
+// did (a lake, a flat reach, a vertical pair outside a fall). A pair whose
+// cells rank differently moves mass ONE WAY, from the higher to the lower:
+//   * both held -- CARRIED (solCarry): SOL_HELD_CARRY / 256 of the upper
+//     cell's mass a visit, whatever the lower holds, up to the lower cell's
+//     saturation. Laterally that is down the surface (a ramp, a rapid: the
+//     smaller T8) and, at one T8, toward the drop (the approach, over the
+//     crest, across the curtain: the smaller r); vertically, in a fall column
+//     only, it is DOWN the curtain to its foot, where the reach below (a
+//     smaller T8) takes it on sideways;
+//   * held over unheld -- the plain diffusive amount, but only if it runs
+//     from the held cell into the unheld one.
+// All four strides take part (a stride pair is still connected only through
+// its solvent), so a plume crosses a terrace of equal T8 by the long pairs.
+//
+// TERMINATION (rule 2). Let PHI = SUM over cells of mass x rank (the cell's
+// index in the preorder) and D = SUM mass^2 / fullness. A carry or a one-way
+// diffusion moves at least one unit to a strictly lower rank: PHI falls by
+// at least one. An equal-rank exchange leaves PHI alone and strictly lowers
+// D (the half-down rounding, solDiffuse's argument). The fade and the floor
+// only remove mass. So (PHI, D) falls lexicographically with every write and
+// is bounded below: nothing can cycle, and when every unit stands where no
+// lower-ranked neighbour has room -- the foot of the river in the window, a
+// lake at the end of it, unheld water -- only d == 0 diffusion is left and
+// the chunks stall and sleep as before. WHY UNHELD IS LOWEST and not just
+// "level": an unheld pocket dug beside a curtain touches it at many heights;
+// plain diffusion through the pocket would lift what the curtain carried down
+// and the pair of them would run for ever. One way into it, it cannot.
+// The window edge is not special: a pair whose partner is not resident is no
+// pair, so mass reaching the downstream face stops there (bounded by the
+// saturation cap) and stalls like any other.
+//
+// RULE 1. Pure reads of the still table (written by worldgen `cols` and
+// sim_stream before this pass; pass_table.def orders it), integer arithmetic,
+// the rounding byte a counter hash of (seed, tick, the owner cell), the same
+// single-owner pairs as the diffusion.
+//
+// STILL_WORDS / stillIndex / stillTag / STILL_UNHELD / stillLevel8 below are
+// sim_step.wgsl's, copied TEXT-IDENTICAL (check_invariants.py `stilllevel`
+// fails if they drift): the carry must agree with the held rule about which
+// columns are held and where their surfaces stand.
+// ============================================================================
+@group(0) @binding(58) var<storage, read> stillWater : array<u32>;
+const STILL_WORDS : u32 = 4u;
+fn stillIndex(x : i32, z : i32) -> u32 {
+  return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
+}
+fn stillTag(x : i32, z : i32) -> u32 {
+  let tx = bitcast<u32>(x >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  let tz = bitcast<u32>(z >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  return 1u | (tx << 1u) | (tz << 16u);
+}
+const STILL_UNHELD : i32 = -1073741824;
+fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
+  if (T.stillWaterRelax == 0u) { return STILL_UNHELD; }
+  let si = stillIndex(x, z);
+  if (stillWater[si] != stillTag(x, z)) { return STILL_UNHELD; }
+  let v = stillWater[si + 1u];
+  if (v != 0u) {
+    if ((v >> 20u) != mat) { return STILL_UNHELD; }
+    return bitcast<i32>(v << 12u) >> 12u;
+  }
+  let d = stillWater[si + 2u];
+  if (d == 0u || (stillWater[si + 3u] & 0xFFFu) != mat) { return STILL_UNHELD; }
+  return bitcast<i32>(d << 12u) >> 12u;
+}
+
+// The share of the upper cell's mass a carried pair moves per visit, of 256.
+// Every pair is visited once in 8 ticks per stride (24 phases), so at 96 a
+// unit at the top of a fall is most of the way down a 20-voxel curtain in a
+// few seconds, and a plume runs down a ramp as a smear, not a slug.
+const SOL_HELD_CARRY : u32 = 96u;
+// A DROP: a held column of the same liquid at least this many eighths (one
+// voxel) under a column's target. Not "any lower column": a ramp falls an
+// eighth every few columns, and every ramp column a fall column would sink
+// everything dissolved in a river onto its bed (a ramp's carry is its T8).
+const SOL_FALL_DROP8 : i32 = 8;
+// How far along an axis a column looks for a drop: RIVER_CREST +
+// RIVER_CURTAIN (worldgen.wgsl), so a waterfall's crest and both curtain
+// strips are graded toward it, and the stride pairs (up to 8) reach on from
+// there into the flat approach. Each extra column is four still-table lookups
+// for every pair with mass at one T8 -- a blood cloud in a lake pays them.
+const SOL_DROP_REACH : i32 = 4;
+// The column's drop distance (THE POTENTIAL, above), reach + 1 when there is
+// none within `reach` (SOL_DROP_REACH; 1 when only "is it a fall column"
+// matters, a quarter of the lookups). A ray stops at the first column that is not held
+// at exactly this target -- a bank, another liquid, a ramp's step (the T8
+// order already carries across that one).
+fn solDropDist(x : i32, z : i32, mat : u32, t8 : i32, reach : i32) -> i32 {
+  var best = reach + 1;
+  for (var a = 0; a < 4; a++) {
+    let dx = select(0, select(-1, 1, a == 0), a < 2);
+    let dz = select(0, select(-1, 1, a == 2), a >= 2);
+    for (var j = 1; j < best; j++) {
+      let t = stillLevel8(x + dx * j, z + dz * j, mat);
+      if (t == STILL_UNHELD) { break; }
+      if (t <= t8 - SOL_FALL_DROP8) { best = j; break; }
+      if (t != t8) { break; }
+    }
+  }
+  return best;
+}
+// Where the pair's two liquid cells stand on the potential above: 0 = level
+// (plain diffusion), +-1 = held over unheld (one-way diffusion), +-2 = both
+// held, carried. Positive: A ranks higher, mass runs A -> B. cB is cA plus a
+// positive axis step, so a vertical pair's B is the UPPER cell.
+fn solHeldOrder(cA : vec3<i32>, mA : u32, cB : vec3<i32>, mB : u32) -> i32 {
+  let tA = stillLevel8(cA.x, cA.z, mA);
+  let tB = stillLevel8(cB.x, cB.z, mB);
+  let hA = tA != STILL_UNHELD;
+  let hB = tB != STILL_UNHELD;
+  if (!hA && !hB) { return 0; }
+  if (!hB) { return 1; }
+  if (!hA) { return -1; }
+  if (tA != tB) { return select(-2, 2, tA > tB); }
+  if (cA.x == cB.x && cA.z == cB.z) {
+    // One column (one record, so one liquid): down, in a fall column.
+    return select(0, -2, solDropDist(cA.x, cA.z, mA, tA, 1) == 1);
+  }
+  let rA = solDropDist(cA.x, cA.z, mA, tA, SOL_DROP_REACH);
+  // Side by side at one T8 and one y: the nearer the drop ranks lower; two
+  // at the same distance are level (two fall cells at one y included).
+  let rB = solDropDist(cB.x, cB.z, mB, tB, SOL_DROP_REACH);
+  if (rA == rB) { return 0; }
+  return select(-2, 2, rA > rB);
+}
+
+// A CARRIED pair (both held, A ranks over B when aToB): 0 = nothing to do,
+// 1 = work pending, 3 = wrote -- solPairExchange's convention. "Nothing to
+// do" is EXACT: the upper cell is empty or the lower one is at its
+// saturation, which no later visit of this pair can change by itself.
+fn solCarry(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32, write : bool,
+            s : u32, aToB : bool, fA : u32, fB : u32, xA : u32, xB : u32) -> u32 {
+  let xh = select(xB, xA, aToB);
+  let xl = select(xA, xB, aToB);
+  if (xh == 0u) { return 0u; }
+  let cap = min(solCap(s, select(fA, fB, aToB)), 255u);
+  if (xl >= cap) { return 0u; }
+  for (var i = 1u; i < k; i = i + 1u) {
+    if (!solIsSolvent(voxMat(voxWordAt(cA + step * i32(i))), s)) { return 0u; }
+  }
+  if (!write) { return 1u; }
+  // Stochastic rounding, as the diffusion's: a single unit still moves (with
+  // chance SOL_HELD_CARRY / 256 a visit) instead of stalling the tail.
+  let rnd = hash3(T.seed ^ 0xCA221EDu, T.tick, cellIndexW(cA)) & 255u;
+  let q = min(min((xh * SOL_HELD_CARRY + rnd) >> 8u, xh), cap - xl);
+  if (q == 0u) { return 1u; }
+  if (!solWritable(cA) || !solWritable(cB)) { return 1u; }
+  if (aToB) {
+    _ = solStoreAt(cA, solPack(s, xA - q));
+    _ = solStoreAt(cB, solPack(s, xB + q));
+  } else {
+    _ = solStoreAt(cA, solPack(s, xA + q));
+    _ = solStoreAt(cB, solPack(s, xB - q));
+  }
+  return 3u;
+}
+
+// ============================================================================
 // solDiffuse: PAIR-EXCHANGE diffusion (PLAN_solutes §3.3), at FOUR STRIDES.
 //
 // Three dispatches per tick, one per axis (DYN_CA hands iteration k the passUBO
@@ -366,6 +547,11 @@ fn solAlloc(@builtin(workgroup_id) wg : vec3<u32>,
 // A p = 1 pair whose OWNER is in the -axis neighbour is checked here too (read
 // only): if it has work the owner is marked dirty -- the owner may be asleep,
 // and a gradient across the face would otherwise never move.
+//
+// In HELD water a pair across the held flow's potential is not diffused but
+// CARRIED one way (THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT, above):
+// same pairs, same owner, same work / no-work convention, so the stall clock,
+// the back-check and the wake-ups below need nothing new.
 // ============================================================================
 var<workgroup> difWork : atomic<u32>;
 var<workgroup> difCross : atomic<u32>;
@@ -396,6 +582,12 @@ fn solPairExchange(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32,
   let fB = voxState(wB) + 1u;
   let xA = solMassOf(vA);
   let xB = solMassOf(vB);
+  // THE HELD FLOW (above): a pair across its potential is carried, or
+  // diffuses one way only.
+  let ord = solHeldOrder(cA, mA, cB, mB);
+  if (ord == 2 || ord == -2) {
+    return solCarry(cA, cB, step, k, write, s, ord > 0, fA, fB, xA, xB);
+  }
   // The equalising amount, ROUNDED HALF DOWN rather than truncated: with
   // truncation a one-unit film over a clean full cell (8 : 0 in concentration)
   // is a fixpoint -- measured, the last unit of a pinch in a pond sat on the
@@ -409,6 +601,8 @@ fn solPairExchange(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32,
   var d = (2 * abs(num) + den - 1) / (2 * den);
   if (num < 0) { d = -d; }
   if (d == 0) { return 0u; }
+  // Held over unheld: only down the potential, out of the held cell.
+  if (ord != 0 && (d > 0) != (ord > 0)) { return 0u; }
   // A stride pair is connected only through its solvent.
   for (var i = 1u; i < k; i = i + 1u) {
     if (!solIsSolvent(voxMat(voxWordAt(cA + step * i32(i))), s)) { return 0u; }

@@ -291,6 +291,61 @@ ever covers bodies >= 65,536 voxels and **refuses straddles** (`waterbody.h:463`
 so it can never be the only mechanism. §3.3 must stand alone and be correct
 without it. Do not build P4 until `waterBodyMode=1` has landed on its own merits.
 
+### 3.5 Held water carries what is dissolved in it (BUILT 2026-10-16)
+
+Ticket 2026-10-16_11-11-51: blood poured at the top of a waterfall stayed at
+the top. A map river, a waterfall's crest and curtain and an adopted stream
+are HELD water (DESIGN.md §5b.13): voxels at rest that the CA never moves, and
+the CA is what carries solute. So in held water the pair exchange
+(`sim_solute.wgsl`, "THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT") moves mass
+down the held flow itself.
+
+**The potential.** Every liquid cell has a rank in one total preorder: a cell
+whose column holds no target for its liquid (unheld) is lowest; a held cell
+ranks by (T8, r, h) lexicographically -- T8 its column's target from the still
+table; r its DROP DISTANCE (`solDropDist`: how many columns along an axis,
+through held columns at the same T8, to one at least a voxel under it -- 1 for
+a FALL column such as the curtain's outer strip, 2..4 for the inner strip, the
+crest and the last voxels of the approach, 5 for everything else); h its own y
+in a fall column, else 0. Equal ranks exchange by plain §3.3 diffusion (a lake,
+a flat reach, a vertical pair outside a fall). Unequal ranks move mass ONE way,
+high to low: two held cells are CARRIED (`solCarry`: 96/256 of the upper cell's
+mass a visit, stochastically rounded, up to the lower cell's saturation,
+whatever the lower holds); held over unheld diffuses only out of the held
+cell. All four strides take part. Laterally the carry is down a ramp or a
+rapid (the smaller T8) and, at one T8, toward the drop (over the crest, across
+the curtain); vertically, only in a fall column, it is down the curtain to its
+foot, where the reach below (a smaller T8) takes it on sideways.
+
+**Termination.** PHI = SUM mass x rank falls by at least one with every carry
+and every one-way diffusion; an equal-rank exchange leaves PHI alone and
+lowers D = SUM m^2/f (§3.3's argument); the fade and the floor only remove
+mass. (PHI, D) is bounded below and falls lexicographically with every write,
+so nothing cycles, and when every unit stands where no lower-ranked neighbour
+has room only d == 0 diffusion is left and the chunks stall and sleep. Unheld
+is LOWEST rather than "level" on purpose: an unheld pocket dug beside a curtain
+touches it at many heights, and plain diffusion through it would lift what the
+curtain carried down -- the pair would run for ever. A pair whose partner is
+out of the window is no pair, so mass reaching the downstream face stops there
+(capped at saturation) and stalls.
+
+**Limits, as built.** The table has no flow direction for a FLAT reach: a
+reach whose T8 does not fall (between a smooth river's eighth-steps the long
+stride pairs bridge it; a `stepVox` 24 reach of hard steps only is flat end to
+end) moves mass only by diffusion until it is within a stride pair of a
+lower-ranked column -- in practice the last ~12 voxels before a brink (the
+drop distance's 4 plus a stride of 8) are carried, the rest of a flat reach
+only diffuses. A wider drop reach costs four still-table lookups a column for
+every pair with mass at one T8 (a blood cloud in a lake pays it). A stream one cell deep stepping down a voxel a column has no
+axis-aligned liquid pair between its columns at all, so it carries nothing (as
+before). There is no sink at the window's downstream face: what a river
+carries out of view piles there up to saturation (blood fades away there like
+anywhere; ink and salt stay until the window moves).
+
+Gate: `rivers` pass V (`PassSoluteCarried`): ink poured above `falls`' first
+waterfall must reach the reach below, balance the ledger and sleep
+(`tests/baseline.json` `rivers.solute*`).
+
 ## 4. Concentration-dependent behaviour
 
 Not `if (mass > X)` in the kernel — that is behaviour as code, one branch per
