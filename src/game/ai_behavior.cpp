@@ -1961,6 +1961,21 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
   b.replans++;
   b.stuckTicks = 0;
   b.navFailed = !FindPath(v.probe, np, foot, goal, b.path);
+  // THE LONG REPLAN (WorldView::navRadiusLong): the local grid found no way,
+  // and the caller's ground is good far enough to look wider. One retry over
+  // the wide grid; FindPath raises its node budget to the grid's own count.
+  // A failure backs off so a creature that is truly boxed in does not pay a
+  // wide search on every replan cadence.
+  constexpr uint32_t kLongPlanBackoffTicks = 90;
+  if (b.navFailed && v.navRadiusLong > np.radius && tick >= b.longPlanTick) {
+    NavParams wide = np;
+    wide.radius = v.navRadiusLong;
+    wide.radiusCap = v.navRadiusLong;
+    wide.partialWhenClamped = true;
+    b.longPlans++;
+    b.navFailed = !FindPath(v.probe, wide, foot, goal, b.path);
+    if (b.navFailed) b.longPlanTick = tick + kLongPlanBackoffTicks;
+  }
   b.lastWaypointDist =
       b.path.Done() ? 1e9f : PlanarDist(foot, b.path.Current());
 }

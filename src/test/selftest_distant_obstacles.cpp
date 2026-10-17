@@ -517,6 +517,7 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
     int ticks = 0, inside = 0, maxDepth = 0;
     float walked = 0, minAxis = 1e9f, endDist = 0;
     bool crossed = false;
+    Vec3 endPos{};
     uint64_t digest = 0;
     std::string why;
   };
@@ -526,6 +527,8 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
     Walk r;
     Digest dg;
     const uint32_t t0 = tick;
+    bool havePrev = false;
+    Vec3 prev{};
     for (int k = 0; k < maxTicks; k++) {
       c.mobs.TickDistant(t0 + (uint32_t)k, c.world, nullptr);
       const DistantMob* d = tier.Find(id);
@@ -547,8 +550,25 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
           r.why = Format("tick %d: %d of its column cells in matter at (%d,%d,%d)", k, depth, gx, fy, gz);
       }
       r.minAxis = std::min(r.minAxis, std::hypot(cc.x - axis.x, cc.z - axis.z));
-      if (door != nullptr && gx >= door->lo.x && gx <= door->hi.x && gz >= door->lo.z && gz <= door->hi.z)
-        r.crossed = true;
+      // THROUGH THE LEAF: a stride moves several voxels between samples, so
+      // the one-cell leaf is crossed when the step from the last sample to
+      // this one passes its plane inside the leaf's span (+-1), not only when
+      // a sample lands on it.
+      if (door != nullptr && havePrev) {
+        const bool thinX = door->hi.x - door->lo.x <= door->hi.z - door->lo.z;
+        const float plane = thinX ? (float)door->lo.x + 0.5f : (float)door->lo.z + 0.5f;
+        const float a = thinX ? prev.x : prev.z, b = thinX ? cc.x : cc.z;
+        if ((a - plane) * (b - plane) <= 0.0f && a != b) {
+          const float u = (plane - a) / (b - a);
+          const float o = thinX ? prev.z + (cc.z - prev.z) * u : prev.x + (cc.x - prev.x) * u;
+          const float lo = thinX ? (float)door->lo.z : (float)door->lo.x;
+          const float hi = thinX ? (float)door->hi.z + 1.0f : (float)door->hi.x + 1.0f;
+          if (o >= lo - 1.0f && o <= hi + 1.0f) r.crossed = true;
+        }
+      }
+      havePrev = true;
+      prev = cc;
+      r.endPos = cc;
       r.walked = d->walked;
       r.endDist = std::hypot(goal.x - cc.x, goal.z - cc.z);
       if (d->brain.routine.arrived || r.endDist <= 6.0f) {
@@ -600,31 +620,46 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
         if (matter(x, y, z)) return true;
       return false;
     };
+    // THE HOUSE IN THE WAY. A first version took the most obstructed line
+    // across the whole locale; it ran into the middle of the village's big
+    // walled compound, whose way round is a route problem for a global
+    // planner, not an obstacle test (the walker never stood in matter, it just
+    // never found the far gate). The claim here is the one the plan makes:
+    // a HOUSE between a walker and its goal is walked ROUND, never through.
+    // So: the largest stamp in the locale no wider than the planner's local
+    // reach (48 voxels each way), crossed through its middle on its longer
+    // axis, from 24 voxels before its footprint to 24 past it. Deterministic:
+    // the map's site order breaks ties.
     int bestN = -1;
     Vec3 from{}, to{};
-    for (int axis = 0; axis < 2; axis++) {
-      const int a0 = axis == 0 ? z0 : x0, a1 = axis == 0 ? z1 : x1;
-      const int s0 = axis == 0 ? x0 : z0, s1 = axis == 0 ? x1 : z1;
-      for (int a = a0 + 24; a <= a1 - 24; a += 8) {
-        int n = 0, run = 0, worst = 0;
-        for (int s = s0; s <= s1; s++) {
-          const bool o = axis == 0 ? obstructed(s, a) : obstructed(a, s);
-          run = o ? run + 1 : 0;
-          worst = std::max(worst, run);
-          n += o ? 1 : 0;
-        }
-        if (worst > 48 || n <= bestN) continue;
-        bestN = n;
-        b1Run = worst;
-        if (axis == 0) {
-          from = Vec3{(float)s0 - 24.0f, 0, (float)a + 0.5f};
-          to = Vec3{(float)s1 + 24.0f, 0, (float)a + 0.5f};
-        } else {
-          from = Vec3{(float)a + 0.5f, 0, (float)s0 - 24.0f};
-          to = Vec3{(float)a + 0.5f, 0, (float)s1 + 24.0f};
-        }
-        b1Line = Format("%s %d", axis == 0 ? "z" : "x", a);
+    long long bestArea = -1;
+    for (const auto& st : map.sites) {
+      if (st.kind != worldmap::kSiteStamp) continue;
+      const int w = st.x1 - st.bx0 + 1, d = st.z1 - st.bz0 + 1;
+      if (w < 8 || d < 8 || w > 48 || d > 48) continue;
+      if (st.bx0 < x0 || st.x1 > x1 || st.bz0 < z0 || st.z1 > z1) continue;
+      const long long area = (long long)w * d;
+      if (area <= bestArea) continue;
+      // The crossing: along x through the middle when the house is wider in
+      // x, else along z. Count its obstructed columns (the walker must meet
+      // matter, or the arm proves nothing).
+      const bool alongX = w >= d;
+      const int cxm = (st.bx0 + st.x1) / 2, czm = (st.bz0 + st.z1) / 2;
+      int n = 0, run = 0, worst = 0;
+      const int a0 = alongX ? st.bx0 - 24 : st.bz0 - 24, a1 = alongX ? st.x1 + 24 : st.z1 + 24;
+      for (int a = a0; a <= a1; a++) {
+        const bool o = alongX ? obstructed(a, czm) : obstructed(cxm, a);
+        run = o ? run + 1 : 0;
+        worst = std::max(worst, run);
+        n += o ? 1 : 0;
       }
+      if (n == 0) continue;
+      bestArea = area;
+      bestN = n;
+      b1Run = worst;
+      from = alongX ? Vec3{(float)a0 + 0.5f, 0, (float)czm + 0.5f} : Vec3{(float)cxm + 0.5f, 0, (float)a0 + 0.5f};
+      to = alongX ? Vec3{(float)a1 + 0.5f, 0, (float)czm + 0.5f} : Vec3{(float)cxm + 0.5f, 0, (float)a1 + 0.5f};
+      b1Line = Format("round a house %dx%d at (%d,%d) along %s", w, d, cxm, czm, alongX ? "x" : "z");
     }
     b1Obstructed = std::max(bestN, 0);
     if (bestN > 0) {
@@ -636,14 +671,60 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
       place(wLine, fx, fz);
       gotoGoal(wLine, to);
       b1 = walk(wLine, to, (int)BaselineNumber("distantObstLineMaxTicks", 2400), Vec3{-1e9f, 0, -1e9f}, nullptr);
+      // WHERE IT STOPPED, drawn: the obstruction map round the end (#
+      // obstructed, . open, @ the walker, G the goal side), so a stall names
+      // its wall instead of a distance.
+      if (!b1.reached) {
+        const int ex = ifloor(b1.endPos.x), ez = ifloor(b1.endPos.z);
+        std::printf("distant-obstacles: B1 stalled at (%d,%d); map x %d..%d (right = +x), z %d..%d (down = +z)\n",
+                    ex, ez, ex - 48, ex + 48, ez - 24, ez + 24);
+        for (int z = ez - 24; z <= ez + 24; z += 2) {
+          std::string row;
+          for (int x = ex - 48; x <= ex + 48; x++)
+            row += (x == ex && (z == ez || z + 1 == ez)) ? '@' : (obstructed(x, z) || obstructed(x, z + 1)) ? '#' : '.';
+          std::printf("  %s\n", row.c_str());
+        }
+        // ...and the ground along its row: TerrainTop, the probed standing
+        // height from 6 over it, and the overlay's matter in the feet band,
+        // plus the planner's own state -- a wall, a terrace edge and a route
+        // the planner believes in are different stalls.
+        std::string hs2;
+        for (int x = ex - 8; x <= ex + 12; x++) {
+          int st = 0;
+          ground.ProbeGround(x, ez, ground.TerrainTop(x, ez) + 6, st);
+          hs2 += Format(" %d:%d/%d%s", x, ground.TerrainTop(x, ez), st, obstructed(x, ez) ? "#" : "");
+        }
+        std::printf("distant-obstacles: B1 row z %d (x:top/stand):%s\n", ez, hs2.c_str());
+        // The whole locale at 4 voxels a character (any obstructed column in
+        // the 4x4 = '#'), the line's row marked '='.
+        std::printf("distant-obstacles: B1 locale x %d..%d z %d..%d, 4 vox/char, '@' the walker, '=' the line\n",
+                    x0, x1, z0, z1);
+        for (int z = z0; z <= z1; z += 4) {
+          std::string row;
+          for (int x = x0; x <= x1; x += 4) {
+            bool o = false;
+            for (int k = 0; k < 16 && !o; k++) o = obstructed(x + (k & 3), z + (k >> 2));
+            const bool here = ex >= x && ex < x + 4 && ez >= z && ez < z + 4;
+            const bool line = ez >= z && ez < z + 4;
+            row += here ? '@' : o ? '#' : line ? '=' : '.';
+          }
+          std::printf("  %s\n", row.c_str());
+        }
+        if (const DistantMob* d = tier.Find(wLine))
+          std::printf("distant-obstacles: B1 brain: replans %u longPlans %u navFailed %d path %d/%d "
+                      "stepUp %d stepDown %d headroom %d feet %.1f\n",
+                      d->brain.replans, d->brain.longPlans, d->brain.navFailed ? 1 : 0,
+                      (int)d->brain.path.cursor, (int)d->brain.path.pts.size(), d->stepUpCells,
+                      d->stepDownCells, d->headroomCells, (double)d->origin.y);
+      }
       park(wLine, 0);
     }
   }
   check(b1Obstructed > 0 && b1.reached && b1.inside == 0,
         Format("B1: line %s (%d obstructed columns, worst run %d): reached %d in %d ticks (%.0f from the "
-               "goal, walked %.0f), %d ticks in matter%s%s",
+               "goal at (%.0f,%.0f,%.0f), walked %.0f), %d ticks in matter%s%s",
                b1Line.c_str(), b1Obstructed, b1Run, b1.reached, b1.ticks, (double)b1.endDist,
-               (double)b1.walked, b1.inside, b1.why.empty() ? "" : ": ", b1.why.c_str()));
+               (double)b1.endPos.x, (double)b1.endPos.y, (double)b1.endPos.z, (double)b1.walked, b1.inside, b1.why.empty() ? "" : ": ", b1.why.c_str()));
   lap("B1");
 
   // ======== B2: through a trunk ================================================================
@@ -705,14 +786,18 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
   lap("B2");
 
   // ======== C: the door ===========================================================================
+  // THE HOUSE MUST BE SHUT BUT FOR ITS DOOR, or the arm proves nothing: an
+  // open-sided building (the smithy's forge front) lets a walker in with
+  // every leaf shut. So the doors are tried in the map's order and the FIRST
+  // whose shut control keeps the walker out is the fixture (deterministic);
+  // the ones skipped are named in the detail.
   Walk cw[2], cShut;
   const GenOverlay::DoorBox* door = nullptr;
-  for (const GenOverlay::DoorBox& d : ov.Doors())
-    if (d.id.find("smithy") != std::string::npos) door = &d;
-  if (door == nullptr && !ov.Doors().empty()) door = &ov.Doors().front();
   GenOverlay::DoorBox doorCopy;
-  std::string cWhere;
-  if (door != nullptr) {
+  std::string cWhere, cSkipped;
+  const size_t nDoors = std::min<size_t>(ov.Doors().size(), 8);
+  for (size_t di = 0; di < nDoors; di++) {
+    door = &ov.Doors()[di];
     doorCopy = *door;
     // The leaf is one cell thick on the axis it swings across: OUTSIDE is the
     // side with open sky over its standing height (no roof within 6 m).
@@ -754,7 +839,11 @@ Status GateDistantObstacles(Ctx& c, std::string& detail) {
       probe.SetOptions(GenOverlay::Options{});
     }
     park(wDoor, 2);
+    if (!cShut.reached) break;
+    cSkipped += (cSkipped.empty() ? "" : ", ") + doorCopy.id;
+    if (di + 1 == nDoors) break;   // none shut: report the last one
   }
+  if (!cSkipped.empty()) cWhere += " (open-sided, skipped: " + cSkipped + ")";
   check(door != nullptr && cw[0].reached && cw[0].crossed && cw[0].inside == 0,
         Format("C: %s: reached %d in %d ticks (%.0f from the goal), through the door %d, %d ticks in matter%s%s",
                door ? cWhere.c_str() : "no door on the map", cw[0].reached, cw[0].ticks, (double)cw[0].endDist,

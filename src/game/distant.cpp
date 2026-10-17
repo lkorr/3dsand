@@ -2914,6 +2914,10 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     wv.losCtx = nullptr;
     wv.aimPart = nullptr;
     wv.aimCtx = nullptr;
+    // THE LONG REPLAN (8.5): DistantGround is never unknown, so when the
+    // local plan cannot see round a long wall (a village's yard walls, a row
+    // of houses) a wider search over the same ground can.
+    wv.navRadiusLong = kDistantNavRadiusLong;
     const auto tThink = Clock::now();
     nsWorld += (uint64_t)std::max<int64_t>(
         0, std::chrono::duration_cast<std::chrono::nanoseconds>(tThink - tWorld).count());

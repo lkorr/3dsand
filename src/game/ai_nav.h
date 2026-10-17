@@ -133,6 +133,18 @@ struct NavParams {
   // agreed; the other half is not authoring cliffs the planner can ramp up.
   float dropPenalty = 1.0f;
   float climbPenalty = 4.0f;
+  // THE GRID's CEILING. `radius` is clamped to [4, radiusCap]: 40 for the near
+  // tier, whose ground past its fetch cache is unknown anyway. The distant
+  // tier's long replan (WorldView::navRadiusLong) raises it, because its
+  // ground is never unknown and a village block is wider than 40.
+  int radiusCap = 40;
+  // A GOAL OUTSIDE THE GRID that the search cannot reach (it is clamped to
+  // the grid's edge, often onto a wall or into a house): return the route to
+  // the reached cell NEAREST the goal instead of failing, when that cell is
+  // nearer the goal than the start by at least a quarter of the radius.
+  // "Walk as far toward them as I can" is then a route round the wall, not a
+  // straight line into it. Off for the near tier (no behaviour change there).
+  bool partialWhenClamped = false;
 };
 
 // Plan from `fromVox` to `toVox` (world voxels; only X/Z are used to pick

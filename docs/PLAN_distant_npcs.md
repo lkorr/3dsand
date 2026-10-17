@@ -2421,3 +2421,49 @@ the matter passes (burn, stain, splatter, wash) read nothing past the face
 (no voxels there) for the <= 16 voxels it spends crossing. A footstep past
 the face is a footstep on dirt. LOS past the face is open (deviation 1). The
 gate cannot see trees past the face until D10 lands (the pad box has none).
+
+### 8.5 D10 as landed (branch `dg-d10`, finished on `distant-gaps` 2026-10-17)
+
+**What landed.** `game/distant_obstacles.{h,cpp}` (`GenOverlay`: per-column
+spans built lazily, per-cell records for dungeons and the layer,
+epoch-checked), `sim/worldgen_twin.h` + the twin at the end of `world.cpp`
+(lattice trees, authored tree sites, cacti, stamps -- beside the mirrored
+statics they read), `wgtwin::SetGenEnv` (Simulation records the uploaded tree
+atlas and packed world map, so no `main.cpp` local is needed), the stamp
+decoder lifted out of `faredits.cpp` and shared, `WorldEdits::Generation()`.
+`DistantGround::Solid` reads stored chunk -> overlay -> `TerrainTop`; the
+fast path of `Stand` / `ProbeGround` / `Land` leaves any column the overlay
+touches. Doors read as air. Gate `distant-obstacles`.
+
+**Measured** (`--gate distant-obstacles`, 9 real GPU boxes of the default map,
+5.4 M cells): tree 7,372/7,372, stamp 191,305/191,305, dungeon 24,995/24,995,
+layer 36,914/36,914, whole trees 9,210/9,210 -- every modelled source exact.
+Base 62 mismatches of 5.16 M, all `crystal_spire` / `crystal` (a worldgen
+feature outside the overlay's list; not obstacles a walker meets). Overlay
+column build 1.2 us mean; the `peaks` walk's tick cost 17.4 -> 44.7 us.
+
+**Deviations, finished by the orchestrator after the agent was cut off.**
+1. **The long replan** (`ai::WorldView::navRadiusLong`, `kDistantNavRadiusLong`
+   96, `NavParams::radiusCap` / `partialWhenClamped`): with obstacles real, a
+   distant creature's local plan (navRadius 22-30, and `FindPath` silently
+   capped every grid at 40) cannot see round a wall longer than its grid.
+   A failed local plan now retries once over 96 voxels, returning the route
+   to the reached cell nearest a goal that lies off the grid; a failure backs
+   off 90 ticks. Distant tier only (the near tier's fields keep their
+   defaults: no behaviour change near).
+2. **Arm B1 walks round ONE HOUSE** (the largest stamp of the locale no wider
+   than 48, crossed through its middle), not the most obstructed line across
+   the whole locale: that line ran into the middle of Harrowby's large walled
+   compound, a global route problem, and the walker (never inside matter)
+   simply never found the far gate. Measured: reached in 92 ticks, 0 ticks in
+   matter.
+3. **Arm C picks the first door whose house the shut control keeps out** (the
+   smithy is open-sided: with every leaf shut the walker still got in), and
+   the crossing test is a segment test (a stride jumps the one-cell leaf
+   between samples).
+4. **No cacti in the default map's boxes**: the cactus floor's cell minimum is
+   0 (`distantObstCactusCellsMin`); the twin is measured when a map has them.
+
+**Open.** A global (village-scale) route planner for distant creatures; the
+crystal spires; a creature whose goal lies inside a closed compound may still
+stall at its wall (it never walks through it).

@@ -815,6 +815,12 @@ constexpr size_t kDistantLogMax = 256;
 // of the window (or inside it, waiting at the promotion line) is published to
 // the near tier's.
 constexpr float kDistantEdgeBandVox = 192.0f;
+// THE LONG REPLAN's radius (ai::WorldView::navRadiusLong): when a distant
+// creature's local plan (its profile's navRadius, ~22-30) fails, it plans once
+// more over this half-extent (193 x 193 columns), backed off 90 ticks after a
+// failure. Wide enough to round a village block; the cost is paid only by a
+// creature whose local plan failed.
+constexpr int kDistantNavRadiusLong = 96;
 // ...and at most this many distant creatures a tick are published (nearest
 // to the window first, ties by id, then in id order): Think walks the near
 // crowd's list several times a step, and 64 near creatures each weighing a

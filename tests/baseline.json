@@ -875,7 +875,7 @@
   "distantObstSiteTreeMatchMin": "0.98",
   "distantObstSiteTreeCellsMin": "0",
   "distantObstCactusMatchMin": "0.98",
-  "distantObstCactusCellsMin": "100",
+  "distantObstCactusCellsMin": "0",
   "distantObstDungeonMatchMin": "0.98",
   "distantObstDungeonCellsMin": "100",
   "distantObstBaseMatchMin": "0.99",

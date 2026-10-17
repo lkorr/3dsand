@@ -202,7 +202,7 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
   out.Clear();
   if (probe.ground == nullptr || probe.blocked == nullptr) return false;
 
-  const int radius = std::clamp(p.radius, 4, 40);
+  const int radius = std::clamp(p.radius, 4, std::max(4, p.radiusCap));
   const int sx = ifloor(fromVox.x), sz = ifloor(fromVox.z);
   Scratch& s = Pad();
   s.Reset(radius, sx, sz);
@@ -226,6 +226,7 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
   // than refused: "walk as far toward them as I can see" is the useful answer
   // when a duelist is chasing something that just stepped out of range, and the
   // replan cadence re-asks a few ticks later from further along.
+  const bool clamped = gxGoal < 0 || gzGoal < 0 || gxGoal >= s.side || gzGoal >= s.side;
   gxGoal = std::clamp(gxGoal, 0, s.side - 1);
   gzGoal = std::clamp(gzGoal, 0, s.side - 1);
 
@@ -306,6 +307,28 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
     else if ((int)s.colY[i] - startHeight > p.maxStepUp) out.colsSteep++;
   }
 
+  // NavParams::partialWhenClamped: the goal was off the grid and its clamped
+  // cell was not reached. Take the CLOSED cell nearest the goal (ties by
+  // index: the scan order, deterministic) if it gains at least a quarter of
+  // the radius on the start; the back-trace below walks to it.
+  int endIdx = goalIdx;
+  if (!reached && p.partialWhenClamped && clamped) {
+    const float startH = Heuristic(gxGoal - gxStart, gzGoal - gzStart);
+    float bestH = startH - 0.25f * (float)radius;
+    int best = -1;
+    for (int i = 0; i < s.side * s.side; i++) {
+      if (!s.closed[i]) continue;
+      const float h = Heuristic(gxGoal - i % s.side, gzGoal - i / s.side);
+      if (h < bestH) {
+        bestH = h;
+        best = i;
+      }
+    }
+    if (best >= 0) {
+      endIdx = best;
+      reached = true;
+    }
+  }
   if (!reached) return false;
 
   // ---- back-trace, then shortcut ------------------------------------------
@@ -315,7 +338,7 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
   // reaches, emit that point, repeat.
   static std::vector<Vec3> raw;
   raw.clear();
-  for (int i = goalIdx; i >= 0; i = s.came[i]) {
+  for (int i = endIdx; i >= 0; i = s.came[i]) {
     const int gx = i % s.side, gz = i / s.side;
     raw.push_back(Vec3{(float)(s.baseX + gx) + 0.5f, (float)s.colY[i],
                        (float)(s.baseZ + gz) + 0.5f});
