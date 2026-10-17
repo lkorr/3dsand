@@ -19219,6 +19219,26 @@ where you hear from either (§12b, "The ears are on the character").
     the far bed is the level's centre-sampled staircase, not the near
     voxels; no traced reflection of the far shore; the waterline is a cell
     top (or the refine's exact column top at levels 1-2).
+  - **A shallow river's bed sinks a cell at level 4 (found 2026-10-16, ticket
+    `2026-10-16_11-05-33`, NOT fixed: the cause is in the sieve).** Seen from
+    93 m up, the river's bed shows through its water out to the level-3 box
+    face and the water turns uniform past it. Measured along the river
+    (SEAM_DBG 7, the bed march instrumented): the ray's path to the bed is
+    2.5-4.6 m at level 3 and 15-24 m at level 4, every bed found (not a
+    missed bed, not the cap). Cause: `farSurfaceMat`'s `wetTop`
+    (worldgen.wgsl) paints the BED's topmost cell with the fluid wherever the
+    water is too shallow for any cell centre to fall inside it -- right for
+    the colour from above (the sea shelf it was made for), but `farWaterBed`
+    then treats that bed cell as a full cell of water: the bed drops to the
+    cell's floor, on average a whole cell under the true bed (h is in the
+    cell's upper half by construction). At 1.6 m cells on a ~1 m river that
+    doubles the depth, and at the grazing angles level 4 is seen at (path ~
+    9x depth) Beer-Lambert takes the bed. The cascade alone cannot tell a
+    wetTop cell from a real one-cell column (both put the refined surface in
+    the same range), so the fix needs the sieve or the map to say so: e.g.
+    the surface map's sub-skin bits of a FLUID-topped sub-column (always the
+    fluid itself, so free there) carrying the column's true depth, which
+    farWaterBed would take as the bed under every refined far water hit.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -25178,6 +25198,27 @@ RISER, lit as top; a face with a solid in front (glass, ice) stays a plain wall
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
 
+**Past the handoff** (2026-10-16, ticket `2026-10-16_11-13-31`: "waterfall
+look disappears at the lod seam"): the cascade's water side faces used to be
+either the surface (air over the cell: the handoff step) or a flat side wall
+(water over it) -- so every far curtain was a flat blue wall from 20.5 m out.
+`farWaterSideKind` is `waterSideKind` on the cascade: a cell's whole height is
+water, so a one-cell step is ambiguous (the handoff step, a ramp's
+quantisation, a bank the centre sample missed) and stays the surface; a face
+with two or more cells of water exposed over open air in front -- this cell,
+the water over it, the open cell under the one in front -- is a SHEET, drawn
+with the near field's own `fallingSheet` and `whiteWaterLight` (one function for
+both sides), its streaks eased to their measured mean cover (0.28) as a pixel
+grows from 3 to 12 cm (`farFallingSheet`). The blocker flag in front counts as
+open (it is not a primary hit, so the ray came through it: the surface band of
+the pool at a fall's foot, which first drew as a flat band across the bottom of
+every far fall, measured with a side-kind debug frame). A face with liquid or a
+solid in front cannot be seen inside one level's data: the ray crossed into the
+coarser level there, its pool a cell higher than the finer level's; under more
+water with open air in front of that it is the foot of the sheet, otherwise
+the surface (liquid) or the old side wall (solid). Not reproduced past the
+handoff: `fallCueAt`'s mist and plunge spray (they read the near columns).
+
 **Gate `rivers`** grew: D compares the top cell's eighths, E allows air beside
 water only over a held column whose surface is below it (and prints every
 piece's view of a leak), **R** scoops a crater out of the river (it refills) and
@@ -25612,6 +25653,30 @@ the sim licence the stream arm did: `CurrentAtCpuSim` (the player's swim stroke,
 NPCs afloat) reads it. It is not hashed (the player is not part of the world
 hash) and no GPU sim kernel reads it.
 
+**The far grid (2026-10-16, ticket `2026-10-16_11-05-33`).** The window grid
+ends on the window's square edge (~26 m out), and far water had no current past
+it: seen from the air, a river's streaks, boils and foam lines stopped on one
+hard line across it ("the water shader stops working discretely at one seam").
+The far grid is the SAME field -- the same cached blocks, the same tent blend,
+composed by the same arithmetic -- sampled every `kFlowFarStep` (16 cells) over
++-`kFlowFarHalf` (2048 cells = 205 m, the level-3 box) around the window, in the
+same buffer after the window grid (`kFlowFarBase`; `raymarch.wgsl`
+`FLOW_FAR_BASE`, pinned by `check_invariants.py`). It is recentred when the
+window has moved `kFlowFarSnap` (128 cells) and re-composed when blocks it lacked
+land (at most every 8 updates), and uploaded apart from the window grid
+(`FarVersion`, ~0.5 MiB per recentre). It NEVER solves synchronously: a block it
+needs and does not have is solved on its own background lane
+(`kFlowFarPending` = 2, nearest first, separate from the window's ring so it
+never takes a slot the window needs) and its nodes compose dry until it lands,
+which is legal because nothing on the CPU samples it (`Sample()` reads the
+window grid only). Blocks are kept within `kEvictBlocks` (6) of the window's
+centre block, ~121 x 200 KB. The renderer reads it through `waterCurrentAt`
+(raymarch.wgsl): on a far hit the window grid hands over to the far grid over
+the window grid's outer nodes, the vertical gate widened by the hit level's
+cell (a cascade water top may stand up to a cell over the true surface), and
+the far grid fades out over its own outer 16 nodes, where the footprint has
+already taken the streaks. A window hit is `currentAt` exactly.
+
 **Gates.** `rivers` passes I (main's middle runs downstream at no less than the
 floor, nothing in the air over it), K (the cross-section: 0.8 of the half-width
 out is under 0.8 of the thalweg's speed) and J (window moves).
@@ -25635,6 +25700,14 @@ a conveyor. A current writes its own marks, and three carry the read:
 All scale with `flowMarkStrength` (0.04 .. 0.55 m/s), so a river's slow margins
 and a lake's middle stay glassy and still water pays one compare. The chop
 keeps 70% of its amplitude on fully flowing water.
+
+**Past the handoff they are the same marks** (2026-10-16): `shadeFarWater`
+shares `waterWaveNormal` and `waterFoam`, and every current they read goes
+through `waterCurrentAt`, which on a cascade hit reads the far grid (§9d.10). The
+far field has no columns, so it has no `gSlopeFlow` (a held ramp's macro slope
+as a current): shadeFarWater zeroes it rather than inheriting the last near
+pixel's value. On the map's rivers the solved field carries the current either
+way; what the far field loses is only the slope term on a ramp.
 
 **The frame trap.** "Noise in the flow's frame" first meant `(p . dir, p .
 perp)` with the local `dir` -- a rotation about the WORLD ORIGIN by an angle
