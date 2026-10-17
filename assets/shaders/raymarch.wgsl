@@ -1942,11 +1942,16 @@ fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
 // disc). One evaluation of each layer, like skyColor itself.
 struct SkyParts { full : vec3f, glow : vec3f };
 fn skyColorParts(rdIn : vec3f) -> SkyParts {
+  return skyColorPartsG(rdIn, skyAirglowV(normalize(rdIn), dayWeight()));
+}
+// The same, around an airglow the caller already holds: `g` MUST be
+// skyAirglowV(normalize(rdIn), dayWeight()). applyAerial evaluates that once
+// for both of its modes (see there).
+fn skyColorPartsG(rdIn : vec3f, g : SkyLayer) -> SkyParts {
   let rd = normalize(rdIn);
   let dayW = dayWeight();
   var moon = SkyLayer(vec3f(0.0), 0.0);
   if (dayW < 0.999) { moon = moonLayer(rd); }
-  let g = skyAirglowV(rd, dayW);
   var c = g.c;
   if (dayW < 0.999) {
     let hidden = 1.0 - (1.0 - g.veil) * (1.0 - clamp(moon.veil, 0.0, 1.0));
@@ -7997,8 +8002,8 @@ fn aerialFrac(tFine : f32, dirY : f32) -> f32 {
 // This is what turns an overcast into a GREY horizon rather than a blue one
 // with a grey lid — the distant hills fog into the cloud they stand under.
 // TUNE_CLOUD_FOG_MIX 0 restores the cloudless fog target exactly.
-fn cloudySkyAirglow(rd : vec3f) -> vec3f {
-  let sky = skyAirglow(rd);
+// `sky` is skyAirglow(rd): applyAerial, the one caller, holds it already.
+fn cloudySkyAirglowG(rd : vec3f, sky : vec3f) -> vec3f {
   if ((R.weatherFlags & RWF_CLOUDS) == 0u || TUNE_CLOUD_FOG_MIX <= 0.0) { return sky; }
   let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
   return mix(sky, sky * e.a + e.rgb, TUNE_CLOUD_FOG_MIX);
@@ -8533,7 +8538,11 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
 // sources. ONE function because short-range fog (applyAerial) has to converge
 // to exactly what the sky branch draws next to it.
 fn skyBackdrop(rd : vec3f, xy : vec2f) -> SkyParts {
-  let sp = skyColorParts(rd);
+  return skyBackdropG(rd, xy, skyAirglowV(normalize(rd), dayWeight()));
+}
+// ...around the caller's skyAirglowV(normalize(rd), dayWeight()).
+fn skyBackdropG(rd : vec3f, xy : vec2f, g : SkyLayer) -> SkyParts {
+  let sp = skyColorPartsG(rd, g);
   if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sp; }
   let cs = cloudScreenAt(xy, rd);
   let glow = sp.glow * cs.t + cs.c;
@@ -8546,6 +8555,13 @@ fn skyBackdrop(rd : vec3f, xy : vec2f) -> SkyParts {
 // read as a gray veil over the whole horizon instead of atmosphere.
 fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   let f = aerialFrac(tFine, rd.y);
+  // THE AIRGLOW IN `rd`, ONCE (2026-10-17, shader slimming). Both modes below
+  // start from skyAirglowV(normalize(rd), dayWeight()) -- the short-range
+  // backdrop through skyColorParts, the airlight through skyAirglow -- and
+  // each was its own inlined copy of it (the night glow's seven fbm calls
+  // included) in every one of the fragment shader's ~14 applyAerial copies.
+  // Same function, same arguments, evaluated once either way.
+  let glow = skyAirglowV(normalize(rd), dayWeight());
   // ---- SHORT-RANGE MODE: DISSOLVE INTO THE PIXEL'S OWN BACKDROP ----------
   // Owner ticket 2026-10-09_11-01-50: "with fog on at 100 m I see clear walls
   // in the distance at what are probably LOD boundaries". The walls were
@@ -8564,7 +8580,7 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // ceiling, but no starfield on a hill that is merely hazy
   // (gotcha-sky-tiers-fog-target).
   if (SPEC_SHORT_RANGE && (R.flags & 4u) != 0u) {
-    let bg = skyBackdrop(rd, gFragXY);
+    let bg = skyBackdropG(rd, gFragXY, glow);
     return mix(color, bg.glow, f) + (bg.full - bg.glow) * smoothstep(0.9, 1.0, f);
   }
   // Star-free sky. Aerial perspective is AIR between the eye and a SOLID
@@ -8573,7 +8589,7 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // nebulae into distant terrain — which renders stars *through* hillsides,
   // trees and the ground near the horizon, because those surfaces are exactly
   // the ones carrying the most fog.
-  var airlight = cloudySkyAirglow(rd);
+  var airlight = cloudySkyAirglowG(rd, glow.c);
   // THE DISTANCE BLUE (H1, render.fogHaze). The horizon band of the sky is
   // pale because it is the airlight of an INFINITE path; the airlight of a
   // finite one -- a ridge 15 km off, part dissolved -- is the deeper blue of
