@@ -11692,6 +11692,17 @@ Status GatePierce(Ctx& c, std::string& detail) {
 //   (g) THE INPUT PATH: a bow in the rig's kit hand, TB_ATTACK held past a
 //       full draw and released, looses one arrow at the full draw speed and
 //       spends one from the pack; a tap under minDraw looses nothing.
+//   (i) THE RETICLE (ticket 2026-10-16_11-02-47, "arrows are a little offset
+//       when they fire"): the same input path, the crosshair on a fresh
+//       human's torso, from four sight lines -- first person on the head and
+//       off it, the third-person boom, the over-shoulder boom (the render eye
+//       the frame settles TickInput::aimAt down, as main.cpp does) -- at 2-5 m and
+//       from four sides. The arrow leaves from the rest and must ENTER the
+//       target no more than arrowSightTolVox across the reticle's line
+//       (camera right), and no more than arrowSightDropVox below it
+//       (gravity). And BowSightDistance's grid half on its own: a pick cell
+//       on the line answers the face it enters at; one well off it is not
+//       used.
 //
 // PRINTED, for the owner's numbers (decision 1, and "a couple of arrows to
 // the head, not always one"): full-draw arrows to kill through the torso and
@@ -12420,6 +12431,187 @@ Status GateArrow(Ctx& c, std::string& detail) {
       fail("(g) a tap under minDraw loosed an arrow");
     if (afterDraw != 1 || ammoAfterDraw != 2 || drawn < 0.999f)
       fail("(g) a full draw and release did not loose exactly one arrow");
+  }
+
+  // ======== (i) THE RETICLE: the loose lands on what the crosshair is on ======
+  {
+    const float sightTol = (float)BaselineNumber("arrowSightTolVox", 0.35);
+    const float dropSlack = (float)BaselineNumber("arrowSightDropVox", 0.6);
+    // The sight line's origin in the CAMERA's frame (right, up, forward),
+    // world voxels from the head's eye: where the frame draws the crosshair
+    // from (main.cpp's `pourFrom`, the render eye).
+    struct SightCase {
+      const char* name;
+      Vec3 off;      // (right, up, fwd)
+      float range;   // eye to the torso, horizontally
+      float lift;    // the eye over the torso centre
+      int side;      // which side of the body it shoots from (0..3)
+    };
+    const SightCase cases[] = {
+        {"first person, on the head", {0.0f, 0.0f, 0.0f}, 20.0f, 4.0f, 0},
+        {"first person, head off the line", {0.6f, 0.3f, 2.5f}, 45.0f, 6.0f, 1},
+        {"third-person boom", {0.0f, 2.5f, -32.0f}, 30.0f, 5.0f, 2},
+        {"over the shoulder", {5.5f, 2.5f, -17.0f}, 50.0f, 6.0f, 3},
+    };
+    const float gTick = ArrowGravityPerTick2();
+    // (h.0) the grid half, on its own: a sight line straight up from high over
+    // the fixture (nothing in Jolt up there).
+    {
+      Fixture f = fixture(76000);
+      if (f.id) {
+        const Vec3 sight = f.torsoC + Vec3{0.25f, 120.0f, 0.25f};
+        const Vec3 up{0.0f, 1.0f, 0.0f};
+        const Vec3 rest = sight + Vec3{0.0f, 7.0f, 0.0f};
+        WorldSnapshot snap;
+        snap.valid = true;
+        snap.pick[0] = 1;
+        const IVec3 cell{ifloor(sight.x), ifloor(sight.y) + 40, ifloor(sight.z)};
+        snap.pick[2] = (uint32_t)cell.x;
+        snap.pick[3] = (uint32_t)cell.y;
+        snap.pick[4] = (uint32_t)cell.z;
+        const float want = (float)cell.y - sight.y;   // the cell's lower face
+        const float on = BowSightDistance(snap, c.phys, {}, sight, up, rest, 300.0f);
+        snap.pick[2] = (uint32_t)(cell.x + 6);
+        const float offLine =
+            BowSightDistance(snap, c.phys, {}, sight, up, rest, 300.0f);
+        lines += Format(" | (i) grid: on the line %.2f (face at %.2f), 6 off it %.1f",
+                        on, want, offLine);
+        if (std::fabs(on - want) > 0.01f)
+          fail(Format("(i) a pick cell on the sight line answered %.2f, not the "
+                      "face it enters at %.2f", on, want));
+        if (std::fabs(offLine - 300.0f) > 0.01f)
+          fail(Format("(i) a pick cell 6 voxels off the sight line was used (%.2f)",
+                      offLine));
+      }
+    }
+    int k = 0;
+    for (const SightCase& sc : cases) {
+      Fixture f = fixture(77000 + 1000 * (uint32_t)k++);
+      if (!f.id) {
+        fail(Format("(i) %s: the fixture human did not spawn", sc.name));
+        continue;
+      }
+      // PINNED (the authored `dummy` profile, mobile: false; SpawnTarget's
+      // note in selftest_impact.cpp): unprofiled, the human walked ~39
+      // voxels off its mark over the draw, and the crosshair was on grass.
+      mobs.SetMobBehavior(f.id, "dummy");
+      PlayerSession& s = f.rig->Session();
+      Kit& kit = s.kit();
+      kit.equip.slots[EquipSlotOfHand(Hand::Right)] = StackOf(c.items, bowIdx);
+      wearQuiver(kit);
+      kit.bag.Add(StackOf(c.items, arrowIdx, 2));
+      {
+        int from = -1;
+        for (int i = 0; i < Bag::kSlots && from < 0; i++)
+          if (kit.bag.slots[i].name == "arrow") from = i;
+        kit.Move(KitRef{KitSpace::Bag, from},
+                 KitRef{KitSpace::Equip, (int)EquipSlotId::Back}, c.items);
+      }
+      // Stand the shooter `range` off on the case's side, the eye `lift`
+      // over the torso, and turn the camera until the SIGHT line (not the
+      // head's) runs through the torso's centre.
+      const Vec3 sides[4] = {f.front, f.side, (f.front + f.side).normalized(),
+                             f.side * -1.0f};
+      const Vec3 T = f.torsoC;
+      const Vec3 eyeAt = T + sides[sc.side] * sc.range + Vec3{0.0f, sc.lift, 0.0f};
+      s.player.pos = eyeAt - Vec3{0.0f, s.player.EyeOffsetNow(), 0.0f};
+      s.player.vel = Vec3{};
+      Vec3 fwd = (T - eyeAt).normalized();
+      auto sightOf = [&](Vec3 eye, Vec3 fw) {
+        const Vec3 r = fw.cross(Vec3{0, 1, 0}).normalized();
+        const Vec3 u = r.cross(fw).normalized();
+        return eye + r * sc.off.x + u * sc.off.y + fw * sc.off.z;
+      };
+      // The player TRACKS the mark through the draw (a pinned body still
+      // settles a couple of voxels as it is posed): the camera is turned onto
+      // the torso's centre as it stands, every tick, as a player's hand would.
+      auto aimAtTorso = [&](Vec3 eye) {
+        const Vec3 at = centroid(f.id, torso);
+        for (int it = 0; it < 8; it++)
+          fwd = (at - sightOf(eye, fwd)).normalized();
+        s.cam.pitch = std::asin(std::clamp(fwd.y, -1.0f, 1.0f));
+        s.cam.yaw = std::atan2(fwd.z, fwd.x);
+      };
+      aimAtTorso(eyeAt);
+      Vec3 camFwd{}, camRight{}, camUp{};
+      ArrowFlights& fl = f.rig->Authority().arrows;
+      const uint64_t launched0 = fl.stats.launched;
+      const size_t ev0 = fl.Events().size();
+      Vec3 sight{}, aimAt{}, eyeNow{};
+      // What main.cpp's frame does before each tick's Consume: the point the
+      // reticle is on, down the sight line, into the command.
+      auto hold = [&](int ticks, bool down) {
+        support::RunTicks(*f.rig, ticks, [&](uint32_t, support::TickOps& o) {
+          o.intent.handsUp = true;
+          aimAtTorso(s.player.EyePos());
+          camFwd = s.cam.Forward();
+          camRight = s.cam.Right();
+          camUp = s.cam.Up();
+          const Vec3 head = s.player.EyePos(), fw = s.cam.Forward();
+          sight = sightOf(head, fw);
+          const Vec3 rest = BowRestPoint(head, fw, s.cam.Right(), s.cam.Up(),
+                                         false, false);
+          o.input.aimValid = 1;
+          o.input.aimAt = sight + fw * BowSightDistance(c.world.Snap(), c.phys, {},
+                                                        sight, fw, rest, kBowZeroVox);
+          aimAt = o.input.aimAt;
+          eyeNow = head;
+          if (down) o.input.SetHeld(TB_ATTACK, true);
+        });
+      };
+      hold(BowFullDrawTicks(*bowDef) + 3, true);
+      hold(1, false);
+      const Vec3 aimLoosed = aimAt, eyeLoosed = eyeNow;
+      const Vec3 torsoLoosed = centroid(f.id, torso);
+      const Vec3 fwdL = camFwd, rightL = camRight, upL = camUp, sightL = sight;
+      hold(20, false);
+      const ArrowEvent* hit = nullptr;
+      const auto& evs = fl.Events();
+      for (size_t i = ev0; i < evs.size() && hit == nullptr; i++)
+        if (evs[i].kind == ArrowEvent::Kind::Hit && evs[i].mobId == f.id)
+          hit = &evs[i];
+      if (fl.stats.launched - launched0 != 1) {
+        fail(Format("(i) %s: the full draw loosed %llu arrows", sc.name,
+                    (unsigned long long)(fl.stats.launched - launched0)));
+        continue;
+      }
+      if (hit == nullptr) {
+        std::string seen;
+        for (size_t i = ev0; i < evs.size(); i++)
+          seen += Format(" [kind %d mob %llu at %.1f,%.1f,%.1f]", (int)evs[i].kind,
+                         (unsigned long long)evs[i].mobId, evs[i].at.x, evs[i].at.y,
+                         evs[i].at.z);
+        fail(Format("(i) %s: the arrow never hit the human under the crosshair "
+                    "(eye at the loose %.1f,%.1f,%.1f, wanted %.1f,%.1f,%.1f; aim "
+                    "%.1f,%.1f,%.1f, %.1f down the sight; torso %.1f,%.1f,%.1f, "
+                    "at the loose %.1f,%.1f,%.1f):",
+                    sc.name, eyeLoosed.x, eyeLoosed.y, eyeLoosed.z, eyeAt.x, eyeAt.y,
+                    eyeAt.z, aimLoosed.x, aimLoosed.y, aimLoosed.z,
+                    (aimLoosed - sight).len(), T.x, T.y, T.z, torsoLoosed.x,
+                    torsoLoosed.y, torsoLoosed.z) + seen);
+        continue;
+      }
+      // Off the RETICLE's line: across it (camera right) and up/down it.
+      // (the camera and sight AT THE LOOSE: the tracking above keeps turning
+      // after it)
+      const Vec3 d = hit->at - sightL;
+      const float along = d.dot(fwdL);
+      const float across = d.dot(rightL), vert = d.dot(upL);
+      // Ticks in the air: the flight starts at the rest, ~7.6 voxels down
+      // the look from the head's eye, which is -off.z down it from the sight.
+      const float flown = std::max(0.0f, along + sc.off.z - 7.6f);
+      const float ticks = flown / std::max(1e-3f, fullVox * kTickDt);
+      const float dropExp = 0.5f * gTick * ticks * ticks;
+      lines += Format(" | (i) %s at %.0f vox: %.2f across, %.2f up (drop %.2f)",
+                      sc.name, along, across, vert, dropExp);
+      if (std::fabs(across) > sightTol)
+        fail(Format("(i) %s: the arrow went in %.2f voxels across the reticle's "
+                    "line (tolerance %.2f)", sc.name, across, sightTol));
+      if (vert > dropSlack || vert < -(dropExp + dropSlack))
+        fail(Format("(i) %s: the arrow went in %.2f voxels up/down the reticle's "
+                    "line (gravity's drop %.2f, slack %.2f)", sc.name, vert,
+                    dropExp, dropSlack));
+    }
   }
 
   mobs.Reset();

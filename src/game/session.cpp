@@ -2369,7 +2369,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             // right of the eye line and a little under it (bow_draw*; the
             // crouched draw holds the flat bow lower and nearer the middle;
             // the mirror for a bow in the left fist) -- aimed at the point
-            // the look reaches kZero ahead, so it crosses the crosshair there
+            // the crosshair is on (below), so it lands on the reticle
             // (gravity aside: the player holds over, as before). Launched
             // from the eye it flew straight away from the camera, end-on, a
             // centimetre of nock nobody could see -- the shot looked
@@ -2390,17 +2390,39 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             // right -- so the flight starts there and the arrow the player
             // was looking at is the one that flies. World voxels; the mirror
             // for a bow in the left fist.
-            constexpr float kZero = 300.0f;    // 30 m
+            //
+            // AT WHAT THE CROSSHAIR IS ON (2026-10-16, ticket 11-02-47:
+            // "arrows are a little offset when they fire"). The flight used
+            // to aim at a FIXED point 30 m down the HEAD's line, and the
+            // reticle is on neither: (1) the rest sits ~1.5 voxels left of
+            // and ~1.2 under the eye, so the flight crossed the head's line
+            // only at 30 m -- a shot at a tree 10.7 m off went in
+            // 1.46 x (1 - 107/300) = ~0.9 voxels left of where it was aimed,
+            // more the nearer the mark; (2) the crosshair is drawn from the
+            // RENDER eye -- the posed head pushed ahead in first person, the
+            // boom in third (3.2 m back and 0.25 m up; the over-shoulder
+            // boom also 0.55 m right) -- so a third-person shot was off by
+            // the boom's offset at every range. Now the FRAME, which has the
+            // render eye and the pick cast from it, settles the point the
+            // reticle is on (TickInput::aimAt, game/arrows.h
+            // BowSightDistance: the first cell or body past the rest, else
+            // kBowZeroVox down that line) and the flight flies from the rest
+            // the player sees AT it: the parallax cancels exactly at what the
+            // crosshair is on. In the command, so a replay or a peer looses
+            // the same arrow. No aim in the command (a harness with no
+            // camera): the old zero down the head's line.
             const Vec3 eye = player.EyePos();
             const Vec3 fwd = cam.Forward();
-            const float side = bowHand == Hand::Left ? -1.0f : 1.0f;
-            const Vec3 rest = eye + fwd * (crouchDraw ? 7.85f : 7.6f) +
-                              cam.Right() * (side * (crouchDraw ? 0.34f : -1.46f)) -
-                              cam.Up() * (crouchDraw ? 1.66f : 1.23f);
+            const Vec3 rest = BowRestPoint(eye, fwd, cam.Right(), cam.Up(),
+                                           crouchDraw, bowHand == Hand::Left);
             std::vector<uint64_t> ignore;
             avatar.AppendLiveLimbBodies(ignore);
             if (playerBody) ignore.push_back(playerBody);
-            Vec3 from = rest, dir = (eye + fwd * kZero) - rest;
+            const Vec3 aimAt = ti.aimValid != 0 ? ti.aimAt : eye + fwd * kBowZeroVox;
+            Vec3 from = rest, dir = aimAt - rest;
+            // An aim point behind the rest (a stale sample after a whirl):
+            // the look's own direction rather than a flight backwards.
+            if (dir.dot(fwd) <= 0.5f) dir = fwd;
             {
               const Vec3 seg = rest - eye;
               const float len = seg.len();

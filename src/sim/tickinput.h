@@ -116,7 +116,9 @@ enum TickButton : uint32_t {
 //    `demonRef` (demons D5; 76 -> 84 bytes).
 // 9: TB_CROUCH's PRESSED edge means something (the crouch toggle / prone).
 // 10: TB_HANDS_AWAY (held: the frame has taken the hands; a draw is let down).
-constexpr uint32_t kTickInputVersion = 10;   // 2: TB_THROW, 3: TB_APPLY
+// 11: `aimAt` + `aimValid`: the point the crosshair is on, the bow's sight
+//     (84 -> 100 bytes, ticket 2026-10-16_11-02-47).
+constexpr uint32_t kTickInputVersion = 11;   // 2: TB_THROW, 3: TB_APPLY
 
 // THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
 // in the conversation panel is a player INPUT like a strike or a use, so it
@@ -181,6 +183,19 @@ struct TickInput {
   Vec3 right{0, 0, 1};
   Vec3 lookFwd{1, 0, 0};
 
+  // WHERE THE CROSSHAIR IS: the world point (voxels) the reticle is on --
+  // down the RENDER eye's line (the posed head in first person, the boom in
+  // third), which only the frame has -- to the first cell or body past the
+  // arrow rest (game/arrows.h BowSightDistance; kBowZeroVox down that line on
+  // nothing). A loosed arrow flies from the rest AT it, so it lands on the
+  // reticle whatever the camera's offset from the head; carried in the
+  // command, not re-derived in the tick, because a replay or a peer has no
+  // render eye and no pick of its own. A SAMPLE like the held mask: the
+  // newest wins and it is not cleared by Consume. `aimValid` 0 (a harness
+  // with no camera) = the tick aims kBowZeroVox down the head's line.
+  Vec3 aimAt{0, 0, 0};
+  uint32_t aimValid = 0;
+
   bool Held(uint32_t bits) const { return (held & bits) != 0; }
   bool Pressed(uint32_t bits) const { return (pressed & bits) != 0; }
   void SetHeld(uint32_t bits, bool on) {
@@ -191,7 +206,7 @@ struct TickInput {
   }
 };
 
-static_assert(sizeof(TickInput) == 84, "TickInput is a wire message");
+static_assert(sizeof(TickInput) == 100, "TickInput is a wire message");
 
 // ---- THE FRAME LAYER'S ACCUMULATOR ---------------------------------------
 //
@@ -244,6 +259,10 @@ struct TickInputFeeder {
   void Dismiss(uint32_t demon) {
     pend.pressed |= TB_DEMON_DISMISS;
     pend.demonRef = demon;
+  }
+  void SetAim(bool valid, const Vec3& at) {
+    pend.aimValid = valid ? 1u : 0u;
+    pend.aimAt = valid ? at : Vec3{0, 0, 0};
   }
   void SetSelection(int tool, int hotbarSlot) {
     pend.tool = (int16_t)tool;
