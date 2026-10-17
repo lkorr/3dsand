@@ -39,7 +39,7 @@
   "rivers.soluteDiscardMax": "0.05",
   "rivers.soluteRequireSleep": "0",
   "rivers.soluteSettleTicks": "4000",
-  "rivers.soluteCarryLeftMax": "4",
+  "rivers.soluteCarryLeftMax": "8",
   "rivers.driftTicks": "900",
   "rivers.driftMin": "8",
   "rivers.driftRadius": "90",

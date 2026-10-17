@@ -25547,6 +25547,14 @@ its chunks stall and sleep when nothing lower has room (`docs/PLAN_solutes.md`
 downstream face is no sink).
 **The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted. Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
 
+**THE SURFACE IS BLENDED** (2026-10-17, ticket 11-37-20): channel water was the
+NEAREST claiming piece's surface, a Voronoi pick -- on a wide river (hw ~155)
+down a steep stretch of short pieces it stepped 6-7 voxels wherever the nearest
+piece changed (the Silverrun's held terraces drawn as sheer falls). Now every
+claiming channel of the same water within twice the nearest's d2 (+64) is
+averaged with weights that reach 0 at that cutoff (continuous; integer; the CPU
+twin matches, `rivers` D). At the ticket's spot the largest step between
+neighbouring water columns went from 6-7 voxels to 2.6 (mean 0.14).
 **THE DRIFT** (2026-10-17, ticket 00-01-44): a level reach gives the held
 flow no direction, so worldgen `cols` writes each river column's network
 distance to its mouth (worldwater.cpp `River::mouth`, packed over the pieces'

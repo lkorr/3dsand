@@ -3152,27 +3152,41 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
     }
   }
   if (!nearR && lake == 0u) return out;
+  // THE SURFACE IS BLENDED, not picked: the shader's note (worldgen.wgsl,
+  // above its second walk). Same integer arithmetic, so `rivers` D stays
+  // exact.
   bool foreignHi = false;
   if (inCh) {
     const int wv = (w8Min - 1) >> 3;
     const int tol = (int)kRiverWaterfall + mNear;
     foreignHi = hiFS > wv + tol;
-    if (loFS < wv - tol) {
+    const bool reFloor = loFS < wv - tol;
+    if (reFloor) {
       floorMin = 1048576;
       mCh = 1;
       crest8 = -8388608;
       curt8 = -8388608;
-      for (uint32_t k = 0u; k < n; k++) {
-        const WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
-        if ((uint32_t)st.kind != kSiteRiver) continue;
-        const RivPM p = rivPieceAt(st, x, z);
-        if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol) continue;
+    }
+    const int cut = 2 * chD2 + 64;
+    int wsum = 0, acc = 0;
+    for (uint32_t k = 0u; k < n; k++) {
+      const WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
+      if ((uint32_t)st.kind != kSiteRiver) continue;
+      const RivPM p = rivPieceAt(st, x, z);
+      if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol || p.s - p.m > wv + tol) continue;
+      if (reFloor) {
         mCh = std::max(mCh, p.m);
         floorMin = std::min(floorMin, p.floorY);
         if (p.strip == 1) crest8 = std::max(crest8, p.edgeT8);
         if (p.strip == 2) curt8 = std::max(curt8, p.edgeT8);
       }
+      const int wt = (cut - p.d2) >> 4;
+      if (wt > 0) {
+        wsum += wt;
+        acc += wt * std::clamp(p.s8 - w8Min, -8 * (int)kRiverWaterfall, 8 * (int)kRiverWaterfall);
+      }
     }
+    if (wsum > 0) w8Min += acc / wsum;
   }
   int h = h0, water = -1, gap = 0;
   uint32_t bed = 0u;

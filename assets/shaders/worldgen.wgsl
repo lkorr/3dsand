@@ -2613,27 +2613,53 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
   // steepness and strips are not this water's, so they are walked again
   // without it -- only where two rivers' channels overlap, since the first
   // walk cannot know the winning surface until it has seen every piece.
+  //
+  // THE SURFACE IS BLENDED, not picked (2026-10-17, ticket 2026-10-17_11-37-20:
+  // "slowly becomes a sheer frozen waterfall"). The nearest piece alone is a
+  // Voronoi pick: on a WIDE river (hw ~155) down a steep stretch cut into
+  // short pieces, a column lies near the ends of half a dozen chords whose
+  // surfaces there differ by voxels, and wherever the nearest one changed the
+  // water stepped -- the default map's Silverrun stood in terraces of held
+  // water 6-7 voxels tall across its width (measured at (14452, -7280): seven
+  // claiming pieces, 3232..3456 eighths). Now every claiming channel of THIS
+  // water within twice the nearest's d2 (+64) is averaged, weighted by how
+  // much nearer it is than that cutoff -- a weight that falls to 0 at the
+  // cutoff, so the surface is continuous wherever the set changes. Integer,
+  // offsets from the nearest's surface clamped to RIVER_FOREIGN (weights
+  // >> 4 keep every sum inside i32); the CPU twin computes the same.
   var foreignHi = false;
   if (inCh) {
     let wv = (w8Min - 1) >> 3u;
     let tol = RIVER_FOREIGN + mNear;
     foreignHi = hiFS > wv + tol;
-    if (loFS < wv - tol) {
+    let reFloor = loFS < wv - tol;
+    if (reFloor) {
       floorMin = 1048576;
       mCh = 1;
       crest8 = -8388608;
       curt8 = -8388608;
-      for (var k = 0u; k < n; k++) {
-        let sid = wmSiteK(lst, k);
-        if (wmSiteKind(sid) != WM_SITE_RIVER) { continue; }
-        let p = rivPieceAt(sid, x, z);
-        if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol) { continue; }
+    }
+    let cut = 2 * chD2 + 64;
+    var wsum = 0;
+    var acc = 0;
+    for (var k = 0u; k < n; k++) {
+      let sid = wmSiteK(lst, k);
+      if (wmSiteKind(sid) != WM_SITE_RIVER) { continue; }
+      let p = rivPieceAt(sid, x, z);
+      if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol || p.s - p.m > wv + tol) { continue; }
+      if (reFloor) {
         mCh = max(mCh, p.m);
         floorMin = min(floorMin, p.floorY);
         if (p.strip == 1) { crest8 = max(crest8, p.edgeT8); }
         if (p.strip == 2) { curt8 = max(curt8, p.edgeT8); }
       }
+      let wt = (cut - p.d2) >> 4u;
+      if (wt > 0) {
+        wsum += wt;
+        acc += wt * clamp(p.s8 - w8Min, -8 * RIVER_FOREIGN, 8 * RIVER_FOREIGN);
+      }
     }
+    if (wsum > 0) { w8Min += acc / wsum; }
   }
   var h = h0;
   var water = -1;
