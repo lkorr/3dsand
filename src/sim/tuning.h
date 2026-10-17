@@ -3359,6 +3359,12 @@ struct Tuning {
     // authored level with this chance per 1024 per CA visit (two a tick).
     // 32 drains a full eighth-stack cell in ~4 s; 0 turns the stage off.
     int stillWaterRelax = TPD(sim, stillWaterRelax);
+    // What a held river carries dissolved (blood, ink, salt) drifts
+    // downstream along a LEVEL reach -- where the surface does not fall and
+    // so gives no direction of its own -- at this many /256 of the upstream
+    // cell's mass per pair visit (sim_solute.wgsl THE DRIFT). 24 reads as a
+    // slow current; 0 = off (it then only diffuses there).
+    int soluteDrift = TPD(sim, soluteDrift);
 
     // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
     //

@@ -333,6 +333,92 @@ struct SolOracle {
   }
 };
 
+// ---- X. dissolved mass drifts downstream on a level reach ------------------
+// Ticket 2026-10-17_00-01-44: "blood solute in water should also slowly
+// drift in the direction of water current". THE DRIFT (sim_solute.wgsl): at
+// one (T8, drop distance) the column nearer the river's mouth (the still
+// table's MOUTH words, worldgen `cols`) ranks lower. Ink poured on main an
+// eighth of the way down; the mass-weighted network distance to the mouth of
+// the ink near the pour must fall by rivers.driftMin voxels in driftTicks.
+// Measured over a disc round the pour only, so V's ink further down is not
+// counted.
+bool PassSoluteDrift(Ctx& c, sandvox::support::TickCursor& tick, const worldmap::WorldMapData::River& main,
+                     std::vector<std::string>& problems) {
+  const SoluteDef* ink = CurrentSoluteNamed("ink");
+  if (!ink || main.line.size() < 16) {
+    problems.push_back("X: needs the `ink` species and main's line");
+    std::printf("rivers: X solute drift: FAIL (no ink or no line)\n");
+    return false;
+  }
+  const auto& P = main.line[main.line.size() / 8];
+  const int px = P[0], pz = P[1], py = P[2];
+  const int radius = static_cast<int>(BaselineNumber("rivers.driftRadius", 90));
+  const size_t L = size_t(kWorldN) * kWorldN * 4u + 4u;
+  std::vector<uint32_t> tab(L + size_t(kWorldN) * kWorldN);
+  auto census = [&](double& mean, uint64_t& mass, int& mouthCols) {
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), 0, tab.data(), tab.size() * 4,
+                          "rvDriftStill");
+    SolLayerR S;
+    ReadSolLayerR(c, S);
+    double sum = 0;
+    mass = 0;
+    mouthCols = 0;
+    for (int dz = -radius; dz <= radius; dz += 4)
+      for (int dx = -radius; dx <= radius; dx += 4) {
+        const size_t ci = size_t((pz + dz) & int(kWorldN - 1)) * kWorldN + size_t((px + dx) & int(kWorldN - 1));
+        if (tab[L + ci] != 0u) mouthCols++;
+      }
+    for (uint32_t sl = 0; sl < kNumSlots; sl++) {
+      if (S.table[sl] == 0u) continue;
+      const IVec3 wc = c.world.SlotToWorldChunk(sl);
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t m = S.Value(sl, k) & 0xFFu;
+        if (m == 0u) continue;
+        const int x = wc.x * 16 + int(k % 16), z = wc.z * 16 + int(k / 256);
+        if ((x - px) * (x - px) + (z - pz) * (z - pz) > radius * radius) continue;
+        const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
+        const uint32_t mo = tab[L + ci];
+        if (mo == 0u) continue;
+        sum += double(m) * double(mo - 1u);
+        mass += m;
+      }
+    }
+    mean = mass ? sum / double(mass) : 0.0;
+  };
+  const uint32_t units = static_cast<uint32_t>(BaselineNumber("rivers.soluteUnits", 1600));
+  sandvox::support::TickOps pour;
+  pour.cells.push_back(CellOp{World::SlotCellIndex(IVec3{px, py + 2, pz}), CellOpSolute(ink->species, units)});
+  tick(pour);
+  for (int k = 0; k < 30; k++) tick();
+  double m0 = 0, m1 = 0;
+  uint64_t mass0 = 0, mass1 = 0;
+  int cols0 = 0, cols1 = 0;
+  census(m0, mass0, cols0);
+  const int driftTicks = static_cast<int>(BaselineNumber("rivers.driftTicks", 900));
+  std::string curve;
+  for (int k = 1; k <= driftTicks; k++) {
+    tick();
+    if (k % 300 == 0) {
+      double mk = 0;
+      uint64_t massk = 0;
+      int colsk = 0;
+      census(mk, massk, colsk);
+      curve += Format(" %d:%.1f/%llu", k, mk, (unsigned long long)massk);
+    }
+  }
+  census(m1, mass1, cols1);
+  const double driftMin = BaselineNumber("rivers.driftMin", 8.0);
+  const bool xOk = cols0 > 0 && mass0 > 0 && m0 - m1 >= driftMin;
+  std::printf("rivers: X solute drift: %s (ink at main's eighth (%d,%d) y%d, %d river columns with a mouth word in "
+              "the disc; mean distance to the mouth %.1f -> %.1f after %d ticks (fell %.1f >= %.1f), mass in the disc "
+              "%llu -> %llu; tick:mean/mass%s)\n",
+              xOk ? "PASS" : "FAIL", px, pz, py, cols0, m0, m1, driftTicks, m0 - m1, driftMin,
+              (unsigned long long)mass0, (unsigned long long)mass1, curve.c_str());
+  RecordObserved("rivers.observedDrift", Format("%.1f", m0 - m1));
+  if (!xOk) problems.push_back(Format("X: drift %.1f voxels (>= %.1f), %d mouth columns", m0 - m1, driftMin, cols0));
+  return xOk;
+}
+
 bool PassSoluteCarried(Ctx& c, sandvox::support::TickCursor& tick, const worldmap::WorldMapData::River& falls,
                        std::vector<std::string>& problems) {
   const SoluteDef* ink = CurrentSoluteNamed("ink");
@@ -341,6 +427,15 @@ bool PassSoluteCarried(Ctx& c, sandvox::support::TickCursor& tick, const worldma
     std::printf("rivers: V solute carried: FAIL (no `ink` species or no waterfall)\n");
     return false;
   }
+  // V measures the CARRY: the drift (sim.soluteDrift, pass X) is a long-running
+  // current by design -- ink keeps moving downstream until it reaches the
+  // window's face -- so with it on, (c)'s "the carry has terminated" can never
+  // be read. Off for this pass, restored on the way out.
+  struct DriftOff {
+    Tuning saved = CurrentTuning();
+    DriftOff() { Tuning t = saved; t.sim.soluteDrift = 0; SetCurrentTuning(t); }
+    ~DriftOff() { SetCurrentTuning(saved); }
+  } driftOff;
   // The first fall: its sample is the first of the reach BELOW (worldwater.cpp
   // step 9); the one before it is the upper reach's last.
   const auto& F = falls.falls[0];
@@ -1674,6 +1769,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
       }
       // ---- V. the held flow carries solute (sim_solute.wgsl), after S ----
       PassSoluteCarried(c, tick, *rFalls, problems);
+      // ---- X. ... and drifts downstream on a level reach ----
+      PassSoluteDrift(c, tick, *rMain, problems);
       // ---- W. gravel poured into the river does not lift it onto the pile ----
       // (After S: a pile in main beside S's mouth floods the stream's mouth.)
       // Ticket 2026-10-17_00-02-59: a grain sinking into held water swapped

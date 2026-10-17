@@ -2974,7 +2974,13 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       // words written above are re-written, and word 7 stays 0.
       r[kS_Radius] = U(s.radius); r[kS_PadMargin] = U(s.padMargin);
       r[kS_RivHwB] = U(s.hwB);
-      r[kS_RivDepthA] = U(s.depthA); r[kS_StampOff] = 0u; r[kS_RivDepthB] = U(s.depthB);
+      // Depth in the low byte (<= kRiverDepthMax), the network distance to the
+      // mouth above it (24 bits; worldgen.wgsl riverMouthAt).
+      auto dm = [](int d, int m) {
+        return (static_cast<uint32_t>(std::clamp(d, 0, 255))) |
+               (static_cast<uint32_t>(std::clamp(m, 0, 0xFFFFFF)) << 8);
+      };
+      r[kS_RivDepthA] = dm(s.depthA, s.mouthA); r[kS_StampOff] = 0u; r[kS_RivDepthB] = dm(s.depthB, s.mouthB);
       r[kS_RivSurf] = U(s.surf);
       r[kS_RivBed] = (s.bed & 0xFFFu) | ((static_cast<uint32_t>(s.wflags) & 15u) << 12) |
                      (static_cast<uint32_t>(std::clamp(s.len, 0, 1023)) << 16);

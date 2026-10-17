@@ -128,6 +128,14 @@ const GEN_V_MAT_SHIFT : u32 = 4u;
 // (the reader); `--gate lake-settle` fails if the two ever disagree, because
 // a reader that never matches a tag never levels anything.
 const STILL_WORDS : u32 = 4u;
+// THE MOUTH WORDS (2026-10-17, ticket 2026-10-17_00-01-44): one per window
+// column in their own region after the records and the conduit's four ledger
+// words (so the records keep their stride): a river column's network distance
+// to its final mouth + 1 (riverMouthAt), 0 for anything else. The downstream
+// direction a LEVEL reach has nowhere else; sim_solute.wgsl drifts what is
+// dissolved in held water toward the smaller number. Same tag discipline as
+// the records: `cols` rewrites it with its record.
+const STILL_MOUTH : u32 = WORLD_N * WORLD_N * STILL_WORDS + 4u;
 fn stillIndex(x : i32, z : i32) -> u32 {
   return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
 }
@@ -2476,8 +2484,10 @@ fn rivPieceAt(sid : u32, x : i32, z : i32) -> RivPM {
   p.edgeT8 = 8 * p.lipV + 8 - fallDrop8(cd);
   p.floorY = s;
   if (d2 < hw * hw) {
-    let da = wmSiteI(sid, WM_S_RIV_DEPTH_A);
-    let dep = da + (((wmSiteI(sid, WM_S_RIV_DEPTH_B) - da) * tq) >> 8u);
+    // Depth in the words' low byte; the network distance to the mouth rides
+    // above it (worldmap.cpp, riverMouthAt).
+    let da = wmSiteI(sid, WM_S_RIV_DEPTH_A) & 0xFF;
+    let dep = da + ((((wmSiteI(sid, WM_S_RIV_DEPTH_B) & 0xFF) - da) * tq) >> 8u);
     var drop = (dep * (hw * hw - d2)) / (hw * hw);
     if ((fl & RIV_PROFILE_V) != 0u) { drop = (dep * (hw - isqrtLe(d2, hw))) / hw; }
     p.floorY = s - drop;
@@ -2485,6 +2495,33 @@ fn rivPieceAt(sid : u32, x : i32, z : i32) -> RivPM {
   p.bank = max(bank, RIVER_LIP);
   p.bed = u32(bw) & 0xFFFu;
   return p;
+}
+// The network distance to the mouth (worldmap.h River::mouth) of the NEAREST
+// river channel claiming (x, z), + 1; 0 where no channel does. Only `cols`
+// asks (the still table's mouth word), never the far kernels.
+fn riverMouthAt(x : i32, z : i32) -> u32 {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  var best = -1;
+  var out = 0u;
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_RIVER) { continue; }
+    let p = rivPieceAt(sid, x, z);
+    if (!p.ok || p.d2 >= p.hw * p.hw) { continue; }
+    if (best >= 0 && p.d2 >= best) { continue; }
+    best = p.d2;
+    let ax = wmSiteI(sid, WM_S_X);
+    let az = wmSiteI(sid, WM_S_Z);
+    let vx = wmSiteI(sid, WM_S_BOX_X1) - ax;
+    let vz = wmSiteI(sid, WM_S_BOX_Z1) - az;
+    let l2 = max(vx * vx + vz * vz, 1);
+    let tq = (clamp((x - ax) * vx + (z - az) * vz, 0, l2) * 256) / l2;
+    let ma = i32(bitcast<u32>(wmSiteI(sid, WM_S_RIV_DEPTH_A)) >> 8u);
+    let mb = i32(bitcast<u32>(wmSiteI(sid, WM_S_RIV_DEPTH_B)) >> 8u);
+    out = u32(max(ma + (((mb - ma) * tq) >> 8u), 0)) + 1u;
+  }
+  return out;
 }
 fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, LandCol>) {
   if (T.labMode != 0u) { return; }
@@ -7539,6 +7576,11 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
       }
       stillWater[si] = tag;
       stillWater[si + 1u] = sv;
+      // THE MOUTH WORD (STILL_MOUTH): a held river column's downstream
+      // direction. Only for the map's water; a lake and the sea have none.
+      var mouth = 0u;
+      if (sv != 0u && col.wet) { mouth = riverMouthAt(x, z); }
+      stillWater[STILL_MOUTH + si / STILL_WORDS] = mouth;
     }
     // Low byte the top cell's grains, next byte h - sedTop (clamped: 255 is
     // deeper than any wedge, i.e. the whole wedge is firm).

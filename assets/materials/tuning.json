@@ -728,6 +728,7 @@
     "waterRelevelGain": 8,
     "waterRelevelDepth": 32,
     "stillWaterRelax": 32,
+    "soluteDrift": 24,
     "waveMode": 1,
     "waveGravity": 98,
     "waveDepthCap": 10,

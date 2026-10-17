@@ -1558,6 +1558,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // snapshot, per tick, so a gate's SetCurrentTuning reaches it without a
     // pipeline rebuild.
     tp.stillWaterRelax = (uint32_t)std::clamp(wtun.sim.stillWaterRelax, 0, 1024);
+    tp.soluteDrift = (uint32_t)std::clamp(wtun.sim.soluteDrift, 0, 255);
     // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
     // for the WindQuantize reason — the rounding mode is part of what the sim
     // sees, so it is written here rather than left to a compiler flag. At the

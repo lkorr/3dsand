@@ -417,6 +417,23 @@ fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
   return bitcast<i32>(d << 12u) >> 12u;
 }
 
+// THE DRIFT (2026-10-17, ticket 2026-10-17_00-01-44: "blood solute in water
+// should also slowly drift in the direction of water current"). A LEVEL reach
+// -- equal T8 and equal drop distance across a pair -- has no direction in the
+// records, so the rank above left it to diffusion. worldgen `cols` writes a
+// river column's network distance to its mouth into the still table's MOUTH
+// words (worldgen.wgsl STILL_MOUTH, its own region after the records and the
+// conduit's ledger; + 1, 0 = none: a lake, the sea, a stream). It is the next
+// key of the rank, after r: at one (T8, r), the column nearer the mouth ranks
+// LOWER, and a pair across it moves sim.soluteDrift / 256 of the upstream
+// cell's mass a visit downstream -- slow, a current, not the carry's slug.
+// A function of the column only, so the rank stays a total preorder and
+// THE POTENTIAL's argument is unchanged: every drift lowers PHI. Mass the
+// drift brings to the window's downstream face stops there (as the carry's).
+const STILL_MOUTH : u32 = WORLD_N * WORLD_N * STILL_WORDS + 4u;
+fn solMouth(x : i32, z : i32) -> u32 {
+  return stillWater[STILL_MOUTH + stillIndex(x, z) / STILL_WORDS];
+}
 // The share of the upper cell's mass a carried pair moves per visit, of 256.
 // Every pair is visited once in 8 ticks per stride (24 phases), so at 96 a
 // unit at the top of a fall is most of the way down a 20-voxel curtain in a
@@ -473,7 +490,15 @@ fn solHeldOrder(cA : vec3<i32>, mA : u32, cB : vec3<i32>, mB : u32) -> i32 {
   // Side by side at one T8 and one y: the nearer the drop ranks lower; two
   // at the same distance are level (two fall cells at one y included).
   let rB = solDropDist(cB.x, cB.z, mB, tB, SOL_DROP_REACH);
-  if (rA == rB) { return 0; }
+  if (rA == rB) {
+    // THE DRIFT (above): +-3, toward the smaller distance to the mouth. A
+    // column without one (a lake, the sea, a stream) is level with all.
+    if (T.soluteDrift == 0u) { return 0; }
+    let gA = solMouth(cA.x, cA.z);
+    let gB = solMouth(cB.x, cB.z);
+    if (gA == 0u || gB == 0u || gA == gB) { return 0; }
+    return select(-3, 3, gA > gB);
+  }
   return select(-2, 2, rA > rB);
 }
 
@@ -482,7 +507,7 @@ fn solHeldOrder(cA : vec3<i32>, mA : u32, cB : vec3<i32>, mB : u32) -> i32 {
 // do" is EXACT: the upper cell is empty or the lower one is at its
 // saturation, which no later visit of this pair can change by itself.
 fn solCarry(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32, write : bool,
-            s : u32, aToB : bool, fA : u32, fB : u32, xA : u32, xB : u32) -> u32 {
+            s : u32, aToB : bool, fA : u32, fB : u32, xA : u32, xB : u32, rate : u32) -> u32 {
   let xh = select(xB, xA, aToB);
   let xl = select(xA, xB, aToB);
   if (xh == 0u) { return 0u; }
@@ -495,7 +520,7 @@ fn solCarry(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32, write : b
   // Stochastic rounding, as the diffusion's: a single unit still moves (with
   // chance SOL_HELD_CARRY / 256 a visit) instead of stalling the tail.
   let rnd = hash3(T.seed ^ 0xCA221EDu, T.tick, cellIndexW(cA)) & 255u;
-  let q = min(min((xh * SOL_HELD_CARRY + rnd) >> 8u, xh), cap - xl);
+  let q = min(min((xh * rate + rnd) >> 8u, xh), cap - xl);
   if (q == 0u) { return 1u; }
   if (!solWritable(cA) || !solWritable(cB)) { return 1u; }
   if (aToB) {
@@ -548,7 +573,7 @@ fn solStepCarry(cA : vec3<i32>, cB : vec3<i32>, wA : u32, wB : u32, aWet : bool,
   if (sl != 0u && sl != sh) { return 0u; }
   if (!solIsSolvent(mh, sh)) { return 0u; }
   let r = solCarry(hi, lo, vec3<i32>(0), 1u, write, sh, true, voxState(select(wB, wA, aWet)) + 1u,
-                   voxState(wl) + 1u, solMassOf(vh), solMassOf(vl));
+                   voxState(wl) + 1u, solMassOf(vh), solMassOf(vl), SOL_HELD_CARRY);
   if (r == 3u) {
     let ls = chunkSlotOf(worldChunkOf(lo), T.origin);
     if (ls != SLOT_NONE) { atomicOr(&dirtyOut[ls], DIRTY_R_SOLUTE); }
@@ -640,7 +665,10 @@ fn solPairExchange(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32,
   // diffuses one way only.
   let ord = solHeldOrder(cA, mA, cB, mB);
   if (ord == 2 || ord == -2) {
-    return solCarry(cA, cB, step, k, write, s, ord > 0, fA, fB, xA, xB);
+    return solCarry(cA, cB, step, k, write, s, ord > 0, fA, fB, xA, xB, SOL_HELD_CARRY);
+  }
+  if (ord == 3 || ord == -3) {
+    return solCarry(cA, cB, step, k, write, s, ord > 0, fA, fB, xA, xB, T.soluteDrift);
   }
   // The equalising amount, ROUNDED HALF DOWN rather than truncated: with
   // truncation a one-unit film over a clean full cell (8 : 0 in concentration)

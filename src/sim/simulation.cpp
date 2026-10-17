@@ -999,7 +999,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // [3] the eighths deposited / withdrawn so far (diagnostic: the
     // `stream-pool` gate reads them, the sim never does). The dense worldgen
     // Fill clears them with the table.
-    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u;
+    // ...plus ONE word per window column after the ledger (2026-10-17,
+    // worldgen.wgsl STILL_MOUTH): a river column's network distance to its
+    // mouth + 1 (0 = none), the downstream direction sim_solute.wgsl drifts
+    // dissolved mass along on a level reach. Its own region, so the four-word
+    // records and every reader of them keep their stride.
+    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u + (uint64_t)kWorldN * kWorldN;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
                                       rhi::BufferUsage::CopySrc,

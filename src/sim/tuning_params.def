@@ -1164,6 +1164,11 @@ TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32, 0, kWaterRelevelDepth
 // identity: stillWant returns before its first read. NO_WGSL: it reaches the
 // kernel as TickParams::stillWaterRelax (SubmitTick), so it is live.
 TP_I(sim, stillWaterRelax, NO_WGSL, 32, 0, 1024)
+// THE DRIFT (sim_solute.wgsl; ticket 2026-10-17_00-01-44): per 256 of the
+// upstream cell's dissolved mass moved downstream a pair visit along a level
+// held river reach. NO_WGSL: it reaches the kernel as TickParams::soluteDrift
+// (SubmitTick), so it is live; 0 turns the drift off.
+TP_I(sim, soluteDrift, NO_WGSL, 24, 0, 255)
 
 // ---- SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2) ----
 // The relevel relaxes and never overshoots. This is the overshoot: four

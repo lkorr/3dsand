@@ -25463,6 +25463,13 @@ its chunks stall and sleep when nothing lower has room (`docs/PLAN_solutes.md`
 downstream face is no sink).
 **The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted. Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
 
+**THE DRIFT** (2026-10-17, ticket 00-01-44): a level reach gives the held
+flow no direction, so worldgen `cols` writes each river column's network
+distance to its mouth (worldwater.cpp `River::mouth`, packed over the pieces'
+depth words) into the still table's own STILL_MOUTH region, and sim_solute's
+rank orders a level pair by it: `sim.soluteDrift`/256 (TickParams, live; 0 =
+off) of the upstream cell's dissolved mass moves downstream a visit. `rivers`
+X checks ink drifts downstream; V runs with it off.
 **Gate `rivers`** grew: **W** pours a 5x5 column of gravel half into main (ticket 2026-10-17_00-02-59: a grain sinking into AT-REST held water used to swap that water up onto the pile while the reservoir refilled the river, so water climbed every pile poured into a river; `tryMove` now returns displaced held water to the reservoir -- the source becomes air) and counts water standing on the pile (<= `rivers.gravelWaterMax`). **L** walks every waterfall of the SHIPPED map
 (`default`, CPU twin, a 41-column box round each) and counts leaking faces —
 water over a dry neighbour whose ground is under it, the sea excepted

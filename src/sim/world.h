@@ -3320,10 +3320,14 @@ struct TickParams {
   // above kFluidCap.
   uint32_t fluidExciteEnable = 0;
   uint32_t fluidSpawnCount = 0;
-  // PADDING (was the per-species splash material table, retired by W1-B2: a
-  // particle splashes as its own material). Keeps mirrorBase 16-byte aligned
-  // at the same offset; common.wgsl TickParams._padSplash is its twin.
-  uint32_t _padSplash[4] = {0, 0, 0, 0};
+  // sim.soluteDrift (0..255, /256 of the upstream cell's mass a visit): how
+  // fast what is dissolved in a held river drifts downstream on a level reach
+  // (sim_solute.wgsl THE DRIFT). 0 = off. Then three words of PADDING (the
+  // first word was too: the per-species splash table, retired by W1-B2),
+  // keeping mirrorBase 16-byte aligned at the same offset; common.wgsl
+  // TickParams.soluteDrift / _padSplash0..2 are the twins.
+  uint32_t soluteDrift = 0;
+  uint32_t _padSplash0 = 0, _padSplash1 = 0, _padSplash2 = 0;
   // WORLD chunk coord of the 3x3x3 CPU-mirror corner (World::MirrorBaseFor of
   // the player chunk — the SAME clamp EncodeReadbacks uses, or the fold and
   // the voxel mirror would describe different cubes). The seam's mirrorFold
