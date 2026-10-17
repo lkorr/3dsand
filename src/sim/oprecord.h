@@ -339,7 +339,8 @@ struct Header {
 //    same size, new meaning.
 // 7: Frame carries `tickets`, the chunk-ticket ops of the tick (tickets P1).
 // 8: TickInput grew `contractHash` + `demonRef` (76 -> 84 bytes, demons D5).
-constexpr uint32_t kRecordVersion = 8;
+// 9: TickInput grew `aimAt` + `aimValid` (84 -> 100 bytes, the bow's sight).
+constexpr uint32_t kRecordVersion = 9;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its

@@ -16723,6 +16723,32 @@ int main(int argc, char** argv) {
       // throttle above, the readback pump, the park probe, and the HANDOVER
       // of one TickInput. That handover IS the authority boundary.
       //
+      // THE BOW'S SIGHT (TickInput::aimAt; ticket 2026-10-16_11-02-47): the
+      // point the crosshair is on, settled HERE because only the frame has
+      // the render eye the reticle is drawn from (last frame's, `pourFrom`:
+      // the posed head in first person, the boom in third) and the pick cast
+      // from it -- per tick, after the pump above, so the pick is the
+      // freshest there is. A loose flies from the arrow rest AT this point.
+      // Only while a bow is up (session.bowHand, the tick's own record of
+      // it): one Jolt ray a tick, none otherwise.
+      if (session.bowHand >= 0) {
+        static std::vector<uint64_t> bowOwn;
+        bowOwn.clear();
+        avatar.AppendLiveLimbBodies(bowOwn);
+        if (playerBody) bowOwn.push_back(playerBody);
+        const Vec3 head = player.EyePos();
+        const Vec3 sight = pourFromValid ? pourFrom : head;
+        const Vec3 fwd = cam.Forward();
+        const Vec3 rest =
+            BowRestPoint(head, fwd, cam.Right(), cam.Up(),
+                         player.crouching && !player.prone,
+                         HandAt(session.bowHand) == Hand::Left);
+        feeder.SetAim(true, sight + fwd * BowSightDistance(world.Snap(), phys,
+                                                           bowOwn, sight, fwd,
+                                                           rest, kBowZeroVox));
+      } else {
+        feeder.SetAim(false, Vec3{});
+      }
       // `ti` is consumed here rather than inside, because consuming the
       // command is the frame layer's last act as the player's proxy: a server
       // would take the same value off the wire and call the same function.
