@@ -25675,7 +25675,15 @@ centre block, ~121 x 200 KB. The renderer reads it through `waterCurrentAt`
 the window grid's outer nodes, the vertical gate widened by the hit level's
 cell (a cascade water top may stand up to a cell over the true surface), and
 the far grid fades out over its own outer 16 nodes, where the footprint has
-already taken the streaks. A window hit is `currentAt` exactly.
+already taken the streaks. A window hit is `currentAt` exactly. A far hit's
+current under `FLOW_MARK_LO` (4 cm/s: the open sea and lakes away from their
+mouths) is zeroed, so it keeps the one-copy wave field it had before (the
+deadband), and its centre value is computed once per pixel. Cost,
+`--render-budget` baseline arm, worktree exe, GPU lock only (NOT exclusive, so
++-0.3 ms): peaksea 8.55 -> 10.04 ms without the deadband, 9.77 with it;
+cascade 3.45 -> 3.91. Not attributed further (the remaining far-water cost is
+the two grid samples, the side-kind reads and register pressure; an exclusive
+pair and `--shader-stats` are the next measurement).
 
 **Gates.** `rivers` passes I (main's middle runs downstream at no less than the
 floor, nothing in the air over it), K (the cross-section: 0.8 of the half-width

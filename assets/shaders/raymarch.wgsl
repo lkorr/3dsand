@@ -10626,19 +10626,47 @@ fn flowNearCover(p : vec3f) -> f32 {
 // waterFoam): currentAt on a window hit, the window grid handing over to the
 // far grid on a far one. The primitives and the measured flow are the same
 // terms currentAt adds (they bound themselves).
+//
+// THE FAR DEADBAND, and why it is the far side's alone. A sea or a lake far
+// from its mouths holds a solved current of a few mm/s, which buys nothing
+// visible -- the flow marks start at FLOW_MARK_LO (4 cm/s), a 4 cm/s drift of
+// the chop is not seen past the handoff -- but every such pixel paid
+// waveSlope's two-copy advection and the convergence's four taps of two
+// grids. Measured (--render-budget, worktree exe, both arms back to back, GPU
+// lock only): peaksea (the sea from 3 m: far water to the horizon) 8.55 ->
+// 10.04 ms without it. Under FLOW_MARK_LO a far hit's current is zero and the
+// one-copy wave field stands, as it did before the far grid existed. The
+// centre current of a far pixel is asked three times (the wave normal, the
+// foam lines, the convergence gate) and computed once (gFarCurP).
+var<private> gFarCurP : vec3f = vec3f(-1e30);
+var<private> gFarCurV : vec3f = vec3f(0.0);
 fn waterCurrentAt(p : vec3f) -> vec3f {
   if (gFlowSlack < 0.0) { return currentAt(p, &R); }
   if (R.currentRenderOn == 0u) { return vec3f(0.0); }
+  if (all(p == gFarCurP)) { return gFarCurV; }
   let wN = flowNearCover(p);
   var solved = vec3f(0.0);
   if (wN > 0.0) { solved += flowSolvedAt(0u, p, gFlowSlack) * wN; }
   if (wN < 1.0) { solved += flowSolvedAt(FLOW_FAR_BASE, p, gFlowSlack) * (1.0 - wN); }
-  return currentPrimAt(p, &R) + flowBlend(solved, flowMeasAt(p) * TUNE_CURRENT_MEASURED);
+  var v = currentPrimAt(p, &R) + flowBlend(solved, flowMeasAt(p) * TUNE_CURRENT_MEASURED);
+  if (dot(v.xz, v.xz) * (VOXEL_METERS * VOXEL_METERS) < FLOW_MARK_LO * FLOW_MARK_LO) {
+    v = vec3f(0.0);
+  }
+  // The first far ask of a pixel is its centre (shadeFarWater resets this).
+  if (gFarCurP.x == -1e30) {
+    gFarCurP = p;
+    gFarCurV = v;
+  }
+  return v;
 }
-// currentConvergeAt over waterCurrentAt (the same central difference).
+// currentConvergeAt over waterCurrentAt (the same central difference); on a
+// far pixel whose own current is in the deadband, none (no flow, no foam to
+// gather).
 fn waterConvergeAt(p : vec3f) -> f32 {
   if (gFlowSlack < 0.0) { return currentConvergeAt(p, &R); }
   if (R.currentRenderOn == 0u || !FLOW_BOUND) { return 0.0; }
+  let c = waterCurrentAt(p);
+  if (c.x == 0.0 && c.z == 0.0) { return 0.0; }
   let e = 1.5;
   let vx1 = waterCurrentAt(p + vec3f(e, 0.0, 0.0)).x;
   let vx0 = waterCurrentAt(p - vec3f(e, 0.0, 0.0)).x;
@@ -16064,8 +16092,10 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
                  bed : FarBed, level : u32, cell : vec3<i32>) -> vec3f {
   let up = nFace.y > 0.5;
   // No columns out here, so no macro slope and none of its current
-  // (gSlopeFlow); the solved current is waterCurrentAt's (gFlowSlack).
+  // (gSlopeFlow); the solved current is waterCurrentAt's (gFlowSlack), its
+  // centre value cached from the first ask on (gFarCurP).
   gSlopeFlow = vec2f(0.0);
+  gFarCurP = vec3f(-1e30);
   var n = nFace;
   if (up) {
     // The near field's waterNormal on open water: no macro slope, full fetch,
