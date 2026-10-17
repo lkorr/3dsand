@@ -255,3 +255,18 @@ Measured (`rivers` S: a channel dug from the lake ~12 voxels down to main, 153
 columns of its own): 153 wet by tick 300, all 153 adopted by tick 1050, its
 chunks 6 -> 0 awake by tick 1350; plugged, 147 released within 150 ticks (the
 6 left stand level with main, which supports them as its own).
+
+## Solute rides the held flow (`sim_solute.wgsl`, landed 2026-10-16)
+
+Ticket 2026-10-16_11-11-51: held water never moves, so nothing dissolved in it
+travelled -- blood poured at the top of a waterfall stayed there. The solute
+pair exchange now reads the still table (binding 58, `R(StillWater)` on
+`solDiffuse`, a text-identical copy of `stillLevel8` held to sim_step's by
+`check_invariants.py stilllevel`) and CARRIES mass one way across the held
+flow's potential: rank (T8, distance to a drop of a voxel or more within 4
+columns, y in a fall column), unheld lowest; down a ramp, over the brink, down the curtain, out into the reach
+below. Equal ranks still only diffuse, so a lake, the sea and a flat reach
+are unchanged. Termination: SUM mass x rank strictly falls with every carry
+(full argument: `docs/PLAN_solutes.md` §3.5). Gate: `rivers` V.
+
+**The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted (`rivers` V, first run: 13 chunks awake at tick 4600, MOVE+equalize+bridge). Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.

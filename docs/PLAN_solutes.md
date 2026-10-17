@@ -291,6 +291,94 @@ ever covers bodies >= 65,536 voxels and **refuses straddles** (`waterbody.h:463`
 so it can never be the only mechanism. §3.3 must stand alone and be correct
 without it. Do not build P4 until `waterBodyMode=1` has landed on its own merits.
 
+### 3.5 Held water carries what is dissolved in it (BUILT 2026-10-16)
+
+Ticket 2026-10-16_11-11-51: blood poured at the top of a waterfall stayed at
+the top. A map river, a waterfall's crest and curtain and an adopted stream
+are HELD water (DESIGN.md §5b.13): voxels at rest that the CA never moves, and
+the CA is what carries solute. So in held water the pair exchange
+(`sim_solute.wgsl`, "THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT") moves mass
+down the held flow itself.
+
+**The potential.** Every liquid cell has a rank in one total preorder: a cell
+whose column holds no target for its liquid (unheld) is lowest; a held cell
+ranks by (T8, r, h) lexicographically -- T8 its column's target from the still
+table; r its DROP DISTANCE (`solDropDist`: how many columns along an axis,
+through held columns at the same T8, to one at least a voxel under it -- 1 for
+a FALL column such as the curtain's outer strip, 2..4 for the inner strip, the
+crest and the last voxels of the approach, 5 for everything else); h its own y
+in a fall column, else 0. Equal ranks exchange by plain §3.3 diffusion (a lake,
+a flat reach, a vertical pair outside a fall). Unequal ranks move mass ONE way,
+high to low: two held cells are CARRIED (`solCarry`: 96/256 of the upper cell's
+mass a visit, stochastically rounded, up to the lower cell's saturation,
+whatever the lower holds); held over unheld diffuses only out of the held
+cell. All four strides take part. Laterally the carry is down a ramp or a
+rapid (the smaller T8) and, at one T8, toward the drop (over the crest, across
+the curtain); vertically, only in a fall column, it is down the curtain to its
+foot, where the reach below (a smaller T8) takes it on sideways.
+
+**Termination.** PHI = SUM mass x rank falls by at least one with every carry
+and every one-way diffusion; an equal-rank exchange leaves PHI alone and
+lowers D = SUM m^2/f (§3.3's argument); the fade and the floor only remove
+mass. (PHI, D) is bounded below and falls lexicographically with every write,
+so nothing cycles, and when every unit stands where no lower-ranked neighbour
+has room only d == 0 diffusion is left and the chunks stall and sleep. Unheld
+is LOWEST rather than "level" on purpose: an unheld pocket dug beside a curtain
+touches it at many heights, and plain diffusion through it would lift what the
+curtain carried down -- the pair would run for ever. A pair whose partner is
+out of the window is no pair, so mass reaching the downstream face stops there
+(capped at saturation) and stalls.
+
+**Limits, as built.** The table has no flow direction for a FLAT reach: a
+reach whose T8 does not fall (between a smooth river's eighth-steps the long
+stride pairs bridge it; a `stepVox` 24 reach of hard steps only is flat end to
+end) moves mass only by diffusion until it is within a stride pair of a
+lower-ranked column -- in practice the last ~12 voxels before a brink (the
+drop distance's 4 plus a stride of 8) are carried, the rest of a flat reach
+only diffuses. A wider drop reach costs four still-table lookups a column for
+every pair with mass at one T8 (a blood cloud in a lake pays it). A surface that steps down a whole cell ON A SILL -- the
+waterfall's crest (one cell of water on stone; since THE BRINK the curtain's
+top is a cell lower), a stream one cell deep -- has no axis-aligned liquid pair
+across the step, so a stride-1 lateral pair with one cell wet and one dry
+carries from the wet cell into the cell UNDER the dry one when the wet cell
+stands on a non-liquid and outranks it (`solStepCarry`; the single-owner
+argument is in its header: the only other pair that could touch either cell
+is the one a row down, which is inert or would need the opposite rank order).
+Measured before it: on main's brink geometry ink poured above the fall stayed
+above it for 3,600 ticks (0 of 3,200 units below). There is no sink at the window's downstream face: what a river
+carries out of view piles there up to saturation (blood fades away there like
+anywhere; ink and salt stay until the window moves).
+
+Gate: `rivers` pass V (`PassSoluteCarried`): ink poured above `falls`' first
+waterfall must reach the reach below, balance the ledger and sleep
+(`tests/baseline.json` `rivers.solute*`).
+
+**The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted (`rivers` V, first run: 13 chunks awake at tick 4600, MOVE+equalize+bridge). Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
+
+**Next: drift on a FLAT reach (owner ticket 2026-10-17_00-01-44, NOT built).**
+"Blood in water should also slowly drift in the direction of the current" --
+on a level reach the still table has no direction, so the carry above leaves
+it to diffusion. The clean way is a fourth term in the rank, between r and h:
+the column's ARC TO THE MOUTH, baked with the target. `waterApply` already
+knows, per column, the nearest claiming piece and `tq` (the position along
+it); the bake knows each piece's arc offset along its river (pieces are
+emitted in order, `st.len`). So `cols` can write arc8 = (arc of the piece's
+end A + tq * len / 256), monotone increasing downstream across the whole river
+(a tributary's continues from its join), into a FIFTH still word (STILL_WORDS 4
+-> 5: worldgen.wgsl `cols` + `wg_fill_stillWater`, sim_stream.wgsl's copy,
+sim_step's and this file's copies, the 4 MiB -> 5 MiB buffer, the `rivers` S
+readback). Equal (T8, r) then ranks by arc: a slow one-way DRIFT (a small
+SOL_HELD_DRIFT, a few /256, so it reads as a current, not a slug) toward the
+larger arc. Termination is unchanged -- arc is a function of the column, so the
+rank stays a total preorder and SUM mass x rank still falls with every move;
+lakes and the sea carry arc 0 (level, diffusion only), and an adopted stream
+inherits the arc of the hop-0 column it was fed from + its hop. Rejected: the
+render flow field (`flowfield.*`, `flowGridAt`) is float, solved on the CPU
+for the look -- the sim may not read it (rule 1); a look-ahead scan for the
+nearest lower T8 is O(reach) still-table reads per pair and arbitrary in
+reach. Ramps already drift: a stride-8 pair spans the eighth-steps of any
+ramp of up to 1 voxel per 48 columns once in a few pairs.
+
 ## 4. Concentration-dependent behaviour
 
 Not `if (mass > X)` in the kernel — that is behaviour as code, one branch per

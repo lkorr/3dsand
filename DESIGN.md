@@ -25393,6 +25393,27 @@ white water, not black streaks and glowing flecks (2026-10-16 tickets
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
 
+**What is dissolved in held water rides it** (`sim_solute.wgsl`, THE HELD
+FLOW CARRIES WHAT IS DISSOLVED IN IT; ticket 2026-10-16_11-11-51). Held water
+never moves, and the CA is what carries solute, so blood poured at the top of a
+waterfall used to stay there. The solute pair exchange now reads the still
+table too (`R(StillWater)` on `solDiffuse`; its `stillLevel8` is sim_step's,
+held text-identical by `check_invariants.py stilllevel`) and ranks every liquid
+cell: unheld lowest, a held cell by (T8, its column's distance along an axis
+to a held column a voxel or more under it -- 1 for a FALL column, up to 4 --
+then its y in a fall column). Equal ranks
+diffuse as before (a lake, the sea, a flat reach); unequal ranks move mass one
+way, high to low -- two held cells are CARRIED (96/256 of the upper cell's mass
+a visit, up to the lower one's saturation: down a ramp, over the brink, down
+the curtain, out into the reach below; and across a one-cell STEP on a sill --
+the crest over the curtain's top -- from the wet cell into the cell under the
+dry one, `solStepCarry`), held over unheld diffuses only out.
+SUM mass x rank strictly falls with every one-way move, so it cannot cycle and
+its chunks stall and sleep when nothing lower has room (`docs/PLAN_solutes.md`
+§3.5 has the argument and the limits: a flat reach only diffuses, the window's
+downstream face is no sink).
+**The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted. Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
+
 **Gate `rivers`** grew: **L** walks every waterfall of the SHIPPED map
 (`default`, CPU twin, a 41-column box round each) and counts leaking faces —
 water over a dry neighbour whose ground is under it, the sea excepted
@@ -25424,7 +25445,8 @@ water only over a held column whose surface is below it (and prints every
 piece's view of a leak), **R** scoops a crater out of the river (it refills) and
 cuts a breach through its bank (it floods), **S** digs a channel from the lake
 down to the river (it runs, is adopted and its chunks sleep; plugged, it is
-released). G measured 0 active chunks after 800 ticks over the whole fixture.
+released), **V** pours ink above a waterfall (it reaches the reach below, the
+ledger balances, its chunks sleep). G measured 0 active chunks after 800 ticks over the whole fixture.
 
 ## 9d. The current field, and surface waves (added 2026-08-29)
 
