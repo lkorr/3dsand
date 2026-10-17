@@ -11706,7 +11706,6 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   // pixels back and forth across the threshold and the surface breaks into
   // per-pixel speckle instead of reading as one continuous sheet.
   let horizon = smoothstep(-0.06, 0.02, rr.y);
-  if (horizon <= 0.0) { return reflectionSkyBlur(rr, blur); }
   // Step budget, not distance: this is one secondary ray per water pixel and a
   // lake can fill the screen, so this number is a direct frame-time multiplier
   // on water-heavy views. Rays that run out return sky, which is what a long
@@ -11727,16 +11726,28 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   // material and the palette variant, and a coarse hit has no word (a 4^3
   // block holds up to 64 materials). Every caller that reads `word` passes
   // 1e30; see the traceOpaque header in common.wgsl.
-  let h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
-                      &occupancy, &materials);
-  rsAdd(RS_REFLECT, h.steps);
-  if (!h.hit) { return reflectionSkyBlur(rr, blur); }
+  //
+  // ONE reflectionSkyBlur CALL SITE (2026-10-17, shader slimming). The three
+  // exits -- below the horizon blend, a miss, a hit mixed over the sky -- all
+  // want reflectionSkyBlur(rr, blur), and as three call sites it was three
+  // inlined copies of the sky (airglow, night glow, stars, cloud env) in each
+  // of the fragment shader's five traceReflection copies. Every path still
+  // evaluates it exactly once, AFTER the trace exactly as the hit path's
+  // mix() did, so nothing new is live across the reflected march.
+  var h : OpaqueHit;
+  h.hit = false;
+  if (horizon > 0.0) {
+    h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
+                    &occupancy, &materials);
+    rsAdd(RS_REFLECT, h.steps);
+  }
+  let sky = reflectionSkyBlur(rr, blur);
+  if (!h.hit) { return sky; }
 
   // Reflected geometry is seen across the water plus its own distance, so it
   // takes aerial perspective too — without this, a reflected far hillside is
   // sharper than the real one and the reflection reads as a decal.
-  return mix(reflectionSkyBlur(rr, blur), applyAerial(shadeSecondaryHit(h), rr, h.t),
-             horizon);
+  return mix(sky, applyAerial(shadeSecondaryHit(h), rr, h.t), horizon);
 }
 
 // Shade a SECONDARY ray's hit with the same terms as a primary hit, minus the
