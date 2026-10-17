@@ -19216,24 +19216,36 @@ where you hear from either (§12b, "The ears are on the character").
     its heads 10.4 % / 0.7 % -> 13.0 % / 5.7 %. Known: a near card's head
     zone stops at the top cell (a blade whose tip is under 0.6 voxel into it
     loses up to 0.25 voxel of head the far card draws).
-  - **NOT FIXED: low-sun direct light.** At minute 960 (sun ~20 degrees) the
-    trend-corrected luma step at the line is +6.6 (far brighter), unchanged by
-    the above, and the far side keeps brightening ~10 luma over the next ~25
-    rows while the near side is flat. Its terms (encoded, step at the line):
-    raw Lambert +17.5 (the far staircase eases to the smooth heightfield
-    normal -- `farFootprintFade` wN / `farTerraceLightW` wL, both keyed to
-    start at the handoff, so the near side has no matching ramp) and the raw
-    sun shadow +17 (the far contact shadow is lighter past the line);
-    openness +29 at that hour comes through the same closed form. Noon +2.0,
-    night ~+1. The fix is the same shape as the openness band (one weight
-    across the line, the near shade taking the far's staircase average and
-    shadow law as it nears the sphere), not done here.
+  - **Low-sun direct light: measured, no step to fix -- read this before
+    "fixing" it.** At minute 960 (sun ~20 degrees) the whole-frame luma
+    profile across the line extrapolates to +6.6 (far brighter), and a first
+    reading blamed the far staircase average (`farFootprintFade` wN /
+    `farTerraceLightW` wL) and a lighter far contact shadow. Split by CLASS
+    (plant / tread / riser, from `SEAM_DBG` 1 materials and `SEAM_DBG` 4 face
+    weights of the same frame) the step is not in the shading: 6 rows either
+    side, final luma far - near is plant -2.5, tread -1.1, riser -2.6 (noon
+    -2.3 / -0.8 / -1.8, night -0.7 / -0.5 / +0.7). The +6.6 is COMPOSITION
+    -- the TREAD share of the ground pixels is ~0.64 a few rows past the line
+    and ~0.40 a few rows inside it on this camera, which looks over a crest,
+    and the same rows drawn with the handoff pulled in to 17 m (all of them
+    far) show the same drop (0.68 / 0.51 / 0.37 at -9 / 0 / +3 rows): it is
+    the terrain, not the seam -- plus the line's own row (the boundary row lands on step edges, a
+    +2-4 bump that the seamless 8 m arm shows at the same pixels). wN and wL
+    are 0 at the handoff by construction (`farFootprintFade` clamps its
+    start to the handoff's footprint; `farTerraceLightW` starts there), so
+    the far smoothing is a ramp past the line, not a step; giving the near
+    side a matching ramp would flatten the last 6 m of near terraces to buy
+    nothing at the line. What is left per class (far ~2 darker at noon and
+    low sun) has opposing terms underneath: risers' raw sun shadow is
+    lighter far (+14 encoded) while their bounce is much lower far (near
+    gather ~2.4x the closed form); treads' far shadow is slightly darker.
   Method: the line is read off a `SEAM_DBG` 1 frame's side channel (R 0.5
   near / 1 far), then every term is averaged per column in row bands either
-  side of it; a step is the two sides' linear fits extrapolated to the line.
-  The same-pixel arms alone miss a step that sits AT the line (the near arm's
-  rule near the handoff is not the far arm's), which is how the card mile
-  asymmetry hid.
+  side of it, PER CLASS: a whole-frame profile mixes shading with what the
+  ground is doing at that distance. The same-pixel arms (handoff 8 m) miss a
+  step that sits AT the line (the near arm's rule near the handoff is not the
+  far arm's), which is how the card mile asymmetry hid, and at 9-20 m they
+  carry the far arm's wL ramp, which the shipped frame never shows there.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
