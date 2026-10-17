@@ -18543,7 +18543,10 @@ where you hear from either (§12b, "The ears are on the character").
   - **The handoff band** (`farBandNearWeight`, raymarch.wgsl): a cascade hit
     between the sphere and 22.3 m still sits over window cells the near field
     has measured, so its OPENNESS is read from the near grid there and eased
-    to the far constant across the band — never on the stepping face. This was
+    to the far constant across the band — never on the stepping face. (Since
+    2026-10-16 the band STRADDLES the sphere: it starts `FAR_BAND_IN_M` 6 m
+    inside it, the near shade easing its grid toward the far law there; see
+    "The band straddles the sphere" after the sea-seam entries.) This was
     ATTRIBUTED, not guessed: a temporary debug output wrote each shading term
     (albedo, face, wrapped Lambert, shadow, AO, ambient, GI, openness,
     pre-aerial colour, aerial fraction, final) for near and far pixels, and the
@@ -18708,7 +18711,8 @@ where you hear from either (§12b, "The ears are on the character").
   - **Plants hand over instead of vanishing.** B's per-column vanish distance
     (16-20 m) now switches a plant cell to its FAR FORM (`bladeCardHit`): one
     vertical card per column, yaw (8 steps) and offset hashed from the column,
-    carrying a row of blades that cover `BLADE_COVER` (0.45) of its length;
+    carrying a row of blades that cover `BLADE_COVER` (0.45; 0.75 since
+    2026-10-16, with a per-blade head, "The band straddles the sphere") of its length;
     blades are never drawn thinner than 0.8 px, so as a pixel grows they widen
     and thin (lattice offset per column) — coverage kept by PROJECTED PIXEL
     SIZE, not cut at a distance. The far field draws the same function from
@@ -18727,7 +18731,11 @@ where you hear from either (§12b, "The ears are on the character").
     the same odds; what is given up is a plant seen against ground more than
     1.6 m behind it (a stand's crest edge, a sparse tussock's upper part).
     The cover tint now applies only where the features are gone
-    (`1 - farFeatKeep`, 67-87 m).
+    (`1 - farFeatKeep`, 67-87 m). (2026-10-16: the near side tests them only
+    for a ray it RESOLVED; an unresolved ray's last mile is walked by
+    `farFeatMarch`, which may start up to `FAR_CARD_MILE` inside the handoff,
+    because only it knows where the ground is -- "The band straddles the
+    sphere".)
   - **Past the features' fade the march does not walk** (2026-10-03,
     raymarch-far): every card's coverage is scaled by `farFeatKeep` of its
     cell's entry t, which is never before the walk's start, and the keep only
@@ -19200,6 +19208,78 @@ where you hear from either (§12b, "The ears are on the character").
     definition fan from the bed face, but that is a second inlined copy of
     the fan in fs (farWaterBed has two shading call sites) and was not
     taken without a register measurement.
+  **The band straddles the sphere, and a meadow's far form is its model
+  (2026-10-16, ticket 2026-10-16_11-03-34: flying low over the default map's
+  tall-grass meadow at night, "clear shadow differences or grass rendering
+  differences on the first lod seam, expanding like a sphere").** Attributed
+  with the same-pixel arms (`render.lodHandoffDist` 8 vs 20.5, `SEAM_DBG` 1 /
+  2 / 3 / 12) at the ticket's camera, and with luma profiles against the row
+  offset from the shipped frame's near/far line. Three terms, two fixed:
+  - **Openness on open ground.** The far law there is the closed form (tread
+    1, riser 0.6: the patch fan runs only where `farGroundOver` finds
+    something standing near), the grid is per 40 cm block, and its treads
+    darken in front of every step (11-17 % of the tread pixels read under 1:
+    the soft dark blotches). The band from the grid to that law was the 1.8 m
+    of ground PAST the line -- a few pixel rows at eye height. Under the moon
+    the ambient is nearly all the light, so it was the night's seam. Now one
+    weight (`bandGridWeight`) runs from `FAR_BAND_IN_M` (6 m) inside the
+    sphere to `FAR_BAND_END_M` past it: the near shade applies it where the
+    far patch would keep the closed form (`nearFarClosedForm`, a copy of the
+    prefilter: MUST AGREE with shadow_resolve.wgsl `farGroundOver`; where it
+    fires the far measures the definition, which the grid already is), the
+    far shade continues it. Openness step at the line (encoded, the measured
+    pixels, 6 rows either side): +4.7 -> -1.4; final luma, night, same boot
+    type: +0.75 -> +0.54, near texture sd 3.22 -> 2.83 against the far 3.06.
+  - **Tall grass.** Two causes. (1) The CARD covered half what the MODEL it
+    replaces covers (tracePlant: eight 15 cm blades a column, 1 - 0.85^8 =
+    0.73 of its width): `BLADE_COVER` 0.45 -> 0.75. (2) The card wore the
+    plant's head only in the column's top voxel (2-5 % of a stand's pixels
+    against the model's ~25 %: its tipFrac, dead blades and seed heads), so
+    the olive heads stopped on the ring: `bladeCardHit` now returns a per-blade
+    head flag (the top `BLADE_HEAD_V` 0.6 voxel, and one blade in eight
+    whole), read by both cards (the near takes the plant def's body / tip,
+    the far the feature word's slots). Also a rule asymmetry: an UNRESOLVED
+    near ray tested the last mile before the HANDOFF, whatever ground lay
+    behind it, so plants 18.9-20.5 m out were drawn against any background and
+    those just past the line were not; trace() PHASE 3 now runs only for a ray
+    it resolved, and `farFeatMarch` starts up to `FAR_CARD_MILE` inside the
+    handoff (never in front of a latched liquid / tinted-solid surface), with
+    a plant still nearer than its vanish distance refused there (the near
+    model owns it). Tall-grass share of the ground pixels 10 rows either side
+    of the line, noon (`SEAM_DBG` 1): 43.5 % / 19.1 % -> 46.8 % / 39.4 %;
+    its heads 10.4 % / 0.7 % -> 13.0 % / 5.7 %. Known: a near card's head
+    zone stops at the top cell (a blade whose tip is under 0.6 voxel into it
+    loses up to 0.25 voxel of head the far card draws).
+  - **Low-sun direct light: measured, no step to fix -- read this before
+    "fixing" it.** At minute 960 (sun ~20 degrees) the whole-frame luma
+    profile across the line extrapolates to +6.6 (far brighter), and a first
+    reading blamed the far staircase average (`farFootprintFade` wN /
+    `farTerraceLightW` wL) and a lighter far contact shadow. Split by CLASS
+    (plant / tread / riser, from `SEAM_DBG` 1 materials and `SEAM_DBG` 4 face
+    weights of the same frame) the step is not in the shading: 6 rows either
+    side, final luma far - near is plant -2.5, tread -1.1, riser -2.6 (noon
+    -2.3 / -0.8 / -1.8, night -0.7 / -0.5 / +0.7). The +6.6 is COMPOSITION
+    -- the TREAD share of the ground pixels is ~0.64 a few rows past the line
+    and ~0.40 a few rows inside it on this camera, which looks over a crest,
+    and the same rows drawn with the handoff pulled in to 17 m (all of them
+    far) show the same drop (0.68 / 0.51 / 0.37 at -9 / 0 / +3 rows): it is
+    the terrain, not the seam -- plus the line's own row (the boundary row lands on step edges, a
+    +2-4 bump that the seamless 8 m arm shows at the same pixels). wN and wL
+    are 0 at the handoff by construction (`farFootprintFade` clamps its
+    start to the handoff's footprint; `farTerraceLightW` starts there), so
+    the far smoothing is a ramp past the line, not a step; giving the near
+    side a matching ramp would flatten the last 6 m of near terraces to buy
+    nothing at the line. What is left per class (far ~2 darker at noon and
+    low sun) has opposing terms underneath: risers' raw sun shadow is
+    lighter far (+14 encoded) while their bounce is much lower far (near
+    gather ~2.4x the closed form); treads' far shadow is slightly darker.
+  Method: the line is read off a `SEAM_DBG` 1 frame's side channel (R 0.5
+  near / 1 far), then every term is averaged per column in row bands either
+  side of it, PER CLASS: a whole-frame profile mixes shading with what the
+  ground is doing at that distance. The same-pixel arms (handoff 8 m) miss a
+  step that sits AT the line (the near arm's rule near the handoff is not the
+  far arm's), which is how the card mile asymmetry hid, and at 9-20 m they
+  carry the far arm's wL ramp, which the shipped frame never shows there.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
