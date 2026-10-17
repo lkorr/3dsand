@@ -1623,9 +1623,34 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   // does a sentinel source, so a fault record names the right chunk.
   var si = gSelfIdx;
   if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
-  voxStore(si, packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
+  // HELD WATER IS NOT LIFTED (ticket 2026-10-17_00-02-59: "pour gravel next
+  // to water ... water materializes on top of all of the gravel"). A grain or
+  // chip sinking into a river, a map lake or the sea took a cell of AT-REST
+  // held water and swapped it UP into its own cell -- onto the pile, over the
+  // column's target, where it stood on gravel. The reservoir refilled the
+  // river behind it (a held column under its target takes from its held
+  // neighbours, then TAKE), and the GIVE branch only takes water standing on
+  // water back, so every grain poured in lifted another cell onto the pile:
+  // a sheet of water climbing the gravel for as long as you poured. The held
+  // body is the reservoir: the water a grain displaces from it goes back to
+  // it -- the source becomes AIR, not water. Water over a target, a bucket on
+  // the bank, oil, any unheld liquid still swaps as before. Pure reads of the
+  // displaced word and the still table (rule 1); it only writes air where the
+  // swap wrote water, so no move is added (rule 2).
+  var back = tw;
+  let tm = voxMat(tw);
+  if (tm != MAT_AIR && materials[tm].klass == CLASS_LIQUID &&
+      materials[voxMat(myWord)].klass != CLASS_LIQUID &&
+      heldRest(dst, tm, voxState(tw) + 1u)) {
+    back = packVox(MAT_AIR, 0u, 0u);
+    // The river's dissolved mass leaves with its water (counted, as every
+    // discard is).
+    let rd = solValueAt(dst);
+    if (rd != 0u && solStoreAt(dst, 0u)) { solDiscard(solMassOf(rd)); }
+  }
+  voxStore(si, packVoxKeepStain(voxMat(back), voxState(back), stamp, back));
   markVoxActive(si);
-  solSwap(src, dst, myWord, tw);
+  solSwap(src, dst, myWord, back);
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
   // a powder sliding out from under a solid may leave it floating
