@@ -461,7 +461,9 @@ else
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# CHECK_SHADERS_KEEP=<dir>: copy the assembled sources (exactly what the engine
+# compiles) there before cleanup -- scripts/spv_sizes.sh measures from them.
+trap '[ -n "${CHECK_SHADERS_KEEP:-}" ] && mkdir -p "$CHECK_SHADERS_KEEP" && cp "$TMP"/*.wgsl "$CHECK_SHADERS_KEEP"/ 2>/dev/null; rm -rf "$TMP"' EXIT
 
 failed=0
 checked=0
