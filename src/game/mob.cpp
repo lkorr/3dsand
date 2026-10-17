@@ -2666,6 +2666,13 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matNames_.clear();
   matNames_.reserve(mats.size());
   for (const MaterialDef& m : mats) matNames_.push_back(m.name);
+  // THE GROUND PAST THE WINDOW FACE reports itself as dirt (D11,
+  // OutsideGroundMat): resolved by name, never a literal id.
+  {
+    int g = FindMaterialId(mats, "dirt");
+    if (g <= 0) g = FindMaterialId(mats, "stone");
+    outsideMat_ = g > 0 ? (uint32_t)g : 0u;
+  }
   // An id is only valid against the table it was resolved from.
   matNameLast_.clear();
   matNameLastId_ = 0;
@@ -5175,10 +5182,28 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
   int ccY = INT32_MIN;
   uint32_t lastMat = 0;
   bool unknown = false;
+  // PAST THE WINDOW FACE (D11, MobSystem::OutsideGroundFor): asked once, on
+  // the first cell of this column outside the window -- a creature that never
+  // nears a face never asks. Null = the old answer, "I cannot see".
+  DistantGround* outside = nullptr;
+  bool outsideAsked = false;
   auto supports = [&](int y) -> bool {
     unknown = false;
     const IVec3 cell{wx, y, wz};
     if (!world.CellInWindow(cell)) {
+      if (!outsideAsked) {
+        outsideAsked = true;
+        outside = sys_ != nullptr ? sys_->OutsideGroundFor(*this) : nullptr;
+      }
+      if (outside != nullptr) {
+        // KNOWN, solid or air: the distant tier's own "carries weight" (the
+        // same test as below, over TerrainHeight, the stored chunks and --
+        // with D10 -- worldgen's structures). The creature walks out onto the
+        // ground it will walk on as a distant creature.
+        if (!outside->Solid(wx, y, wz)) return false;
+        lastMat = sys_->OutsideGroundMat();
+        return true;
+      }
       unknown = true;
       return false;
     }
@@ -5273,7 +5298,12 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
 }
 
 bool Mob::CellSupportsWeight(World& world, IVec3 cell) const {
-  if (!world.CellInWindow(cell)) return false;          // outside = open
+  if (!world.CellInWindow(cell)) {
+    // Outside = open, unless this creature may walk out there (D11): then
+    // the distant tier's ground, as GroundHeightAt reads it.
+    DistantGround* outside = sys_ != nullptr ? sys_->OutsideGroundFor(*this) : nullptr;
+    return outside != nullptr && outside->Solid(cell.x, cell.y, cell.z);
+  }
   return CellSupportsWeightIn(
       world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4}), cell);
 }
@@ -6593,6 +6623,12 @@ struct AiProbeCtx {
   mutable IVec3 memoChunk{};
   mutable const CachedChunk* memoCc = nullptr;
   mutable bool memoValid = false;
+  // PAST THE WINDOW FACE (D11): the system to ask for the distant tier's
+  // ground (MobSystem::OutsideGroundFor), asked once per context, on the
+  // first cell outside the window the planner's headroom test meets.
+  MobSystem* sys = nullptr;
+  mutable DistantGround* outside = nullptr;
+  mutable bool outsideAsked = false;
 };
 
 // Is this cell something a body cannot stand in? ONE implementation, shared
@@ -6600,9 +6636,27 @@ struct AiProbeCtx {
 // "what counts as solid" is a copy that eventually disagrees with the
 // locomotion it is steering (ai_nav.h rule 2, applied to the other half of the
 // probe pair).
-bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z) {
+//
+// PAST THE WINDOW FACE, `readOutside` decides (D11). The PLANNER's headroom
+// test reads the distant tier's ground there when the creature may walk out
+// (MobSystem::OutsideGroundFor) -- the same ground GroundHeightAt now answers
+// for the column, so the planner and the drive still agree (ai_nav.h rule 2).
+// LINE OF SIGHT does not: past the face is open to the eye as it always was.
+// The distant tier's own sight is open-field (no line test at all), so a
+// look across the face keeps the fidelity of the tier it ends in, and a near
+// creature fighting a distant one across the edge (D3) sees it exactly as
+// before. Trees and houses past the face (D10) would only block a look
+// through a band whose other side cannot see back.
+bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z, bool readOutside) {
   const IVec3 cell{x, y, z};
-  if (!c.world->CellInWindow(cell)) return false;  // outside = open
+  if (!c.world->CellInWindow(cell)) {
+    if (!readOutside || c.sys == nullptr) return false;   // outside = open
+    if (!c.outsideAsked) {
+      c.outsideAsked = true;
+      c.outside = c.sys->OutsideGroundFor(*c.mob);
+    }
+    return c.outside != nullptr && c.outside->Solid(x, y, z);
+  }
   const IVec3 ch{x >> 4, y >> 4, z >> 4};
   if (!c.memoValid || ch.x != c.memoChunk.x || ch.y != c.memoChunk.y ||
       ch.z != c.memoChunk.z) {
@@ -6619,7 +6673,7 @@ bool AiProbeGround(void* ctx, int x, int z, int yFrom, int& outY) {
 }
 
 bool AiProbeBlocked(void* ctx, int x, int y, int z) {
-  return AiCellBlocked(*(AiProbeCtx*)ctx, x, y, z);
+  return AiCellBlocked(*(AiProbeCtx*)ctx, x, y, z, /*readOutside=*/true);
 }
 
 // Line of sight: one voxel-stepped sample walk, exactly the sampler
@@ -6638,7 +6692,8 @@ bool AiLineOfSight(void* ctx, Vec3 from, Vec3 to) {
   // cells, and a creature standing in tall grass must not be blind.
   for (int i = 1; i < steps; i++) {
     const Vec3 p = from + step * (float)i;
-    if (AiCellBlocked(c, ifloor(p.x), ifloor(p.y), ifloor(p.z))) return false;
+    if (AiCellBlocked(c, ifloor(p.x), ifloor(p.y), ifloor(p.z), /*readOutside=*/false))
+      return false;
   }
   return true;
 }
@@ -8443,6 +8498,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
   // write nothing but desiredHeading and the local drive vector.
   if (mob.ai_.profile >= 0 && world_ != nullptr) {
     AiProbeCtx pctx{&mob, world_};
+    pctx.sys = this;
     ai::SelfView self;
     self.id = mob.id_;
     self.origin = mob.origin_;
@@ -9973,6 +10029,18 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                mob.origin_.x > wlo.x + (float)kWorldN + kPad ||
                mob.origin_.y > wlo.y + (float)kWorldN + kPad ||
                mob.origin_.z > wlo.z + (float)kWorldN + kPad;
+    // D11's witness: a creature standing in the PAD (its footprint centre
+    // past a face, its origin not yet kPad out) -- one that walked off the
+    // window, was thrown, or was left there by a window move. Counted, never
+    // acted on.
+    if (!out) {
+      const float cx = mob.origin_.x + def.worldSize.x * 0.5f;
+      const float cz = mob.origin_.z + def.worldSize.z * 0.5f;
+      if (cx < wlo.x || cz < wlo.z || cx >= wlo.x + (float)kWorldN ||
+          cz >= wlo.z + (float)kWorldN || mob.origin_.y < wlo.y ||
+          mob.origin_.y >= wlo.y + (float)kWorldN)
+        distant_.Note(&DistantMobs::Stats::nearPastFace);
+    }
     // A GHOST's corpse is excepted: its rig is not this machine's to hand to
     // debris (that would be local bodies for a corpse the peer still keeps).
     // It takes the ghost's exit below -- released, not parked -- and the
@@ -10014,7 +10082,21 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           ByteWriter w{rec};
           mob.SaveOne(w);
         }
+        // WALKED OUT (D11): alive, on its feet or afloat (not thrown, not
+        // falling, not a ragdoll), and JUST over the pad line -- within a
+        // tick's travel of kPad past the face. A creature a window move left
+        // behind stands anywhere past it (a one-chunk shift cannot carry
+        // anybody over the line at all, a bigger jump strands it deep), so
+        // this counts the drive's crossings, not the window's. Read first:
+        // the demotion moves the creature's state out of this Mob.
+        const float past = std::max(
+            {wlo.x - mob.origin_.x, mob.origin_.x - (wlo.x + (float)kWorldN),
+             wlo.y - mob.origin_.y, mob.origin_.y - (wlo.y + (float)kWorldN),
+             wlo.z - mob.origin_.z, mob.origin_.z - (wlo.z + (float)kWorldN)});
+        const bool ownPower = mob.alive_ && !mob.airborne_ && !mob.Ragdolled() &&
+                              past <= kPad + 4.0f;
         bool gone = DemoteToDistant(mob, rec, wlo);
+        if (gone && ownPower) distant_.Note(&DistantMobs::Stats::walkedOut);
         if (!gone && parkFn_(mob.origin_, rec)) {
           parkedTotal_++;
           gone = true;
@@ -25805,6 +25887,11 @@ uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
     int gy = 0;
     uint32_t gmat = 0;
     if (!GroundHeightAt(world, x, z, yFrom, gy, &gmat)) return;
+    // PAST THE WINDOW FACE nothing can hold a print: GroundHeightAt answers
+    // there from the distant tier's ground for a creature walking out (D11),
+    // but no op writes outside the window -- the droplet would be dropped and
+    // the sole would lose its coat for no mark. Not a print, so not a loss.
+    if (!world.CellInWindow(IVec3{x, gy - 1, z})) return;
     if (gmat == 0 || gmat >= sys_->matGpu_.size()) return;
     if (sys_->matGpu_[gmat].klass == CLASS_LIQUID) return;
     // GroundHeightAt answers with the SURFACE (the open cell above the solid);

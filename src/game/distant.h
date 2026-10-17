@@ -971,6 +971,11 @@ class DistantMobs {
     uint64_t shotsOutReentered = 0; // ...that crossed back into the window
     uint64_t shotsOutExpired = 0;   // ...that ran out of life
     uint64_t edgeArrowsOutInWindow = 0;  // D3 hand-overs refused: the target stood in the window
+    // ---- D11: NEAR CREATURES WALK OUT (MobSystem::OutsideGroundFor) ---------
+    uint64_t outsideGrounds = 0;    // near probes that met the face and read DistantGround past it
+    uint64_t nearPastFace = 0;      // near creature-ticks with the footprint centre past the face
+    uint64_t walkedOut = 0;         // demotions of a near creature that walked / swam over the pad
+                                    // line (on its feet, <= kPad + 4 out: not a window move's)
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 

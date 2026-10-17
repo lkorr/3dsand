@@ -135,7 +135,7 @@ void MobSystem::SenseAfloat(Mob& mob, const MobDef& def, World& world) {
   const int cz = ifloor(mob.origin_.z + def.worldSize.z * 0.5f);
   const int y0 = ifloor(mob.origin_.y);
   const int reach = (int)std::ceil(kScanHeights * H);
-  mobwater::CellCache cache{world, mob.ClassOf()};
+  mobwater::CellCache cache = WaterCache(world, mob);
 
   const CellKind sole = cache.At(IVec3{cx, y0, cz});
   if (sole == CellKind::Unknown) return;   // not fetched yet: keep the mode

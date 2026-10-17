@@ -16,6 +16,7 @@
 #include "game/distant.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -27,6 +28,7 @@
 #include "game/arrows.h"   // MobShotsLeft: an archer's arrows, cached at demotion
 #include "game/mob.h"
 #include "game/persist.h"   // EntityParking::kUnparkMarginChunks: the promotion line
+#include "game/workpool.h"  // InTask: OutsideGroundFor is single-threaded (D11)
 #include "sim/chunkstore.h"  // ActivateParked: the region buckets (D5+D6)
 #include "sim/materials.h"  // CLASS_SOLID / CLASS_POWDER: what carries weight
 #include "sim/rng.h"
@@ -1709,6 +1711,49 @@ Vec3 DistantSpread(Vec3 dir, float spread, uint64_t id, uint32_t tick) {
 
 void MobSystem::SetDistantStream(Stream* s) {
   distantGround_.Bind(s, &classOf_, sandvox::kDefaultSeed);
+}
+
+// ============================================================================
+// D11: THE NEAR TIER READS THE DISTANT GROUND PAST THE FACE (mob.h)
+// ============================================================================
+namespace {
+// OutsideGroundFor asked inside a workpool task: refused (null) and counted.
+// An atomic because a task is exactly where it would be bumped.
+std::atomic<uint64_t> gOutsideTaskRefusals{0};
+}  // namespace
+
+bool MobSystem::DistantReachable() const {
+  // A leaver is KEPT when the tier is on and the park rule has somewhere to
+  // put it: DemoteToDistant, or -- the tier full, the creature past the
+  // radius -- parkFn_ itself. Without a park function the rule RELEASES it
+  // (mob.cpp, "PARKED, NOT FORGOTTEN": no function, no parking), so walking
+  // out would be deletion. The switch off is the old behaviour, all of it
+  // (section 1 goal 6): with `distant.enabled` false nobody walks out either.
+  // D7a: a client handing its leavers to the host's tier joins this test.
+  return CurrentTuning().distant.enabled && (bool)parkFn_;
+}
+
+DistantGround* MobSystem::OutsideGroundFor(const Mob& m) {
+  // Only a creature the park rule would KEEP: alive (a corpse does not walk;
+  // its ragdoll has no terrain past the face either way), this machine's own
+  // (a ghost is the peer's -- its owner's window decides where it may go),
+  // and not a body a player drives (never distant: DemoteToDistant refuses
+  // it, so a player's avatar must keep the face it always had).
+  if (!m.alive_ || m.IsGhost() || m.PlayerControlled() || !DistantReachable()) return nullptr;
+  // SINGLE-THREADED BY CONTRACT (DistantGround's caches, the store drain).
+  // Every caller found runs in the serial mob loop; this is the assert that
+  // keeps it so -- in a task the answer is "past the face is unknown", which
+  // is the old behaviour and deterministic, never a race.
+  if (workpool::InTask()) {
+    gOutsideTaskRefusals.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  distant_.Note(&DistantMobs::Stats::outsideGrounds);
+  return &distantGround_;
+}
+
+uint64_t MobSystem::OutsideGroundTaskRefusals() {
+  return gOutsideTaskRefusals.load(std::memory_order_relaxed);
 }
 
 bool MobSystem::DemoteForTest(uint64_t id) {

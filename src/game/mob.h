@@ -51,6 +51,9 @@
 // (ReleaseRigToDebris).
 
 class ChunkStore;   // MobSystem::ActivateParked reads its region buckets
+namespace mobwater {
+struct CellCache;   // game/mob_cellcache.h: MobSystem::WaterCache builds one
+}
 
 struct MobLimbDef {
   std::string name;            // matches a .vox scene-graph model name
@@ -4545,6 +4548,10 @@ class Mob {
   // an eight-voxel stone wall whenever the chunk above the wall happened not to
   // be cached yet. "I cannot see" and "I can see something and cannot see past
   // it" are opposite answers.
+  // A cell OUTSIDE THE WINDOW is "I cannot see" -- unless this creature may
+  // walk out (MobSystem::OutsideGroundFor, D11): then the distant tier's
+  // ground answers it, solid or air, never unknown, with
+  // MobSystem::OutsideGroundMat() as its material.
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
                       uint32_t* outMat = nullptr, bool* outUnknown = nullptr,
                       bool* outBlocked = nullptr) const;
@@ -4748,7 +4755,10 @@ class Mob {
   // locomotion, shared by the ground probe, the footprint collider and the
   // navigator's `blocked` adapter, so "walkable" means one thing in this
   // engine. A cell the CPU mirror cannot answer for is NOT solid — unknown is
-  // open, everywhere, always (ai_nav.h rule 1).
+  // open, everywhere, always (ai_nav.h rule 1). PAST THE WINDOW FACE, for a
+  // creature that may walk out (MobSystem::OutsideGroundFor, D11), the cell is
+  // not unknown: the distant tier's ground answers it (DistantGround::Solid),
+  // here and in GroundHeightAt alike.
   bool CellSupportsWeight(World& world, IVec3 cell) const;
   bool CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const;
 
@@ -8447,6 +8457,48 @@ class MobSystem {
   // and water only).
   void SetDistantStream(Stream* s);
   DistantGround& DistantGroundMut() { return distantGround_; }
+  // ---- D11: A NEAR CREATURE MAY WALK OUT OF THE WINDOW ----------------------
+  // (docs/PLAN_distant_npcs.md section 8.1.) Every layer above the walk drive
+  // already treats a column past the window face as open; the drive alone
+  // refused to stand on ground it could not see, so a creature on a Goto past
+  // the face froze a voxel outside it. Past the face the near tier now reads
+  // the DISTANT tier's ground -- the very ground it will walk on once the park
+  // rule demotes it at kPad -- but only where leaving is survivable:
+  //
+  // DistantReachable(): would a near creature that leaves this machine's
+  // window be KEPT (demoted, or parked when the tier is full / it is past the
+  // radius) rather than released? Today: `distant.enabled` and a park
+  // function installed (main.cpp binds EntityParking in single player and on
+  // the host; no harness without one answers true). With NO park function the
+  // park rule RELEASES a leaver and erases it, so a harness that walked its
+  // crowd out of the window would delete it: there past the face stays
+  // unknown and the drive stops the creature at the face exactly as before.
+  // D7a EXTENDS THIS with the client's hand-out: a client whose leavers go to
+  // the host's tier is reachable too (that is its whole change here).
+  bool DistantReachable() const;
+  // The ground the near tier reads PAST THE WINDOW FACE for creature `m`:
+  // `distantGround_` when DistantReachable() and `m` is one the park rule
+  // would keep -- alive, not a ghost (the peer's: its owner decides), not a
+  // body a player drives (a player is never distant, section 2.7) -- else
+  // null, and past the face is what it always was (unknown to the ground
+  // probe, open to the AI's blocked probe, solid to the swim readers).
+  // Readers: Mob::GroundHeightAt, Mob::CellSupportsWeight, the AI's blocked
+  // probe, mobwater::CellCache (mob_cellcache.h). Each asks LAZILY, on the
+  // first cell it meets outside the window, so a creature that never nears a
+  // face never calls this. DistantGround mutates its caches (single-threaded):
+  // asked inside a workpool task it answers null and counts the refusal
+  // (OutsideGroundTaskRefusals; no caller is in a task today -- the pool's
+  // loops are bleed / burn / stain / splatter).
+  DistantGround* OutsideGroundFor(const Mob& m);
+  // ...the refusals above, over the process (an atomic: a task bumps it).
+  static uint64_t OutsideGroundTaskRefusals();
+  // The material a cell answered past the face reports as its ground
+  // (GroundHeightAt's `outMat`): no CPU source names the column's surface
+  // material (worldgen's genCellIn is WGSL only), so the earth every biome
+  // stands on -- "dirt", resolved by name at each materials load ("stone"
+  // if a table has none). A footstep there is a footstep on dirt; ShedCoat
+  // prints nothing past the face (no op can write there).
+  uint32_t OutsideGroundMat() const { return outsideMat_; }
   // THE STATUES (D4a, game/distant_draw.h): the bake cache a demotion bakes
   // into, BEFORE the rig is released. Null (every harness) = no statue.
   void SetDistantDraw(DistantDraw* dd) { distantDraw_ = dd; }
@@ -9878,6 +9930,13 @@ class MobSystem {
   // The same three samples about a POINT (a corpse lies down, so the column
   // over its walk anchor says nothing): `centre` and +-1.5 voxels in y.
   float PointImmersion(const Mob& mob, Vec3 centre) const;
+  // THE CELL READER a body's water question uses (mobwater::CellCache,
+  // game/mob_cellcache.h): its own classes, `fetch` as the caller says, and
+  // PAST THE WINDOW FACE the distant tier's water and ground when the body may
+  // leave (OutsideGroundFor, D11; resolved on the first cell past the face).
+  // Const like the watchers that ask it: DistantGround's caches are pure (a
+  // hit and a miss give the same answer), so asking changes no outcome.
+  mobwater::CellCache WaterCache(World& world, const Mob& mob, bool fetch = true) const;
   // CARRION (ai::Perception::carrion): recount a corpse's edible cells per
   // limb into Mob::carrionLimb_ / fleshRatio_. Edible = matEdible_.
   void RefreshCarrion(Mob& corpse) const;
@@ -10637,6 +10696,8 @@ class MobSystem {
   void RetireDistant(Vec3 wlo);
   // ---- D1: the distant tick's own state (distant.cpp) ----------------------
   DistantGround distantGround_;
+  // D11: OutsideGroundMat()'s id, resolved in OnMaterialsReloaded.
+  uint32_t outsideMat_ = 0;
   DistantDraw* distantDraw_ = nullptr;
   // ---- D2b: the abstract hit model's table (SetAttackStyles loads it) -------
   distant::DistantCalib distantCalib_;

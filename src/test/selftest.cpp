@@ -733,6 +733,13 @@ const char* const kOrder[] = {
     // arm. `distant-sleep` leaves the window where it found it (it ticks THE
     // tick but never moves or edits it).
     "distant-walk",
+    // NEAR CREATURES WALK OUT (docs/PLAN_distant_npcs.md D11). Between the two
+    // D1 gates on purpose: its exit is distant-walk's (tuning, items and the id
+    // counter restored, mobs / debris / tier reset, park function removed, the
+    // store cleared (OnRegen), the window back home and worldgen regenerated
+    // there -- it moves the window six chunks -X to put a face through the
+    // fixture lake), so `distant-sleep` after it starts where it always did.
+    "distant-walkout",
     "distant-sleep",
     // THE DISTANT TIER FIGHTS (docs/PLAN_distant_npcs.md D2b). After
     // `distant-sleep` for the same exit contract: tuning, items and the id
@@ -1959,7 +1966,14 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"shotsOutGrounded\": " << ds.shotsOutGrounded
       << ", \"shotsOutReentered\": " << ds.shotsOutReentered
       << ", \"shotsOutExpired\": " << ds.shotsOutExpired
-      << ", \"edgeArrowsOutInWindow\": " << ds.edgeArrowsOutInWindow << "},\n";
+      << ", \"edgeArrowsOutInWindow\": " << ds.edgeArrowsOutInWindow
+      // D11: NEAR CREATURES WALK OUT -- probes answered past the face from the
+      // distant ground, creature-ticks in the pad, demotions under the
+      // creature's own power, and the refusals inside a work-pool task (must
+      // stay 0: OutsideGroundFor is single-threaded).
+      << ", \"outsideGrounds\": " << ds.outsideGrounds
+      << ", \"nearPastFace\": " << ds.nearPastFace << ", \"walkedOut\": " << ds.walkedOut
+      << ", \"outsideTaskRefusals\": " << MobSystem::OutsideGroundTaskRefusals() << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want
@@ -2380,7 +2394,14 @@ int Run(Ctx& c, const Options& opt) {
         return c.mobs.MicroSet() ? MicroBodyArtUsed(*c.mobs.MicroSet()) : 0;
       };
       const size_t leakArt = artCount();
+      const uint64_t walkedOut0 = DistantRunTotals().walkedOut;
       r.status = g->fn(c, detail);
+      // D11's attribution (CLAUDE.md rule 6): last_run.json's `distant` block
+      // sums the run, so a gate whose near creatures WALKED out of the window
+      // (and became distant) says so by name here.
+      if (DistantRunTotals().walkedOut != walkedOut0)
+        std::printf("selftest: %s: %llu near creature(s) walked out of the window\n", g->name,
+                    (unsigned long long)(DistantRunTotals().walkedOut - walkedOut0));
       {
         const IVec3 wo = c.world.WindowOrigin();
         std::string leak;
