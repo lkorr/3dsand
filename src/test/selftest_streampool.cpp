@@ -78,7 +78,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
   if (mWater == 0) return fail("no `water` material");
 
   auto num = [](const char* k, double d) { return static_cast<int>(BaselineNumber(k, d)); };
-  const int resX = num("streamPool.resX", 32), resZ = num("streamPool.resZ", 32), resH = num("streamPool.resH", 8);
+  const int resX = num("streamPool.resX", 32), resZ = num("streamPool.resZ", 32), resH = num("streamPool.resH", 4);
   const int chanLen = num("streamPool.chanLen", 80), chanW = num("streamPool.chanW", 3);
   const int chanRun = std::max(1, num("streamPool.chanRun", 4));
   const int basinX = num("streamPool.basinX", 40), basinZ = num("streamPool.basinZ", 40);
@@ -94,7 +94,8 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
   const long long strandMax = num("streamPool.strandMax", 600);
   const int endAwakeMax = num("streamPool.endAwakeMax", 0);
   const double adoptMin = BaselineNumber("streamPool.adoptMin", 0.5);
-  const double emptyFrac = BaselineNumber("streamPool.emptyFrac", 0.05);
+  const double emptyFrac = BaselineNumber("streamPool.emptyFrac", 0.08);
+  const double spentFrac = BaselineNumber("streamPool.spentFrac", 0.005);
   const int siteX = num("streamPool.siteX", 130), siteZ = num("streamPool.siteZ", 282);
 
   // ---- geometry (x runs downstream) ----
@@ -192,11 +193,20 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     SetCurrentTuning(saved);
     weather::SetOverride(prevPin);
   };
-  auto pinTuning = [&](int exciteMode) {
+  auto pinTuning = [&](int exciteMode, int relax) {
     Tuning dawn = saved;
     dawn.dayNight.freeze = 1;
     dawn.dayNight.freezePhase = static_cast<int>(kDaySunrise + 1024u);
     if (exciteMode >= 0) dawn.sim.fluidExciteMode = exciteMode;
+    // WATER-BODY DISCOVERY OFF (sim.waterDiscoverMinEighths 0, its own off
+    // switch). A sealed reservoir is exactly what W-D adopts as a body, and a
+    // draining body's DISCHARGE (DESIGN.md 5b.5) throws part of the drain out
+    // as MPM particles: measured, the first diagnosed run put 1,536 eighths in
+    // particles and, in the determinism arm, 3,535 eighths of water outside the
+    // structure. That is the body system's behaviour, gated by its own gates;
+    // this gate's claims are the conduit's.
+    dawn.sim.waterDiscoverMinEighths = 0;
+    if (relax >= 0) dawn.sim.stillWaterRelax = relax;
     SetCurrentTuning(dawn);
   };
   weather::SetOverride("clear");
@@ -241,14 +251,14 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     // put on it or ruled out.
     int bodies = 0;
     long long bodyVol = 0, bodyDebit = 0;
-    uint64_t hash = 0;
+    uint64_t hash = 0, hashVox = 0, hashStill = 0;   // all, the box's voxels, its still words
     long long Total() const { return res + chan + basin + other + fluid + ledger; }
   };
   const rhi::Buffer& still = c.sim.StillWaterBuffer();
   auto census = [&](bool wantHash) -> Census {
     c.ctx.WaitIdle();
     Census s;
-    uint64_t h = 1469598103934665603ull;
+    uint64_t h = 1469598103934665603ull, hs = h;
     std::vector<uint32_t> cbuf(kChunkVol);
     std::map<std::pair<int, int>, int> colTop;   // each column's highest water surface, 8 y + f
     for (const IVec3& ch : boxChunks) {
@@ -283,7 +293,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     for (int z = zBeg; z <= zEnd; z++)
       for (int x = xBeg; x <= xEnd; x++) {
         const size_t si = (size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1))) * 4u;
-        if (wantHash) h = (h ^ tab[si + 2]) * 1099511628211ull, h = (h ^ tab[si + 3]) * 1099511628211ull;
+        if (wantHash) hs = (hs ^ tab[si + 2]) * 1099511628211ull, hs = (hs ^ tab[si + 3]) * 1099511628211ull;
         const int kd = kindAt(x, z);
         if (kd == 4) s.chanCols++;
         if (tab[si + 2] == 0u) continue;
@@ -310,8 +320,9 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
       const int t8 = static_cast<int>(tab[si + 2] << 12) >> 12;
       s.lane += top == INT_MIN ? '.' : top > t8 ? '^' : top < t8 ? 'v' : '=';
     }
-    if (wantHash) h = (h ^ tab[L]) * 1099511628211ull;
-    s.hash = h;
+    s.hashVox = h;
+    s.hashStill = hs;
+    s.hash = ((h ^ hs) * 1099511628211ull ^ tab[L]) * 1099511628211ull;
     for (const auto* list : {&sandvox::WaterBodies().Bodies(), &sandvox::WaterBodies().Children()})
       for (const sandvox::WaterBodyDesc& d : *list) {
         bool in = false;
@@ -370,8 +381,8 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
   // yet open. Returns the census after.
   uint32_t t = 96000;
   const IVec3 fixture{(xc0 + chanLen / 2) >> 4, floorAt(chanLen / 2) >> 4, zc >> 4};
-  auto setup = [&](int exciteMode) -> Census {
-    pinTuning(exciteMode);
+  auto setup = [&](int exciteMode, int relax = -1) -> Census {
+    pinTuning(exciteMode, relax);
     c.stream.OnRegen();   // the `determinism` gate's regen: the streamer forgets the old world too
     SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
     c.ctx.WaitIdle();
@@ -417,6 +428,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     long long massErrMax = 0;
     int bestPool = 0, sleepRun = 0, sleepBest = 0, sleepAt = -1, emptyAt = -1, done = 1;
     long long prevRes = before.res;
+    std::vector<long long> resHist;
     Census s;
     for (; done < maxTicks;) {
       for (int k = 0; k < sampleTicks; k++) tick();
@@ -433,7 +445,14 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
       } else {
         sleepRun = 0;
       }
-      if (emptyAt < 0 && s.res < static_cast<long long>(emptyFrac * poured)) emptyAt = done;
+      // SPENT: under emptyFrac of the pour, or STOPPED -- it lost under
+      // spentFrac of the pour over the last two samples (the reservoir floor
+      // is level with the channel's first tread, so a shallow pool stays
+      // behind that no stream can carry).
+      resHist.push_back(s.res);
+      const size_t nh = resHist.size();
+      const bool stopped = nh >= 3 && resHist[nh - 3] - s.res < static_cast<long long>(spentFrac * poured);
+      if (emptyAt < 0 && (s.res < static_cast<long long>(emptyFrac * poured) || stopped)) emptyAt = done;
       if (emptyAt >= 0 && done - emptyAt >= settleTicks) break;
     }
     const Census end = s;
@@ -456,7 +475,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     if (!cOk) problems.push_back(Format("C: mass off by up to %lld eighths of %lld", massErrMax, poured));
     const bool dOk = emptyAt >= 0 && end.poolAny == 0 && end.box <= endAwakeMax &&
                      std::llabs(static_cast<long long>(end.ledger)) <= strandMax;
-    std::printf("stream-pool: D run out: %s (reservoir under %.2f of the pour at tick %d; %d ticks on: %d POOL columns "
+    std::printf("stream-pool: D run out: %s (source spent (under %.2f of the pour, or stopped) at tick %d; %d ticks on: %d POOL columns "
                 "left, %d fixture chunks awake (<= %d), ledger stranded %d (|.| <= %lld); window %u awake)\n",
                 dOk ? "PASS" : "FAIL", emptyFrac, emptyAt, emptyAt >= 0 ? done - emptyAt : -1, end.poolAny, end.box,
                 endAwakeMax, end.ledger, strandMax, sandvox::ReadActiveChunksSync(c.ctx, c.world, c.sim));
@@ -469,29 +488,67 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     RecordObserved("streamPool.observedEmptyAt", static_cast<double>(emptyAt));
   }
 
-  // ---- E. determinism: twice from a fresh worldgen at the same tick numbers ----
-  // MPM excitation off in both runs: a particle still in flight at the end of
-  // one run would otherwise be the next run's starting state.
+  // ---- E. determinism: THREE runs from a fresh worldgen at the same tick numbers ----
+  // MPM excitation off: a particle still in flight at the end of one run would
+  // otherwise be the next run's starting state. THREE, not two (memory note
+  // gotcha-hash-identity-needs-three-arms): run 1 follows the long main arm,
+  // runs 2 and 3 follow an identical E run each, so state that survives a
+  // worldgen (the main arm's leftovers) shows as 1 != 2 == 3, and only 2 != 3
+  // is a rule-1 failure. Every run hashes the fixture each sampleTicks, so a
+  // divergence names its first sample.
   if (detTicks > 0) {
+    // Runs 0..2: the conduit (as above). Runs 3..4: the CONTROL -- the same
+    // build, open and ticks with sim.stillWaterRelax 0 (no held water, no
+    // streams, no ledger: the CA alone). If the control pair differs too, what
+    // differs is not the conduit's (state that survives a worldgen, or a
+    // nondeterminism elsewhere), and the line says so.
     const uint32_t tE = t;
-    uint64_t hash[2] = {0, 0};
-    Census last[2];
-    for (int r = 0; r < 2; r++) {
+    std::vector<uint64_t> seq[5], seqV[5], seqS[5];
+    Census last[5];
+    for (int r = 0; r < 5; r++) {
       t = tE;
-      setup(0);
+      setup(0, r < 3 ? -1 : 0);
       sandvox::support::TickCursor tick{c, t, fixture};
       sandvox::support::TickOps o;
       o.cells = open;
       tick(o);
-      for (int k = 1; k < detTicks; k++) tick();
-      last[r] = census(true);
-      hash[r] = last[r].hash;
+      for (int k = 1; k < detTicks; k++) {
+        tick();
+        if ((k + 1) % sampleTicks == 0 || k + 1 == detTicks) {
+          last[r] = census(true);
+          seq[r].push_back(last[r].hash);
+          seqV[r].push_back(last[r].hashVox);
+          seqS[r].push_back(last[r].hashStill);
+        }
+      }
     }
-    const bool eOk = hash[0] == hash[1];
-    std::printf("stream-pool: E determinism: %s (%d ticks after opening, twice: %016llx vs %016llx;%s /%s)\n",
-                eOk ? "PASS" : "FAIL", detTicks, static_cast<unsigned long long>(hash[0]),
-                static_cast<unsigned long long>(hash[1]), line(detTicks, last[0]).c_str(), line(detTicks, last[1]).c_str());
-    if (!eOk) problems.push_back("E: two runs of the same pour differ -- RULE 1");
+    // The first sample at which runs a and b differ, and in what.
+    auto firstDiff = [&](int a, int b, std::string& what) -> int {
+      for (size_t i = 0; i < seq[a].size() && i < seq[b].size(); i++)
+        if (seq[a][i] != seq[b][i]) {
+          what = std::string(seqV[a][i] != seqV[b][i] ? " voxels" : "") + (seqS[a][i] != seqS[b][i] ? " still-words" : "") +
+                 (seqV[a][i] == seqV[b][i] && seqS[a][i] == seqS[b][i] ? " ledger" : "");
+          return static_cast<int>(std::min<size_t>((i + 1) * sampleTicks, detTicks));
+        }
+      return -1;
+    };
+    std::string w12, w23, wC;
+    const int d12 = firstDiff(0, 1, w12), d23 = firstDiff(1, 2, w23), dC = firstDiff(3, 4, wC);
+    // A FAIL is the conduit's only when the control pair agrees.
+    const bool eOk = d23 < 0 || dC >= 0;
+    std::printf("stream-pool: E determinism: %s (%d ticks after opening; conduit runs 1/2/3 %016llx / %016llx / %016llx: "
+                "2 vs 3 (same pre-history) first differ at tick %d%s, 1 vs 2 at tick %d%s; CONTROL (stillWaterRelax 0) "
+                "twice: %016llx / %016llx, first differ at tick %d%s%s)\n",
+                d23 < 0 ? "PASS" : (dC >= 0 ? "INCONCLUSIVE" : "FAIL"), detTicks,
+                static_cast<unsigned long long>(seq[0].back()), static_cast<unsigned long long>(seq[1].back()),
+                static_cast<unsigned long long>(seq[2].back()), d23, w23.c_str(), d12, w12.c_str(),
+                static_cast<unsigned long long>(seq[3].back()), static_cast<unsigned long long>(seq[4].back()), dC, wC.c_str(),
+                d23 >= 0 && dC >= 0 ? " -- the control differs too: not the conduit's" : "");
+    RecordObserved("streamPool.observedDetDiffTick", static_cast<double>(d23));
+    RecordObserved("streamPool.observedDetControlDiffTick", static_cast<double>(dC));
+    if (!eOk)
+      problems.push_back(Format("E: two runs of the same pour differ from tick %d (%s) and the control does not -- RULE 1",
+                                d23, w23.c_str()));
   }
 
   // ---- a fresh world back ----

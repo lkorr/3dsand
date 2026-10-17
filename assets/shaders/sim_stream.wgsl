@@ -198,6 +198,30 @@ const STREAM_FLOOD_DEEP : u32 = 16u;
 // a FINITE source (sim_step.wgsl reads it: STILL_POOL_BIT there). A pending
 // adopt of a POOL column is action 3 (the age bits carry the hop, as for 1).
 const STREAM_POOL_BIT : u32 = 1u << 24u;
+// THE SHORT WINDOW: a column fed by a held POOL column is adopted after this
+// many steady visits, not STREAM_ADOPT_TICKS. The 120 is a guard against
+// freezing a surface still on its way somewhere; below a held POOL column
+// there is no such surface -- the ledger refills an adopted column to its
+// target whatever it stood at -- and the long window is what left the thin,
+// flickering tail of a finite stream unadopted for good (measured,
+// `stream-pool`: the last ~15 of 80 columns never adopted, their gaps kept
+// the middle awake). A ROOT (hop 1 from a live source) keeps the long window:
+// the source must really be steady.
+const STREAM_ADOPT_TICKS_POOL : u32 = 24u;
+// A ROOT's steady window: twice the map's. A shallow channel fed by a lake has
+// deep, flat water at its top that passes every root test, and a POOL root
+// there raced the lake's own hop chain coming down the same channel (measured,
+// `rivers` S: 78 of the first 87 adopted columns POOL). At twice the window
+// the map chain, one column a tick once its first column is adopted, is there
+// first.
+const STREAM_ADOPT_TICKS_ROOT : u32 = 240u;
+// A ROOT's width: cells of the 48 round it that hold the liquid (sourceWide).
+const STREAM_ROOT_WIDE : i32 = 29;
+// A ROOT's depth in cells (sourceDeep).
+const STREAM_ROOT_DEPTH : i32 = 3;
+// RETARGET: the most a POOL column's target is lowered in one step, eighths
+// (a voxel). A source that fell further than that is let go instead.
+const STREAM_RETARGET_MAX : i32 = 8;
 const STREAM_ACT_ADOPT_POOL : u32 = 3u;
 // "Pours": a source must stand this many eighths over a column's surface --
 // the CA's own equalize threshold (TUNE_LIQUID_EQUALIZE is 2): less than that
@@ -325,22 +349,114 @@ fn liveSource(x : i32, y : i32, z : i32, t8 : i32, mat : u32, rootOnly : bool) -
     if (!inBounds(mc)) { continue; }
     let mm = voxMat(voxWordAt(mc));
     if (mm != MAT_AIR && mm != mat && materials[mm].klass != CLASS_GAS) { continue; }
-    if (rootOnly && !isRoot(nx, s.y, nz, s.x, mat)) { continue; }
+    if (rootOnly && (!isRoot(nx, s.y, nz, s.x, mat) || !sourceDeep(nx, s.y, nz, mat) ||
+                     !sourceWide(nx, s.y, nz, mat))) { continue; }
     return true;
   }
   return false;
+}
+
+// A ROOT IS A POOL: the source column holds STREAM_ROOT_DEPTH cells of the
+// liquid down from its top cell. A shallow stream has flat stretches -- a
+// column with nothing STREAM_POUR over it beside it -- all along a gentle
+// slope, and without this every one of them rooted a POOL stream (measured,
+// `rivers` S: 131 of the lake-fed stream's 152 adopted columns came out POOL,
+// so the map stream ran as a conduit and its plugged leftover was re-adopted
+// and held). A pour, a pond, a tank are deep; a running film is not.
+fn sourceDeep(nx : i32, ys : i32, nz : i32, mat : u32) -> bool {
+  for (var k = 1; k < STREAM_ROOT_DEPTH; k++) {
+    let c = vec3<i32>(nx, ys - k, nz);
+    if (!inBounds(c) || voxMat(voxWordAt(c)) != mat) { return false; }
+  }
+  return true;
+}
+
+// ...and WIDE: at least STREAM_ROOT_WIDE of the 48 cells round it (7 x 7, its
+// surface row) hold the liquid. Depth alone did not tell a pool from the deep,
+// flat top of a channel a lake feeds through water nobody has adopted yet
+// (measured, `rivers` S with the depth test and the 240-visit window: 56 of 120
+// adopted columns POOL at tick 600, the POOL segment discharging into the map
+// chain beside it, chunks awake and the flood count past 3,000). A channel 3
+// wide fills 20 of the 48 at most; a pond, a tank, a pour's pool fill them.
+// ...and NOT A SINK: no POOL stream's column stands among those 48. A basin a
+// conduit's mouth falls into is deep and wide under the fall, and rooted
+// there it became a second conduit fed by the first (measured, `stream-pool`:
+// ~300 basin columns adopted, the ledger turning over ~3,000 eighths every 150
+// ticks inside the basin and filling to the cap, which held the real head back
+// until the source read as spent with 40% of it left).
+fn sourceWide(nx : i32, ys : i32, nz : i32, mat : u32) -> bool {
+  var n = 0;
+  for (var dz = -3; dz <= 3; dz++) {
+    for (var dx = -3; dx <= 3; dx++) {
+      if (dx == 0 && dz == 0) { continue; }
+      let c = vec3<i32>(nx + dx, ys, nz + dz);
+      if (inBounds(c) && voxMat(voxWordAt(c)) == mat) { n++; }
+      if (neighbourTarget(c.x, c.z, mat).z != 0) { return false; }
+    }
+  }
+  return n >= STREAM_ROOT_WIDE;
+}
+
+// RETARGET (THE CONDUIT): the highest level an adopted POOL column with target
+// t8 and hop `hop` is still FED at, below t8 -- a held feeder of smaller hop
+// whose target has fallen under t8 (its own target, open way in), or an
+// unheld source that still pours at STREAM_POUR over (its surface minus
+// STREAM_POUR) and stands at or over this column's own water `curS` (so the
+// water it spills into downstream is never mistaken for a feed; STREAM_NONE
+// = no surface, held feeders only) -- or STREAM_NONE. Searched from a voxel
+// under the target's top row (a retarget lowers by at most
+// STREAM_RETARGET_MAX eighths a step).
+fn lowerFeed(x : i32, z : i32, t8 : i32, mat : u32, hop : u32, curS : i32) -> i32 {
+  var best = STREAM_NONE;
+  let y0 = ((t8 - 1) >> 3u) - 1;
+  for (var i = 0u; i < 4u; i++) {
+    var d = vec2<i32>(1, 0);
+    if (i == 1u) { d = vec2<i32>(-1, 0); }
+    else if (i == 2u) { d = vec2<i32>(0, 1); }
+    else if (i == 3u) { d = vec2<i32>(0, -1); }
+    let nx = x + d.x;
+    let nz = z + d.y;
+    let t = neighbourTarget(nx, nz, mat);
+    var cand = STREAM_NONE;
+    var row = 0;
+    if (t.x != STREAM_NONE) {
+      if (u32(t.y) >= hop || t.x >= t8) { continue; }
+      cand = t.x;
+      row = (t.x - 1) >> 3u;
+    } else {
+      if (curS == STREAM_NONE) { continue; }
+      let sf = sideSurface(nx, y0, nz, mat);
+      if (sf.x == STREAM_NONE || sf.z == 0 || sf.x < curS) { continue; }
+      cand = sf.x - STREAM_POUR;
+      row = sf.y;
+    }
+    if (cand <= best || cand >= t8 || cand <= t8 - STREAM_RETARGET_MAX) { continue; }
+    let mc = vec3<i32>(x, row, z);
+    if (!inBounds(mc)) { continue; }
+    let mm = voxMat(voxWordAt(mc));
+    if (mm != MAT_AIR && mm != mat && materials[mm].klass != CLASS_GAS) { continue; }
+    best = cand;
+  }
+  return best;
 }
 
 // ROOT: no lateral neighbour of the source column (nx, nz), whose surface is
 // sN at row ys, has `mat` standing STREAM_POUR or more over sN -- tested on
 // the two rows that can hold such water next to a top cell (ys and ys + 1;
 // water higher than that has water at ys + 1 too).
+// NOR a held column (the map's water, an adopted stream) whose target stands
+// at or over sN: a column a held body can feed is that body's, and its stream
+// is adopted from the body (map-rooted, or POOL-fed), never rooted afresh.
+// (A guard, not the fix for `rivers` S's POOL columns -- that was the flat
+// stretches of a shallow stream; see sourceDeep.)
 fn isRoot(nx : i32, ys : i32, nz : i32, sN : i32, mat : u32) -> bool {
   for (var i = 0u; i < 4u; i++) {
     var d = vec2<i32>(1, 0);
     if (i == 1u) { d = vec2<i32>(-1, 0); }
     else if (i == 2u) { d = vec2<i32>(0, 1); }
     else if (i == 3u) { d = vec2<i32>(0, -1); }
+    let ht = neighbourTarget(nx + d.x, nz + d.y, mat);
+    if (ht.x != STREAM_NONE && ht.x >= sN) { return false; }
     for (var k = 0; k < 2; k++) {
       let c = vec3<i32>(nx + d.x, ys + k, nz + d.y);
       if (!inBounds(c)) { continue; }
@@ -366,6 +482,17 @@ fn isRoot(nx : i32, ys : i32, nz : i32, sN : i32, mat : u32) -> bool {
 // column at the row (refused here), and the columns below it lose their
 // support one tick later, when the plugged column's record is gone.
 fn streamSupport(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32) -> vec2<u32> {
+  return streamSupportTo(x, z, t8, mat, hopBelow, STREAM_HOP_MAX);
+}
+// streamSupport with `poolStepMax`: a POOL feeder counts only if its target
+// stands at most this many eighths over t8. A FALL ENDS A CONDUIT: the basin
+// under a waterfall at a POOL stream's mouth is "fed" by a target ten voxels
+// over it, and adopted (a bowl with a mound under the fall has local slopes,
+// so it passes the strict outflow too) it held the mouth's water: the mouth
+// emitted into its own sink and the conduit stalled at the cap (measured,
+// `stream-pool`: ~105 basin columns POOL-adopted). Below a fall the water is
+// plain water, as a falling sheet should be.
+fn streamSupportTo(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32, poolStepMax : u32) -> vec2<u32> {
   var best = STREAM_HOP_MAX + 1u;
   var pool = 0u;
   for (var i = 0u; i < 4u; i++) {
@@ -379,6 +506,7 @@ fn streamSupport(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32) -> vec2<
     if (t.x == STREAM_NONE || t.x < t8) { continue; }
     let hop = u32(t.y);
     let np = u32(t.z);
+    if (np != 0u && t.x > t8 + i32(poolStepMax)) { continue; }
     // Smaller hop wins; an equal hop replaces a POOL best with a map one.
     if (hop >= hopBelow || hop > best || (hop == best && (np != 0u || pool == 0u))) { continue; }
     let yt = (t.x - 1) >> 3u;
@@ -397,7 +525,14 @@ fn streamSupport(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32) -> vec2<
 // least two eighths lower. A stream always has one (it runs downhill); a pool
 // being filled has none (it is a bowl), so a filling pool is never frozen part
 // way up: it fills to its feeder's level and sleeps as plain water.
-fn streamOutflow(x : i32, y : i32, z : i32, s8 : i32, mat : u32) -> bool {
+// `strict` (a POOL candidate, THE CONDUIT): a held neighbour counts only if
+// its target stands STREAM_POUR or more UNDER this surface. A flat pool beside
+// a held column at its own level otherwise has both a feed (T >= s8) and an
+// outflow (T <= s8), and the short POOL window flood-filled the SOURCE from
+// the stream's head (measured, `stream-pool`: 319 reservoir columns adopted,
+// the source frozen, the conduit stalled at the cap). A stream has somewhere
+// lower to go; a pool has it only at its edge.
+fn streamOutflow(x : i32, y : i32, z : i32, s8 : i32, mat : u32, strict : bool) -> bool {
   for (var i = 0u; i < 4u; i++) {
     var d = vec2<i32>(1, 0);
     if (i == 1u) { d = vec2<i32>(-1, 0); }
@@ -410,7 +545,7 @@ fn streamOutflow(x : i32, y : i32, z : i32, s8 : i32, mat : u32) -> bool {
     if (m == MAT_AIR) { return true; }
     if (m == mat && 8 * y + i32(voxState(w) + 1u) + 2 <= s8) { return true; }
     let t = neighbourTarget(n.x, n.z, mat);
-    if (t.x != STREAM_NONE && t.x <= s8) { return true; }
+    if (t.x != STREAM_NONE && t.x <= s8 - select(0, STREAM_POUR, strict)) { return true; }
   }
   return false;
 }
@@ -490,7 +625,26 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
     if (!held && pool != 0u && over < STREAM_FLOOD_COUNT) {
       held = liveSource(x, (t8 - 1) >> 3u, z, t8, mat, false);
     }
-    word = mat | pool | (over << STREAM_OVER_SHIFT) | select(STREAM_ACT_RELEASE << 30u, 0u, held);
+    // ...and when what feeds it now stands LOWER -- the pool it drains has
+    // fallen, or the column above was lowered -- it is RETARGETED to that
+    // level rather than released (THE CONDUIT, RETARGET). Released, its
+    // water drained into the next column and that one lost its feed too: the
+    // whole stream let go from the top every time the source fell two
+    // eighths, and re-adopted 120 visits later (measured, `stream-pool`: 209,
+    // 134, 99, 15, 49, 115, 205 ... columns adopted, the middle awake through
+    // every cycle). The pending word keeps the liquid and the POOL bit where
+    // a neighbour reads them; the drop rides in the flood-count bits, which
+    // nobody else reads, and `commit` lowers [2] by it.
+    if (!held && pool != 0u && over < STREAM_FLOOD_COUNT) {
+      let lf = lowerFeed(x, z, t8, mat, dyn >> 20u, select(STREAM_NONE, s.s8, s.ok && s.mat == mat));
+      if (lf != STREAM_NONE) {
+        word = mat | pool | (u32(t8 - lf) << STREAM_OVER_SHIFT) | (STREAM_ACT_ADOPT_POOL << 30u);
+      } else {
+        word = mat | pool | (over << STREAM_OVER_SHIFT) | (STREAM_ACT_RELEASE << 30u);
+      }
+    } else {
+      word = mat | pool | (over << STREAM_OVER_SHIFT) | select(STREAM_ACT_RELEASE << 30u, 0u, held);
+    }
   } else {
     let s = columnSurface(x, top, z);
     var age = (w3 >> 20u) & STREAM_AGE_MAX;
@@ -503,13 +657,21 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
       var obs = s.s8;
       if (age > 0u && abs(s.s8 - sdec(w3)) <= 8) { obs = sdec(w3); } else { age = 0u; }
       word = (bitcast<u32>(obs) & 0xFFFFFu) | (age << 20u);
-      if (age >= STREAM_ADOPT_TICKS && streamOutflow(x, s.y, z, s.s8, s.mat)) {
-        let sup = streamSupport(x, z, s.s8, s.mat, STREAM_HOP_MAX);
+      if (age >= STREAM_ADOPT_TICKS_POOL && streamOutflow(x, s.y, z, s.s8, s.mat, false)) {
+        let sup = streamSupportTo(x, z, s.s8, s.mat, STREAM_HOP_MAX, u32(STREAM_RETARGET_MAX));
         var hop = sup.x + 1u;
         var act = select(STREAM_ACT_ADOPT, STREAM_ACT_ADOPT_POOL, sup.y != 0u);
+        // A column fed by a held POOL column needs only the short window (and
+        // a STRICT outflow); a map-fed one the full one.
+        if (hop <= STREAM_HOP_MAX && sup.y == 0u && age < STREAM_ADOPT_TICKS) { hop = STREAM_HOP_MAX + 1u; }
+        else if (hop <= STREAM_HOP_MAX && sup.y != 0u && !streamOutflow(x, s.y, z, s.s8, s.mat, true)) {
+          hop = STREAM_HOP_MAX + 1u;
+        }
         // No held feeder: a live source at the top of a slope roots a POOL
-        // stream (THE CONDUIT).
-        if (hop > STREAM_HOP_MAX && liveSource(x, s.y, z, s.s8, s.mat, true)) {
+        // stream (THE CONDUIT) -- after the ROOT window, so a map stream
+        // being adopted down the same water always gets there first.
+        else if (hop > STREAM_HOP_MAX && age >= STREAM_ADOPT_TICKS_ROOT &&
+                 streamOutflow(x, s.y, z, s.s8, s.mat, true) && liveSource(x, s.y, z, s.s8, s.mat, true)) {
           hop = 1u;
           act = STREAM_ACT_ADOPT_POOL;
         }
@@ -559,6 +721,19 @@ fn commit(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index
     }
     stillWater[si + 2u] = 0u;
     stillWater[si + 3u] = 0u;
+  } else if (act == STREAM_ACT_ADOPT_POOL && stillWater[si + 2u] != 0u) {
+    // RETARGET (scan's adopted branch): lower [2]'s target by the drop in the
+    // flood-count bits, keep the hop, reset the count. Wake the column's
+    // chunk(s) so the columns it feeds look at their own feed again.
+    let d2 = stillWater[si + 2u];
+    let nt = sdec(d2) - i32((w3 >> STREAM_OVER_SHIFT) & STREAM_OVER_MAX);
+    stillWater[si + 2u] = (bitcast<u32>(nt) & 0xFFFFFu) | (d2 & 0xFFF00000u);
+    stillWater[si + 3u] = (w3 & 0xFFFu) | (w3 & STREAM_POOL_BIT);
+    let tc = vec3<i32>(x, (nt - 1) >> 3u, z);
+    for (var k = 0u; k < 8u; k++) {
+      let ns = dirtyFanSlot(tc, T.origin, k);
+      if (ns != SLOT_NONE) { atomicOr(&dirtyOut[ns], DIRTY_R_WRITE); }
+    }
   } else if (act == STREAM_ACT_ADOPT || act == STREAM_ACT_ADOPT_POOL) {
     // The surface `scan` saw is still this column's (nothing writes a voxel
     // between the two kernels); its material goes into [3].

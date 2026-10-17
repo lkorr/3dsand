@@ -25282,8 +25282,13 @@ bit 24; a pending POOL adopt is action 3) and accounted through a LEDGER
 instead. ROOT: a steady, running column with no held feeder may be fed by an
 UNHELD neighbour that stands at least 2 eighths over it, can pour (not a
 stranded one-eighth film) and is itself a root (nothing stands 2 eighths over
-it) — the top of the slope, so POOL adoption walks down the hop chain from the
-source as a map stream does. RELEASE has hysteresis: a POOL column with no held
+it), is fed by no held column, and is a POOL (3 cells deep: the flat
+stretches of a shallow stream are not sources) — the top of the slope, so POOL
+adoption walks down the hop chain from the source as a map stream does. As the
+source falls, a POOL column whose feed now stands lower is RETARGETED (its
+target lowered, a voxel at most a step, the excess deposited) rather than
+released: released, the whole stream let go from the top every couple of
+eighths the source fell. RELEASE has hysteresis: a POOL column with no held
 feeder of smaller hop stays while any unheld water still pours into it, so as
 the source runs down the held stream RETREATS from the top (a released head's
 water feeds the next column, now the head). The ledger is two words after the
@@ -25291,19 +25296,32 @@ column records (live, snapshot), added to through binding 62 (`stillLedger`,
 the same buffer as 58 bound again as atomics) and snapshotted by
 `sim_stream.wgsl commit` after the CA. In `sim_step.wgsl` (THE CONDUIT): a POOL
 cell over its target DEPOSITS all its excess at stage 0 (refused at the cap,
-1024 eighths); TAKE / GROW WITHDRAW (refused while the snapshot is <= 0); while
-the snapshot is empty a POOL column under its target is full to held
-neighbours at rest, and a POOL cell at rest moves nothing sideways (the CLOSED
-VALVE: the mouth emits only what the head deposited, and keeps its chunk
-awake while it has somewhere to go — `liquidSideWork`, the same predicate
-`canFlowAnywhere` asks). So only the head (absorbing) and the mouth (emitting)
+512 eighths, when the head's excess counts as at rest and the source is held
+back); TAKE / GROW WITHDRAW (refused while the snapshot is <= 0; a POOL refill
+does not spend the cell's visit); a POOL cell at rest never pours into another
+POOL column that holds any of its liquid (no flow INSIDE a conduit: the ledger
+refills an under-target column; a dry one may be seeded); while the snapshot
+is empty a POOL column under its target is full to every held neighbour at
+rest, and a POOL cell at rest moves nothing sideways (the CLOSED VALVE: the
+mouth emits only what the head deposited, and keeps its chunk awake while it
+has somewhere to go — `liquidSideWork`, the same predicate `canFlowAnywhere`
+asks). A column fed by a held POOL column is adopted after 24 steady visits
+(a root, and a map stream, still 120). A paged `SubmitWorldgen` now zeroes the
+still table (it kept the old world's streams before: the dense Fill was the
+only clear). So only the head (absorbing) and the mouth (emitting)
 are awake; the middle sleeps and is drawn running. Decisions read the
 snapshot only (rule 1); voxels + MPM + ledger is exact; what the ledger can
 strand when no POOL column is left is bounded by the cap plus one tick's
 deposits (and an overdraft of one tick's withdrawals). One ledger for the
 whole window: two finite streams at once share it. Not saved (a load clears
-it). Known limit: a POOL stream into MAP water cannot discharge (the held rule
-refuses its mouth), fills the cap and runs awake as before. Gate `stream-pool`
+it). A POOL cell at rest is never refused by a non-POOL held column: a conduit
+DISCHARGES into the map's water, whose reservoir takes it back (refused, a
+plugged map stream's leftover water re-adopted as POOL stood held for good);
+and a cell at rest in a non-POOL held column never pours into a POOL column
+(the map never feeds a conduit at rest: with the permission alone a POOL
+segment between two map-rooted runs was a source-and-sink conveyor).
+Known limit: a drowned mouth fills the cap and the head waits, awake, until the
+flood count releases it. Gate `stream-pool`
 (a stone reservoir, channel and basin on the harness pad).
 
 **The look** (`raymarch.wgsl`): a SIDE face of water where the water outside

@@ -59,6 +59,23 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // staleness fallback at once, and the unsnapshotted mirror dilated a ring
   // per tick through the pool.
   world.InvalidateSnapshot();
+  // THE STILL TABLE'S STREAMS AND THE CONDUIT'S LEDGER describe the old world
+  // too (sim_stream.wgsl; docs/PLAN_running_water.md phases 2 and 3). The
+  // dense path clears the whole table (pass_table.def wg_fill_stillWater,
+  // C_DENSEWG) -- but the PAGED path below never runs that row, and its
+  // `cols` keeps a column's stream words while the column's tag is unchanged,
+  // which a regeneration of the same window always is. So a paged regen kept
+  // the old world's adopted streams and the ledger's balance (measured,
+  // `stream-pool` E: two runs of the same pour from fresh worldgens differed
+  // from the first sample, the reservoir-off control did not). Zero the whole
+  // table here, as the dense Fill does: every column of the window is
+  // regenerated, and `cols` writes its tag and authored word again.
+  {
+    static const std::vector<uint32_t> kZeroStill(
+        (size_t)(sim.StillWaterBuffer().Size() / 4u), 0u);
+    ctx.queue.WriteBuffer(sim.StillWaterBuffer(), 0, kZeroStill.data(),
+                          kZeroStill.size() * 4u);
+  }
   // THE WIND-DRAFT FIELD DESCRIBES THE OLD WORLD as well: its blocker mask and
   // shelter solve are derived from the voxels (sim_draft.wgsl), and the
   // rebuild verdict (Simulation::SetDraft) only fires when the box moves, the

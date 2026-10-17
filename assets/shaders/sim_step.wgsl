@@ -4314,7 +4314,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
 // CLOSED VALVE (THE CONDUIT: a POOL column at rest while the ledger is empty
 // moves nothing sideways, but keeps its chunk awake while it has somewhere to
 // go) asks exactly what the mirror asks.
-fn liquidSideWork(c : vec3<i32>, mat : u32, m : Material, f : u32, submerged : bool, rest : bool) -> bool {
+fn liquidSideWork(c : vec3<i32>, mat : u32, m : Material, f : u32, submerged : bool, rest : u32) -> bool {
   // 2a) the four axis down-diagonals.
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
@@ -4591,25 +4591,64 @@ fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
 // `rest` is the ACTING cell's test, computed once per visit; `heldBlocks` is
 // asked per candidate target. `nf` is the target's current fullness in
 // eighths, 0 when it holds no liquid of this kind (air, a gas).
-fn heldRest(c : vec3<i32>, mat : u32, f : u32) -> bool {
+// heldRest's answer: not at rest in a held column, at rest in one, or at rest
+// in a POOL stream's (THE CONDUIT: such a cell pours into no other POOL
+// column at all -- see heldBlocks).
+const HELD_NO : u32 = 0u;
+const HELD_REST : u32 = 1u;
+const HELD_REST_POOL : u32 = 2u;
+fn heldRest(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   let t8 = stillLevel8(c.x, c.z, mat);
-  if (t8 == STILL_UNHELD) { return false; }
-  if (8 * c.y + i32(f) <= t8) { return true; }
+  if (t8 == STILL_UNHELD) { return HELD_NO; }
+  let pool = stillPool(c.x, c.z);
+  if (8 * c.y + i32(f) <= t8) { return select(HELD_REST, HELD_REST_POOL, pool); }
   // THE CONDUIT, CAPPED: a POOL column over its target while the ledger is
   // full is AT REST too -- the head waits (its excess stands in it, the
   // source stops pouring once level with it) instead of running down the
   // held stream. Only evaluated over a held target, so it costs nothing on
   // the common path.
-  return ledgerSnap() >= STILL_LEDGER_CAP && stillPool(c.x, c.z);
+  return select(HELD_NO, HELD_REST_POOL, pool && ledgerSnap() >= STILL_LEDGER_CAP);
 }
-fn heldBlocks(rest : bool, n : vec3<i32>, mat : u32, nf : u32) -> bool {
-  if (!rest) { return false; }
+// THE CONDUIT, two more refusals, both into a POOL column under its target:
+//   * from a cell at rest in ANOTHER POOL column, ALWAYS. Inside a conduit
+//     water never moves between held columns: an under-target column is
+//     refilled by the ledger (TAKE), not by its neighbour. Measured, the
+//     second `stream-pool` run without it: the ledger turned over ~19 eighths
+//     a tick against a real throughput of ~3.5 -- every under-target column
+//     was refilled from the ledger and poured into the next one under its
+//     target, a conveyor INSIDE the held stream that kept its middle awake.
+//     EXCEPT into a cell that holds none of the liquid: a POOL column that
+//     has gone DRY has no cell to take a refill, and refused its neighbour's
+//     water it cut the conduit for good (measured, the third run: five dry
+//     adopted columns near the mouth, the ledger at its cap, the stream
+//     stopped). Water poured into a dry cell is the refill's seed: the next
+//     visit's TAKE fills it to the target;
+//   * from any held cell at rest while the ledger is empty (STARVED): the
+//     deficit stays at the mouth instead of running up the stream.
+// And one PERMISSION: a cell at rest in a POOL column is never refused by a
+// NON-POOL held column (the map's water, a map-rooted stream) -- a conduit
+// DISCHARGES into the map's water, whose reservoir takes the excess back
+// (GIVE). Refused, a finite stream that ran into a river could never empty
+// its ledger and stood held for good (measured, `rivers` S: the plugged
+// channel's leftover water re-adopted as a POOL stream draining into main,
+// 121 of 153 columns still held 900 ticks after the plug).
+// ...and its mirror, a REFUSAL: a cell at rest in a NON-POOL held column never
+// pours into a POOL column, under its target or not -- the map never feeds a
+// conduit at rest. With the permission alone, a POOL segment between two
+// map-rooted runs of one stream was refilled by the map above and discharged
+// into the map below: a source-and-sink conveyor through held water (measured,
+// `rivers` S while running: 4 of 6 chunks awake, the flood count climbing).
+// Refused, such a segment is fed only by the ledger and by unheld water, so it
+// starves and rests.
+fn heldBlocks(rest : u32, n : vec3<i32>, mat : u32, nf : u32) -> bool {
+  if (rest == HELD_NO) { return false; }
   let t8 = stillLevel8(n.x, n.z, mat);
   if (t8 == STILL_UNHELD) { return false; }
+  let npool = stillPool(n.x, n.z);
+  if (rest == HELD_REST_POOL && !npool) { return false; }
+  if (rest == HELD_REST && npool) { return true; }
   if (8 * n.y + i32(nf) >= t8) { return true; }
-  // THE CONDUIT, STARVED: a POOL column under its target is full while the
-  // ledger is empty (see THE CONDUIT).
-  return ledgerSnap() <= 0 && stillPool(n.x, n.z);
+  return ((rest == HELD_REST_POOL && nf > 0u) || ledgerSnap() <= 0) && npool;
 }
 // The fullness of liquid `mat` in the word, 0 when it holds something else.
 fn heldFullness(nw : u32, mat : u32) -> u32 {
@@ -4618,12 +4657,16 @@ fn heldFullness(nw : u32, mat : u32) -> u32 {
 // heldBlocks for a target the caller has not read yet: the cheap tests first
 // (the acting cell's own `rest`, then the target column's record), the voxel
 // read only for a held target.
-fn heldBlocksAt(rest : bool, n : vec3<i32>, mat : u32) -> bool {
-  if (!rest || !inBounds(n)) { return false; }
+fn heldBlocksAt(rest : u32, n : vec3<i32>, mat : u32) -> bool {
+  if (rest == HELD_NO || !inBounds(n)) { return false; }
   let t8 = stillLevel8(n.x, n.z, mat);
   if (t8 == STILL_UNHELD) { return false; }
-  if (8 * n.y + i32(heldFullness(voxWordAt(n), mat)) >= t8) { return true; }
-  return ledgerSnap() <= 0 && stillPool(n.x, n.z);   // THE CONDUIT, STARVED
+  let npool = stillPool(n.x, n.z);
+  if (rest == HELD_REST_POOL && !npool) { return false; }   // THE CONDUIT discharges into map water
+  if (rest == HELD_REST && npool) { return true; }          // ...and the map never feeds it at rest
+  let nf = heldFullness(voxWordAt(n), mat);
+  if (8 * n.y + i32(nf) >= t8) { return true; }
+  return ((rest == HELD_REST_POOL && nf > 0u) || ledgerSnap() <= 0) && npool;   // THE CONDUIT
 }
 
 // Which branch, if any, cell c (liquid `mat`, fullness f) is in. PURE READ:
@@ -4848,7 +4891,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w0 : u32, mat : u32, m : Material, rnd :
   // stream's middle has neither (its neighbours are held and full, or starved
   // and so full -- heldBlocks) and sleeps. Only REFUSES moves (rule 2); the
   // straight descent above still settles the column within itself.
-  if (rest && ledgerSnap() <= 0 && stillPool(c.x, c.z)) {
+  if (rest == HELD_REST_POOL && ledgerSnap() <= 0) {
     if (want != STILL_NONE || liquidSideWork(c, mat, m, f, submerged, rest)) {
       markDirtyR(c, DIRTY_R_REACT);
     }

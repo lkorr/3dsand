@@ -1047,16 +1047,30 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // a bare drop in the adopted count).
         const rhi::Buffer& still = c.sim.StillWaterBuffer();
         uint32_t floodMax = 0;
+        // ATTRIBUTION (phase 3, CLAUDE.md rule 6): how many of the adopted
+        // columns are POOL streams' ([3] bit 24: rooted on a finite source,
+        // THE CONDUIT), and the most-flooded column's record -- where it is,
+        // its hop, POOL or map, its target and the flood count.
+        int poolN = 0;
+        std::string floodWho;
         auto adoptedCount = [&]() {
           std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
           int k = 0;
           floodMax = 0;
+          poolN = 0;
+          floodWho.clear();
           for (const auto& xz : byCols) {
             const size_t si = (size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1))) * 4u;
             if (tab[si + 2] != 0u) {
               k++;
-              floodMax = std::max(floodMax, (tab[si + 3] >> 12) & 4095u);
+              if (tab[si + 3] & (1u << 24)) poolN++;
+              const uint32_t fl = (tab[si + 3] >> 12) & 4095u;
+              if (fl > floodMax || floodWho.empty()) {
+                floodWho = Format("(%d,%d) hop %u %s t8 %d", xz.first, xz.second, tab[si + 2] >> 20,
+                                  (tab[si + 3] & (1u << 24)) ? "POOL" : "map", static_cast<int>(tab[si + 2] << 12) >> 12);
+              }
+              floodMax = std::max(floodMax, fl);
             }
           }
           return k;
@@ -1068,12 +1082,17 @@ Status GateRivers(Ctx& c, std::string& detail) {
             if (vox(xz.first, floorOf[xz], xz.second) == mWater) k++;
           return k;
         };
+        uint32_t awakeWhy = 0;   // the dirty reasons of the awake channel chunks (OR)
         auto awakeOn = [&]() {
           std::vector<uint32_t> fl2(kNumSlots, 0);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl2.data(), kNumSlots * 4, "riversActiveS");
           int k = 0;
+          awakeWhy = 0;
           for (uint32_t ci : byChunks)
-            if (ci < kNumSlots && fl2[ci] != 0u) k++;
+            if (ci < kNumSlots && fl2[ci] != 0u) {
+              k++;
+              awakeWhy |= fl2[ci];
+            }
           return k;
         };
         sandvox::support::TickOps byLining;
@@ -1103,13 +1122,16 @@ Status GateRivers(Ctx& c, std::string& detail) {
             adopted = adoptedCount();
             lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            curve += Format(" %d:%d/%d/%d/%u", k, wet, adopted, awake, floodMax);
+            curve += Format(" %d:%d/%d(%dP)/%d/%u", k, wet, adopted, poolN, awake, floodMax);
           }
         }
         c.ctx.WaitIdle();
         wet = wetCount();
         adopted = adoptedCount();
         awake = awakeOn();
+        std::string runWho = Format("; %d POOL; the most flooded: %s; awake by", poolN, floodWho.c_str());
+        for (int b = 0; b < kDirtyReasonBits; b++)
+          if ((awakeWhy >> b) & 1u) runWho += Format(" %s", kDirtyReasonName[b]);
         const int nBy = static_cast<int>(byCols.size());
         // (c) the plug: stone over the mouth, from below the channel floor up.
         std::vector<CellOp> plug;
@@ -1125,7 +1147,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
           tick();
           if (k % 150 == 0) {
             c.ctx.WaitIdle();
-            curve2 += Format(" %d:%d/%d", k, wetCount(), adoptedCount());
+            const int wc2 = wetCount(), ac2 = adoptedCount();
+            curve2 += Format(" %d:%d/%d(%dP)", k, wc2, ac2, poolN);
           }
         }
         c.ctx.WaitIdle();
@@ -1139,9 +1162,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
                          lost <= static_cast<int>(flapMax * nBy) && adoptedAfter <= static_cast<int>(releaseMax * nBy);
         std::printf("rivers: S stream held: %s (channel %d columns: after %d ticks %d wet, %d adopted (>= %.2f), %d of its "
                     "%zu chunks awake (<= %d), %d released while running (<= %.2f); plugged, %d ticks on: %d adopted "
-                    "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s; after the plug tick:wet/adopted%s)\n",
+                    "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
-                    flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), curve2.c_str());
+                    flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
         RecordObserved("rivers.observedStreamAdopted", std::to_string(adopted));
         if (!sOk)
           problems.push_back(Format("S: channel %d cols, %d wet, %d adopted, %d awake, %d released while running; after plug "
