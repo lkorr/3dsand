@@ -5042,40 +5042,48 @@ fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u3
 fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
              fine : bool, sedRun : i32) -> vec3<i32> {
   let h = (*col).h;
-  let a = colHeightAt(x + 1, z, seed);
-  let b = colHeightAt(x - 1, z, seed);
-  let c = colHeightAt(x, z + 1, seed);
-  let d = colHeightAt(x, z - 1, seed);
-  let lo = min(min(a, b), min(c, d));
-  let hi = max(max(a, b), max(c, d));
-  var top = min(h, lo + 1);
   let run = select(0, reposeRunOf(mat), mat != MAT_AIR);
   let runMax = max(run, sedRun);
+  // ONE colHeightAt CALL SITE (2026-10-17, shader slimming). colHeightAt is a
+  // whole landColumn, and this used to be five inlined copies of it (the four
+  // axis neighbours, then the slide's far columns): ~337k of the ~670k
+  // instructions `cols` expanded to (scripts/spv_inline_tree.py). Now one
+  // fenced loop over a worklist: j 0..3 are the axis neighbours (+x, -x, +z,
+  // -z: a, b, c, d), and, when a slide can reach past them (runMax >= 2),
+  // j 4.. are direction (j - 4) / (runMax - 1) at distance
+  // 2 + (j - 4) % (runMax - 1) -- the old nested (i, k) loop in its own
+  // order, asked only where that direction's lateral is open (g1 < top).
+  // Same heights, same tests, same answer.
+  var g = vec4<i32>(0);   // a, b, c, d
+  var lo = 0;
+  var hi = 0;
+  var top = h;
+  var slides = false;
   var slidesSed = false;
-  if (runMax >= 2) {
-    // A lateral (d, 0) at `top` is open only where that neighbour is exactly
-    // top - 1 (the step line forbids lower). Look past it.
-    var slides = false;
-    for (var i = 0; i < 4; i++) {
-      var dx = 0;
-      var dz = 0;
-      var g1 = a;
-      switch (i) {
-        case 0: { dx = 1; g1 = a; }
-        case 1: { dx = -1; g1 = b; }
-        case 2: { dz = 1; g1 = c; }
-        default: { dz = -1; g1 = d; }
+  let span = max(runMax - 1, 1);
+  let nAsk = 4 + select(0, 4 * (runMax - 1), runMax >= 2);
+  for (var j = unrollFence(); j < nAsk; j++) {
+    let i = select(j, (j - 4) / span, j >= 4);   // direction 0..3
+    let k = select(1, 2 + (j - 4) % span, j >= 4);
+    if (j >= 4 && g[i] >= top) { continue; }
+    let dx = select(0, select(-1, 1, i == 0), i < 2);
+    let dz = select(select(-1, 1, i == 2), 0, i < 2);
+    let gh = colHeightAt(x + k * dx, z + k * dz, seed);
+    if (j < 4) {
+      g = select(g, vec4<i32>(gh), vec4<i32>(j) == vec4<i32>(0, 1, 2, 3));
+      if (j == 3) {
+        lo = min(min(g.x, g.y), min(g.z, g.w));
+        hi = max(max(g.x, g.y), max(g.z, g.w));
+        top = min(h, lo + 1);
       }
-      if (g1 >= top) { continue; }
-      for (var k = 2; k <= runMax; k++) {
-        if (colHeightAt(x + k * dx, z + k * dz, seed) < top - 1) {
-          if (k <= run) { slides = true; }
-          if (k <= sedRun) { slidesSed = true; }
-        }
-      }
+    } else if (gh < top - 1) {
+      // A lateral (d, 0) at `top` is open only where that neighbour is
+      // exactly top - 1 (the step line forbids lower); this is past it.
+      if (k <= run) { slides = true; }
+      if (k <= sedRun) { slidesSed = true; }
     }
-    if (slides) { top = top - 1; }
   }
+  if (slides) { top = top - 1; }
   let sedTop = min(h, lo + 1) - select(0, 1, slidesSed);
   var mass = 8;
   if (mat != MAT_AIR && TUNE_POWDER_FINE_REPOSE != 0u && fine && lo < h) {
