@@ -2493,13 +2493,17 @@ and the `net: distant:` exit line in `src/main.cpp`. Gate `distant-mp`
    `PromoteDistant` refusal) is the same answer.
 2. **Whose remote promotion it is.** Over a peer's promotion line ALONE ->
    that peer, with no ownership question; over the host's line AND a peer's ->
-   the ownership rule at the feet decides (`MobSystem::DistantGoesToPeer`; the
+   the ownership rule decides, asked at the body box's MIN CORNER -- the very
+   point the lines tested (`MobSystem::DistantGoesToPeer`; the
    host's own pass and the overflow skip a creature it gives to a peer). Asked
    as 8.3 wrote it ("the ownership rule names that peer"), a creature whose
    ORIGIN chunk is over a peer's line while its FEET chunk sits on that
    window's authority margin is owned by nobody (`kNoAuthority` -> the host),
    is over no line the host promotes on, and is held at the peer's line for
-   ever.
+   ever. (Finished by the orchestrator: asked at the FEET, a creature over
+   both lines whose feet still stood in the windows' outermost z plane got
+   `kNoAuthority` and the host promoted it locally although the client was
+   eight chunks nearer -- `distant-mp` P and D failed on it.)
 3. **The flip bound is the host's alone.** A hand-out arriving (the creature
    demoted on the client's side) and a hand-in sent are flips on the host's
    log; a return is not (the creature never left the distant world); the
@@ -2543,7 +2547,19 @@ and the `net: distant:` exit line in `src/main.cpp`. Gate `distant-mp`
 12. `kHandInMaxWaitTicks` = 150 (5 s) and `kHandedLooksMax` = 1024 (the client's
     id -> look memory) are constexprs in `distant.h`.
 
-**Measured** (`distant-mp`): MEASURED_NUMBERS
+**Measured** (`distant-mp`, 2.0 s, both runs fdb96028c0b4fee9): 327 ticks; H
+the round trip 6 ticks (hand-out, base hp bit-identical, target kept, bleed
+0.1487 carried); L the born latch held; P handed in after a 176-tick walk and
+promoted ON B 5 ticks later, hp and x/z bit-identical, snap dy 0; R kept /
+retired / activated / still parked as W says; W given back after 151 ticks;
+D 2 transits restored on A, B promoted its waiting room at once. The view:
+145 entries (13 with the shape), 17.6 KB in 145 batches = 122 B/batch, 54
+B/tick for a handful of creatures. Must-stay-green verified on the merged
+tree (D10 + D11 + D7a): mob-handoff, net-melee, net-corpse, authority,
+ops-exchange, determinism, distant-* (roundtrip, edge, save, schedule,
+overflow, arrow, walkout, obstacles), refs-npc-identity, mob-park,
+npc-catchup all PASS; `two-players` FAILS identically on main's exe
+(a6e01667: "last analytic tick 177 (want < 60)"), pre-existing.
 
 **The API D7b builds on.**
 - The role and W: `MobSystem::GetDistantNetRole()`, `DistantPeers()` (the
