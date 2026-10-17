@@ -14814,6 +14814,33 @@ fn windowExitT(ro : vec3f, rdIn : vec3f) -> f32 {
   return select(0.0, tExit, tExit > tEnter);
 }
 
+// ---- THE FAR HIT BOUNDS THE FLUID TOO (ticket 2026-10-16_00-29-21) ----
+// windowExitT's note is why the fluid's bound past the handoff is the WINDOW
+// and not the fine march -- but the window is only the bound when the cascade
+// found nothing either. A ray the far march stopped on terrain inside the
+// window (the handoff is 20.5 m, the window face ~25 m and more) used to keep
+// marching the fluid to the window face, through that terrain: a lake
+// breached through its bank, seen from past the handoff, drew the excited
+// water BEHIND the bank as a translucent chunk-edged slab over it, streaked
+// by the thickness walk (the owner's "weird blue lines"; the harness pour seen
+// from 28 m drew the pit's torrent through the dune in front of it). The bound
+// is the far hit's CELL EXIT, not far.t: a coarse cell's top stands up to half
+// a cell over the true ground or water line (centre sampling), so a puddle or
+// a raft of particles inside the hit cell is still the surface the cascade
+// drew; only the cells behind it are hidden. Never short of far.t (a refined
+// or feature hit lies inside its cell; a ticket hit is past the window face).
+fn farHitFluidBoundT(ro : vec3f, rdIn : vec3f, far : FarHit) -> f32 {
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let s = f32(1u << farCellShift(far.level & 0xFFu));
+  let lo = vec3f(far.cell) * s;
+  let tf = max((lo - ro) * inv, (lo + vec3f(s) - ro) * inv);
+  return max(far.t, min(tf.x, min(tf.y, tf.z)));
+}
+
 // ---- LIVE BLOCK BOX: the exact world-chunk bounds of this tick's blocks ----
 // RENDER-ONLY derived data, read by no sim kernel. Six words after the two
 // kNumSlots halves of fluidBlockMap: min chunk xyz, then max chunk xyz, each
@@ -17433,8 +17460,12 @@ fn fs(in : VSOut) -> FSOut {
   var mfLake = false;   // the hit surface is settled lake water (see below)
   if (SPEC_FLUID && R.fluidCount > 0u) {
     // windowExitT, NOT h.tExit — the fine march's stop is not the extent of
-    // the sim-resident data the fluid lives in. See windowExitT's note.
-    let sceneT = select(windowExitT(R.camPos, rd), h.t, h.hit || h.saturated);
+    // the sim-resident data the fluid lives in. See windowExitT's note. And
+    // no further than the cell the cascade stopped on (farHitFluidBoundT).
+    var sceneT = select(windowExitT(R.camPos, rd), h.t, h.hit || h.saturated);
+    if (!h.hit && !h.saturated && far.hit) {
+      sceneT = min(sceneT, farHitFluidBoundT(R.camPos, rd, far));
+    }
     let mode = i32(round(TUNE_FLUID_SURFACE));
     if (mode == 1) {
       mf = fluidMarch(R.camPos, rd, sceneT);

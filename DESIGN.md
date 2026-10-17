@@ -4780,6 +4780,23 @@ bounded by the SCENE, not by `fluidLo/fluidHi`, because the settled water in the
 field extends arbitrarily far past the live particle blocks and clipping there
 made a pour into a lake absorb like a puddle.
 
+THE FAR HIT BOUNDS THE MARCH (2026-10-16, ticket 2026-10-16_00-29-21: "weird
+blue lines" past a lake bank bored through). The fluid lives on window slots
+only, so past the 20.5 m handoff its bound is the WINDOW face, not the fine
+march (`windowExitT`'s note says why) -- but that bound also ignored the
+CASCADE, so a ray the far march stopped on terrain inside the window kept
+marching the fluid through it, and MPM water hidden behind that terrain drew
+over it: the water excited behind a breached bank, seen from 25-30 m, as a
+translucent chunk-edged slab streaked by the thickness walk. `fs` now bounds
+the march by `farHitFluidBoundT`: the EXIT of the far hit's cell, not `far.t`,
+because centre sampling stands a cell's top up to half a cell over the true
+ground or waterline, so a puddle or a raft inside the hit cell is still the
+surface the cascade drew; only the cells behind it are hidden. Repro: the
+harness pour seen from past the handoff, `SANDVOX_MAP=harness
+SANDVOX_POUR_EYE=60,250,420,0,-9 --render-budget --budget-cams pour` (the pit's
+torrent drew through the dune in front of it; `SANDVOX_POUR_FARPROBE=x,z`
+prints the live column beside the level 1-3 cascade bytes).
+
 DRAW MODES — `render.fluidSurface` is a MODE, not a boolean, and it kept its
 name because 0 and 1 still mean what they always did (no `tuning.json`
 migration). `0` = one raster cube per particle, the solver-debug view and the
