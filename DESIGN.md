@@ -1057,7 +1057,21 @@ promote(demote(m)) re-saves byte for byte (`distant-roundtrip`).
 water (`TerrainColumn().water` / `WaterColumnAt`), and EDITED chunks read from
 the `ChunkStore` after their pending eviction is drained
 (`Stream::SettledStoredChunk` -- an eviction lands on a GPU-timed tick, audit
-A3). Trees, buildings and `.svedit` layers are not obstacles (v1 gap). Ground
+A3). Between the stored chunk and `TerrainHeight` sits THE WORLDGEN OVERLAY
+(D10, `game/distant_obstacles.h`, CPU twin `sim/worldgen_twin.h`): what
+genChunk stands on and cuts into the ground, re-derived on the CPU from the
+shader's own inputs (the tree atlas and packed biome records as last
+uploaded, the current map's sites, a dungeon block packed from the current
+map, a private resolved copy of the `.svedit` layer), in genCellIn's order --
+the low 3.2 m band of every lattice and authored tree (a crown overhead is no
+obstacle), cacti, stamps (houses), dungeon/ruin matter, the edit layer last.
+Door leaves of placed structures read AIR (policy: the tier opens no door).
+Per-column spans built lazily (dungeon and layer per cell), age-trimmed, dropped
+on (map serial, uploaded environment, layer generation, seed, vegetation); a
+column the overlay does not touch keeps the `TerrainHeight` fast path, so the
+drive, A*, the line test and the ground fan all see the matter unchanged. Not
+modelled: caves, passable cover, the top cell's partial grains. Gate
+`distant-obstacles` holds it to real generated boxes per source. Ground
 MODE is decided once at demotion: SURFACE (feet within `surfaceSnapMaxVox` of
 the terrain, outside every placed dungeon box) walks; ANCHORED (underground,
 indoors, on a wall) thinks, turns and strikes what reaches it but never moves.
@@ -1182,7 +1196,8 @@ distant walks its day -- the SAME resident step (one Resident per ref, kept
 across the edge because the id is), run on the distant creature's brain, its
 ref dormant or not; the tier's Think walks it to the routine's goal over
 DistantGround, a movement goal and never a teleport. At distance it opens no
-door (there are none on DistantGround), strikes no pose and holds at its anchor
+door (DistantGround reads every door leaf as an open doorway, D10), strikes no
+pose and holds at its anchor
 (wander and socialize rows stand), so the tier sleeps it; a sleeper is woken
 only by its day (a new row when the schedule clock reaches a new minute, an
 edit, a patrol's pause ending via `SetDistantRoutineClock`). With everything
@@ -1211,7 +1226,8 @@ A-F, `corpse-save`, `npc-catchup`, `refs-npc-identity` A-E; C2 runs the tier).
 Counters: `build/last_run.json` -> `distant`. Gates `distant-roundtrip`,
 `distant-walk`, `distant-sleep`, `distant-fight`, `distant-calibrate`,
 `distant-calib-matrix`, `distant-look`, `distant-edge`, `distant-schedule`,
-`distant-save`, `distant-overflow`, `distant-arrow`. Planned: D7 (multiplayer).
+`distant-save`, `distant-overflow`, `distant-arrow`, `distant-obstacles`.
+Planned: D7 (multiplayer).
 
 ---
 

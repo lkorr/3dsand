@@ -159,8 +159,10 @@
 #include "game/steer.h"        // SteerState
 #include "math3d.h"
 
+class GenOverlay;   // game/distant_obstacles.h: the worldgen overlay (D10)
 class Stream;
 class World;
+struct MaterialGpu;
 
 // ---- the ground MODE a distant creature has (§2.4) ---------------------------
 //
@@ -194,8 +196,8 @@ bool InPlacedDungeonBox(IVec3 c);
 //
 //   1. BASE: World::TerrainHeight, the height contract (worldgen's ground,
 //      roads, site pads, pond bowls, rivers). A cell is solid at or below it.
-//      Trees, buildings, ruins and `.svedit` layers are NOT in it: a distant
-//      creature walks through a house 60 m away (accepted for v1, §2.4).
+//      Trees, buildings, ruins and `.svedit` layers are NOT in it -- source 5
+//      puts them back.
 //   2. WATER: the higher of TerrainColumn().water (tarns, the sea) and
 //      worldmap::WaterColumnAt (rivers, lakes). Liquid is never ground: a
 //      body in water stands on the BED; the walk decides to wade or swim.
@@ -205,7 +207,15 @@ bool InPlacedDungeonBox(IVec3 c);
 //      Read through Stream::SettledStoredChunk, which first completes any
 //      eviction of that chunk still in flight -- the RegenerateChunks loop --
 //      because when an eviction's bytes reach the store is up to the GPU
-//      (audit A3). A chunk not in the store is procgen, i.e. source 1.
+//      (audit A3). A chunk not in the store is procgen, i.e. sources 5 + 1.
+//   4. THE WINDOW (D8), for an overflow creature only (SetWindowSource).
+//   5. THE WORLDGEN OVERLAY (D10, game/distant_obstacles.h): what genChunk
+//      stands on and cuts into the base -- the low band of every lattice and
+//      authored tree, cacti, the stamps (houses; their DOOR leaves read air),
+//      the dungeons' ruins, the `.svedit` layers -- re-derived on the CPU from
+//      the shader's own inputs. Between the stored chunk (which already holds
+//      all of it, as the GPU made it) and the base. A column the overlay does
+//      not touch keeps the TerrainHeight fast path.
 //
 // "Walkable" is the plan's rule: the HIGHEST cell that carries weight (the
 // near tier's own test: solid, or a powder of at least kPowderMobSupportMin)
@@ -236,13 +246,24 @@ class DistantGround {
   static constexpr int kProbeUp = 32;
 
   DistantGround();
+  ~DistantGround();
+  DistantGround(const DistantGround&) = delete;
+  DistantGround& operator=(const DistantGround&) = delete;
   // The edited-ground source (null = TerrainHeight + water only: a gate's
   // CPU arm, a harness with no stream) and the material collision classes
   // that say what carries weight (MobSystem's `classOf_`). Cheap when
   // nothing changed; rebinding a different stream drops the chunk cache and
   // installs this object's listener on the new store (ONE listener per
-  // store: ChunkStore::SetChangeFn).
-  void Bind(Stream* stream, const std::vector<uint32_t>* classOf, uint32_t seed);
+  // store: ChunkStore::SetChangeFn). `gpu` (D10): the material table's GPU
+  // words, which the overlay's dungeon twin reads (null = no dungeons).
+  void Bind(Stream* stream, const std::vector<uint32_t>* classOf, uint32_t seed,
+            const std::vector<MaterialGpu>* gpu = nullptr);
+  // ---- 5. THE WORLDGEN OVERLAY (D10) -------------------------------------------
+  // On by default. Off = the D1 ground exactly (the cost arm's "before", and a
+  // gate's control). The overlay object itself, for the gates' attribution.
+  void SetOverlayEnabled(bool on);
+  bool OverlayEnabled() const;
+  GenOverlay& Overlay() { return *overlay_; }
   // Everything cached, gone (a materials reload, a world reset, a gate that
   // swapped the map by hand).
   void InvalidateAll();
@@ -360,6 +381,9 @@ class DistantGround {
   // D8: the window source (null = off) and its decoded chunks.
   const World* window_ = nullptr;
   std::unordered_map<uint64_t, WinChunk> winChunks_;
+  // D10: the worldgen overlay. It holds a pointer back to this object (its
+  // TerrainTop / WaterTop), so the ground is not copyable.
+  std::unique_ptr<GenOverlay> overlay_;
   Stats stats_;
 };
 
