@@ -4404,68 +4404,67 @@ struct PlantCol {
 // Is (cx, cz) a place a tile plant may stand? The same exclusions the
 // ground-flora block applies to its own column, evaluated at the CENTRE, plus
 // "not in or against a trunk" and, for ferns, canopy cover.
-struct PlantSite { ok : bool, h : i32 };
-fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
-  var ps : PlantSite;
-  ps.ok = false;
-  ps.h = 0;
-  if (siteKeepOut(cx, cz) || dgSurfNear(cx, cz, 3)) { return ps; }   // 3: a tile plant's footprint overhangs its centre
-  if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
-  var L : LandCol;
-  landColumn(cx, cz, seed, &L);
-  ps.h = L.h;
-  if (L.h >= treelineAt(cx, cz, seed) || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
-  if (featureSteepAt(L.slope)) { return ps; }   // no tile plant on a cliff
-  if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
-  let ug = undergrowthSite(cx, cz, seed, &L.ponds);
-  if (ug.trunkD2 <= 4) { return ps; }
-  if (needCover && ug.cover < UG_COVER_MIN) { return ps; }
-  ps.ok = true;
-  return ps;
-}
-
-fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
+//
+// THE COLUMN'S OWN GROUND RIDES THE SAME LOOP (2026-10-17, shader slimming).
+// A tile plant's site test needs a whole landColumn at the plant's centre, and
+// genColumn needs one at its own column; every call site of landColumn is a
+// full inlined copy (pond scan, bowl, shore, roads, pads, rivers) in every
+// entry point that reaches genColumn -- `far`, `farpatch`, `fardown`, `farmap`
+// and `cols`. Written as genColumn's landColumn plus a plantSiteAt per species
+// it was three copies (scripts/spv_inline_tree.py: ~67k instructions each in
+// the expansion). So this is ONE fenced worklist with one landColumn in it:
+//   k 0  the asking column itself -> *L (genColumn's ground, as before);
+//   k 1  the fern tile's centre, when the column is in a fern footprint and
+//        bank (the patch mask the one-cell fern used), under real cover;
+//   k 2  the big toadstool's, when the column is in its footprint -- rare,
+//        anywhere in the wood; a fern bank is the wrong place for one, so a
+//        column whose fern site was accepted never gets here (`break`).
+// A site test that fails moves on to the next entry, exactly as the old
+// per-species blocks fell through. Same columns, same tests, same order.
+fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32,
+                 L : ptr<function, LandCol>) -> PlantCol {
   var pc : PlantCol;
   pc.mat = MAT_AIR;
   pc.base = 0;
   pc.top = -1;
-  if (!GROUND_COVER) { return pc; }
   // The tile plants belong to biomes with the ground-flora layer (the
   // world map's flag), not to two hard-coded ids.
-  if (!wmFlag(biome, WM_BF_GROUND_FLORA)) { return pc; }
-  // FERNS: the signature closed-canopy plant, in banks (the same patch mask
-  // the one-cell fern used), under real cover.
-  {
-    let pt = plantTileAt(x, z, seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
-                         PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH,
-                         PLANT_FERN_CHANCE);
-    let half = PLANT_FERN_FOOT / 2;
-    if (pt.present && abs(x - pt.cx) <= half && abs(z - pt.cz) <= half &&
-        vnoise(pt.cx, pt.cz, UG_FERN_PATCH_CELL, seed ^ 0xFE70u) > UG_FERN_PATCH) {
-      let site = plantSiteAt(pt.cx, pt.cz, seed, true);
-      if (site.ok) {
-        pc.mat = M_FERN;
-        pc.base = site.h;
-        pc.top = site.h + pt.h;
-        return pc;
-      }
+  let flora = GROUND_COVER && wmFlag(biome, WM_BF_GROUND_FLORA);
+  let fpt = plantTileAt(x, z, seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
+                        PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH,
+                        PLANT_FERN_CHANCE);
+  let fhalf = PLANT_FERN_FOOT / 2;
+  let fernHere = fpt.present && abs(x - fpt.cx) <= fhalf && abs(z - fpt.cz) <= fhalf &&
+                 vnoise(fpt.cx, fpt.cz, UG_FERN_PATCH_CELL, seed ^ 0xFE70u) > UG_FERN_PATCH;
+  let spt = plantTileAt(x, z, seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
+                        PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH,
+                        PLANT_SHROOM_CHANCE);
+  let shalf = PLANT_SHROOM_FOOT / 2;
+  let shroomHere = spt.present && abs(x - spt.cx) <= shalf && abs(z - spt.cz) <= shalf;
+  for (var k = unrollFenceU(); k < 3u; k++) {
+    let fern = k == 1u;
+    var px = x;
+    var pz = z;
+    if (k != 0u) {
+      if (!flora || !select(shroomHere, fernHere, fern)) { continue; }
+      px = select(spt.cx, fpt.cx, fern);
+      pz = select(spt.cz, fpt.cz, fern);
+      if (siteKeepOut(px, pz) || dgSurfNear(px, pz, 3)) { continue; }   // 3: a tile plant's footprint overhangs its centre
+      if (!wmFlag(biomeAt(px, pz, seed), WM_BF_GROUND_FLORA)) { continue; }
     }
-  }
-  // BIG TOADSTOOLS: rare, anywhere in the wood — a fern bank is the wrong
-  // place for one, so a column already in a fern footprint never gets here.
-  {
-    let pt = plantTileAt(x, z, seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
-                         PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH,
-                         PLANT_SHROOM_CHANCE);
-    let half = PLANT_SHROOM_FOOT / 2;
-    if (pt.present && abs(x - pt.cx) <= half && abs(z - pt.cz) <= half) {
-      let site = plantSiteAt(pt.cx, pt.cz, seed, false);
-      if (site.ok) {
-        pc.mat = M_MUSHROOM_LARGE;
-        pc.base = site.h;
-        pc.top = site.h + pt.h;
-      }
-    }
+    var C : LandCol;
+    landColumn(px, pz, seed, &C);
+    if (k == 0u) { *L = C; continue; }
+    if (C.h >= treelineAt(px, pz, seed) || C.pond >= 0 || C.inRim || C.inPoolFloor) { continue; }
+    if (featureSteepAt(C.slope)) { continue; }   // no tile plant on a cliff
+    if (C.near.onShore && C.near.past < wmWaterI(C.near.wp, WM_W_SHORE_BAND)) { continue; }
+    let ug = undergrowthSite(px, pz, seed, &C.ponds);
+    if (ug.trunkD2 <= 4) { continue; }
+    if (fern && ug.cover < UG_COVER_MIN) { continue; }
+    pc.mat = select(M_MUSHROOM_LARGE, M_FERN, fern);
+    pc.base = C.h;
+    pc.top = C.h + select(spt.h, fpt.h, fern);
+    break;
   }
   return pc;
 }
@@ -4783,10 +4782,12 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   // THE GROUND, and everything derived from it, in one call. This is the same
   // `h` World::TerrainHeight returns — that equality is the whole point of the
   // split (see the height contract above landColumn).
+  // (plantColumnAt fills L: its one landColumn call site serves this column
+  // and the tile plants' site tests -- see there.)
   var L : LandCol;
-  landColumn(x, z, seed, &L);
-  let h = L.h;
   let biome = biomeAt(x, z, seed);
+  let plant = plantColumnAt(x, z, seed, biome, &L);
+  let h = L.h;
   let tl = treelineAt(x, z, seed);
 
   // ---- the marsh fringe: landColumn's berm scan, narrowed ----
@@ -4844,7 +4845,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.nearWater = nearWater;
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
-  col.plant = plantColumnAt(x, z, seed, biome);
+  col.plant = plant;
   // A tile plant's cell over ground more than a voxel below its base is not
   // placed (featureSteepAt, rule 2): the rigid rosette / cap would float there.
   if (col.plant.mat != MAT_AIR && h < col.plant.base - 1) {
