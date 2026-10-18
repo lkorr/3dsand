@@ -52,6 +52,9 @@ inline uint32_t FarFeatHead(uint32_t w) { return (w >> 23) & 0x7Fu; }
 constexpr uint64_t kFarStrataWords = kFarMapWords;
 constexpr uint64_t kFarStrataBase = kFarMapWords + kFarFeatWords;
 constexpr uint32_t kFarStrataPresent = 0x80000000u;
+constexpr uint32_t kFarStrataWet = 0x40000000u;
+// A WET word's bed skin slot (0: it did not fit seven bits).
+inline uint32_t FarStrataWetBed(uint32_t w) { return (w >> 16) & 0x7Fu; }
 inline uint64_t FarStrataWord(uint32_t level, int mx, int mz) {
   return kFarStrataBase + kFarMapWord(level, mx, mz);
 }

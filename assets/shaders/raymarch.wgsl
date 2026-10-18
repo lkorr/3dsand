@@ -1088,8 +1088,15 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // levels read as distinct greys), the fullness-gradient macro slope x 8 (a
 // one-eighth step reads 0.5), the sim flux's slope x 16. Anything that steps
 // from one column to the next on open water is one of these three.
+// 20 = THE FAR WATER'S BED (2026-10-18, ticket 2026-10-16_11-05-33): a far
+// water pixel's path to the bed as the CASCADE's cells put it / 30 m, the
+// path farWaterBed returned / 30 m (1 = the cap: no bed shows), and its
+// level / 16 + 0.5 where the map's wet bed overruled the cascade's.
+// Everything else black.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
+var<private> gDbgWet : vec2f = vec2f(0.0);
+var<private> gDbgPath : f32 = -1.0;
 var<private> gDbgLayer : f32 = 0.0;
 var<private> gDbgMap : f32 = 0.0;
 // SEAM_DBG 14: per-pixel tap verdicts of shadowSlotRead (valid, found but
@@ -16891,6 +16898,8 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
   // plane at the column's true bed, met from above -- a tread, wearing the
   // bed's skin. A bed the march met over the map's (a bank's riser above
   // the bed, a shelf deepening away from the eye) stands as found.
+  let t0c = t0;   // the cascade's bracket, for SEAM_DBG 20
+  let tc1 = t;
   var wet = false;
   var bedMat = hitK >> 2u;
   if (rd.y < 0.0) {
@@ -16904,6 +16913,12 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
         if (wl.mat != 0u) { bedMat = wl.mat; }
       }
     }
+  }
+  if (SEAM_DBG == 20u) {
+    // The cascade's own answer, before the overrule: the bed it entered, or
+    // the cap.
+    gDbgWet = vec2f(select(r.path, min(0.5 * (t0c + tc1), maxV), hitK != 0u),
+                    select(0.0, 1.0, wet));
   }
   if (hitK == 0u && !wet) { return r; }
   // THE BED IS LIT BY THE FAR TERRAIN'S LAW on the face the ray entered
@@ -16943,6 +16958,7 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
   let ob = farOpenness(nb);
   let albedo = farSoakedAlbedo(paletteMean(bm), bedMat, liq);
   r.path = min(0.5 * (t0 + t), maxV);
+  if (SEAM_DBG == 20u) { gDbgPath = r.path; }
   var lam = wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP);
   // THE BED'S SUN IS THE FAR TERRAIN'S (2026-10-13, ticket 2026-10-09_14-23-01,
   // the sea seam): its face's far shadow patch (farShadowCached, the resolve's
@@ -19447,6 +19463,21 @@ fn fs(in : VSOut) -> FSOut {
         gDbg = vec4f(f32(flv) / 8.0, gDbgLayer, gDbgMap, 1.0);
       }
       if (SEAM_DBG == 18u) { gDbg.x = select(select(1.0, 0.75, fFeat), 0.5, fRefined); gDbg.z = f32(flv) / 8.0; }
+      if (SEAM_DBG == 20u) {
+        gDbg = select(vec4f(0.0, 0.0, 0.0, 1.0),
+                      vec4f(min(gDbgWet.x * VOXEL_METERS / 30.0, 1.0),
+                            min(select(gDbgPath, FAR_WATER_PATH_MAX_M / VOXEL_METERS, gDbgPath < 0.0) *
+                                VOXEL_METERS / 30.0, 1.0),
+                            f32(flv) / 16.0 + 0.5 * gDbgWet.y, 1.0),
+                      m.klass == CLASS_LIQUID && gDbgWet.x > 0.0);
+        // Not measured: a far liquid hit (1, 0, level / 16 + 0.5 if it took
+        // the far water shade), anything else far (0, 1, level / 16).
+        if (gDbgWet.x <= 0.0) {
+          gDbg = select(vec4f(0.0, 1.0, f32(flv) / 16.0, 1.0),
+                        vec4f(1.0, 0.0, f32(flv) / 16.0 + select(0.0, 0.5, farWater), 1.0),
+                        m.klass == CLASS_LIQUID);
+        }
+      }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
       // moves any more. The plasma field crawls and pulses over its emission,
