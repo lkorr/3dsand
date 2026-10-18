@@ -8938,9 +8938,21 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
           limp.lowest = std::min(limp.lowest, com.y);
           limp.final = com.y;
           if (i % 30 == 0) limp.trace += Format(" %.1f", com.y);
+          if (i % 60 == 0) {
+            const Vec3 cur = sandvox::CurrentOnFloater(
+                com, com.y - 2.0f, com.y + 2.0f, (float)(waterTop + 1));
+            limp.drift += Format(" (%.1f,%.1f cur %.2f,%.2f)", com.x - (float)site.x,
+                                 com.z - (float)site.z, cur.x, cur.z);
+          }
         }
       }
       if (m) {
+        for (int li = 0; li < m->LimbCount(); li++) {
+          const uint64_t hl = mobs.LimbBody(id, li);
+          Vec3 lc{};
+          if (!hl || !c.phys.BodyCenterOfMass(hl, lc)) continue;
+          limp.limbs += Format(" %d:%.1f", li, lc.y);
+        }
         limp.pushes = m->FloatedLimbs();
         limp.surf = m->FloatSurfaceY();
         limpHeld = m->Alive() && m->Ragdoll() == Mob::RagdollPhase::Limp;
@@ -9072,10 +9084,12 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                   waterTop) + line(hu) +
            line(au) + line(an) + line(sy) +
            (limp.ran ? Format("limp human: %s, surface y%.0f, pelvis lowest "
-                              "y%.1f final y%.1f, %u pushes, y every 30:%s",
+                              "y%.1f final y%.1f, %u pushes, y every 30:%s, drift "
+                              "every 60:%s, limbs%s",
                               limpHeld ? "held limp" : "NOT LIMP AT END",
                               limp.surf, limp.lowest, limp.final, limp.pushes,
-                              limp.trace.c_str())
+                              limp.trace.c_str(), limp.drift.c_str(),
+                              limp.limbs.c_str())
                      : std::string("limp human: (no def)")) +
            (severRan ? " | severed:" + severWhy
                      : std::string(" | severed: (no human)"));
