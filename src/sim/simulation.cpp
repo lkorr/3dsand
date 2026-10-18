@@ -25,6 +25,7 @@
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
 #include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
+#include "sim/worldgen_twin.h"  // SetGenEnv: the CPU twin reads what worldgen was handed (D10)
 #include "sim/solutes.h"     // LoadSolutes: the species table UploadTables packs
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
@@ -75,6 +76,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // (gpu/resources.cpp WorldgenPrelude). Set BEFORE the first
   // LoadShader below, and it stays set for F5 reloads and --shader-stats.
   treeatlas::SetCurrentTreeLattice(trees.lattice);
+  // ...and the atlas and the packed map themselves, for the CPU twin of
+  // worldgen's features (sim/worldgen_twin.h: the distant tier's obstacles,
+  // D10). Copies: what the GPU was handed, whatever the caller does after.
+  wgtwin::SetGenEnv(trees, worldMapWords);
   // The pond lattice the same way (POND_TILE, from the map already set as
   // CurrentWorldMap by the caller); remembered so UploadEnvironment knows
   // whether a reload moved it under the compiled shaders.
@@ -847,6 +852,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // here in the fragment and vertex stages, covered by the global
         // barrier every command buffer opens with (gasOuter's standing).
         entry(49, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // flowMeas
+        // THE STILL-WATER TABLE (worldgen.wgsl / sim_stream.wgsl, the sim's
+        // binding 58), read-only: an ADOPTED STREAM's column is drawn as
+        // running water (raymarch.wgsl THE FROZEN STREAM PLAYS BACK) and a
+        // held column's side face is a falling sheet only over a real drop.
+        // Written on the TICK command buffer (cols, streamCommit), read in the
+        // FRAGMENT stage, covered by the global barrier every command buffer
+        // opens with (flowMeas's standing). Render-only.
+        entry(50, T::ReadOnlyStorage, S::Fragment),               // stillWater
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1005,19 +1018,22 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // dissolved mass along on a level reach. Its own region, so the four-word
     // records and every reader of them keep their stride.
     // ...plus TWO words per window column after the mouth words (2026-10-17,
-    // sim_stream.wgsl STILL_ECHO): a stream column's surface recorded while
-    // it was observed, eight signed-byte samples relative to the target it was
-    // adopted at -- render-only (raymarch replays it), never read by the sim.
+    // STILL_ECHO): an adopted stream's recorded surface, 8 signed byte
+    // samples of its offset from the held target in eighths, which the
+    // renderer plays back (raymarch.wgsl THE FROZEN STREAM PLAYS BACK); written
+    // by sim_stream.wgsl while the column is observed, frozen once it is held.
+    // Both words 0 = no recording.
     // ...plus EIGHT words per window column after those (2026-10-17,
     // sim_stream.wgsl STREAM_OBS): the stream observer's own state -- the
-    // steady test's anchor and sums, the downstream-quiet stamps (scratch +
-    // published), the record's tag, the adoption tick, release / adoption
-    // counts. Read and written by sim_stream.wgsl only (and the gates).
-    // Every clear (the dense Fill, the paged regen's WriteBuffer, the load's
-    // clearStreams) covers them.
-    constexpr uint64_t kStillWaterWords =
-        (uint64_t)kWorldN * kWorldN * 4u + 4u + (uint64_t)kWorldN * kWorldN + 2ull * kWorldN * kWorldN +
-        8ull * kWorldN * kWorldN;
+    // steady test's anchor and sums, the block, the downstream event stamps
+    // (scratch + published), the record's tag, the adoption tick, release /
+    // adoption counters. Read and written by sim_stream.wgsl only (and the
+    // gates). Every clear (the dense Fill, the paged regen's WriteBuffer, the
+    // load's clearStreams) covers them.
+    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u +
+                                          (uint64_t)kWorldN * kWorldN +
+                                          2u * (uint64_t)kWorldN * kWorldN +
+                                          8u * (uint64_t)kWorldN * kWorldN;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
                                       rhi::BufferUsage::CopySrc,
@@ -1671,6 +1687,9 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
                                    const TreeAtlas& trees,
                                    const std::vector<uint32_t>& worldMapWords) {
   FlushQueuedUploads(device, queue);
+  // The CPU twin follows the upload (Init's note): a gate's environment is a
+  // local, so the twin keeps its own copy.
+  wgtwin::SetGenEnv(trees, worldMapWords);
   // Grow-only: a table that shrank keeps its buffer and is zero-padded, the
   // same way Init pads to the header floor. Only a table that no longer fits
   // costs a new buffer -- and with it the two bind groups, because a bind
@@ -4572,6 +4591,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(47, world_->shadowHist),    // far patches' indirect light (shadow_resolve.wgsl)
         b(48, flowGridBuf_),          // the terrain flow field (flowfield.h)
         b(49, flowMeasBuf_),          // the measured flow (flowfield.h kFlowMeas*)
+        b(50, stillWaterBuf_),        // the still-water table (held + adopted streams)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

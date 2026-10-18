@@ -115,6 +115,12 @@ class WorldEdits {
   // Chunks the RESOLVED layer touches (0 before the first Resolve).
   size_t ChunkCount() const { return byChunk_.size(); }
   const std::string& Name() const { return name_; }
+  // A process-unique number for the layer's CONTENT: a fresh one on every
+  // Clear and every file parsed in, never reused, and carried by a copy. A
+  // reader that keeps a derived form of the layer (the distant tier's
+  // obstacle overlay keeps a resolved copy, D10) compares it to know the
+  // layer it copied is still the one in force. Resolution is not content.
+  uint64_t Generation() const { return gen_; }
 
   // Converts the file's columns to world cells for `seed` and the map in
   // force (worldmap::CurrentWorldMap). A no-op when neither changed since the
@@ -235,6 +241,7 @@ class WorldEdits {
   size_t within_ = 0;       // next cell inside pending_[cursor_]
   size_t voxelCount_ = 0;
   std::string name_;
+  uint64_t gen_ = 0;   // Generation()
 
   struct Applied {
     uint32_t seq = 0;

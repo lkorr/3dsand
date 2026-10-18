@@ -996,7 +996,7 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
     biome whose cover splits (desert, ocean); tundra's snow skin opted out of
     the firm split and keeps its settle transient.
 
-### Distant creatures (2026-10-15/16; `docs/PLAN_distant_npcs.md` D0-D3, D5+D6, D8, D9, `game/distant.h`)
+### Distant creatures (2026-10-15/16; `docs/PLAN_distant_npcs.md` D0-D3, D5+D6, D8, D9, D11, `game/distant.h`)
 
 The window is 51.2 m across and used to be the edge of the living world: a
 creature 16 voxels past it was PARKED (its record in a region bucket, frozen,
@@ -1017,7 +1017,20 @@ ops**. PARKED = `ChunkStore::DormantEntities` (bytes; nothing ticks).
   the radius with room in the tier -- the living AND the dead (a corpse is a
   dead `DistantMob`, asleep forever) -- keeps its id and brain; the kit,
   vitals and statue are read off the live rig before `ReleaseRig`. Past the
-  radius or with the tier full it parks as before (counted).
+  radius or with the tier full it parks as before (counted). A creature
+  reaches the pad by WALKING (or swimming) as well as by being thrown or by
+  the window moving (D11, 2026-10-16): past the face the near tier reads the
+  distant tier's ground -- `Mob::GroundHeightAt`, `CellSupportsWeight`, the
+  planner's headroom probe and the swim cell readers (`mob_cellcache.h`: solid,
+  then `WaterTop`'s water, then air) answer an out-of-window cell from
+  `DistantGround` -- so a Goto, a chase or a flee past the face carries it over
+  the pad and the park rule demotes it with its brain mid-walk. Only where a
+  leaver is KEPT (`MobSystem::DistantReachable`: the tier on and a park
+  function bound; D7a adds a client handing its leavers to the host) and only
+  for a living, owned, AI-driven body; elsewhere past the face stays unknown
+  and the drive stops it at the face as before (with no park function a leaver
+  is released and erased). Line of sight past the face stays open (the tier's
+  own sight is open-field). Nothing pushes anyone out. Gate `distant-walkout`.
 - *Promote* (`EntityParking::Unpark`, phase H, before `mobs.PreTick`): inside
   the window by `kUnparkMarginChunks` (THE PROMOTION LINE), nearest first, under
   Unpark's waits (budget, living cap, ground in the fetch cache incl. the snap's
@@ -1057,7 +1070,21 @@ promote(demote(m)) re-saves byte for byte (`distant-roundtrip`).
 water (`TerrainColumn().water` / `WaterColumnAt`), and EDITED chunks read from
 the `ChunkStore` after their pending eviction is drained
 (`Stream::SettledStoredChunk` -- an eviction lands on a GPU-timed tick, audit
-A3). Trees, buildings and `.svedit` layers are not obstacles (v1 gap). Ground
+A3). Between the stored chunk and `TerrainHeight` sits THE WORLDGEN OVERLAY
+(D10, `game/distant_obstacles.h`, CPU twin `sim/worldgen_twin.h`): what
+genChunk stands on and cuts into the ground, re-derived on the CPU from the
+shader's own inputs (the tree atlas and packed biome records as last
+uploaded, the current map's sites, a dungeon block packed from the current
+map, a private resolved copy of the `.svedit` layer), in genCellIn's order --
+the low 3.2 m band of every lattice and authored tree (a crown overhead is no
+obstacle), cacti, stamps (houses), dungeon/ruin matter, the edit layer last.
+Door leaves of placed structures read AIR (policy: the tier opens no door).
+Per-column spans built lazily (dungeon and layer per cell), age-trimmed, dropped
+on (map serial, uploaded environment, layer generation, seed, vegetation); a
+column the overlay does not touch keeps the `TerrainHeight` fast path, so the
+drive, A*, the line test and the ground fan all see the matter unchanged. Not
+modelled: caves, passable cover, the top cell's partial grains. Gate
+`distant-obstacles` holds it to real generated boxes per source. Ground
 MODE is decided once at demotion: SURFACE (feet within `surfaceSnapMaxVox` of
 the terrain, outside every placed dungeon box) walks; ANCHORED (underground,
 indoors, on a wall) thinks, turns and strikes what reaches it but never moves.
@@ -1182,7 +1209,8 @@ distant walks its day -- the SAME resident step (one Resident per ref, kept
 across the edge because the id is), run on the distant creature's brain, its
 ref dormant or not; the tier's Think walks it to the routine's goal over
 DistantGround, a movement goal and never a teleport. At distance it opens no
-door (there are none on DistantGround), strikes no pose and holds at its anchor
+door (DistantGround reads every door leaf as an open doorway, D10), strikes no
+pose and holds at its anchor
 (wander and socialize rows stand), so the tier sleeps it; a sleeper is woken
 only by its day (a new row when the schedule clock reaches a new minute, an
 edit, a patrol's pause ending via `SetDistantRoutineClock`). With everything
@@ -1205,13 +1233,62 @@ the edge, outcomes resolved before any is applied, ground and ChunkStore reads
 latency-fixed. Mob state is not in `determinismHash`; twice-run digests hold
 it (`distant-walk`, `distant-fight`, `distant-edge`, `distant-schedule`).
 
+**Across machines** (D7a, 2026-10-16; `docs/PLAN_distant_npcs.md` 8.3 / 8.6,
+`net/distantsync.h`, gate `distant-mp`). THE DISTANT WORLD IS THE HOST'S: one
+machine -- the host, whose `ChunkStore` is the world's -- holds, steps,
+retires, activates and saves every distant creature, and every "the window"
+above becomes "a window of the game", W = the host's window plus each
+connected peer's (the `PeerView` origins `net::Authority` reads, handed to the
+tier as `DistantPeerWindow`s every tick). The radius tests (demotion,
+activation) are against the NEAREST centre in W, retirement is past radius +
+hysteresis of EVERY centre, activation also takes records inside a peer's
+window (the old "the host parked it, only the host's window brings it back"
+gap), and the drive holds a waiting creature at the promotion line of every
+window it is over. A creature over a PEER's line -- alone, or where both lines
+have it and the ownership rule names the peer for its feet -- is a REMOTE
+PROMOTION: the host sends a `DistantHandIn` (the patched record with its
+status tail, the brain on the wire, the steer, whether it walked, the look
+key), keeps the creature whole in an IN-TRANSIT list (saved with the tier,
+put back at a disconnect or on a "returned" answer), served nearest to that
+peer's window first, `kUnparkPerCall` a peer a tick, under the room the peer
+reports (`livingFree`) minus what is in transit and the flip bound. A CLIENT
+holds no tier of its own: its park rule HANDS OUT a creature leaving its
+window (`DistantHandOut`: SaveOne record, brain, steer, velocity, statuses,
+the look baked now from the live rig) where it used to erase it, and the host
+makes it a distant creature under the SAME id (`DistantFromRecord`) or parks
+it -- never loses it; a hand-in waits in the client's WAITING ROOM (never
+stepped, retired, activated or published) until the client's own promotion
+pass places it (`EntityParking::Unpark`'s branch for a machine whose parking
+is off: its cap, its fetch cache, the snap) and answers `DistantHandInDone`
+promoted -- or gives it back after `kHandInMaxWaitTicks` (150). The client's
+edge band and statues come from the host's `DistantView` of its window
+(every tier creature within the radius of the peer's window centre: the shape
+on first sight and a 1 s keyframe, the statue state on change, the tick-start
+actor and body box inside the edge band of the peer's window, a gone when it
+leaves the set). `EntityBatch` v5 carries the four records after
+`playerBodies`. Ownership: an id that enters a tier on either machine loses its
+incumbent in `EntitySync`'s memory, and a creature made live inside a tick is
+held by its maker for one tick (`Mob::ownLatch_`) so the next `ScanHandoffs`
+hands it over WITH its record (the latent "promoted near a peer, ghosted with
+no handoff, expired" case, for every path). Nothing of it runs unconnected:
+the role is Off outside a two-player session. **D7b (2026-10-17) carries the
+edge across a peer's window** (`DistantEdgeWire`, EntityBatch v6): the
+client's near creatures at its faces are actors in the host's distant band;
+its strokes, arrows out, box hits and shots past the face are landed by the
+host's impact pass; the host's swings at the client's creatures are ROLLED ON
+THE CLIENT with the host's keys against the live body and enter through D3's
+door; inbound flights cross into the client's window there. Open: a player's
+shot that re-enters the client's window after leaving it is flown and
+tested on the host only.
+
 **Off** (`distant.enabled = false`): the park rule exactly as S5b ran it; the
 gates that test the PARK path pin it off (`DistantSwitchScope`: `mob-park`
 A-F, `corpse-save`, `npc-catchup`, `refs-npc-identity` A-E; C2 runs the tier).
 Counters: `build/last_run.json` -> `distant`. Gates `distant-roundtrip`,
 `distant-walk`, `distant-sleep`, `distant-fight`, `distant-calibrate`,
 `distant-calib-matrix`, `distant-look`, `distant-edge`, `distant-schedule`,
-`distant-save`, `distant-overflow`, `distant-arrow`. Planned: D7 (multiplayer).
+`distant-save`, `distant-overflow`, `distant-arrow`, `distant-obstacles`,
+`distant-walkout`, `distant-mp` (D7a + D7b, the tier across machines).
 
 ---
 
@@ -1684,7 +1761,10 @@ SSBO lists of chunk indices.
     and spill bytes exactly (worldgen/worldgenList 128 + 800 B, worldgenCols
     168 + 416 B, far* unchanged); `worldgenCols`' binary grows 1.65 -> 1.83
     MB because each `colHeightAt` is inlined, which is why `looseStep` has one
-    call site for cover and bed and its far probes are one loop.
+    call site for cover and bed and its far probes are one loop. (Since
+    2026-10-17 the four axis neighbours ride that same loop: one
+    `colHeightAt` call site in all, `cols` 382k -> 133k instructions after
+    the worldgen recipe; docs/PLAN_shader_compile.md "Slimming".)
     The `worldmap` gate's skin probe (`selftest_biomes.cpp`) now counts the
     biome's own `cover.firmSkin` as its skin: its desert sample at (144,426)
     is on ground steeper than 34° and is generated sandstone, which is the
@@ -15020,7 +15100,11 @@ inspection:
   blocked stops a mob dead at the edge of its own knowledge — an invisible wall.
   This is the mob-scale twin of the projectile rule in CLAUDE.md: *unknown* and
   *out-of-window* are different tests. The drive's own `haveGround` check is
-  what prevents walking off into space.
+  what prevents walking off into space. PAST THE WINDOW FACE (2026-10-16, D11)
+  the ground is not unknown for a creature that may leave: the near tier reads
+  the distant tier's (`MobSystem::OutsideGroundFor` -> `DistantGround`), so
+  the drive walks it off the window onto the ground it will walk on as a
+  distant creature (see "Distant creatures", the demote border).
 - **Probe reach is per-axis, not an isotropic `max`.** A long creature that
   probes at `max(sizeX, sizeZ)` reaches well past where it can walk and refuses
   gaps it would fit through.
@@ -25479,6 +25563,36 @@ white water, not black streaks and glowing flecks (2026-10-16 tickets
 `fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
+**HELD STEPS ARE NOT WATERFALLS UNLESS WATER FALLS** (2026-10-17, tickets
+11-26-13 / 11-37-20: a frozen spill fan and a frozen stream drawn as a fan of
+white curtains). The raymarch now binds the still table read-only (render
+binding 50, the sim's 58) and asks, per CA water pixel, whether the column is
+held (`heldColumnT8`, `gHeldKind`). For a HELD column (map or adopted stream) a
+side face is a sheet only over a real drop (`heldSideKind`): the water or floor
+in front at least `HELD_SHEET_MIN_DROP` (2.5) cells under the column's surface,
+or open air down past `HELD_SHEET_LOOK` (3) cells — an overhang, a cliff, the
+bake's curtain; a step of a cell or two is a riser, lit as surface. Unheld (live
+CA) water keeps the 0.75 rule: its spill really is in flight.
+**THE FROZEN STREAM PLAYS BACK** (same tickets; owner: "when frozen it
+continues to flicker"): a RUNNING held column's surface is DRAWN at
+T8 + o(t) eighths. For an ADOPTED stream o is the column's recording
+(`STILL_ECHO`, two words a column after the mouth words: 8 signed byte samples
+of its live surface relative to T8, one per 4 ticks; written by
+`sim_stream.wgsl`; -128 = no water, drawn dry), played back at 7.5 samples/s
+from a per-column phase and stepped in whole eighths; with no recording (both
+words 0) a procedural -3..+3 eighth flicker. A map RIVER column (its
+`STILL_MOUTH` word set — worldgen writes it for river water only) takes the
+procedural flicker scaled by its current (none under 0.08 m/s, all of it from
+0.6 m/s), so a slack reach stays glassy; a lake and the sea never flicker
+(ticket 11-37-20's "frozen waterfall" is map river water, not a stream). In fs the ray is re-met against the column's box topped at that height
+(`streamSurfaceHit`): lowered, the ray goes down onto it or out of its side onto
+the next column (drawn as surface); raised, it is met earlier through its top or
+side; dry, the bed shows. `waterNormal` adds the neighbours' drawn offsets to
+the column gradient, as a live partial cell is tilted by its neighbours'
+fullness — the patchwork of per-cell tilts is what made the live stream read as
+moving. Render-only: the voxels stay held. Not drawn: a raised column seen only
+past its own water (under a cell of silhouette), and the far field.
+`HELD_WATER_LOOK` (a const) turns both off for an A/B.
 
 **What is dissolved in held water rides it** (`sim_solute.wgsl`, THE HELD
 FLOW CARRIES WHAT IS DISSOLVED IN IT; ticket 2026-10-16_11-11-51). Held water
@@ -25501,6 +25615,14 @@ its chunks stall and sleep when nothing lower has room (`docs/PLAN_solutes.md`
 downstream face is no sink).
 **The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted. Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
 
+**THE SURFACE IS BLENDED** (2026-10-17, ticket 11-37-20): channel water was the
+NEAREST claiming piece's surface, a Voronoi pick -- on a wide river (hw ~155)
+down a steep stretch of short pieces it stepped 6-7 voxels wherever the nearest
+piece changed (the Silverrun's held terraces drawn as sheer falls). Now every
+claiming channel of the same water within twice the nearest's d2 (+64) is
+averaged with weights that reach 0 at that cutoff (continuous; integer; the CPU
+twin matches, `rivers` D). At the ticket's spot the largest step between
+neighbouring water columns went from 6-7 voxels to 2.6 (mean 0.14).
 **THE DRIFT** (2026-10-17, ticket 00-01-44): a level reach gives the held
 flow no direction, so worldgen `cols` writes each river column's network
 distance to its mouth (worldwater.cpp `River::mouth`, packed over the pieces'
@@ -30510,6 +30632,29 @@ a `switch` whose empty labels were separated from their target; and
 `SaveWorld`'s untagged resident flush erased the tags it existed to keep.
 Smoke: a flying, painting client put 2,163 chunks; the host received, saved
 and a fresh process loaded exactly 2,163 tagged chunks at the saved tick.
+
+**The distant tier across machines (D7a, 2026-10-16; `net/distantsync.h`,
+"Distant creatures" -> "Across machines", gate `distant-mp`).** Before D7a a
+creature that walked out of the CLIENT's window was released and erased (a
+client has no park function), and the host's distant tier knew only the
+host's window. Now the distant world is the HOST'S, over every window of the
+game: a client HANDS OUT what leaves its window (`DistantHandOut`, the same
+SaveOne record a park writes plus the brain, steer and statuses), the host
+keeps it under its id, steps it, retires it past every window's reach,
+activates parked records near any window, and HANDS IN to a peer what reaches
+that peer's promotion line (`DistantHandIn`, answered by `DistantHandInDone`:
+promoted, or returned to the host's in-transit copy); every batch it sends
+the peer a `DistantView` of the tier near the peer's window, from which the
+client draws statues and publishes its edge band. Four records in
+`EntityBatch` v5 after `playerBodies`, plus the client's `livingFree` room
+report. A disconnect puts the host's in-transit creatures back in its tier;
+a client keeps and still promotes its waiting room. Two ownership fixes rode
+along: an id that enters a tier loses its `EntitySync` incumbent, and a
+creature made live inside a tick (promotion, unpark, rising, spawn) is its
+maker's for that one tick (`Mob::ownLatch_`), so the next `ScanHandoffs`
+hands it over with its record instead of the old silent ghost-and-expire.
+Measured by `distant-mp` (two machines in one process, bytes both ways): see
+`docs/PLAN_distant_npcs.md` 8.6.
 
 **What is still not multiplayer, stated plainly.** Two players, one host,
 direct IP over TCP; no lobby, NAT traversal or third peer; melee hits on a

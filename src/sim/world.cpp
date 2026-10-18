@@ -14,8 +14,11 @@
 #include "sim/flowfield.h"
 #include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
+#include "sim/dungeon.h"    // TwinSurfNear: the worldgen twin's dgSurfNear (D10)
 #include "sim/rng.h"
+#include "sim/treeatlas.h"  // the worldgen twin's tree atlas (D10)
 #include "sim/tuning.h"
+#include "sim/worldgen_twin.h"
 #include "sim/worldmap.h"
 
 // SANDVOX_DIRTY_REASONS=<n>: print the DIRTY_R_* histogram every n snapshots
@@ -3149,27 +3152,41 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
     }
   }
   if (!nearR && lake == 0u) return out;
+  // THE SURFACE IS BLENDED, not picked: the shader's note (worldgen.wgsl,
+  // above its second walk). Same integer arithmetic, so `rivers` D stays
+  // exact.
   bool foreignHi = false;
   if (inCh) {
     const int wv = (w8Min - 1) >> 3;
     const int tol = (int)kRiverWaterfall + mNear;
     foreignHi = hiFS > wv + tol;
-    if (loFS < wv - tol) {
+    const bool reFloor = loFS < wv - tol;
+    if (reFloor) {
       floorMin = 1048576;
       mCh = 1;
       crest8 = -8388608;
       curt8 = -8388608;
-      for (uint32_t k = 0u; k < n; k++) {
-        const WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
-        if ((uint32_t)st.kind != kSiteRiver) continue;
-        const RivPM p = rivPieceAt(st, x, z);
-        if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol) continue;
+    }
+    const int cut = 2 * chD2 + 64;
+    int wsum = 0, acc = 0;
+    for (uint32_t k = 0u; k < n; k++) {
+      const WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
+      if ((uint32_t)st.kind != kSiteRiver) continue;
+      const RivPM p = rivPieceAt(st, x, z);
+      if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol || p.s - p.m > wv + tol) continue;
+      if (reFloor) {
         mCh = std::max(mCh, p.m);
         floorMin = std::min(floorMin, p.floorY);
         if (p.strip == 1) crest8 = std::max(crest8, p.edgeT8);
         if (p.strip == 2) curt8 = std::max(curt8, p.edgeT8);
       }
+      const int wt = (cut - p.d2) >> 4;
+      if (wt > 0) {
+        wsum += wt;
+        acc += wt * std::clamp(p.s8 - w8Min, -8 * (int)kRiverWaterfall, 8 * (int)kRiverWaterfall);
+      }
     }
+    if (wsum > 0) w8Min += acc / wsum;
   }
   int h = h0, water = -1, gap = 0;
   uint32_t bed = 0u;
@@ -3621,3 +3638,410 @@ bool World::FluidRenderBounds(uint32_t tick, IVec3& lo, IVec3& hi) const {
   hi.x += kFluidRenderPadVox; hi.y += kFluidRenderPadVox; hi.z += kFluidRenderPadVox;
   return true;
 }
+
+// ============================================================================
+// THE WORLDGEN TWIN: worldgen's features above the ground, on the CPU
+// (sim/worldgen_twin.h; docs/PLAN_distant_npcs.md §8.2, package D10)
+// ============================================================================
+//
+// Here and not in a file of its own because every input is one of this file's
+// mirrored statics (landAt, treelineAt, the pond scan, the site footprints):
+// exporting them one by one would scatter the mirror; defining the twin beside
+// them keeps it in the one file the height contract lives in. NOT inside a
+// MIRROR block: check_invariants.py token-compares those against the shader,
+// and the functions below are the shader's tree / cactus / stamp code, which
+// sits outside every mirror there too. The `distant-obstacles` gate is the
+// per-voxel proof, against real generated boxes.
+
+// worldgen.wgsl featureSteepAt: no tree / cactus roots where the landform
+// slope reaches map.json terrain.rockSlope (0 = off).
+static bool featureSteepAt(int slope) {
+  const int r = wmTerrain(worldmap::kHTerrainRockSlope);
+  return r > 0 && slope >= r;
+}
+// worldgen.wgsl crownMeetsPad: does a crown of reach r round (wx, wz) put any
+// of itself over the map's pad box? (The empty-box guard is load-bearing.)
+static bool crownMeetsPad(int wx, int wz, int r) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (m.padX1 < m.padX0) return false;
+  return wx + r >= m.padX0 && wx - r <= m.padX1 && wz + r >= m.padZ0 && wz - r <= m.padZ1;
+}
+// worldgen.wgsl clearingRefuses (CLEARING_THIN_SALT 0xC1EA5u): a clearing's
+// box keeps the crown square off and thins its feather band by a hash.
+static bool clearingRefuses(uint32_t sid, int wx, int wz, int reach, uint32_t seed) {
+  const worldmap::WorldMapData::StampSite& s = wmSite(sid);
+  const int gx = std::max(s.x - wx, wx - s.x1);
+  const int gz = std::max(s.z - wz, wz - s.z1);
+  const int gap = std::max(gx, gz) - reach;
+  if (gap < 0) return true;
+  const int feather = s.padMargin;
+  if (gap >= feather) return false;
+  const uint32_t roll = hash3(seed ^ 0xC1EA5u, (uint32_t)wx, (uint32_t)wz) % (uint32_t)feather;
+  return (int)roll >= gap;
+}
+// worldgen.wgsl siteBlocksTrunk, branch for branch (the shader's comments say
+// why each kind refuses what it does). `h` is the trunk's landAt ground.
+static bool siteBlocksTrunk(int wx, int wz, int h, int reach, uint32_t seed) {
+  using namespace worldmap;
+  const uint32_t* lst = wmSiteList(wx, wz);
+  const uint32_t n = wmSiteN(lst);
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    const WorldMapData::StampSite& s = wmSite(sid);
+    const uint32_t kind = (uint32_t)s.kind;
+    if (kind == kSiteClearing) {
+      if (clearingRefuses(sid, wx, wz, reach, seed)) return true;
+    } else if (kind == kSiteTree) {
+      const int d = std::max(std::abs(wx - s.x), std::abs(wz - s.z));
+      if (d <= s.radius + reach) return true;
+    } else if (kind == kSiteStamp) {
+      if (stampRectDist(sid, wx, wz) < s.apron + s.padMargin) return true;
+      const int gx = std::max(s.bx0 - wx, wx - s.x1);
+      const int gz = std::max(s.bz0 - wz, wz - s.z1);
+      if (std::max(gx, gz) <= reach + (int)kStampTreeClear) return true;
+    } else if (kind == kSitePath) {
+      if (routeNear(s, wx, wz, s.padMargin)) return true;
+    } else if (kind == kSiteRoad) {
+      const int keep = s.radius + std::max(reach, s.padMargin);
+      if (routeNear(s, wx, wz, keep)) return true;
+    } else if (kind == kSiteRiver) {
+      const int hw = std::max(s.radius, s.hwB);
+      if (routeNear(s, wx, wz, hw + std::max(reach, s.padMargin))) return true;
+    } else if (kind == kSiteLakeEdge) {
+      if (routeNear(s, wx, wz, s.padMargin + reach)) return true;
+    } else if (kind == kSiteLakeCell) {
+      if (h < s.surf && lakeTest(sid, wx, wz, 0).inside != 0) return true;
+    } else if (siteFootprintHas(sid, wx, wz)) {
+      return true;
+    }
+  }
+  return false;
+}
+// worldgen.wgsl waterDistAt / nearWaterOk: whole voxels of dry ground from
+// (x, z) to the nearest pond CANDIDATE's rim within `band` (-1: none, or
+// inside a disc), and a row's authored bounds against it.
+static int waterDistAt(const PondSet& s, int x, int z, int band) {
+  if (band <= 0) return -1;
+  if (pondCovers(s, x, z)) return -1;
+  int best = 0x7FFFFFFF, bestR = 0;
+  const Pond* d[5] = {&s.d0, &s.d1, &s.d2, &s.d3, &s.d4};
+  for (const Pond* p : d) {
+    const int c = candD2(*p, x, z, band);
+    if (c < best) { best = c; bestR = p->r; }
+  }
+  if (best == 0x7FFFFFFF) return -1;
+  int lo = 0, hi = band;
+  for (int i = 0; i < 10; i++) {
+    if (lo >= hi) break;
+    const int mid = (lo + hi) / 2;
+    const int rr = bestR + mid;
+    if (best <= rr * rr) hi = mid; else lo = mid + 1;
+  }
+  return std::max(lo - 1, 0);
+}
+static bool nearWaterOk(int d, int nearMax, int nearMin) {
+  if (nearMax >= 0 && (d < 0 || d >= nearMax)) return false;
+  if (nearMin > 0 && d >= 0 && d < nearMin) return false;
+  return true;
+}
+// worldgen.wgsl isin / segDist2 (the cactus arms). 64-bit products where the
+// shader's i32 cannot overflow at the sizes it is asked about -- the same
+// values, without C++'s undefined signed overflow.
+static int isin(int a) {
+  const int p = a & 255;
+  const int half = p & 127;
+  const int v = (4 * half * (128 - half) * 256) / (128 * 128);
+  return p >= 128 ? -v : v;
+}
+static int segDist2(int px, int py, int pz, int ax, int ay, int az, int bx, int by, int bz) {
+  const int vx = bx - ax, vy = by - ay, vz = bz - az;
+  const int wx = px - ax, wy = py - ay, wz = pz - az;
+  const int len2 = vx * vx + vy * vy + vz * vz;
+  if (len2 <= 0) return wx * wx + wy * wy + wz * wz;
+  int tq = (int)(((int64_t)(wx * vx + wy * vy + wz * vz) * 1024) / len2);
+  tq = std::clamp(tq, 0, 1024);
+  const int cx = ax + (vx * tq) / 1024;
+  const int cy = ay + (vy * tq) / 1024;
+  const int cz = az + (vz * tq) / 1024;
+  const int ex = px - cx, ey = py - cy, ez = pz - cz;
+  return ex * ex + ey * ey + ez * ez;
+}
+
+namespace wgtwin {
+namespace {
+GenEnv& EnvSlot() {
+  static GenEnv g;
+  return g;
+}
+// The atlas, bounds-checked: a word past the buffer reads 0 (the shader's
+// buffer is the same words, so an in-range read is the shader's read).
+inline uint32_t taW(const TreeAtlas& a, size_t i) { return i < a.words.size() ? a.words[i] : 0u; }
+inline uint32_t taSpecies(const TreeAtlas& a, int sp, uint32_t w) {
+  return taW(a, (size_t)taW(a, treeatlas::kHSpeciesDir) + (size_t)sp * treeatlas::kSpeciesWords + w);
+}
+inline bool vegetationOn() { return CurrentTuning().debug.vegetation != 0u; }
+}  // namespace
+
+void SetGenEnv(const TreeAtlas& atlas, const std::vector<uint32_t>& mapWords) {
+  GenEnv& g = EnvSlot();
+  g.atlas = std::make_shared<const TreeAtlas>(atlas);
+  g.map = std::make_shared<const std::vector<uint32_t>>(mapWords);
+  g.serial++;
+}
+const GenEnv& CurrentGenEnv() { return EnvSlot(); }
+
+uint32_t BiomeWord(const std::vector<uint32_t>& W, uint32_t b, uint32_t w) {
+  if (W.size() <= worldmap::kHBiomeRecords) return 0u;
+  const uint32_t n = W[worldmap::kHBiomeCount];
+  if (n == 0u) return 0u;
+  const uint32_t id = b >= n ? 0u : b;
+  const size_t i = (size_t)W[worldmap::kHBiomeRecords] + (size_t)id * worldmap::kBiomeRecWords + w;
+  return i < W.size() ? W[i] : 0u;
+}
+
+void LatticeTreeSite(int tx, int tz, uint32_t seed, int& wx, int& wz) {
+  // worldgen.wgsl treeSite: the trunk in the middle half of its tile.
+  const int T = treeatlas::CurrentTreeLattice().tile;
+  const uint32_t hsh = hash3(seed ^ 0x7BEE5u, (uint32_t)tx, (uint32_t)tz);
+  const int inset = T / 4;
+  const uint32_t span = (uint32_t)(T / 2);
+  wx = tx * T + inset + (int)((hsh >> 3u) % span);
+  wz = tz * T + inset + (int)((hsh >> 9u) % span);
+}
+
+// worldgen.wgsl treeSite + treeInfoBare. Every gate is a `return` of a
+// non-present tree, in the shader's order.
+Tree LatticeTree(int tx, int tz, uint32_t seed, const TreeAtlas& A,
+                 const std::vector<uint32_t>& bio, const std::vector<uint32_t>& dg) {
+  using namespace treeatlas;
+  Tree t;
+  LatticeTreeSite(tx, tz, seed, t.wx, t.wz);
+  const uint32_t hsh = hash3(seed ^ 0x7BEE5u, (uint32_t)tx, (uint32_t)tz);
+  if (sLabWorld) return t;   // the lab's slab: inRim, no trees anywhere
+  const int ns = (int)taW(A, kHSpeciesCount);
+  if (ns <= 0 || !vegetationOn()) return t;
+  const Land land = landAt(t.wx, t.wz, seed);
+  t.base = land.h;
+  const int h = land.h;
+  if (h >= treelineAt(t.wx, t.wz, seed)) return t;
+  if (featureSteepAt(land.slope)) return t;
+  const uint32_t biome = World::MapBiomeAt(t.wx, t.wz, seed);
+  if ((hsh >> 16u) >= BiomeWord(bio, biome, worldmap::kB_TreeChanceQ16)) return t;
+  const uint32_t h2 = hash3(seed ^ 0x7BEE6u, (uint32_t)t.wx, (uint32_t)t.wz);
+  const uint32_t bt = taW(A, kHBiomeTable) + biome * (1u + (uint32_t)ns);
+  const uint32_t total = taW(A, bt);
+  if (total == 0u) return t;
+  const uint32_t pickRoll = h2 % total;
+  int sp = -1;
+  for (int i = 0; i < ns; i++)
+    if (pickRoll < taW(A, bt + 1u + (uint32_t)i)) {
+      sp = i;
+      break;
+    }
+  if (sp < 0) return t;
+  // WGSL's i32(u32) is a bit reinterpretation, as is C++20's conversion.
+  const int minY = (int)taSpecies(A, sp, kSMinY), maxY = (int)taSpecies(A, sp, kSMaxY);
+  if (minY >= 0 && h < minY) return t;
+  if (maxY >= 0 && h > maxY) return t;
+  const int maxSlope = (int)taSpecies(A, sp, kSMaxSlope);
+  if (maxSlope > 0 && land.slope > maxSlope) return t;
+  {
+    const uint32_t cb = taW(A, kHCondTable) + (biome * (uint32_t)ns + (uint32_t)sp) * (uint32_t)kCondWords;
+    const int rMinY = (int)taW(A, cb + kCMinY), rMaxY = (int)taW(A, cb + kCMaxY);
+    if (rMinY >= 0 && h < rMinY) return t;
+    if (rMaxY >= 0 && h > rMaxY) return t;
+    const int rSlope = (int)taW(A, cb + kCMaxSlope);
+    if (rSlope > 0 && rSlope < 1024 && land.slope > rSlope) return t;
+    t.nwMax = (int)taW(A, cb + kCNearWaterMax);
+    t.nwMin = (int)taW(A, cb + kCNearWaterMin);
+    const int rPatch = (int)taW(A, cb + kCPatchThreshold);
+    if (rPatch > 0) {
+      const uint32_t pLog2 = BiomeWord(bio, biome, worldmap::kB_PatchCellLog2);
+      const int pm = vnoise2d(t.wx + 307, t.wz - 911, pLog2, seed ^ 0xD5F7u).n >> 6;
+      if (pm <= rPatch) return t;
+    }
+  }
+  const uint32_t h3 = hash3(seed ^ 0x7BEE7u, (uint32_t)t.wx, (uint32_t)t.wz);
+  const int vc = std::max((int)taSpecies(A, sp, kSVariantCount), 1);
+  t.varOff = taSpecies(A, sp, kSVariantDir) + (h3 % (uint32_t)vc) * (uint32_t)kVariantWords;
+  t.rot = (h3 >> 9u) & 3u;
+  t.mir = ((h3 >> 11u) & 1u) != 0u;
+  t.reach = (int)taSpecies(A, sp, kSReach);
+  if (crownMeetsPad(t.wx, t.wz, t.reach)) return t;
+  if (siteBlocksTrunk(t.wx, t.wz, h, t.reach, seed)) return t;
+  if (dungeon::TwinSurfNear(dg, t.wx, t.wz, t.reach + (int)dungeon::kDgTreeClear)) return t;
+  t.sp = sp;
+  const uint32_t ac = taSpecies(A, sp, kSAutumnChance);
+  t.autumn = ac != 0u && ((h3 >> 14u) % std::max(ac, 1u)) == 0u;
+  t.present = true;
+  return t;
+}
+
+// worldgen.wgsl siteTree: no biome, density or placement gates -- the author
+// put it there; VEGETATION and the treeline stay.
+Tree SiteTree(uint32_t sid, uint32_t seed, const TreeAtlas& A) {
+  using namespace treeatlas;
+  Tree t;
+  const worldmap::WorldMapData::StampSite& s = wmSite(sid);
+  t.wx = s.x;
+  t.wz = s.z;
+  t.base = sitePadY(sid);
+  const int sp = s.species;
+  const uint32_t h3 = hash3(seed ^ 0x7BEE7u, (uint32_t)t.wx, (uint32_t)t.wz);
+  if (sLabWorld || !vegetationOn() || sp < 0 || sp >= (int)taW(A, kHSpeciesCount)) return t;
+  if (t.base >= treelineAt(t.wx, t.wz, seed)) return t;
+  const uint32_t vc = std::max(taSpecies(A, sp, kSVariantCount), 1u);
+  const int vsel = s.variant;
+  const uint32_t v = vsel > 0 ? (uint32_t)std::max(vsel - 1, 0) % vc : h3 % vc;
+  t.varOff = taSpecies(A, sp, kSVariantDir) + v * (uint32_t)kVariantWords;
+  const uint32_t rot = (uint32_t)s.rot;
+  t.rot = rot == worldmap::kSiteRotRolled ? (h3 >> 9u) & 3u : rot & 3u;
+  t.mir = rot == worldmap::kSiteRotRolled && ((h3 >> 11u) & 1u) != 0u;
+  t.sp = sp;
+  t.reach = (int)taSpecies(A, sp, kSReach);
+  const uint32_t ac = taSpecies(A, sp, kSAutumnChance);
+  t.autumn = ac != 0u && ((h3 >> 14u) % std::max(ac, 1u)) == 0u;
+  t.present = true;
+  return t;
+}
+
+int CactusTile() { return vlen(40); }
+
+// worldgen.wgsl cactusInfoBare.
+Cactus CactusAt(int tx, int tz, uint32_t seed, const std::vector<uint32_t>& bio,
+                const std::vector<uint32_t>& dg) {
+  Cactus c;
+  const uint32_t hsh = hash3(seed ^ 0xCAC71u, (uint32_t)tx, (uint32_t)tz);
+  c.rnd = hsh;
+  const int CT = CactusTile();
+  const int inset = CT / 4;
+  const uint32_t span = (uint32_t)std::max(CT / 2, 1);
+  c.wx = tx * CT + inset + (int)((hsh >> 3u) % span);
+  c.wz = tz * CT + inset + (int)((hsh >> 9u) % span);
+  if (sLabWorld || !vegetationOn()) return c;
+  const uint32_t cb = World::MapBiomeAt(c.wx, c.wz, seed);
+  if ((BiomeWord(bio, cb, worldmap::kB_Flags) & worldmap::kBF_Cacti) == 0u) return c;
+  const Land land = landAt(c.wx, c.wz, seed);
+  const int h = land.h;
+  c.base = h;
+  if (h >= treelineAt(c.wx, c.wz, seed)) return c;
+  if (featureSteepAt(land.slope)) return c;
+  if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0) || dungeon::TwinSurfNear(dg, c.wx, c.wz, 2))
+    return c;
+  if ((hsh >> 17u) % 100u >= BiomeWord(bio, cb, worldmap::kB_CactusChance)) return c;
+  const uint32_t sroll = (hsh >> 24u) % 100u;
+  c.species = sroll < BiomeWord(bio, cb, worldmap::kB_SaguaroFraction) ? 0u : 1u;
+  const int j = (int)((hsh >> 12u) % 5u);
+  int hDm = 0, rDm = 0;
+  if (c.species == 0u) {
+    hDm = 32 + j * 5;
+    rDm = 3;
+    c.arms = j >= 2 ? (int)((hsh >> 21u) % 3u) : 0;
+  } else {
+    hDm = 5 + j;
+    rDm = 3 + j / 2;
+  }
+  c.height = hDm * kVoxelsPerMetre / 10;
+  c.radius = std::max(rDm * kVoxelsPerMetre / 10, 2);
+  c.present = true;
+  return c;
+}
+int CactusReach(const Cactus& c) { return c.species == 0u ? c.radius * 6 + 4 : c.radius + 2; }
+int CactusVTop(const Cactus& c) { return c.base + c.height + 2; }
+
+// worldgen.wgsl cactusCell (and cactusArm, inlined).
+uint32_t CactusCell(const Cactus& c, int x, int y, int z) {
+  const int dx = x - c.wx, dz = z - c.wz, dy = y - c.base;
+  if (dy < 0) return 0u;
+  const int d2 = dx * dx + dz * dz;
+  const int r = c.radius;
+  if (c.species == 0u) {
+    if (dy <= c.height && d2 <= r * r) {
+      const int flute = (std::abs(dx) * 7 + std::abs(dz) * 11 + dy / 24) % 5;
+      const bool rim = d2 * 4 >= r * r * 3;
+      return (rim || flute == 0) ? kMatCactusRib : kMatCactus;
+    }
+    for (int i = 0; i < 2; i++) {   // CACTUS_ARMS
+      if (i >= c.arms) break;
+      const uint32_t ah = hash3(c.rnd ^ 0x4A12u, (uint32_t)i, 3u);
+      const int attach = c.height * 2 / 5 + (int)(ah % (uint32_t)std::max(c.height / 4, 1));
+      const int az = (i * 128 + (int)(ah >> 7u) % 90) & 255;
+      const int reach = c.radius * 3 + (int)((ah >> 15u) % (uint32_t)std::max(c.radius * 2, 1));
+      const int ex = (isin((az + 64) & 255) * reach) / 256;
+      const int ez = (isin(az) * reach) / 256;
+      const int ar = std::max(r * 2 / 3, 2);
+      if (segDist2(dx, dy, dz, 0, attach, 0, ex, attach, ez) <= ar * ar) return kMatCactusRib;
+      const int riseTop = attach + (c.height - attach) * 3 / 4;
+      if (segDist2(dx, dy, dz, ex, attach, ez, ex, riseTop, ez) <= ar * ar) return kMatCactusRib;
+      if (((c.rnd >> (uint32_t)(4 + i)) % 3u) == 0u) {
+        const int bx = dx - ex, by = dy - (riseTop + 1), bz = dz - ez;
+        if (bx * bx + by * by + bz * bz <= 4) return kMatCactusBloom;
+      }
+    }
+    if (((c.rnd >> 11u) % 3u) == 0u && dy == c.height + 1 && d2 <= r * r) return kMatCactusBloom;
+    return 0u;
+  }
+  if (dy > c.height) {
+    if (dy == c.height + 1 && d2 <= (r / 2) * (r / 2) && ((c.rnd >> 13u) % 2u) == 0u)
+      return kMatCactusBloom;
+    return 0u;
+  }
+  int br = r;
+  const int shoulder = c.height * 2 / 3;
+  if (dy > shoulder) br = r - (r * (dy - shoulder)) / std::max(c.height - shoulder, 1);
+  if (d2 <= br * br) {
+    const int flute = (std::abs(dx) * 7 + std::abs(dz) * 11) % 4;
+    const bool rim = d2 * 4 >= br * br * 3;
+    return (rim || flute == 0) ? kMatCactusRib : kMatCactus;
+  }
+  return 0u;
+}
+
+// genColumn's tree / cactus gates for the ASKING column, and treePondOk /
+// cactusInfo's disc test against ITS pond set (the one gate a feature's tile
+// cannot decide alone: worldgen evaluates it per asking column).
+AskColumn AskColumnAt(int x, int z, uint32_t seed, const PondAsk* asks, int n, uint64_t& okMask) {
+  AskColumn a;
+  okMask = 0;
+  if (sLabWorld) {
+    // genColumn's lab Col: inRim, so no feature cell anywhere.
+    a.tl = INT32_MIN;
+    return a;
+  }
+  a.tl = treelineAt(x, z, seed);
+  a.biome = World::MapBiomeAt(x, z, seed);
+  const PondSet s = pondScan(x, z, seed);
+  a.inPond = bowlAt(pondCover(s, x, z, seed), x, z).y >= 0;
+  for (int i = 0; i < n && i < 64; i++) {
+    const PondAsk& q = asks[i];
+    if (pondCovers(s, q.wx, q.wz)) continue;
+    if (q.nwMax >= 0 || q.nwMin > 0) {
+      const int d = waterDistAt(s, q.wx, q.wz, std::max(q.nwMax, q.nwMin));
+      if (!nearWaterOk(d, q.nwMax, q.nwMin)) continue;
+    }
+    okMask |= 1ull << i;
+  }
+  return a;
+}
+
+// worldgen.wgsl wmStampCell, over the CPU's copy of the block: the same
+// decoder FarEdits::StampContainers used privately (lifted here, D10).
+uint32_t StampTemplateCell(const worldmap::WorldMapData::StampSite& s, int x, int y, int z, int padY) {
+  if (s.words.empty()) return 0u;
+  const int lx = x - (s.x - s.nx / 2), lz = z - (s.z - s.nz / 2);
+  const int ly = y - padY - 1 + s.sink;
+  if (lx < 0 || lz < 0 || ly < 0 || lx >= s.nx || lz >= s.nz || ly >= s.ny) return 0u;
+  const size_t ci = worldmap::kStampHdrWords + ((size_t)lz * s.nx + lx) * 2;
+  if (ci + 1 >= s.words.size()) return 0u;
+  const uint32_t runOff = s.words[ci], cnt = s.words[ci + 1];
+  for (uint32_t k = 0; k < cnt && runOff + k < s.words.size(); k++) {
+    const uint32_t r = s.words[runOff + k];
+    const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0);
+    if (ly < y0) return 0u;
+    if (ly < y0 + (int)((r >> 27) & treeatlas::kRunMaxLen)) return r & 0xFFFu;
+  }
+  return 0u;
+}
+int SitePadY(uint32_t sid) { return sitePadY(sid); }
+
+}  // namespace wgtwin

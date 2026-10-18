@@ -180,6 +180,37 @@ full; colCache `CCW_WP` bits 25..27) into `genCellIn`.
   per unit slope, capped at 3 m/s), added to the flow grid where the two
   surface terms that draw motion read it — a held ramp, a rapid and an adopted
   stream run visibly, though nothing in the sim moves.
+* **Held steps** (2026-10-17, tickets 11-26-13 / 11-37-20): the raymarch binds
+  the still table (render binding 50, read-only; `heldColumnT8` sets
+  `gHeldKind` per CA water pixel). A HELD column's side face is a falling sheet
+  only over a REAL drop (`heldSideKind`): the water or floor in front stands
+  `HELD_SHEET_MIN_DROP` (2.5) cells or more under the column's surface (up to
+  two cells of the column over the face counted), or the column in front is
+  open for `HELD_SHEET_LOOK` (3) cells down. A frozen spill fan or stream's
+  one- and two-cell steps are risers (surface); the bake's curtain (tens of
+  voxels), an overhang or a cliff stay sheets. Unheld water keeps the 0.75
+  rule above.
+* **The frozen stream plays back** (same tickets; the owner: a frozen stream
+  "continues to flicker" as it did live): an ADOPTED column's surface is drawn
+  at T8 + o(t) eighths, o = its recording in `STILL_ECHO` (two words a column
+  after STILL_MOUTH: 8 signed bytes, the live surface minus T8 every 4 ticks,
+  -128 = no water; the sim agent's `sim_stream.wgsl` writes it), played back at
+  7.5 samples/s from a per-column phase (`ECHO_PHASE_JITTER`), interpolated and
+  rounded to whole eighths; with both words 0, a procedural -3..+3 flicker
+  (`echoProc`). A map RIVER column (STILL_MOUTH word set) takes the procedural
+  flicker scaled by its current (`RIVER_FLICKER_V0`/`V1`, 0.08..0.6 m/s); a
+  lake and the sea never flicker. Ticket 11-37-20's scene turned out to be
+  MAP river water (all of it `gHeldKind` 1 in a debug-tinted run at its
+  camera), not an adopted stream; its tall terraces up the right bank are
+  steps of 3+ cells of held map water, still sheets by the rule above. fs re-meets the ray with the column's box at that height
+  (`streamSurfaceHit`) and moves the hit, face, water path and top-cell fill;
+  a column drawn dry where the ray meets its bed first is not shaded as water.
+  `waterNormal` adds the neighbours' drawn offsets to its column gradient (the
+  patchwork of per-cell tilts a live stream shows). Render-only; costs the
+  tag + map word on every CA water pixel, plus the echo words of the column
+  and its four neighbours on an adopted one. Limits: a raised column met only
+  past its real water (silhouette, under a cell), and the far field, draw
+  the held surface. `HELD_WATER_LOOK` false = the old image.
 
 ### 6. Gate: `rivers`
 

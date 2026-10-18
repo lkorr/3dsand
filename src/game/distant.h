@@ -93,6 +93,44 @@
 //     line (Stats::flipWaits) until the oldest flip ages out, which bounds a
 //     creature pacing the edge to kDistantMaxFlips flips per window.
 //
+// D7a THE TIER ACROSS MACHINES (docs/PLAN_distant_npcs.md 8.3 / 8.6; the wire
+// is net/distantsync.h). THE DISTANT WORLD IS THE HOST'S: in a two-player game
+// one machine -- the host, whose ChunkStore is the world's -- holds every
+// distant creature, steps, retires, activates and saves them. Every "the
+// window" in the borders above becomes "a window of the game", W = the host's
+// window plus each connected peer's (DistantPeerWindow, the very origins
+// net::Authority reads):
+//   * demote   the host's park rule, the host's window; the RADIUS is against
+//              the nearest window centre in W;
+//   * retire   only past radius + hysteresis of EVERY centre in W;
+//   * activate within the radius of ANY centre in W, beyond the host window's
+//              pad -- so a record parked inside a PEER's window activates too
+//              (nothing else would ever unpark it there) and is handed in;
+//   * promote  over the host's line -> local, as before; over a PEER's line ->
+//              a REMOTE PROMOTION (a DistantHandIn: the patched record, the
+//              brain, the steer, the look key) when only that peer's line has
+//              it or the ownership rule names that peer for its feet where
+//              both lines do; served nearest to that peer's window first, at
+//              most EntityParking::kUnparkPerCall per peer per tick, under the
+//              peer's reported room (livingFree) minus what is in transit and
+//              the flip bound. The creature leaves the tier into an IN-TRANSIT
+//              list (kept until the peer's DistantHandInDone, restored at a
+//              disconnect, saved with the tier);
+//   * hold     at the promotion line of every window it waits on (the drive's
+//              box test walks the list).
+// A CLIENT holds none of its own. Its park rule HANDS OUT a creature leaving
+// its window (DistantHandOut: the SaveOne record, the brain, the steer and
+// velocity, the statuses, the look it bakes now from the live rig) instead of
+// erasing it; the host makes it a distant creature under the SAME id
+// (DistantFromRecord), or parks it -- never loses it. A hand-in lands in the
+// client's WAITING ROOM (its own DistantMobs, `DistantMob::handIn`): never
+// stepped, retired or activated here; promoted by the client's own pass (the
+// distant half of EntityParking::Unpark, run although its parking is off)
+// under its own waits, or given back after kHandInMaxWaitTicks. The client's
+// edge band and statues come from the host's DistantView of it (DistantViewMob,
+// below). Nothing of this runs unconnected: with no role the code above is
+// exactly the single-player tier.
+//
 // D8 CAP OVERFLOW (fights larger than 64; MobSystem::OverflowSwaps, called once
 // from EntityParking::Unpark before its promotion pass). While the LIVING cap
 // binds -- more living distant creatures wait over the promotion line than
@@ -159,8 +197,10 @@
 #include "game/steer.h"        // SteerState
 #include "math3d.h"
 
+class GenOverlay;   // game/distant_obstacles.h: the worldgen overlay (D10)
 class Stream;
 class World;
+struct MaterialGpu;
 
 // ---- the ground MODE a distant creature has (§2.4) ---------------------------
 //
@@ -194,8 +234,8 @@ bool InPlacedDungeonBox(IVec3 c);
 //
 //   1. BASE: World::TerrainHeight, the height contract (worldgen's ground,
 //      roads, site pads, pond bowls, rivers). A cell is solid at or below it.
-//      Trees, buildings, ruins and `.svedit` layers are NOT in it: a distant
-//      creature walks through a house 60 m away (accepted for v1, §2.4).
+//      Trees, buildings, ruins and `.svedit` layers are NOT in it -- source 5
+//      puts them back.
 //   2. WATER: the higher of TerrainColumn().water (tarns, the sea) and
 //      worldmap::WaterColumnAt (rivers, lakes). Liquid is never ground: a
 //      body in water stands on the BED; the walk decides to wade or swim.
@@ -205,7 +245,15 @@ bool InPlacedDungeonBox(IVec3 c);
 //      Read through Stream::SettledStoredChunk, which first completes any
 //      eviction of that chunk still in flight -- the RegenerateChunks loop --
 //      because when an eviction's bytes reach the store is up to the GPU
-//      (audit A3). A chunk not in the store is procgen, i.e. source 1.
+//      (audit A3). A chunk not in the store is procgen, i.e. sources 5 + 1.
+//   4. THE WINDOW (D8), for an overflow creature only (SetWindowSource).
+//   5. THE WORLDGEN OVERLAY (D10, game/distant_obstacles.h): what genChunk
+//      stands on and cuts into the base -- the low band of every lattice and
+//      authored tree, cacti, the stamps (houses; their DOOR leaves read air),
+//      the dungeons' ruins, the `.svedit` layers -- re-derived on the CPU from
+//      the shader's own inputs. Between the stored chunk (which already holds
+//      all of it, as the GPU made it) and the base. A column the overlay does
+//      not touch keeps the TerrainHeight fast path.
 //
 // "Walkable" is the plan's rule: the HIGHEST cell that carries weight (the
 // near tier's own test: solid, or a powder of at least kPowderMobSupportMin)
@@ -236,13 +284,24 @@ class DistantGround {
   static constexpr int kProbeUp = 32;
 
   DistantGround();
+  ~DistantGround();
+  DistantGround(const DistantGround&) = delete;
+  DistantGround& operator=(const DistantGround&) = delete;
   // The edited-ground source (null = TerrainHeight + water only: a gate's
   // CPU arm, a harness with no stream) and the material collision classes
   // that say what carries weight (MobSystem's `classOf_`). Cheap when
   // nothing changed; rebinding a different stream drops the chunk cache and
   // installs this object's listener on the new store (ONE listener per
-  // store: ChunkStore::SetChangeFn).
-  void Bind(Stream* stream, const std::vector<uint32_t>* classOf, uint32_t seed);
+  // store: ChunkStore::SetChangeFn). `gpu` (D10): the material table's GPU
+  // words, which the overlay's dungeon twin reads (null = no dungeons).
+  void Bind(Stream* stream, const std::vector<uint32_t>* classOf, uint32_t seed,
+            const std::vector<MaterialGpu>* gpu = nullptr);
+  // ---- 5. THE WORLDGEN OVERLAY (D10) -------------------------------------------
+  // On by default. Off = the D1 ground exactly (the cost arm's "before", and a
+  // gate's control). The overlay object itself, for the gates' attribution.
+  void SetOverlayEnabled(bool on);
+  bool OverlayEnabled() const;
+  GenOverlay& Overlay() { return *overlay_; }
   // Everything cached, gone (a materials reload, a world reset, a gate that
   // swapped the map by hand).
   void InvalidateAll();
@@ -360,6 +419,9 @@ class DistantGround {
   // D8: the window source (null = off) and its decoded chunks.
   const World* window_ = nullptr;
   std::unordered_map<uint64_t, WinChunk> winChunks_;
+  // D10: the worldgen overlay. It holds a pointer back to this object (its
+  // TerrainTop / WaterTop), so the ground is not copyable.
+  std::unique_ptr<GenOverlay> overlay_;
   Stats stats_;
 };
 
@@ -616,6 +678,14 @@ struct DistantMob {
   // ActivateParked), not demoted from a rig. Diagnostic; nothing branches on
   // it but the counters.
   bool activated = false;
+  // D7a: IN A CLIENT'S WAITING ROOM -- a DistantHandIn the host sent, held
+  // here until this machine's promotion pass places it (EntityParking::Unpark's
+  // waiting-room branch) or gives it back. Never stepped (TickDistant), never
+  // published to the near band, never retired or activated: the distant world
+  // is the host's, and the host keeps the in-transit copy that is its truth.
+  // `handInTick` is the tick it arrived (the give-back clock).
+  bool handIn = false;
+  uint32_t handInTick = 0;
 
   Vec3 Centre() const {
     return Vec3{origin.x + worldSize.x * 0.5f, origin.y + worldSize.y * 0.5f,
@@ -652,6 +722,11 @@ struct DistantArrowFlight {
   // meets). Uses pos / vel / seed / life as an inbound one does, plus the
   // arrow's flat damage; `target` 0 until it strikes.
   bool outbound = false;
+  // D7b: an INBOUND flight at a PEER's near creature: it is handed to that
+  // peer (DistantEdgeWire::arrowsIn) where it crosses into `peerWo`, the
+  // peer's window (chunks), instead of into this machine's.
+  bool toPeer = false;
+  IVec3 peerWo{};
   float damage = 0.0f;           // outbound: ItemDef::ArrowSpec::damage
   int32_t pos[3] = {0, 0, 0};    // inbound: the point, 24.8 fixed world voxels
   int32_t vel[3] = {0, 0, 0};    // inbound: per tick, 24.8 fixed
@@ -672,6 +747,11 @@ struct NearEdgeBlow {
   Vec3 from{};                   // the attacker's body centre at the cut
   distant::DistantKit kit;
   int style = -1;                // index into kit.styles
+  // D7b: a DISTANT swing at a peer's near creature (host -> client) carries
+  // the planar distance the host measured from its tick-start snapshots, so
+  // the client rolls exactly the roll the host would have. < 0 on a near
+  // stroke (client -> host): the host measures it against its own tier.
+  float dist = -1.0f;
 };
 // An INBOUND arrow crossing into the window this tick: what MobArcheryTick
 // turns into a real ArrowFlight (ArrowFlights::Inject), in the order queued.
@@ -746,6 +826,48 @@ struct NearShotOut {
   float damage = 0.0f;
   std::string ammo;
 };
+// ---- D7b: THE EDGE ACROSS A PEER'S WINDOW (docs/PLAN_distant_npcs.md 8.3) -------
+//
+// One tick's edge traffic between the host (the distant world) and a client
+// (whose near creatures stand at a face of ITS window), both ways, carried in
+// the EntityBatch (net/distantsync.h codecs). Exactly D3's edge, with the wire
+// between the two halves -- what the near tier hands the distant one on the
+// client is applied by the host's next impact pass, and what the host's
+// impact pass resolves at a client's creature is rolled by the client against
+// its LIVE body with the host's keys:
+//   client -> host  actors (its near creatures in its window's edge band,
+//                   never a player, only while its view's band is non-empty),
+//                   blows (near strokes at a view creature, NearEdgeBlow),
+//                   arrowsOut / boxHits / shotsOut (its flights at, into or
+//                   past the host's creatures, D3 and D9's hand-overs);
+//   host -> client  blows (distant swings at the client's creatures, `dist`
+//                   set), arrowsIn (inbound flights crossing into its window).
+struct DistantEdgeWire {
+  std::vector<ai::Actor> actors;
+  std::vector<NearEdgeBlow> blows;
+  std::vector<NearArrowOut> arrowsOut;
+  std::vector<NearArrowBoxHit> boxHits;
+  std::vector<NearShotOut> shotsOut;
+  std::vector<DistantArrowIn> arrowsIn;
+  bool Empty() const {
+    return actors.empty() && blows.empty() && arrowsOut.empty() && boxHits.empty() &&
+           shotsOut.empty() && arrowsIn.empty();
+  }
+  void Clear() {
+    actors.clear();
+    blows.clear();
+    arrowsOut.clear();
+    boxHits.clear();
+    shotsOut.clear();
+    arrowsIn.clear();
+  }
+};
+// A client sends at most this many edge actors a tick (its whole living cap).
+constexpr size_t kDistantEdgeActorsMax = 64;
+// The host trusts a client's edge actors for this many ticks after the batch
+// that carried them (one batch a tick; a gap of more means the client's band
+// emptied or the link stalled).
+constexpr uint32_t kDistantEdgeActorTicks = 2;
 // What an arrow the distant tier flew or landed did (the gates' window into
 // D9; bounded, never an input).
 struct DistantShotEvent {
@@ -791,6 +913,12 @@ constexpr size_t kDistantLogMax = 256;
 // of the window (or inside it, waiting at the promotion line) is published to
 // the near tier's.
 constexpr float kDistantEdgeBandVox = 192.0f;
+// THE LONG REPLAN's radius (ai::WorldView::navRadiusLong): when a distant
+// creature's local plan (its profile's navRadius, ~22-30) fails, it plans once
+// more over this half-extent (193 x 193 columns), backed off 90 ticks after a
+// failure. Wide enough to round a village block; the cost is paid only by a
+// creature whose local plan failed.
+constexpr int kDistantNavRadiusLong = 96;
 // ...and at most this many distant creatures a tick are published (nearest
 // to the window first, ties by id, then in id order): Think walks the near
 // crowd's list several times a step, and 64 near creatures each weighing a
@@ -971,6 +1099,44 @@ class DistantMobs {
     uint64_t shotsOutReentered = 0; // ...that crossed back into the window
     uint64_t shotsOutExpired = 0;   // ...that ran out of life
     uint64_t edgeArrowsOutInWindow = 0;  // D3 hand-overs refused: the target stood in the window
+    // ---- D11: NEAR CREATURES WALK OUT (MobSystem::OutsideGroundFor) ---------
+    uint64_t outsideGrounds = 0;    // near probes that met the face and read DistantGround past it
+    uint64_t nearPastFace = 0;      // near creature-ticks with the footprint centre past the face
+    uint64_t walkedOut = 0;         // demotions of a near creature that walked / swam over the pad
+                                    // line (on its feet, <= kPad + 4 out: not a window move's)
+    // ---- D7a: THE TIER ACROSS MACHINES (net/distantsync.h) -----------------
+    // The client's side: creatures handed to the host at its park rule, and
+    // the hand-ins it took into its waiting room and what became of each.
+    uint64_t handOutsSent = 0;       // client: park rule -> DistantHandOut (not erased)
+    uint64_t handInsReceived = 0;    // client: hand-ins taken into the waiting room
+    uint64_t handInsPromoted = 0;    // ...promoted here (Done: promoted)
+    uint64_t handInsReturned = 0;    // ...given back (Done: returned): the wait ran out, a refusal
+    uint64_t handInGroundWaits = 0;  // a waiting-room promotion held: its ground not in the fetch cache
+    // The host's side: hand-outs it took (or parked), remote promotions it
+    // sent and the waits that held them, the answers, the disconnects.
+    uint64_t handOutsTaken = 0;      // host: hand-outs made distant creatures under their own id
+    uint64_t handOutsParked = 0;     // ...parked instead (no room, outside every radius, unreadable)
+    uint64_t handOutsRefused = 0;    // ...refused: a disagreement (the id is live here), or no role
+    uint64_t handInsSent = 0;        // host: remote promotions (the creature now in transit)
+    uint64_t handInRoomWaits = 0;    // ...held: the peer reported no room (minus what is in transit)
+    uint64_t handInBudgetWaits = 0;  // ...held: this tick's per-peer budget was spent
+    uint64_t handInFlipWaits = 0;    // ...held: the thrash bound
+    uint64_t donesPromoted = 0;      // host: transits closed, promoted on the peer
+    uint64_t donesReturned = 0;      // ...returned: the in-transit copy back in the tier
+    uint64_t donesUnknown = 0;       // ...for an id not in transit (counted, ignored)
+    uint64_t transitRestored = 0;    // ...put back in the tier (or parked) at a disconnect
+    uint64_t transitPeak = 0;        // the most creatures in transit at once
+    // ---- D7b: THE EDGE ACROSS A PEER'S WINDOW (DistantEdgeWire) --------------
+    uint64_t edgeWireBlowsOut = 0;   // client: near strokes sent to the host; host: distant
+                                     // swings at a peer's creature sent to it to roll
+    uint64_t edgeWireBlowsIn = 0;    // ...received (host: queued for its impact pass;
+                                     // client: rolled against its live bodies)
+    uint64_t edgeWireArrowsOut = 0;  // client: arrows out / box hits / shots out sent
+    uint64_t edgeWireArrowsIn = 0;   // host: inbound flights handed to a peer at its window
+    uint64_t edgeWireActorsOut = 0;  // client: edge actors sent, summed over ticks
+    uint64_t edgeWireActorsIn = 0;   // host: peer edge actors in a distant band, summed
+    uint64_t edgeRemoteApplied = 0;  // client: host swings that entered a near body's door
+    uint64_t edgeRemoteNoBody = 0;   // ...whose target was not a living body this machine owns
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 
@@ -1122,6 +1288,73 @@ class DistantMobs {
 // for build/last_run.json's "distant" block: like the op stream's refusals,
 // a demotion that parked for want of room is a number, not a missing NPC.
 const DistantMobs::Stats& DistantRunTotals();
+
+// ============================================================================
+// D7a: THE TIER ACROSS MACHINES (the header's D7a paragraph; net/distantsync.h)
+// ============================================================================
+
+// Which side of a two-player game this MobSystem's tier is on. OFF in single
+// player, in every gate that does not set it, and after a disconnect: then
+// nothing below runs and the tier is exactly D0..D9's.
+enum class DistantNetRole : uint8_t { Off = 0, Host, Client };
+
+// ONE PEER'S WINDOW, as the host's tier rules read it: the peer's id, the
+// origin of its residency window (chunks; PlayerState.windowOrigin, the very
+// number net::Authority reads), and the room it last reported for promotions
+// (its living cap minus its living near creatures minus its waiting room).
+// `haveFree` false: it has not reported yet, so no LIVING creature is handed
+// to it (a corpse needs no room). Set every tick before the tick by the net
+// layer (net::EntitySync::ScanHandoffs).
+struct DistantPeerWindow {
+  uint32_t playerId = 0;
+  IVec3 windowOrigin{};
+  uint32_t livingFree = 0;
+  bool haveFree = false;
+};
+
+// A hand-in a client holds this long without placing it (its ground not
+// fetched, its cap full, the creature not over its line any more because its
+// window moved) is GIVEN BACK: the host puts its in-transit copy back in its
+// tier. 5 s: a fetch is K = 4 ticks plus the queue, so a hand-in that waits
+// this long is waiting on something that will not come soon.
+constexpr uint32_t kHandInMaxWaitTicks = 150;
+// How often a view entry that did not change is sent anyway (the shape with
+// it): the keyframe that lets a client re-learn a creature it lost, and the
+// whole cost of an asleep one. 1 s.
+constexpr uint32_t kDistantViewKeyframeTicks = 30;
+// How many of its own baked looks a client remembers, by id (the creatures it
+// handed out: their statues in the host's view draw as the body the client
+// last saw, not the def's bare look). Oldest forgotten first.
+constexpr size_t kHandedLooksMax = 1024;
+
+// ONE HOST CREATURE AS A CLIENT SEES IT (the mirror a DistantView keeps up):
+// the statue (def, look, draw state) and, inside the edge band of this
+// client's window, the actor its near creatures see and the body box its
+// arrows test. Plain data, rebuilt from the wire only.
+struct DistantViewMob {
+  uint64_t id = 0;
+  bool haveShape = false;      // the def name and look have arrived (first sight / keyframe)
+  std::string defName;
+  DistantLookKey look;
+  Vec3 origin{};               // the statue's origin (a corpse: its rest height)
+  float heading = 0.0f;
+  float gaitPhase = 0.0f;
+  DistantDrawState state = DistantDrawState::Idle;
+  bool dead = false;
+  bool band = false;           // `actor` is live (in this window's edge band)
+  ai::Actor actor;
+  bool box = false;            // `boxLo/boxHi` reach into this window
+  Vec3 boxLo{}, boxHi{};
+};
+
+// A HOST CREATURE IN TRANSIT to a peer (a remote promotion not yet answered):
+// the whole DistantMob as it left the tier -- the truth the host puts back if
+// the peer returns it or drops -- and to whom, since when.
+struct DistantTransit {
+  DistantMob d;
+  uint32_t peer = 0;
+  uint32_t sentTick = 0;
+};
 
 // THE STATUES' ITEM LIST (D4a's seam, game/distant_draw.h): one DistantDrawItem
 // per distant creature that has a baked look -- STRIKE while an abstract

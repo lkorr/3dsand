@@ -29,6 +29,7 @@
 #include "phys/physics.h"
 #include "sim/materials.h"
 #include "net/mobsync.h"    // the four records mob ownership exchanges
+#include "net/distantsync.h"  // D7a: the distant tier's four records (hand-out / -in / done / view)
 #include "sim/bytestream.h"  // ByteWriter/ByteReader: the per-mob record
 #include "sim/microbody.h"
 #include "sim/voxload.h"
@@ -51,6 +52,9 @@
 // (ReleaseRigToDebris).
 
 class ChunkStore;   // MobSystem::ActivateParked reads its region buckets
+namespace mobwater {
+struct CellCache;   // game/mob_cellcache.h: MobSystem::WaterCache builds one
+}
 
 struct MobLimbDef {
   std::string name;            // matches a .vox scene-graph model name
@@ -4545,6 +4549,10 @@ class Mob {
   // an eight-voxel stone wall whenever the chunk above the wall happened not to
   // be cached yet. "I cannot see" and "I can see something and cannot see past
   // it" are opposite answers.
+  // A cell OUTSIDE THE WINDOW is "I cannot see" -- unless this creature may
+  // walk out (MobSystem::OutsideGroundFor, D11): then the distant tier's
+  // ground answers it, solid or air, never unknown, with
+  // MobSystem::OutsideGroundMat() as its material.
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
                       uint32_t* outMat = nullptr, bool* outUnknown = nullptr,
                       bool* outBlocked = nullptr) const;
@@ -4748,7 +4756,10 @@ class Mob {
   // locomotion, shared by the ground probe, the footprint collider and the
   // navigator's `blocked` adapter, so "walkable" means one thing in this
   // engine. A cell the CPU mirror cannot answer for is NOT solid — unknown is
-  // open, everywhere, always (ai_nav.h rule 1).
+  // open, everywhere, always (ai_nav.h rule 1). PAST THE WINDOW FACE, for a
+  // creature that may walk out (MobSystem::OutsideGroundFor, D11), the cell is
+  // not unknown: the distant tier's ground answers it (DistantGround::Solid),
+  // here and in GroundHeightAt alike.
   bool CellSupportsWeight(World& world, IVec3 cell) const;
   bool CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const;
 
@@ -6082,6 +6093,21 @@ class Mob {
   // a peer's blow waits for the record instead of being wiped by it
   // (game/meleehit.h rule 3). 0 = nothing pending.
   uint32_t handoffDueTick_ = 0;
+  // ---- BORN THIS TICK: NOT YET OFFERED TO A HANDOFF (D7a, 2026-10-16) -----
+  //
+  // Set by MobSystem::Spawn, cleared by the first RefreshOwnership that sees
+  // it -- which keeps `owner_` as it is (local, for anything this machine
+  // spawned) instead of asking the ownership function. WHY: a creature made
+  // live DURING a tick (a promotion or an unpark in phase H, a rising, a
+  // spawn) gets its first ownership answer at the top of mobs.PreTick, and
+  // net::EntitySync::ScanHandoffs -- the only place a MobHandoff is BUILT --
+  // ran before that tick began and never saw it. Asked then, an answer naming
+  // the peer made it a ghost here with no record on the wire: the peer never
+  // received it and the ghost expired (kGhostExpiryTicks) -- a creature lost
+  // at a peer's window. Held local for that one tick, the next tick's
+  // ScanHandoffs (before the tick) hands it over properly, record and all.
+  // No effect unconnected (RefreshOwnership returns before reading it).
+  bool ownLatch_ = true;
   // A GHOST'S BLADE IS LIVE: its owner's MobPose says the held item is
   // cutting or held in guard (MobPose::kBladeLive). FindParry reads it in
   // place of `swinging_` / the stroke phase, which a ghost does not run.
@@ -8429,6 +8455,17 @@ class MobSystem {
   bool QueueEdgeArrowOut(const NearArrowOut& out);
   // The inbound arrows that crossed into the window this tick, taken (the
   // caller, MobArcheryTick, makes each a real ArrowFlight).
+  // ---- D7b: THE EDGE ACROSS A PEER'S WINDOW (game/distant.h DistantEdgeWire)
+  // What this machine sends across the wire this tick (EntitySync::Build
+  // takes it; a client: its edge actors and its near tier's hand-overs at the
+  // host's creatures; a host: its swings and inbound flights at the peer's
+  // creatures), and what arrived for the next tick (EntitySync::ApplyForTick
+  // gives it; consumed by the next TickDistant). Nothing unconnected.
+  void TakeDistantEdge(DistantEdgeWire& out) {
+    out = std::move(edgeOut_);
+    edgeOut_.Clear();
+  }
+  void ApplyDistantEdge(DistantEdgeWire&& in, uint32_t tick);
   std::vector<DistantArrowIn> TakeEdgeArrowsIn() {
     std::vector<DistantArrowIn> out;
     out.swap(edgeArrowsIn_);
@@ -8447,6 +8484,48 @@ class MobSystem {
   // and water only).
   void SetDistantStream(Stream* s);
   DistantGround& DistantGroundMut() { return distantGround_; }
+  // ---- D11: A NEAR CREATURE MAY WALK OUT OF THE WINDOW ----------------------
+  // (docs/PLAN_distant_npcs.md section 8.1.) Every layer above the walk drive
+  // already treats a column past the window face as open; the drive alone
+  // refused to stand on ground it could not see, so a creature on a Goto past
+  // the face froze a voxel outside it. Past the face the near tier now reads
+  // the DISTANT tier's ground -- the very ground it will walk on once the park
+  // rule demotes it at kPad -- but only where leaving is survivable:
+  //
+  // DistantReachable(): would a near creature that leaves this machine's
+  // window be KEPT (demoted, or parked when the tier is full / it is past the
+  // radius) rather than released? Today: `distant.enabled` and a park
+  // function installed (main.cpp binds EntityParking in single player and on
+  // the host; no harness without one answers true). With NO park function the
+  // park rule RELEASES a leaver and erases it, so a harness that walked its
+  // crowd out of the window would delete it: there past the face stays
+  // unknown and the drive stops the creature at the face exactly as before.
+  // D7a EXTENDS THIS with the client's hand-out: a client whose leavers go to
+  // the host's tier is reachable too (that is its whole change here).
+  bool DistantReachable() const;
+  // The ground the near tier reads PAST THE WINDOW FACE for creature `m`:
+  // `distantGround_` when DistantReachable() and `m` is one the park rule
+  // would keep -- alive, not a ghost (the peer's: its owner decides), not a
+  // body a player drives (a player is never distant, section 2.7) -- else
+  // null, and past the face is what it always was (unknown to the ground
+  // probe, open to the AI's blocked probe, solid to the swim readers).
+  // Readers: Mob::GroundHeightAt, Mob::CellSupportsWeight, the AI's blocked
+  // probe, mobwater::CellCache (mob_cellcache.h). Each asks LAZILY, on the
+  // first cell it meets outside the window, so a creature that never nears a
+  // face never calls this. DistantGround mutates its caches (single-threaded):
+  // asked inside a workpool task it answers null and counts the refusal
+  // (OutsideGroundTaskRefusals; no caller is in a task today -- the pool's
+  // loops are bleed / burn / stain / splatter).
+  DistantGround* OutsideGroundFor(const Mob& m);
+  // ...the refusals above, over the process (an atomic: a task bumps it).
+  static uint64_t OutsideGroundTaskRefusals();
+  // The material a cell answered past the face reports as its ground
+  // (GroundHeightAt's `outMat`): no CPU source names the column's surface
+  // material (worldgen's genCellIn is WGSL only), so the earth every biome
+  // stands on -- "dirt", resolved by name at each materials load ("stone"
+  // if a table has none). A footstep there is a footstep on dirt; ShedCoat
+  // prints nothing past the face (no op can write there).
+  uint32_t OutsideGroundMat() const { return outsideMat_; }
   // THE STATUES (D4a, game/distant_draw.h): the bake cache a demotion bakes
   // into, BEFORE the rig is released. Null (every harness) = no statue.
   void SetDistantDraw(DistantDraw* dd) { distantDraw_ = dd; }
@@ -8503,6 +8582,115 @@ class MobSystem {
   // What the tier's arrows did (bounded at kDistantLogMax, oldest dropped).
   const std::vector<DistantShotEvent>& DistantShotEvents() const { return shotEvents_; }
   void ClearDistantShotEvents() { shotEvents_.clear(); }
+  // ---- D7a: THE TIER ACROSS MACHINES (game/distant.h's D7a paragraph; the
+  // records are net/distantsync.h's; docs/PLAN_distant_npcs.md 8.3, 8.6) ----
+  //
+  // THE ROLE, set by the net layer at connect (main.cpp netStartPacing: the
+  // host Host, a client Client) and dropped at a disconnect. Off -- every
+  // single-player run and every gate that does not set it -- and nothing of
+  // what follows runs: the tier is D0..D9's exactly.
+  void SetDistantNetRole(DistantNetRole r);
+  DistantNetRole GetDistantNetRole() const { return netRole_; }
+  // THE PEERS' WINDOWS (W minus the host's own) and the room each reported,
+  // every tick before the tick (net::EntitySync::ScanHandoffs). Read only by a
+  // Host's tier rules; a change of any window re-arms the border scans.
+  void SetDistantPeers(std::span<const DistantPeerWindow> peers);
+  const std::vector<DistantPeerWindow>& DistantPeers() const { return peers_; }
+  // A CLIENT HANDS OUT what leaves its window (instead of erasing it): the
+  // role is Client and the tier is enabled. The one predicate D11's
+  // `DistantReachable()` must OR in on a client, where no park function exists
+  // but a creature walking out of the window is kept all the same (the host
+  // takes it).
+  bool DistantHandOutLive() const;
+  // THE PEER WENT AWAY. A host puts every creature in transit back in its tier
+  // (or parks it: never lost) and forgets the peers; a client forgets the view
+  // and keeps its waiting room, which its own promotion pass still places
+  // (there is nobody to give it back to). The role goes Off.
+  void DistantNetDisconnect(uint32_t tick);
+  // OUTGOING, drained by net::EntitySync::Build after the tick: a client's
+  // hand-outs and its answers to hand-ins, a host's hand-ins. Moved out.
+  void TakeDistantOutgoing(std::vector<::net::DistantHandOut>& handOuts,
+                           std::vector<::net::DistantHandIn>& handIns,
+                           std::vector<::net::DistantHandInDone>& dones);
+  // A CLIENT's room for promotions: kMaxMobs minus its living near creatures
+  // minus the living creatures in its waiting room (never below 0).
+  uint32_t DistantLivingFree() const;
+  // INCOMING, applied by net::EntitySync::ApplyForTick (before the tick,
+  // field order: hand-outs, dones, hand-ins, the view). Each answers false
+  // when it did nothing; none ever loses a creature (a hand-out it cannot
+  // take is parked; a hand-in it cannot hold is given back).
+  bool ApplyDistantHandOut(const ::net::DistantHandOut& h, uint32_t tick);
+  bool ApplyDistantDone(const ::net::DistantHandInDone& d, uint32_t tick);
+  bool ApplyDistantHandIn(const ::net::DistantHandIn& h, uint32_t tick);
+  void ApplyDistantView(const ::net::DistantView& v);
+  // THE VIEW A HOST SENDS ONE PEER: every tier creature within distant.radius
+  // of the peer's window centre (`peerWo`, chunks), ascending id, every entry
+  // WHOLE (the shape included; net::EntitySync sends what changed). Band
+  // members (within kDistantEdgeBandVox of the peer's window box) carry their
+  // tick-start actor -- the function the host's own band uses -- and those
+  // whose body box reaches into that window the box.
+  void BuildDistantView(IVec3 peerWo, uint32_t tick,
+                        std::vector<::net::DistantViewEntry>& out);
+  // The client's mirror of the host's view (ascending id).
+  const std::vector<DistantViewMob>& DistantViewMobs() const { return viewMobs_; }
+  // THE CLIENT'S STATUES from the view: one item per mirrored creature with a
+  // shape that is not in this machine's own tier (the waiting room draws
+  // itself), its look this machine's own key for that id if it baked one
+  // (a creature it handed out), else the host's. Appended to `out`.
+  void AppendDistantViewDrawItems(std::vector<DistantDrawItem>& out) const;
+  // The host's creatures in transit (id order), for the save ('MOBS'
+  // saveRecords writes each as its patched record, like the tier) and gates.
+  const std::vector<DistantTransit>& DistantInTransit() const { return inTransit_; }
+  // THE REMOTE PROMOTIONS (a Host's; called by EntityParking::Unpark right
+  // after its own distant pass): every peer's candidates over that peer's
+  // line, nearest to its window centre first, handed in under the peer's
+  // room, the flip bound and kUnparkPerCall a peer a tick. Returns hand-ins.
+  uint32_t RemotePromotions(uint32_t tick);
+  // Does the host's own promotion pass leave distant creature `d` to a PEER?
+  // True when it is over a peer's promotion line and the ownership rule names
+  // that peer for its feet (where only the host's line has it, the host
+  // promotes it, as before). Always false with no peers.
+  bool DistantGoesToPeer(const DistantMob& d);
+  // TEST SEAMS (distant-mp's attribution): the ownership rule's answer for an
+  // id at `feet` (kLocalOwner with no rule) and how many peer windows the
+  // host's tier was told.
+  uint32_t OwnershipAnswerForTest(uint64_t id, Vec3 feet) {
+    return ownershipFn_ ? ownershipFn_(id, feet) : 0u;
+  }
+  size_t DistantPeerCountForTest() const { return peers_.size(); }
+  // ---- the client's waiting room (EntityParking::Unpark's client branch) ---
+  // Anything waiting (a hand-in, connected or not: after a disconnect the
+  // room is still promoted, never given back).
+  bool HasWaitingRoom() const;
+  // D7b: a LIVING creature of the host's view (a client's mirror) by id.
+  bool ViewMobAlive(uint64_t id) const;
+  // Hand-ins held kHandInMaxWaitTicks or longer go back (connected only):
+  // erased here, DistantHandInDone{returned} queued. Returns how many.
+  uint32_t ReturnStaleHandIns(uint32_t tick);
+  // The pass's answer for hand-in `id`: promoted, or let go (a permanent
+  // refusal that PromoteDistant already dropped). Queued while connected.
+  void NoteWaitingRoomResult(uint64_t id, bool promoted);
+  // ---- ownership's memory (net::EntitySync) --------------------------------
+  // The ids that ENTERED a tier on this machine since the last call (a host
+  // demotion, a hand-out sent, a hand-in or hand-out received, a transit
+  // restored): EntitySync forgets their incumbent (mobMem_), so a stale
+  // owner cannot ghost one when it comes back near. Recorded only with a role.
+  void TakeTierEntries(std::vector<uint64_t>& out) {
+    out.swap(tierEntries_);
+    tierEntries_.clear();
+  }
+  // ---- TEST SEAM (distant-mp): the window THIS tier's borders use --------
+  // Every border rule above asks TierWindowOrigin: the World's window, or --
+  // set by a gate that simulates a SECOND machine in one process on the one
+  // World (machine B of distant-mp) -- the override, B's own displaced
+  // window. Null restores the World's. Never set by the game.
+  void SetTierWindowForTest(const IVec3* wo) {
+    tierWindowOverride_ = wo != nullptr;
+    if (wo != nullptr) tierWindow_ = *wo;
+  }
+  IVec3 TierWindowOrigin(const World& w) const {
+    return tierWindowOverride_ ? tierWindow_ : w.WindowOrigin();
+  }
   // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
   // `kMaxMobs` counts the LIVING; the dead have their own count and a body
   // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
@@ -9878,6 +10066,13 @@ class MobSystem {
   // The same three samples about a POINT (a corpse lies down, so the column
   // over its walk anchor says nothing): `centre` and +-1.5 voxels in y.
   float PointImmersion(const Mob& mob, Vec3 centre) const;
+  // THE CELL READER a body's water question uses (mobwater::CellCache,
+  // game/mob_cellcache.h): its own classes, `fetch` as the caller says, and
+  // PAST THE WINDOW FACE the distant tier's water and ground when the body may
+  // leave (OutsideGroundFor, D11; resolved on the first cell past the face).
+  // Const like the watchers that ask it: DistantGround's caches are pure (a
+  // hit and a miss give the same answer), so asking changes no outcome.
+  mobwater::CellCache WaterCache(World& world, const Mob& mob, bool fetch = true) const;
   // CARRION (ai::Perception::carrion): recount a corpse's edible cells per
   // limb into Mob::carrionLimb_ / fleshRatio_. Edible = matEdible_.
   void RefreshCarrion(Mob& corpse) const;
@@ -10637,6 +10832,8 @@ class MobSystem {
   void RetireDistant(Vec3 wlo);
   // ---- D1: the distant tick's own state (distant.cpp) ----------------------
   DistantGround distantGround_;
+  // D11: OutsideGroundMat()'s id, resolved in OnMaterialsReloaded.
+  uint32_t outsideMat_ = 0;
   DistantDraw* distantDraw_ = nullptr;
   // ---- D2b: the abstract hit model's table (SetAttackStyles loads it) -------
   distant::DistantCalib distantCalib_;
@@ -10663,6 +10860,25 @@ class MobSystem {
   std::vector<NearEdgeBlow> edgeBlows_;
   std::vector<NearArrowOut> edgeArrowsOut_;
   std::vector<DistantArrowIn> edgeArrowsIn_;
+  // D7b: the edge across the wire (TakeDistantEdge / ApplyDistantEdge).
+  DistantEdgeWire edgeOut_;
+  DistantEdgeWire edgeIn_;
+  // The host's copy of a client's edge actors (id order) and the tick they
+  // arrived; trusted for kDistantEdgeActorTicks.
+  std::vector<ai::Actor> peerEdgeActors_;
+  uint32_t peerEdgeTick_ = 0;
+  // A client's near creatures in its window's edge band, for the host
+  // (built in TickDistant's client branch from the near actor list).
+  void BuildEdgeActors(const std::vector<ai::Actor>* nearActors, Vec3 wlo);
+  // A client rolls one host swing at its own creature and applies it
+  // through the creature's door (D3's DISTANT HITS NEAR, the roll done here).
+  void ResolveRemoteSwing(const NearEdgeBlow& b, World& world,
+                          std::vector<ParticleSpawn>* spawns);
+  // DISTANT HITS NEAR's door (D3): a resolved hit on a near creature this
+  // machine owns, through ApplyEdgeBlow. True = it entered.
+  bool ApplyDistantHitOnNear(uint64_t attackerId, Vec3 from, const distant::DistantStyle& style,
+                             const distant::StrikeOutcome& o, uint64_t target, uint32_t tick,
+                             World& world, std::vector<ParticleSpawn>* spawns);
   // ---- D8 / D9 (distant.cpp) ------------------------------------------------
   // Living distant creatures whose body CENTRE is inside the window box, as of
   // the last band membership pass: while any is, the distant tick's near band
@@ -10697,6 +10913,43 @@ class MobSystem {
   // its footprint, from the fetch cache, searching up out of matter when
   // TerrainHeight disagreed, within distant.promoteMaxDropVox. Counted.
   void SnapPromotionGround(DistantMob& d);
+  // ---- D7a: the tier across machines (distant.cpp) --------------------------
+  DistantNetRole netRole_ = DistantNetRole::Off;
+  std::vector<DistantPeerWindow> peers_;
+  // Bumped whenever a peer window (or the set of them) changes: the retire and
+  // activation scans' "has W moved" memory (rule 2).
+  uint64_t peersGen_ = 0;
+  uint64_t retirePeersGen_ = ~0ull, actPeersGen_ = ~0ull;
+  // The host's creatures in transit (id order) and the three outboxes.
+  std::vector<DistantTransit> inTransit_;
+  std::vector<::net::DistantHandOut> handOutsOut_;
+  std::vector<::net::DistantHandIn> handInsOut_;
+  std::vector<::net::DistantHandInDone> donesOut_;
+  // The client's mirror of the host's view (ascending id), and the looks it
+  // baked for the creatures it handed out (id -> key, oldest forgotten first).
+  std::vector<DistantViewMob> viewMobs_;
+  std::unordered_map<uint64_t, DistantLookKey> handedLooks_;
+  std::deque<uint64_t> handedOrder_;
+  // Ids that entered a tier here since EntitySync last asked (TakeTierEntries).
+  std::vector<uint64_t> tierEntries_;
+  void NoteTierEntry(uint64_t id) {
+    if (netRole_ != DistantNetRole::Off) tierEntries_.push_back(id);
+  }
+  // distant-mp's machine B (SetTierWindowForTest).
+  bool tierWindowOverride_ = false;
+  IVec3 tierWindow_{};
+  // THE CLIENT'S PARK RULE (D7a): `mob` leaves this machine's window and goes
+  // to the host as a DistantHandOut (its SaveOne `record`, consumed). The
+  // caller releases the rig after, as for a park. False: nothing was sent
+  // (the caller releases it anyway -- today's rule for a client).
+  bool HandOutToHost(Mob& mob, std::vector<uint8_t>& record);
+  // The window centres of W (the host's first, then each peer's), world voxels.
+  void WindowCentres(Vec3 hostWlo, std::vector<Vec3>& out) const;
+  // The squared distance from `p` to the nearest of them.
+  float NearestCentreDistSq(Vec3 hostWlo, Vec3 p) const;
+  // A distant creature back in this host's tier from transit (a Done returned,
+  // a disconnect): inserted awake, or parked when the tier has no room.
+  void RestoreFromTransit(DistantMob&& d, uint32_t tick);
   uint64_t aiSteps_ = 0;
   // The drip pot taken in turns (Mob::BleedTick): creatures that wanted a
   // drip this tick / last tick, and the refusals. Not hashed, not saved --

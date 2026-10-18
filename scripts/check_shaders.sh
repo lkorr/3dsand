@@ -461,7 +461,9 @@ else
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# CHECK_SHADERS_KEEP=<dir>: copy the assembled sources (exactly what the engine
+# compiles) there before cleanup -- scripts/spv_sizes.sh measures from them.
+trap '[ -n "${CHECK_SHADERS_KEEP:-}" ] && mkdir -p "$CHECK_SHADERS_KEEP" && cp "$TMP"/*.wgsl "$CHECK_SHADERS_KEEP"/ 2>/dev/null; rm -rf "$TMP"' EXIT
 
 failed=0
 checked=0
@@ -689,7 +691,11 @@ if [ -f "$RAY_COMBINED" ]; then
     # the pre-opt counts are printed with a note, because a checker that fails
     # on a missing diagnostic tool is a checker people stop running.
     if command -v spirv-opt >/dev/null 2>&1; then optSpv=1; else optSpv=0; fi
-    for pair in "universal:$RAY_COMBINED" "lean:$RAY_LEAN"; do
+    # CHECK_SHADERS_FAST=1 skips this report: the two -O runs over raymarch
+    # are ~2 minutes, and an iteration loop on the shader wants the validation.
+    pairs=("universal:$RAY_COMBINED" "lean:$RAY_LEAN")
+    [ -n "${CHECK_SHADERS_FAST:-}" ] && pairs=()
+    for pair in "${pairs[@]}"; do
       tag="${pair%%:*}"; src="${pair#*:}"
       spv="$TMP/raymarch_${tag}.spv"
       "$TINT_BIN" -f spirv -ep fs -o "$spv" "$src" >/dev/null 2>&1 || {
@@ -815,6 +821,76 @@ print(n)
       echo "check_shaders: worldgen.wgsl:$ep $n SPIR-V instructions (ceiling $ceil)"
     fi
   done
+fi
+
+# ---------------------------------------------------------------------------
+# INLINED-SIZE CEILING for worldgen.wgsl (2026-10-17, docs/PLAN_shader_compile.md
+# "Slimming").
+#
+# The ceiling above counts TINT's module, in which every function is emitted
+# ONCE however many call sites it has. That is blind to the thing the driver
+# actually charges for: the engine runs spirv-opt's legalization recipe
+# (vk_spirv.cpp OptRecipe::kLegalization, inline-exhaustive first) and hands
+# the driver ONE function per entry point, in which every call site of
+# landColumn / genCellIn / colHeightAt is a full copy. The 2026-10-17 slimming
+# took `far` from 377k to 210k instructions after the recipe -- cold compile
+# 113 -> 51 s -- while Tint's count went UP by ~80. So this measures the same
+# recipe (spirv-opt from the Vulkan SDK; skipped with a note when it is not on
+# PATH, or under CHECK_SHADERS_FAST) and fails when an entry's inlined size
+# passes ~1.2x what it measured that day. A new call site of a big function is
+# exactly what moves this number; collapse it into the existing one (a fenced
+# worklist loop, as plantColumnAt / looseStep / far's surface asks do) rather
+# than raising the line. `python scripts/spv_inline_tree.py` names the copies.
+if [ -f "$WORLDGEN_COMBINED" ] && [ -z "${CHECK_SHADERS_FAST:-}" ]; then
+  if command -v spirv-opt >/dev/null 2>&1; then
+    LEGAL_PASSES=(--inline-entry-points-exhaustive --private-to-local --scalar-replacement
+                  --eliminate-local-single-block --convert-local-access-chains --ssa-rewrite
+                  --simplify-instructions --eliminate-dead-branches --merge-blocks
+                  --eliminate-dead-code-aggressive)
+    # entry:ceiling -- measured 2026-10-17: far 210,080 / farpatch 168,968 /
+    # fardown 172,053 / farmap 151,198 / cols 133,180.
+    specs=("far:252000" "farpatch:203000" "fardown:207000" "farmap:182000" "cols:160000")
+    for spec in "${specs[@]}"; do
+      ep="${spec%%:*}"
+      (
+        spv="$TMP/wgl_${ep}.spv"
+        "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1 &&
+        spirv-opt "${LEGAL_PASSES[@]}" --preserve-interface --target-env=vulkan1.1 \
+                  "$spv" -o "$TMP/wgl_${ep}_o.spv" >/dev/null 2>&1
+      ) &
+    done
+    wait
+    for spec in "${specs[@]}"; do
+      ep="${spec%%:*}"; ceil="${spec##*:}"
+      o="$TMP/wgl_${ep}_o.spv"
+      if [ ! -s "$o" ]; then
+        echo "check_shaders: could not run the worldgen recipe on worldgen.wgsl:$ep (inlined size not checked)" >&2
+        continue
+      fi
+      n="$(python -c "
+import struct,sys
+b=open(sys.argv[1],'rb').read()
+w=struct.unpack('<%dI'%(len(b)//4),b)
+i,n=5,0
+while i<len(w):
+    l=w[i]>>16
+    if l==0: break
+    i+=l; n+=1
+print(n)
+" "$o")" || continue
+      if [ "$n" -gt "$ceil" ]; then
+        failed=1
+        echo "FAIL worldgen.wgsl:$ep — $n instructions INLINED (worldgen recipe), ceiling $ceil"
+        echo "  A new call site of a big function is a whole new copy of it in this"
+        echo "  entry (python scripts/spv_inline_tree.py names which). Collapse it into"
+        echo "  the existing call site, or raise the ceiling and say why."
+      else
+        echo "check_shaders: worldgen.wgsl:$ep $n instructions inlined (ceiling $ceil)"
+      fi
+    done
+  else
+    echo "check_shaders: spirv-opt not on PATH -- worldgen inlined-size ceiling not checked"
+  fi
 fi
 
 if [ "$failed" -eq 0 ]; then

@@ -36,6 +36,13 @@ void EntityBatch::Clear() {
   itemGrants.clear();
   meleeHits.clear();
   playerBodies.clear();
+  distantHandOuts.clear();
+  distantDones.clear();
+  distantHandIns.clear();
+  distantView.entries.clear();
+  distantView.gones.clear();
+  livingFree = kNoLivingFree;
+  distantEdge.Clear();
   tick = 0;
   playerId = 0;
 }
@@ -79,6 +86,18 @@ void EntityBatch::Encode(std::vector<uint8_t>& out) const {
 
   w.U32((uint32_t)playerBodies.size());
   for (const PlayerBody& r : playerBodies) ::net::Encode(w, r);
+
+  // v5 (D7a): the distant tier across machines, in apply order.
+  w.U32((uint32_t)distantHandOuts.size());
+  for (const DistantHandOut& r : distantHandOuts) ::net::Encode(w, r);
+  w.U32((uint32_t)distantDones.size());
+  for (const DistantHandInDone& r : distantDones) ::net::Encode(w, r);
+  w.U32((uint32_t)distantHandIns.size());
+  for (const DistantHandIn& r : distantHandIns) ::net::Encode(w, r);
+  ::net::Encode(w, distantView);
+  w.U32(livingFree);
+  // v6 (D7b): the edge across the peer's window.
+  ::net::Encode(w, distantEdge);
 }
 
 namespace {
@@ -125,6 +144,15 @@ bool EntityBatch::Decode(const uint8_t* p, size_t n) {
   };
   if (!ReadVec(r, meleeHits, hitRec)) return false;
   if (!ReadVec(r, playerBodies, mobRec)) return false;
+  // v5 (D7a).
+  auto distRec = [](auto& rr, auto& rec) { return ::net::Decode(rr, rec); };
+  if (!ReadVec(r, distantHandOuts, distRec)) return false;
+  if (!ReadVec(r, distantDones, distRec)) return false;
+  if (!ReadVec(r, distantHandIns, distRec)) return false;
+  if (!::net::Decode(r, distantView)) return false;
+  r.U32(livingFree);
+  // v6 (D7b).
+  if (!::net::Decode(r, distantEdge)) return false;
   return r.ok;
 }
 
@@ -163,6 +191,13 @@ void EntitySync::Connect(uint32_t me, uint32_t peer) {
   gearEverSent_ = false;
   havePeerBody_ = false;
   peerCount_ = 0;
+  // D7a: a view a previous peer was sent, a room it reported, a report this
+  // side made: none of it describes this connection.
+  viewSent_.clear();
+  peerLivingFree_ = 0;
+  havePeerFree_ = false;
+  freeSent_ = kNoLivingFree;
+  freeLabel_ = 0;
 }
 
 void EntitySync::Disconnect() {
@@ -179,6 +214,13 @@ void EntitySync::Disconnect() {
   bodyMem_.clear();
   bodyChunkMem_.clear();
   chunkMem_.clear();
+  // D7a: the view's memory and the room reports go with the peer (the
+  // caller's MobSystem::DistantNetDisconnect restores what was in transit).
+  viewSent_.clear();
+  peerLivingFree_ = 0;
+  havePeerFree_ = false;
+  freeSent_ = kNoLivingFree;
+  freeLabel_ = 0;
   // NOT unbound here: the caller replaces the two closures with an
   // "everything is mine" pair (main.cpp's netDrop), and clearing the flag is
   // what lets a later Connect install ours again.
@@ -314,7 +356,11 @@ bool EntitySync::ChunkOwned(IVec3 wc) {
 void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
                               uint32_t tick) {
   (void)tick;
-  if (!connected_ || peerCount_ < 2) return;
+  if (!connected_) return;
+  // D7a, before anything below asks MobOwner: forget the incumbents of the
+  // ids that entered a tier, and hand the host's tier the peer's window.
+  PrepareDistant(mobs);
+  if (peerCount_ < 2) return;
   // Once per connection, and free after that. It is here rather than only at
   // connect time so that a caller which installed the older position-only
   // debris closure still ends up with the body-keyed hysteresis M9.4-E added
@@ -375,6 +421,153 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
     announcedBodies_.erase(bh.announce.globalId);
     pendingBodyHandoffs_.push_back(std::move(bh));
     c_.handoffsOut++;
+  }
+}
+
+// ============================================================================
+// D7a: THE DISTANT TIER ACROSS MACHINES (net/distantsync.h; game/distant.h)
+// ============================================================================
+//
+// OWNERSHIP'S MEMORY FORGETS A CREATURE THAT ENTERED A TIER. `mobMem_` holds
+// the incumbent net::EntityAuthority's hysteresis reads, keyed by mob id. A
+// creature that went distant (a host demotion, a hand-out sent or received, a
+// hand-in received, a transit restored) keeps its id, and when it comes back
+// near -- a promotion, on either machine, maybe minutes later and on the
+// other side of the map -- a stale incumbent from before it left would win
+// the hysteresis for the wrong machine and ghost it there. Forgotten here, its
+// first answer after promotion is the arithmetic's alone, which both
+// machines compute alike.
+//
+// THE HOST'S TIER IS TOLD W. The peer's window (the very origin the authority
+// arithmetic reads, aged as it is: PeerView) and the room it last reported go
+// to MobSystem::SetDistantPeers every tick before the tick -- empty until the
+// peer has spoken, so a host whose peer has not yet said where it is runs the
+// single-player rules.
+void EntitySync::PrepareDistant(MobSystem& mobs) {
+  std::vector<uint64_t> entered;
+  mobs.TakeTierEntries(entered);
+  for (const uint64_t id : entered) mobMem_.erase(id);
+  if (mobs.GetDistantNetRole() != DistantNetRole::Host) return;
+  if (peerCount_ < 2) {
+    mobs.SetDistantPeers({});
+    return;
+  }
+  DistantPeerWindow p;
+  p.playerId = peers_[1].playerId;
+  p.windowOrigin = peers_[1].windowOrigin;
+  p.livingFree = peerLivingFree_;
+  p.haveFree = havePeerFree_;
+  mobs.SetDistantPeers(std::span<const DistantPeerWindow>(&p, 1));
+}
+
+namespace {
+// FNV-1a over everything a view entry SAYS -- the statue, the band actor, the
+// box, the shape -- so "changed" means "the client would draw or see it
+// differently", bit for bit (no float tolerance: a creature that moved a
+// thousandth of a voxel moved).
+uint64_t ViewEntryHash(const DistantViewEntry& e) {
+  uint64_t h = 1469598103934665603ull;
+  auto bytes = [&h](const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) {
+      h ^= b[i];
+      h *= 1099511628211ull;
+    }
+  };
+  auto f = [&bytes](float v) { bytes(&v, sizeof v); };
+  auto u = [&bytes](uint64_t v) { bytes(&v, sizeof v); };
+  u(e.flags);
+  for (char ch : e.defName) u((uint8_t)ch);
+  u(e.look.full);
+  u(e.look.pristine);
+  u(e.look.bare);
+  u(e.look.def);
+  f(e.origin.x);
+  f(e.origin.y);
+  f(e.origin.z);
+  f(e.heading);
+  f(e.gaitPhase);
+  u(e.state);
+  if (e.flags & DistantViewEntry::kBand) {
+    const DistantViewActor& a = e.actor;
+    f(a.centre.x);
+    f(a.centre.y);
+    f(a.centre.z);
+    f(a.radius);
+    f(a.height);
+    f(a.hpFrac);
+    f(a.heading);
+    f(a.immersion);
+    f(a.reach);
+    u(a.faction);
+    u(a.targetId);
+    f(a.velocity.x);
+    f(a.velocity.y);
+    f(a.velocity.z);
+    u(((uint64_t)a.armed) | ((uint64_t)a.hostile << 8) | ((uint64_t)a.bleeding << 16) |
+      ((uint64_t)a.action << 24));
+  }
+  if (e.flags & DistantViewEntry::kBox) {
+    f(e.boxLo.x);
+    f(e.boxLo.y);
+    f(e.boxLo.z);
+    f(e.boxHi.x);
+    f(e.boxHi.y);
+    f(e.boxHi.z);
+  }
+  return h;
+}
+}  // namespace
+
+// THE VIEW, AS A DIFFERENCE. MobSystem builds every entry whole (the tier
+// creatures within distant.radius of the peer's window centre, ascending id);
+// what goes is: first sight (with the shape), a change (without it), a
+// keyframe every kDistantViewKeyframeTicks (with it -- the asleep creature's
+// whole cost, and the client's way back if it ever lost its mirror), and a
+// GONE for every id sent before that is not in the set now (it walked out of
+// the radius, was handed in, promoted, retired). Gones in ascending id: the
+// bytes are a pure function of the tier and the peer's window.
+void EntitySync::BuildDistantView(MobSystem& mobs, uint32_t label, DistantView& out) {
+  thread_local std::vector<DistantViewEntry> now;
+  thread_local std::vector<uint64_t> ids;
+  mobs.BuildDistantView(peers_[1].windowOrigin, label, now);
+  ids.clear();
+  for (const DistantViewEntry& e : now) ids.push_back(e.id);   // ascending
+  for (DistantViewEntry& e : now) {
+    const uint64_t h = ViewEntryHash(e);
+    auto it = viewSent_.find(e.id);
+    const bool first = it == viewSent_.end();
+    const bool keyframe = !first && label - it->second.label >= kDistantViewKeyframeTicks;
+    const bool changed = !first && it->second.hash != h;
+    if (!first && !changed && !keyframe) continue;
+    viewSent_[e.id] = ViewSent{h, label};
+    if (!first && !keyframe) {
+      e.flags &= ~DistantViewEntry::kShape;
+      e.defName.clear();
+      e.look = WireLook{};
+    } else {
+      c_.viewShapesOut++;
+    }
+    out.entries.push_back(std::move(e));
+    c_.viewEntriesOut++;
+  }
+  // The gones: every id remembered that is not in this tick's set (`ids` is
+  // ascending, so a binary search answers membership).
+  for (auto it = viewSent_.begin(); it != viewSent_.end();) {
+    const uint64_t id = it->first;
+    const bool still = std::binary_search(ids.begin(), ids.end(), id);
+    if (still) {
+      ++it;
+      continue;
+    }
+    out.gones.push_back(id);
+    it = viewSent_.erase(it);
+  }
+  std::sort(out.gones.begin(), out.gones.end());
+  c_.viewGonesOut += out.gones.size();
+  if (!out.Empty()) {
+    c_.viewBatchesOut++;
+    c_.viewBytesOut += EncodedSize(out);
   }
 }
 
@@ -468,6 +661,36 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
     MobSystem::BuildPoseOf(*av, label, pb.pose);
     out.playerBodies.push_back(std::move(pb));
     c_.bodiesOut++;
+  }
+
+  // ---- D7a: THE DISTANT TIER ACROSS MACHINES (net/distantsync.h) ----------
+  //
+  // Addressed records, interest-independent: what this tick's tier queued
+  // for the peer -- a client's hand-outs and its answers to hand-ins, a
+  // host's hand-ins (the outboxes are empty without a role). Then a CLIENT's
+  // room, on change and on the keyframe (the host serves its remote
+  // promotions under it), and a HOST's view of its tier for the peer, which
+  // needs the peer's window.
+  {
+    mobs.TakeDistantOutgoing(out.distantHandOuts, out.distantHandIns, out.distantDones);
+    c_.handOutsOut += out.distantHandOuts.size();
+    c_.handInsOut += out.distantHandIns.size();
+    c_.donesOut += out.distantDones.size();
+    if (mobs.GetDistantNetRole() == DistantNetRole::Client) {
+      const uint32_t free = mobs.DistantLivingFree();
+      if (free != freeSent_ || label - freeLabel_ >= kDistantViewKeyframeTicks) {
+        out.livingFree = free;
+        freeSent_ = free;
+        freeLabel_ = label;
+        c_.freeReportsOut++;
+      }
+    }
+    if (mobs.GetDistantNetRole() == DistantNetRole::Host && peerCount_ >= 2)
+      BuildDistantView(mobs, label, out.distantView);
+    // D7b: THE EDGE ACROSS THE PEER'S WINDOW -- whatever this tick's tier
+    // queued for the other side (game/distant.h DistantEdgeWire). Empty
+    // without a role.
+    mobs.TakeDistantEdge(out.distantEdge);
   }
 
   // ---- interest, which needs to know where the peer is -------------------
@@ -815,6 +1038,37 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
       peerBody_ = std::move(pb);
       havePeerBody_ = true;
     }
+
+    // ---- D7a: the distant tier across machines (the envelope's order) ----
+    // A HOST takes the peer's hand-outs (after the gones above released the
+    // ghost it drew of each) and its answers to the hand-ins it sent; a
+    // CLIENT takes the hand-ins into its waiting room, then the view of the
+    // host's tier its band and statues are drawn from. MobSystem refuses
+    // what its role does not expect -- and a refusal never loses a creature
+    // (a hand-out it cannot take is parked, a hand-in is given back).
+    for (const DistantHandOut& h : b.distantHandOuts) {
+      mobs.ApplyDistantHandOut(h, tick);
+      c_.handOutsIn++;
+    }
+    for (const DistantHandInDone& d : b.distantDones) {
+      mobs.ApplyDistantDone(d, tick);
+      c_.donesIn++;
+    }
+    for (const DistantHandIn& h : b.distantHandIns) {
+      mobs.ApplyDistantHandIn(h, tick);
+      c_.handInsIn++;
+    }
+    if (!b.distantView.Empty()) {
+      mobs.ApplyDistantView(b.distantView);
+      c_.viewEntriesIn += b.distantView.entries.size();
+      c_.viewGonesIn += b.distantView.gones.size();
+    }
+    if (b.livingFree != kNoLivingFree) {
+      peerLivingFree_ = b.livingFree;
+      havePeerFree_ = true;
+    }
+    // D7b: the edge across the window, into the tier's queues for this tick.
+    if (!b.distantEdge.Empty()) mobs.ApplyDistantEdge(::DistantEdgeWire(b.distantEdge), tick);
 
     it = inbox_.erase(it);
   }

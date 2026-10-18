@@ -283,7 +283,8 @@ float ArrowGravityPerTick2();
 // (Grounded: `pos` the last free one); otherwise the whole tick's move (Flying).
 enum class ArrowOutside : uint8_t { Flying = 0, Entered, Grounded };
 ArrowOutside ArrowStepOutside(SpellFxVec& pos, SpellFxVec& vel, const World& world,
-                              const std::function<bool(int, int, int)>& solid);
+                              const std::function<bool(int, int, int)>& solid,
+                              const IVec3* windowOrigin = nullptr);
 
 // What one arrow did, for the `arrow` gate and the counters. Bounded log.
 struct ArrowEvent {

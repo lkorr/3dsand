@@ -74,6 +74,15 @@ inline uint32_t CleanWord(uint32_t w) { return w & ~(kCellOpIfAir | 0x00FF0000u)
 // The seed is RECORDED, not enforced. For v2 it is the seed the offsets were
 // taken against, kept so a diagnostic can say where a layer was built; the
 // offsets themselves mean the same thing over any seed.
+namespace {
+// WorldEdits::Generation's source: process-wide and monotonic, so two
+// contents never share a number (a copy shares its source's, correctly).
+uint64_t NextLayerGeneration() {
+  static uint64_t g = 0;
+  return ++g;
+}
+}  // namespace
+
 bool WorldEdits::Load(const std::string& path, std::string& err) {
   Clear();
   std::ifstream f(path, std::ios::binary);
@@ -133,6 +142,7 @@ bool WorldEdits::LoadFiles(const std::vector<std::string>& paths, std::string& e
 
 bool WorldEdits::ParseInto(const std::vector<uint8_t>& b, const std::string& path,
                            std::string& err) {
+  gen_ = NextLayerGeneration();   // the content may change from here on
   if (b.size() < 32 || Rd32(b.data()) != kMagic) {
     err = path + ": not an SVED edit layer";
     return false;
@@ -214,6 +224,7 @@ bool WorldEdits::ParseInto(const std::vector<uint8_t>& b, const std::string& pat
 }
 
 void WorldEdits::Clear() {
+  gen_ = NextLayerGeneration();
   cols_.clear();
   dcells_.clear();
   unplacedDungeon_ = 0;

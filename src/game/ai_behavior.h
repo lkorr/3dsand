@@ -1081,6 +1081,16 @@ struct WorldView {
   const std::vector<stealth::Noise>* noises = nullptr;
   const stealth::Params* stealthParams = nullptr;
   float ambient = 0.0f;
+  // ---- THE LONG REPLAN (distant tier, PLAN_distant_npcs.md 8.5) -------------
+  // When the local plan (`navRadius`) fails, plan once more over this radius
+  // (world voxels; 0 = never). The near tier leaves it 0: past its fetch cache
+  // the ground is unknown, so a wider grid would only plan over guesses. The
+  // distant tier's ground is never unknown, and a village wall longer than the
+  // local grid is a dead end the local planner cannot see round (measured: a
+  // walker across Harrowby stalled 216 voxels short behind an 80-voxel wall).
+  // Backed off per creature (Brain::longPlanTick) so a boxed-in creature pays
+  // one wide search per kLongPlanBackoffTicks, not one per replan.
+  int navRadiusLong = 0;
 };
 
 // The mob, as the AI sees itself. A view rather than a Mob& so this file has no
@@ -1476,6 +1486,10 @@ struct Brain {
   // with the number of obstacles means the planner is re-deciding a symmetric
   // route every few ticks, which reads as a mob dithering in place.
   uint32_t replans = 0;
+  // The long replan (WorldView::navRadiusLong): the earliest tick another may
+  // run after one FAILED, and how many have run (a diagnostic).
+  uint32_t longPlanTick = 0;
+  uint32_t longPlans = 0;
   // Progress along the CURRENT waypoint, and how long there has been none. A
   // path is retired by being walked or by stalling, never by the agent drifting
   // off the straight line it was planned along — see UpdatePath.

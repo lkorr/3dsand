@@ -1,6 +1,8 @@
 // =============================================================================
 // distant-walk / distant-sleep -- the distant tier WALKS and SLEEPS
 // (docs/PLAN_distant_npcs.md package D1, §4; game/distant.h, distant.cpp).
+// distant-walkout -- a NEAR creature walks (and swims) out of the window into
+// it (package D11, section 8.1; the arms are listed above the gate).
 // =============================================================================
 //
 // distant-walk -- every claim the plan's §4 row makes, one arm each:
@@ -73,6 +75,7 @@
 #include "sim/stream.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
+#include "sim/worlddefaults.h"  // kHarnessLakeSite: distant-walkout's lake
 #include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -241,6 +244,7 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
   // ======== W: the long walk on `peaks` =======================================
   float wWalked = 0, wProgress = 0, wMinY = 1e9f, wMaxY = -1e9f;
   int wOffGround = 0, wTicks = 0, wHeadingDeg = -1, wRange = 0;
+  int wOnOverlay = 0;   // D10: ticks stood on worldgen-overlay ground (a root, a stump)
   uint64_t wDigest[2] = {0, 0};
   uint32_t wReplans = 0;
   uint64_t wClimb = 0, wDrop = 0;
@@ -323,13 +327,19 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
                         d->asleep ? 1 : 0, d->steps);
           }
           if (run == 0) {
+            // ON DistantGround: the cell under the feet carries weight and the
+            // feet's cell is clear (D10: the worldgen overlay counts -- a
+            // root flare is ground; it was y == TerrainTop + 1 before).
             const Vec3 cc = d->Centre();
-            const float gy = (float)(ground.TerrainTop(ifloor(cc.x), ifloor(cc.z)) + 1);
-            if (!d->swimming && d->origin.y != gy) {
+            const int gx = ifloor(cc.x), gz = ifloor(cc.z), fy = ifloor(d->origin.y + 1e-3f);
+            const float gy = (float)(ground.TerrainTop(gx, gz) + 1);
+            const bool on = (float)fy == d->origin.y && ground.Solid(gx, fy - 1, gz) && !ground.Solid(gx, fy, gz);
+            if (on && d->origin.y != gy) wOnOverlay++;
+            if (!d->swimming && !on) {
               wOffGround++;
               if (wWhy.empty())
-                wWhy = Format("tick %d: feet y %.2f, ground %.0f at (%d,%d)", ticks, (double)d->origin.y,
-                              (double)gy, ifloor(cc.x), ifloor(cc.z));
+                wWhy = Format("tick %d: feet y %.2f, terrain ground %.0f at (%d,%d)", ticks,
+                              (double)d->origin.y, (double)gy, gx, gz);
             }
             wMinY = std::min(wMinY, d->origin.y);
             wMaxY = std::max(wMaxY, d->origin.y);
@@ -776,6 +786,7 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
   RecordObserved("distantWalk.climbRefusals", (double)wClimb);
   RecordObserved("distantWalk.dropRefusals", (double)wDrop);
   RecordObserved("distantWalk.replans", (double)wReplans);
+  RecordObserved("distantWalk.ticksOnOverlay", (double)wOnOverlay);
   RecordObserved("distantWalk.lineDepthMax", (double)pDepthMax);
   RecordObserved("distantWalk.promoteSnapErr", (double)pErr);
   RecordObserved("distantWalk.craterDip", (double)cDip);
@@ -786,10 +797,11 @@ Status GateDistantWalk(Ctx& c, std::string& detail) {
   const bool ok = okW && okDW && okA && okX && okP && okC && okS && okDC;
   detail = Format(
       "W %s: %.0f vox walked (%.0f progress, heading %d deg, y %.0f..%.0f, %d ticks, %llu climb + "
-      "%llu drop refusals, %u replans) | D %s | A %s (turned %.2f rad) | X %s | P %s: deepest "
-      "%.2f, %llu holds, snap %.2f | C %s: dip %.1f, %llu drains | S %s",
+      "%llu drop refusals, %u replans, %d ticks on overlay ground) | D %s | A %s (turned %.2f rad) | "
+      "X %s | P %s: deepest %.2f, %llu holds, snap %.2f | C %s: dip %.1f, %llu drains | S %s",
       okW ? "ok" : "FAIL", (double)wWalked, (double)wProgress, wHeadingDeg, (double)wMinY,
       (double)wMaxY, wTicks, (unsigned long long)wClimb, (unsigned long long)wDrop, wReplans,
+      wOnOverlay,
       okDW && okDC ? "ok" : "FAIL", okA ? "ok" : "FAIL", (double)aTurn, okX ? "ok" : "FAIL",
       okP ? "ok" : "FAIL", (double)pDepthMax, (unsigned long long)pHolds, (double)pErr,
       okC ? "ok" : "FAIL", (double)cDip, (unsigned long long)cDrains, okS ? "ok" : "FAIL");
@@ -946,6 +958,434 @@ Status GateDistantSleep(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- distant-walkout ------------------------------------------------------------
+//
+// NEAR CREATURES WALK OUT OF THE WINDOW (docs/PLAN_distant_npcs.md section 8.1,
+// D11). Before D11 the near drive refused to stand on ground past the face (it
+// could not see it), so a creature on a Goto past the face froze a voxel
+// outside it; now the near tier reads the distant tier's ground there
+// (MobSystem::OutsideGroundFor) wherever leaving is survivable
+// (MobSystem::DistantReachable: the tier on and a park function bound).
+//
+// ONE WINDOW FOR EVERY ARM: the harness window moved six chunks -X so its +X
+// face cuts the fixture lake (the harness map's `harness_lake`, an authored
+// water site) -- there is no other lake a face crosses -- and its -Z face runs
+// through the calm pad box (no trees, no tarns: plain worldgen on both sides).
+// All of THE tick (support::TickCursor), parking bound as main.cpp binds it,
+// except arm B.
+//
+//   A. THE WALK OUT. A duelist 24 voxels inside the -Z face on a Goto 64 voxels
+//      past it walks out over the 16-voxel pad, is DEMOTED by the park rule
+//      (same id, the same profile and the very Goto, SURFACE, its feet on the
+//      distant ground), and reaches the goal as a distant creature.
+//   C. THE SWIM OUT, two swimmers in the lake that crosses the +X face:
+//      C1, a human afloat (mob_afloat.cpp; the duelist profile) on a Goto
+//      across the face: it swims out, is demoted swimming, and reaches the
+//      goal swimming at the distant tier. C2, a piranha (mob_swim.cpp's fish
+//      drive, the reader that called everything past the face SOLID) whose
+//      wander anchor lies past the face: it swims out under its own power, is
+//      demoted, and as a distant fish never leaves the water. A and C1 run
+//      together (400 voxels apart); C2 after them, alone in the lake.
+//   B. NO PARK FUNCTION, THE OLD FACE. The walk of A again with parking
+//      unbound (a harness, or a machine that may not keep a leaver): it
+//      reaches the face and stops there -- its footprint centre never more
+//      than distantWalkout.holdMaxVox past it, never demoted, never erased.
+//   D. TWICE-RUN: the whole sequence (A + C1, C2, B) runs twice from a fresh
+//      world at the same tick numbers; the per-tick digests (id, tier, origin
+//      bits) and every demotion tick are equal.
+// Thresholds: tests/baseline.json distantWalkout.*.
+// LEAVES NOTHING: mobs / debris / tier reset, park function and player actors
+// removed, store cleared (OnRegen), tuning / items / id counter restored, the
+// window back home and worldgen regenerated there, ground caches dropped.
+Status GateDistantWalkout(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const Tuning tuneWas = CurrentTuning();
+  std::vector<std::string> fails;
+  auto check = [&](bool ok, const std::string& why) {
+    if (!ok) fails.push_back(why);
+    return ok;
+  };
+  std::string laps;
+  auto lapT0 = std::chrono::steady_clock::now();
+  auto lap = [&](const char* arm) {
+    const auto now = std::chrono::steady_clock::now();
+    laps += Format("%s%s %lld", laps.empty() ? "" : " ", arm,
+                   (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lapT0)
+                       .count());
+    lapT0 = now;
+  };
+  const IVec3 home = c.world.WindowOrigin();
+  const int human = c.mobs.FindDef("human");
+  const int piranha = c.mobs.FindDef("piranha");
+  const int walkTicks = (int)BaselineNumber("distantWalkout.walkTicks", 600);
+  const int swimTicks = (int)BaselineNumber("distantWalkout.swimTicks", 900);
+  const int holdTicks = (int)BaselineNumber("distantWalkout.holdTicks", 150);
+  const float holdMax = (float)BaselineNumber("distantWalkout.holdMaxVox", 3);
+  // ---- the lake, and the window whose +X face cuts it ----------------------
+  int lakeX = 0, lakeZ = 0, lakeR = 0;
+  bool haveLake = false;
+  for (const worldmap::WorldMapData::StampSite& s : worldmap::CurrentWorldMap().sites)
+    if (s.kind == (int)worldmap::kSiteWater && s.id == kHarnessLakeSite) {
+      lakeX = s.x;
+      lakeZ = s.z;
+      lakeR = s.radius;
+      haveLake = true;
+    }
+  if (human < 0 || piranha < 0 || !haveLake) {
+    detail = Format("fixture: human def %d, piranha def %d, lake site %d", human, piranha, haveLake);
+    return Status::Fail;
+  }
+  // The face a chunk boundary just inside the lake's centre: ~a radius of
+  // water on each side of it.
+  const int faceX = ((lakeX - 4) >> 4) << 4;
+  const IVec3 wo{faceX / (int)kChunk - (int)kNChunk, home.y, home.z};
+  const Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
+                 (float)(wo.z * (int)kChunk)};
+  const float faceZ = wlo.z;   // A and B walk out of the -Z face
+  DistantGround& ground = c.mobs.DistantGroundMut();
+  const Vec3 hs = c.mobs.Defs()[(size_t)human].worldSize;
+  const Vec3 ps = c.mobs.Defs()[(size_t)piranha].worldSize;
+  auto wetDepth = [&](int x, int z) {
+    const int wt = ground.WaterTop(x, z);
+    return wt == DistantGround::kNoWater ? -1 : wt - (ground.TerrainTop(x, z) + 1);
+  };
+  // A / B: the window's centre column on x, from 24 inside the -Z face to 64
+  // past it. C1 / C2: two rows of the lake, from inside the +X face to past it.
+  const float aX = wlo.x + (float)kWorldN * 0.5f, bX = aX + 96.0f;
+  const float walkFrom = faceZ + 24.0f, walkTo = faceZ - 64.0f;
+  const float c1Z = (float)lakeZ + 0.5f, c2Z = (float)(lakeZ - lakeR / 2) + 0.5f;
+  const float c1From = (float)faceX - 20.0f, c1To = (float)faceX + 36.0f;
+  // What the fixture's ground is, printed (rule 6: a walk that fails names
+  // the ground it failed on): the steepest step along the walk lines, the
+  // water depth along the swim rows.
+  int stepA = 0, stepB = 0, minDepthC1 = 1 << 30, minDepthC2 = 1 << 30;
+  for (int z = (int)walkTo - 8; z < (int)walkFrom + 4; z++) {
+    stepA = std::max(stepA, std::abs(ground.TerrainTop((int)aX, z + 1) - ground.TerrainTop((int)aX, z)));
+    stepB = std::max(stepB, std::abs(ground.TerrainTop((int)bX, z + 1) - ground.TerrainTop((int)bX, z)));
+  }
+  for (int x = (int)c1From - 4; x <= (int)c1To + 8; x++)
+    minDepthC1 = std::min(minDepthC1, wetDepth(x, (int)c1Z));
+  for (int x = faceX - 16; x <= faceX + 40; x++)
+    minDepthC2 = std::min(minDepthC2, wetDepth(x, (int)c2Z));
+  std::printf("distant-walkout: window (%d,%d,%d) faces -Z %.0f +X %d; lake (%d,%d) r %d; "
+              "walk steepest step A %d B %d; swim rows min depth C1 %d C2 %d\n",
+              wo.x, wo.y, wo.z, (double)faceZ, faceX, lakeX, lakeZ, lakeR, stepA, stepB,
+              minDepthC1, minDepthC2);
+
+  // ---- one run of every arm ----------------------------------------------------
+  struct Arm {
+    uint64_t id = 0;
+    int demoteTick = -1;        // phase tick of the demotion (-1 = never)
+    bool sameBrain = false;     // profile + Goto (or wander anchor) carried over
+    bool surface = false;       // classified SURFACE at demotion
+    float feetErr = -1.0f;      // |feet - (TerrainTop + 1)| at demotion
+    bool swimAtDemote = false;  // swimming the tick it went (C)
+    int arriveTick = -1;        // phase tick it stood within the goal's radius, distant
+    int dryTicks = 0;           // C2: distant ticks out of water
+    int distantTicks = 0;       // ticks it was a distant creature
+    float maxPast = -1e9f;      // footprint centre past its face, the most
+    bool nearAtEnd = false;     // B: still a near creature after its ticks
+    int ticks = 0;              // ticks the phase ran
+  };
+  struct Run {
+    Arm a, b, c1, c2;
+    uint64_t digest = 0;
+    uint64_t walkedOut = 0, nearPastFace = 0, outsideGrounds = 0;
+    std::string why;
+  };
+  const DistantMobs& tier = c.mobs.Distant();
+  auto runOnce = [&](Run& r) {
+    // A FRESH WORLD at the lake window (distant_calib's Fresh, moved): the
+    // fetch cache, the mirror, the water ledger, the body ordinals and the id
+    // counter all start where they started last run.
+    c.mobs.Reset();
+    c.debris.Reset();
+    c.phys.ResetBirthOrdinals();
+    c.phys.ResetBodyIdHistory();
+    c.mobs.SetNextIdCounter(130001);
+    c.mobs.SetWeatherRain(0u);
+    c.mobs.SetRainSlope(0, 0);
+    c.mobs.SetDayPhase(0u);
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.SetItems(&c.items);
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin(wo);
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    SetTier(true);
+    c.mobs.SetDistantStream(&c.stream);
+    ground.InvalidateAll();
+    const DistantMobs::Stats s0 = tier.GetStats();
+    uint32_t t = 130000;
+    Digest dg;
+    EntityParking parking;
+    parking.Bind(c.mobs, c.stream.Store(), true);
+    // The park function captures `parking`: off before it goes, whichever way
+    // this run leaves (an early return on a refused spawn included).
+    struct ParkOff {
+      MobSystem& m;
+      ~ParkOff() { m.SetParkFn(nullptr); }
+    } parkOff{c.mobs};
+    support::TickCursor rt{c, t, IVec3{faceX >> 4, (ground.TerrainTop(faceX, lakeZ) >> 4), lakeZ >> 4}};
+    rt.Rig().Authority().parking = &parking;
+    auto spawnAt = [&](int def, float cx, float cz, int up) -> uint64_t {
+      const Vec3 ws = c.mobs.Defs()[(size_t)def].worldSize;
+      const int ox = ifloor(cx - ws.x * 0.5f), oz = ifloor(cz - ws.z * 0.5f);
+      return c.mobs.Spawn(def, {ox, ground.TerrainTop(ifloor(cx), ifloor(cz)) + 1 + up, oz});
+    };
+    auto gotoFor = [&](uint64_t id, Vec3 goal) {
+      ai::Brain* b = c.mobs.BrainAnyTierMut(id);
+      if (b == nullptr) return;
+      b->routine = ai::Routine{};
+      b->routine.active = true;
+      b->routine.verb = ai::Intent::Goto;
+      b->routine.goal = goal;
+      b->routine.final = true;
+      b->routine.arriveRadius = 4.0f;
+      b->routine.speed = 1.0f;
+    };
+    // Where a creature is this tick, in either tier: its origin, its centre,
+    // which tier (1 near, 2 distant, 0 gone). Digested every tick.
+    auto where = [&](uint64_t id, Vec3& origin, Vec3& centre, const Vec3& ws) {
+      if (const Mob* m = c.mobs.FindMobById(id)) {
+        origin = m->Origin();
+        centre = origin + ws * 0.5f;
+        return 1;
+      }
+      if (const DistantMob* d = tier.Find(id)) {
+        origin = d->origin;
+        centre = d->Centre();
+        return 2;
+      }
+      return 0;
+    };
+    // One tick's observation of one arm. `past` = how far the footprint centre
+    // stands outside its face; `goal` planar.
+    auto observe = [&](Arm& arm, int k, const Vec3& ws, float past, Vec3 goal, int profile,
+                       const Vec3& wantGoal, bool fish) {
+      Vec3 o{}, cc{};
+      const int tierNow = where(arm.id, o, cc, ws);
+      dg.U(arm.id);
+      dg.U((uint64_t)tierNow);
+      dg.F(o.x);
+      dg.F(o.y);
+      dg.F(o.z);
+      if (tierNow == 0) return tierNow;
+      arm.maxPast = std::max(arm.maxPast, past);
+      if (tierNow == 2) {
+        const DistantMob* d = tier.Find(arm.id);
+        arm.distantTicks++;
+        if (arm.demoteTick < 0) {
+          arm.demoteTick = k;
+          dg.U((uint64_t)k);
+          arm.surface = d->groundMode == DistantGroundMode::Surface;
+          arm.feetErr = std::fabs(d->origin.y -
+                                  (float)(ground.TerrainTop(ifloor(cc.x), ifloor(cc.z)) + 1));
+          arm.sameBrain = d->brain.profile == profile &&
+                          (fish ? (d->brain.wanderAnchorSet &&
+                                   std::memcmp(&d->brain.wanderAnchor, &wantGoal, sizeof(Vec3)) == 0)
+                                : (d->brain.routine.active && d->brain.routine.verb == ai::Intent::Goto &&
+                                   std::memcmp(&d->brain.routine.goal, &wantGoal, sizeof(Vec3)) == 0));
+        }
+        if (fish && wetDepth(ifloor(cc.x), ifloor(cc.z)) < 2) arm.dryTicks++;
+        const float dx = cc.x - goal.x, dz = cc.z - goal.z;
+        if (!fish && arm.arriveTick < 0 && std::sqrt(dx * dx + dz * dz) <= 5.0f) arm.arriveTick = k;
+      }
+      return tierNow;
+    };
+
+    // ======== phase 1: A (the walk out) and C1 (the swim out), together =========
+    const Vec3 aGoal{aX, 0.0f, walkTo};
+    r.a.id = spawnAt(human, aX, walkFrom, 0);
+    r.c1.id = spawnAt(human, c1From, c1Z, 0);   // on the lake bed: it comes up and swims
+    const Vec3 c1Goal{c1To, 0.0f, c1Z};
+    if (r.a.id == 0 || r.c1.id == 0) {
+      r.why = "phase 1 spawn refused";
+      return;
+    }
+    c.mobs.SetMobBehavior(r.a.id, "duelist");
+    c.mobs.SetMobBehavior(r.c1.id, "duelist");
+    gotoFor(r.a.id, aGoal);
+    gotoFor(r.c1.id, c1Goal);
+    const int duelist = c.mobs.MobBrain(r.a.id) != nullptr ? c.mobs.MobBrain(r.a.id)->profile : -2;
+    bool c1Swam = false;
+    for (int k = 0; k < std::max(walkTicks, swimTicks); k++) {
+      // The CPU mirror rides with the swimmer (it reads the mirror first);
+      // the walker's ground is the fetch cache either way.
+      Vec3 o{}, cc{};
+      if (where(r.c1.id, o, cc, hs) == 1) rt.chunk = IVec3{ifloor(cc.x) >> 4, ifloor(cc.y) >> 4, ifloor(cc.z) >> 4};
+      if (const Mob* m = c.mobs.FindMobById(r.c1.id)) c1Swam = m->Swimming();
+      rt();
+      r.a.ticks = r.c1.ticks = k + 1;
+      Vec3 ao{}, ac{}, co{}, ccc{};
+      where(r.a.id, ao, ac, hs);
+      where(r.c1.id, co, ccc, hs);
+      observe(r.a, k, hs, faceZ - ac.z, aGoal, duelist, aGoal, false);
+      const bool wasDemoted = r.c1.demoteTick >= 0;
+      observe(r.c1, k, hs, ccc.x - (float)faceX, c1Goal, duelist, c1Goal, false);
+      if (!wasDemoted && r.c1.demoteTick >= 0) r.c1.swimAtDemote = c1Swam;
+      if (r.a.arriveTick >= 0 && r.c1.arriveTick >= 0) break;
+    }
+    // C1 is SWIMMING at the distant tier at its goal (the lake goes on past it).
+    if (const DistantMob* d = tier.Find(r.c1.id)) r.c1.swimAtDemote = r.c1.swimAtDemote && d->swimming;
+    // Out of the way of the fish (RemoveMob takes either tier).
+    c.mobs.RemoveMob(r.a.id);
+    c.mobs.RemoveMob(r.c1.id);
+
+    // ======== phase 2: C2, a fish whose wander anchor lies past the face ========
+    {
+      const int bedX = faceX - 12, bedZ = (int)c2Z;
+      const int wt = ground.WaterTop(bedX, bedZ);
+      const int bed = ground.TerrainTop(bedX, bedZ) + 1;
+      const int up = std::max(1, (wt - bed) / 2 - (int)(ps.y * 0.5f));
+      r.c2.id = spawnAt(piranha, (float)bedX + 0.5f, c2Z, up);
+      if (r.c2.id == 0) {
+        r.why = "phase 2 spawn refused";
+        return;
+      }
+      c.mobs.SetMobBehavior(r.c2.id, "piranha");
+      const int ax = faceX + 28;
+      const int awt = ground.WaterTop(ax, bedZ);
+      const Vec3 anchor{(float)ax + 0.5f, (float)(awt - std::max(4, (awt - ground.TerrainTop(ax, bedZ)) / 2)), c2Z};
+      if (ai::Brain* b = c.mobs.BrainAnyTierMut(r.c2.id)) {
+        b->wanderAnchorSet = true;
+        b->wanderAnchor = anchor;
+      }
+      const int fishProfile = c.mobs.MobBrain(r.c2.id) != nullptr ? c.mobs.MobBrain(r.c2.id)->profile : -2;
+      bool swam = false;
+      int after = 0;
+      for (int k = 0; k < swimTicks; k++) {
+        Vec3 o{}, cc{};
+        if (where(r.c2.id, o, cc, ps) == 1) rt.chunk = IVec3{ifloor(cc.x) >> 4, ifloor(cc.y) >> 4, ifloor(cc.z) >> 4};
+        if (const Mob* m = c.mobs.FindMobById(r.c2.id)) swam = m->Swimming();
+        rt();
+        r.c2.ticks = k + 1;
+        where(r.c2.id, o, cc, ps);
+        const bool was = r.c2.demoteTick >= 0;
+        observe(r.c2, k, ps, cc.x - (float)faceX, anchor, fishProfile, anchor, true);
+        if (!was && r.c2.demoteTick >= 0) r.c2.swimAtDemote = swam;
+        // Ninety distant ticks in the water after it went, then done.
+        if (r.c2.demoteTick >= 0 && ++after >= 90) break;
+      }
+      c.mobs.RemoveMob(r.c2.id);
+    }
+
+    // ======== phase 3: B, the walk of A with NO park function ===================
+    rt.Rig().Authority().parking = nullptr;
+    c.mobs.SetParkFn(nullptr);
+    {
+      const Vec3 bGoal{bX, 0.0f, walkTo};
+      r.b.id = spawnAt(human, bX, walkFrom, 0);
+      if (r.b.id == 0) {
+        r.why = "phase 3 spawn refused";
+        return;
+      }
+      c.mobs.SetMobBehavior(r.b.id, "duelist");
+      gotoFor(r.b.id, bGoal);
+      rt.chunk = IVec3{ifloor(bX) >> 4, ground.TerrainTop((int)bX, (int)faceZ) >> 4, ifloor(faceZ) >> 4};
+      for (int k = 0; k < holdTicks; k++) {
+        rt();
+        r.b.ticks = k + 1;
+        Vec3 o{}, cc{};
+        where(r.b.id, o, cc, hs);
+        observe(r.b, k, hs, faceZ - cc.z, bGoal, duelist, bGoal, false);
+      }
+      r.b.nearAtEnd = c.mobs.FindMobById(r.b.id) != nullptr;
+    }
+    const DistantMobs::Stats s1 = tier.GetStats();
+    r.walkedOut = s1.walkedOut - s0.walkedOut;
+    r.nearPastFace = s1.nearPastFace - s0.nearPastFace;
+    r.outsideGrounds = s1.outsideGrounds - s0.outsideGrounds;
+    r.digest = dg.h;
+    c.mobs.Reset();
+  };
+
+  Run run[2];
+  runOnce(run[0]);
+  lap("run1");
+  runOnce(run[1]);
+  lap("run2");
+  const Run& r = run[0];
+  auto armLine = [](const char* n, const Arm& a) {
+    return Format("%s id %llu demoted at %d (surface %d, feet err %.1f, brain kept %d, swimming %d) "
+                  "arrived at %d, %d distant ticks, max past face %.1f, %d ticks",
+                  n, (unsigned long long)a.id, a.demoteTick, a.surface, (double)a.feetErr,
+                  a.sameBrain, a.swimAtDemote, a.arriveTick, a.distantTicks, (double)a.maxPast,
+                  a.ticks);
+  };
+  std::printf("distant-walkout: %s\n", armLine("A", r.a).c_str());
+  std::printf("distant-walkout: %s\n", armLine("C1", r.c1).c_str());
+  std::printf("distant-walkout: %s, dry %d\n", armLine("C2", r.c2).c_str(), r.c2.dryTicks);
+  std::printf("distant-walkout: %s, near at end %d\n", armLine("B", r.b).c_str(), r.b.nearAtEnd);
+  std::printf("distant-walkout: walkedOut %llu, nearPastFace %llu, outsideGrounds %llu, task "
+              "refusals %llu\n",
+              (unsigned long long)r.walkedOut, (unsigned long long)r.nearPastFace,
+              (unsigned long long)r.outsideGrounds,
+              (unsigned long long)MobSystem::OutsideGroundTaskRefusals());
+  check(r.why.empty() && run[1].why.empty(), "fixture: " + r.why + " / " + run[1].why);
+  const bool okA = check(r.a.demoteTick >= 0 && r.a.sameBrain && r.a.surface && r.a.feetErr >= 0.0f &&
+                             r.a.feetErr <= 2.0f && r.a.arriveTick > r.a.demoteTick,
+                         "A: " + armLine("walker", r.a));
+  const bool okC1 = check(r.c1.demoteTick >= 0 && r.c1.sameBrain && r.c1.swimAtDemote &&
+                              r.c1.arriveTick > r.c1.demoteTick,
+                          "C1: " + armLine("swimmer", r.c1));
+  const bool okC2 = check(r.c2.demoteTick >= 0 && r.c2.sameBrain && r.c2.swimAtDemote &&
+                              r.c2.dryTicks == 0 && r.c2.distantTicks >= 60,
+                          "C2: " + armLine("piranha", r.c2) + Format(", dry %d", r.c2.dryTicks));
+  // B reached the face (the claim is not vacuous) and stopped there.
+  const bool okB = check(r.b.demoteTick < 0 && r.b.nearAtEnd && r.b.maxPast >= -4.0f &&
+                             r.b.maxPast <= holdMax,
+                         "B: " + armLine("no-park walker", r.b) +
+                             Format(", near at end %d (max past %.0f)", r.b.nearAtEnd, (double)holdMax));
+  // Three creatures left under their own power (A, C1, C2); B never did.
+  const bool okW = check(r.walkedOut == 3 && MobSystem::OutsideGroundTaskRefusals() == 0,
+                         Format("counters: walkedOut %llu (want 3), task refusals %llu (want 0)",
+                                (unsigned long long)r.walkedOut,
+                                (unsigned long long)MobSystem::OutsideGroundTaskRefusals()));
+  const bool okD = check(run[0].digest == run[1].digest && run[0].digest != 0 &&
+                             run[0].a.demoteTick == run[1].a.demoteTick &&
+                             run[0].c1.demoteTick == run[1].c1.demoteTick &&
+                             run[0].c2.demoteTick == run[1].c2.demoteTick,
+                         Format("D: digests %016llx / %016llx, demotions A %d/%d C1 %d/%d C2 %d/%d",
+                                (unsigned long long)run[0].digest,
+                                (unsigned long long)run[1].digest, run[0].a.demoteTick,
+                                run[1].a.demoteTick, run[0].c1.demoteTick, run[1].c1.demoteTick,
+                                run[0].c2.demoteTick, run[1].c2.demoteTick));
+
+  RecordObserved("distantWalkout.walkerDemoteTick", (double)r.a.demoteTick);
+  RecordObserved("distantWalkout.walkerArriveTick", (double)r.a.arriveTick);
+  RecordObserved("distantWalkout.walkerFeetErr", (double)r.a.feetErr);
+  RecordObserved("distantWalkout.swimmerDemoteTick", (double)r.c1.demoteTick);
+  RecordObserved("distantWalkout.swimmerArriveTick", (double)r.c1.arriveTick);
+  RecordObserved("distantWalkout.fishDemoteTick", (double)r.c2.demoteTick);
+  RecordObserved("distantWalkout.fishDryTicks", (double)r.c2.dryTicks);
+  RecordObserved("distantWalkout.holdMaxPastVox", (double)r.b.maxPast);
+  RecordObserved("distantWalkout.nearPastFaceTicks", (double)r.nearPastFace);
+  RecordObserved("distantWalkout.outsideGrounds", (double)r.outsideGrounds);
+  const bool ok = fails.empty() && okA && okC1 && okC2 && okB && okW && okD;
+  detail = Format("A %s: demoted t%d, arrived t%d | C1 %s: demoted t%d swimming, arrived t%d | C2 "
+                  "%s: demoted t%d, dry %d | B %s: max %.1f past the face, near | D %s",
+                  okA ? "ok" : "FAIL", r.a.demoteTick, r.a.arriveTick, okC1 ? "ok" : "FAIL",
+                  r.c1.demoteTick, r.c1.arriveTick, okC2 ? "ok" : "FAIL", r.c2.demoteTick,
+                  r.c2.dryTicks, okB ? "ok" : "FAIL", (double)r.b.maxPast, okD ? "ok" : "FAIL");
+  for (size_t i = 0; i < fails.size(); i++) detail += (i == 0 ? " | FAIL: " : " / ") + fails[i];
+  detail += " | ms: " + laps;
+
+  // ---- LEAVES NOTHING ----
+  c.mobs.SetParkFn(nullptr);
+  c.mobs.Reset();
+  c.debris.Reset();
+  c.mobs.ClearPlayerActors();
+  c.mobs.DistantGroundMut().InvalidateAll();
+  SetCurrentTuning(tuneWas);
+  c.stream.OnRegen();
+  c.world.SetWindowOrigin(home);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& DistantGates() {
@@ -953,6 +1393,8 @@ const std::vector<Gate>& DistantGates() {
       // The distant tier walks (docs/PLAN_distant_npcs.md D1, §4).
       {"distant-walk", "mob", {}, false, GateDistantWalk, /*needsRender=*/false},
       {"distant-sleep", "mob", {}, false, GateDistantSleep, /*needsRender=*/false},
+      // Near creatures walk (and swim) out of the window (D11, section 8.1).
+      {"distant-walkout", "mob", {}, false, GateDistantWalkout, /*needsRender=*/false},
   };
   return g;
 }

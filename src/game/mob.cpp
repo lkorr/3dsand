@@ -2666,6 +2666,13 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matNames_.clear();
   matNames_.reserve(mats.size());
   for (const MaterialDef& m : mats) matNames_.push_back(m.name);
+  // THE GROUND PAST THE WINDOW FACE reports itself as dirt (D11,
+  // OutsideGroundMat): resolved by name, never a literal id.
+  {
+    int g = FindMaterialId(mats, "dirt");
+    if (g <= 0) g = FindMaterialId(mats, "stone");
+    outsideMat_ = g > 0 ? (uint32_t)g : 0u;
+  }
   // An id is only valid against the table it was resolved from.
   matNameLast_.clear();
   matNameLastId_ = 0;
@@ -4147,6 +4154,19 @@ void MobSystem::Reset(bool rewindIds) {
   edgeShotsOut_.clear();
   shotEvents_.clear();
   overflowLog_.clear();
+  // ...D7a's: the creatures in transit to a peer and the three outboxes (the
+  // world they belonged to is going), the client's view of a host tier and
+  // the looks it remembered. The ROLE and the peers stay: they are the
+  // connection's, not the world's (the net layer sets the peers every tick).
+  inTransit_.clear();
+  handOutsOut_.clear();
+  handInsOut_.clear();
+  donesOut_.clear();
+  viewMobs_.clear();
+  handedLooks_.clear();
+  handedOrder_.clear();
+  tierEntries_.clear();
+  retirePeersGen_ = actPeersGen_ = ~0ull;
   bodyFx_.clear();
   // ...and the corpses that were going to get up do not, because the world
   // they were lying in is gone: a booked rising names a place and a handful of
@@ -4786,6 +4806,16 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   mob.gore_ = Mob::MakeGoreProfile(mob.id_);
   mob.defIndex_ = defIndex;
   mob.def_ = &def;
+  // BORN THIS TICK (mob.h `ownLatch_`): the first RefreshOwnership keeps it
+  // this machine's, so a handoff -- if it belongs to a peer -- is built by the
+  // next ScanHandoffs rather than skipped. Read only while connected. And it
+  // IS this machine's from birth: `owner_` the local player id (0 in single
+  // player, as before; a client's spawns used to be born owner 0 -- a ghost
+  // of the HOST's on the client -- until the next RefreshOwnership said
+  // otherwise). The two spawn paths that make somebody else's creature
+  // (ApplyAnnounce, ApplyHandoff) set the owner themselves right after.
+  mob.ownLatch_ = true;
+  mob.owner_ = localPlayerId_;
   // Resolve the sidecar's AI profile by name, here rather than at def load: the
   // behaviour library reloads independently (R), so an index baked into the def
   // would rot the moment a profile was inserted above it. -1 = no AI, and the
@@ -5175,10 +5205,28 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
   int ccY = INT32_MIN;
   uint32_t lastMat = 0;
   bool unknown = false;
+  // PAST THE WINDOW FACE (D11, MobSystem::OutsideGroundFor): asked once, on
+  // the first cell of this column outside the window -- a creature that never
+  // nears a face never asks. Null = the old answer, "I cannot see".
+  DistantGround* outside = nullptr;
+  bool outsideAsked = false;
   auto supports = [&](int y) -> bool {
     unknown = false;
     const IVec3 cell{wx, y, wz};
     if (!world.CellInWindow(cell)) {
+      if (!outsideAsked) {
+        outsideAsked = true;
+        outside = sys_ != nullptr ? sys_->OutsideGroundFor(*this) : nullptr;
+      }
+      if (outside != nullptr) {
+        // KNOWN, solid or air: the distant tier's own "carries weight" (the
+        // same test as below, over TerrainHeight, the stored chunks and --
+        // with D10 -- worldgen's structures). The creature walks out onto the
+        // ground it will walk on as a distant creature.
+        if (!outside->Solid(wx, y, wz)) return false;
+        lastMat = sys_->OutsideGroundMat();
+        return true;
+      }
       unknown = true;
       return false;
     }
@@ -5273,7 +5321,12 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
 }
 
 bool Mob::CellSupportsWeight(World& world, IVec3 cell) const {
-  if (!world.CellInWindow(cell)) return false;          // outside = open
+  if (!world.CellInWindow(cell)) {
+    // Outside = open, unless this creature may walk out there (D11): then
+    // the distant tier's ground, as GroundHeightAt reads it.
+    DistantGround* outside = sys_ != nullptr ? sys_->OutsideGroundFor(*this) : nullptr;
+    return outside != nullptr && outside->Solid(cell.x, cell.y, cell.z);
+  }
   return CellSupportsWeightIn(
       world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4}), cell);
 }
@@ -6593,6 +6646,12 @@ struct AiProbeCtx {
   mutable IVec3 memoChunk{};
   mutable const CachedChunk* memoCc = nullptr;
   mutable bool memoValid = false;
+  // PAST THE WINDOW FACE (D11): the system to ask for the distant tier's
+  // ground (MobSystem::OutsideGroundFor), asked once per context, on the
+  // first cell outside the window the planner's headroom test meets.
+  MobSystem* sys = nullptr;
+  mutable DistantGround* outside = nullptr;
+  mutable bool outsideAsked = false;
 };
 
 // Is this cell something a body cannot stand in? ONE implementation, shared
@@ -6600,9 +6659,27 @@ struct AiProbeCtx {
 // "what counts as solid" is a copy that eventually disagrees with the
 // locomotion it is steering (ai_nav.h rule 2, applied to the other half of the
 // probe pair).
-bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z) {
+//
+// PAST THE WINDOW FACE, `readOutside` decides (D11). The PLANNER's headroom
+// test reads the distant tier's ground there when the creature may walk out
+// (MobSystem::OutsideGroundFor) -- the same ground GroundHeightAt now answers
+// for the column, so the planner and the drive still agree (ai_nav.h rule 2).
+// LINE OF SIGHT does not: past the face is open to the eye as it always was.
+// The distant tier's own sight is open-field (no line test at all), so a
+// look across the face keeps the fidelity of the tier it ends in, and a near
+// creature fighting a distant one across the edge (D3) sees it exactly as
+// before. Trees and houses past the face (D10) would only block a look
+// through a band whose other side cannot see back.
+bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z, bool readOutside) {
   const IVec3 cell{x, y, z};
-  if (!c.world->CellInWindow(cell)) return false;  // outside = open
+  if (!c.world->CellInWindow(cell)) {
+    if (!readOutside || c.sys == nullptr) return false;   // outside = open
+    if (!c.outsideAsked) {
+      c.outsideAsked = true;
+      c.outside = c.sys->OutsideGroundFor(*c.mob);
+    }
+    return c.outside != nullptr && c.outside->Solid(x, y, z);
+  }
   const IVec3 ch{x >> 4, y >> 4, z >> 4};
   if (!c.memoValid || ch.x != c.memoChunk.x || ch.y != c.memoChunk.y ||
       ch.z != c.memoChunk.z) {
@@ -6619,7 +6696,7 @@ bool AiProbeGround(void* ctx, int x, int z, int yFrom, int& outY) {
 }
 
 bool AiProbeBlocked(void* ctx, int x, int y, int z) {
-  return AiCellBlocked(*(AiProbeCtx*)ctx, x, y, z);
+  return AiCellBlocked(*(AiProbeCtx*)ctx, x, y, z, /*readOutside=*/true);
 }
 
 // Line of sight: one voxel-stepped sample walk, exactly the sampler
@@ -6638,7 +6715,8 @@ bool AiLineOfSight(void* ctx, Vec3 from, Vec3 to) {
   // cells, and a creature standing in tall grass must not be blind.
   for (int i = 1; i < steps; i++) {
     const Vec3 p = from + step * (float)i;
-    if (AiCellBlocked(c, ifloor(p.x), ifloor(p.y), ifloor(p.z))) return false;
+    if (AiCellBlocked(c, ifloor(p.x), ifloor(p.y), ifloor(p.z), /*readOutside=*/false))
+      return false;
   }
   return true;
 }
@@ -8443,6 +8521,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
   // write nothing but desiredHeading and the local drive vector.
   if (mob.ai_.profile >= 0 && world_ != nullptr) {
     AiProbeCtx pctx{&mob, world_};
+    pctx.sys = this;
     ai::SelfView self;
     self.id = mob.id_;
     self.origin = mob.origin_;
@@ -9655,7 +9734,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // DecayHitFlash for why it is not on the frame clock — the short version is
   // that a gate damages limbs and never runs a frame.
   DecayHitFlash(dt);
-  IVec3 wo = world.WindowOrigin();
+  // The window THIS machine's tier borders use: the World's, except under
+  // distant-mp's machine B, which simulates a second machine on the one World
+  // with its own displaced window (SetTierWindowForTest). Read only by the
+  // retire scan, the edge band and the park rule below.
+  IVec3 wo = TierWindowOrigin(world);
   Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
            (float)(wo.z * (int)kChunk)};
   int bleedOps = 0;
@@ -9973,12 +10056,26 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                mob.origin_.x > wlo.x + (float)kWorldN + kPad ||
                mob.origin_.y > wlo.y + (float)kWorldN + kPad ||
                mob.origin_.z > wlo.z + (float)kWorldN + kPad;
+    // D11's witness: a creature standing in the PAD (its footprint centre
+    // past a face, its origin not yet kPad out) -- one that walked off the
+    // window, was thrown, or was left there by a window move. Counted, never
+    // acted on.
+    if (!out) {
+      const float cx = mob.origin_.x + def.worldSize.x * 0.5f;
+      const float cz = mob.origin_.z + def.worldSize.z * 0.5f;
+      if (cx < wlo.x || cz < wlo.z || cx >= wlo.x + (float)kWorldN ||
+          cz >= wlo.z + (float)kWorldN || mob.origin_.y < wlo.y ||
+          mob.origin_.y >= wlo.y + (float)kWorldN)
+        distant_.Note(&DistantMobs::Stats::nearPastFace);
+    }
     // A GHOST's corpse is excepted: its rig is not this machine's to hand to
     // debris (that would be local bodies for a corpse the peer still keeps).
     // It takes the ghost's exit below -- released, not parked -- and the
     // owner's own window rule decides what becomes of the real one.
+    // D7a: a CLIENT keeps its corpses too -- handed to the host's tier as a
+    // dead distant creature (HandOutToHost below) rather than decayed here.
     if (out && !mob.alive_ && !mob.IsGhost() &&
-        !(parkFn_ && SavesAsRecord(mob))) {
+        !((parkFn_ || DistantHandOutLive()) && SavesAsRecord(mob))) {
       // A CORPSE THAT LEAVES THE WINDOW AND CANNOT BE PARKED (no park
       // function, or nothing left of it) decays to debris, which is what
       // every corpse did before it was a Mob: DebrisSystem's own window rule
@@ -10014,12 +10111,50 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           ByteWriter w{rec};
           mob.SaveOne(w);
         }
+        // WALKED OUT (D11): alive, on its feet or afloat (not thrown, not
+        // falling, not a ragdoll), and JUST over the pad line -- within a
+        // tick's travel of kPad past the face. A creature a window move left
+        // behind stands anywhere past it (a one-chunk shift cannot carry
+        // anybody over the line at all, a bigger jump strands it deep), so
+        // this counts the drive's crossings, not the window's. Read first:
+        // the demotion moves the creature's state out of this Mob.
+        const float past = std::max(
+            {wlo.x - mob.origin_.x, mob.origin_.x - (wlo.x + (float)kWorldN),
+             wlo.y - mob.origin_.y, mob.origin_.y - (wlo.y + (float)kWorldN),
+             wlo.z - mob.origin_.z, mob.origin_.z - (wlo.z + (float)kWorldN)});
+        const bool ownPower = mob.alive_ && !mob.airborne_ && !mob.Ragdolled() &&
+                              past <= kPad + 4.0f;
         bool gone = DemoteToDistant(mob, rec, wlo);
+        if (gone && ownPower) distant_.Note(&DistantMobs::Stats::walkedOut);
         if (!gone && parkFn_(mob.origin_, rec)) {
           parkedTotal_++;
           gone = true;
         }
         if (gone && !mob.alive_)
+          for (size_t k = 0; k < rises_.size();)
+            if (rises_[k].mobId == mob.id_) {
+              rises_[k] = std::move(rises_.back());
+              rises_.pop_back();
+            } else {
+              k++;
+            }
+      } else if (DistantHandOutLive() && !mob.IsGhost() && !mob.PlayerControlled() &&
+                 mob.defIndex_ >= 0 && mob.defIndex_ < (int)defs_.size()) {
+        // ...OR, ON A CLIENT, IT GOES TO THE HOST (D7a; game/distant.h). A
+        // client has no store of its own to park in and no tier of its own
+        // (the distant world is the host's), and this branch used to RELEASE
+        // the creature -- every NPC that walked away from the second player
+        // was gone for good. Now its SaveOne record, its brain, its steer and
+        // statuses and the look baked from this very rig go to the host as a
+        // DistantHandOut, and the host keeps it (in its tier under the same
+        // id, or parked). A rising booked on a corpse is withdrawn as a park
+        // withdraws it: the record carries it.
+        std::vector<uint8_t> rec;
+        {
+          ByteWriter w{rec};
+          mob.SaveOne(w);
+        }
+        if (HandOutToHost(mob, rec) && !mob.alive_)
           for (size_t k = 0; k < rises_.size();)
             if (rises_[k].mobId == mob.id_) {
               rises_[k] = std::move(rises_.back());
@@ -25805,6 +25940,11 @@ uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
     int gy = 0;
     uint32_t gmat = 0;
     if (!GroundHeightAt(world, x, z, yFrom, gy, &gmat)) return;
+    // PAST THE WINDOW FACE nothing can hold a print: GroundHeightAt answers
+    // there from the distant tier's ground for a creature walking out (D11),
+    // but no op writes outside the window -- the droplet would be dropped and
+    // the sole would lose its coat for no mark. Not a print, so not a loss.
+    if (!world.CellInWindow(IVec3{x, gy - 1, z})) return;
     if (gmat == 0 || gmat >= sys_->matGpu_.size()) return;
     if (sys_->matGpu_[gmat].klass == CLASS_LIQUID) return;
     // GroundHeightAt answers with the SURFACE (the open cell above the solid);
@@ -33359,6 +33499,16 @@ void MobSystem::RefreshOwnership() {
     // measured as 187 + 157 poses for the same three humans with zero
     // handoffs between them.
     if (m.announceOnly_) continue;
+    // BORN THIS TICK, NOT YET OFFERED TO A HANDOFF (mob.h `ownLatch_`, D7a):
+    // a creature made live inside the tick (a promotion or an unpark in phase
+    // H, a rising) keeps the owner it was born with -- this machine -- for the
+    // one tick it takes the next ScanHandoffs to hand it over WITH its record.
+    // Answering the ownership function now could make it a ghost here that the
+    // peer was never told about (no handoff is built inside the tick).
+    if (m.ownLatch_) {
+      m.ownLatch_ = false;
+      continue;
+    }
     // THE FEET, not the origin corner and not the centre: net::Authority keys
     // an entity on the chunk it stands in, and a tall creature's centre is up
     // to a chunk above the ground it is standing on.

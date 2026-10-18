@@ -1942,11 +1942,16 @@ fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
 // disc). One evaluation of each layer, like skyColor itself.
 struct SkyParts { full : vec3f, glow : vec3f };
 fn skyColorParts(rdIn : vec3f) -> SkyParts {
+  return skyColorPartsG(rdIn, skyAirglowV(normalize(rdIn), dayWeight()));
+}
+// The same, around an airglow the caller already holds: `g` MUST be
+// skyAirglowV(normalize(rdIn), dayWeight()). applyAerial evaluates that once
+// for both of its modes (see there).
+fn skyColorPartsG(rdIn : vec3f, g : SkyLayer) -> SkyParts {
   let rd = normalize(rdIn);
   let dayW = dayWeight();
   var moon = SkyLayer(vec3f(0.0), 0.0);
   if (dayW < 0.999) { moon = moonLayer(rd); }
-  let g = skyAirglowV(rd, dayW);
   var c = g.c;
   if (dayW < 0.999) {
     let hidden = 1.0 - (1.0 - g.veil) * (1.0 - clamp(moon.veil, 0.0, 1.0));
@@ -7997,8 +8002,8 @@ fn aerialFrac(tFine : f32, dirY : f32) -> f32 {
 // This is what turns an overcast into a GREY horizon rather than a blue one
 // with a grey lid — the distant hills fog into the cloud they stand under.
 // TUNE_CLOUD_FOG_MIX 0 restores the cloudless fog target exactly.
-fn cloudySkyAirglow(rd : vec3f) -> vec3f {
-  let sky = skyAirglow(rd);
+// `sky` is skyAirglow(rd): applyAerial, the one caller, holds it already.
+fn cloudySkyAirglowG(rd : vec3f, sky : vec3f) -> vec3f {
   if ((R.weatherFlags & RWF_CLOUDS) == 0u || TUNE_CLOUD_FOG_MIX <= 0.0) { return sky; }
   let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
   return mix(sky, sky * e.a + e.rgb, TUNE_CLOUD_FOG_MIX);
@@ -8533,7 +8538,11 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
 // sources. ONE function because short-range fog (applyAerial) has to converge
 // to exactly what the sky branch draws next to it.
 fn skyBackdrop(rd : vec3f, xy : vec2f) -> SkyParts {
-  let sp = skyColorParts(rd);
+  return skyBackdropG(rd, xy, skyAirglowV(normalize(rd), dayWeight()));
+}
+// ...around the caller's skyAirglowV(normalize(rd), dayWeight()).
+fn skyBackdropG(rd : vec3f, xy : vec2f, g : SkyLayer) -> SkyParts {
+  let sp = skyColorPartsG(rd, g);
   if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sp; }
   let cs = cloudScreenAt(xy, rd);
   let glow = sp.glow * cs.t + cs.c;
@@ -8546,6 +8555,13 @@ fn skyBackdrop(rd : vec3f, xy : vec2f) -> SkyParts {
 // read as a gray veil over the whole horizon instead of atmosphere.
 fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   let f = aerialFrac(tFine, rd.y);
+  // THE AIRGLOW IN `rd`, ONCE (2026-10-17, shader slimming). Both modes below
+  // start from skyAirglowV(normalize(rd), dayWeight()) -- the short-range
+  // backdrop through skyColorParts, the airlight through skyAirglow -- and
+  // each was its own inlined copy of it (the night glow's seven fbm calls
+  // included) in every one of the fragment shader's ~14 applyAerial copies.
+  // Same function, same arguments, evaluated once either way.
+  let glow = skyAirglowV(normalize(rd), dayWeight());
   // ---- SHORT-RANGE MODE: DISSOLVE INTO THE PIXEL'S OWN BACKDROP ----------
   // Owner ticket 2026-10-09_11-01-50: "with fog on at 100 m I see clear walls
   // in the distance at what are probably LOD boundaries". The walls were
@@ -8564,7 +8580,7 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // ceiling, but no starfield on a hill that is merely hazy
   // (gotcha-sky-tiers-fog-target).
   if (SPEC_SHORT_RANGE && (R.flags & 4u) != 0u) {
-    let bg = skyBackdrop(rd, gFragXY);
+    let bg = skyBackdropG(rd, gFragXY, glow);
     return mix(color, bg.glow, f) + (bg.full - bg.glow) * smoothstep(0.9, 1.0, f);
   }
   // Star-free sky. Aerial perspective is AIR between the eye and a SOLID
@@ -8573,7 +8589,7 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // nebulae into distant terrain — which renders stars *through* hillsides,
   // trees and the ground near the horizon, because those surfaces are exactly
   // the ones carrying the most fog.
-  var airlight = cloudySkyAirglow(rd);
+  var airlight = cloudySkyAirglowG(rd, glow.c);
   // THE DISTANCE BLUE (H1, render.fogHaze). The horizon band of the sky is
   // pale because it is the airlight of an INFINITE path; the airlight of a
   // finite one -- a ridge 15 km off, part dissolved -- is the deeper blue of
@@ -11054,9 +11070,21 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
   let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
   let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
-  let slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
+  var slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
   // Downhill is where the column heights fall: +x when hx0 > hx1.
   if (dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, hx0, hx1, hz0, hz1, slope); }
+  // A running HELD column's wet neighbours are drawn at their played-back
+  // heights (THE FROZEN STREAM PLAYS BACK), so the surface tilts by those, as
+  // a live partial cell's does by its neighbours' fullness. The current above
+  // keeps the held slope: the flicker is not a flow.
+  if (gHeldKind == 2u || gRiverAmp > 0.0) {
+    var o = vec4f(0.0);
+    if (hx0 > 0.0) { o.x = heldNeighbourOff(cell.x - 1, cell.z); }
+    if (hx1 > 0.0) { o.y = heldNeighbourOff(cell.x + 1, cell.z); }
+    if (hz0 > 0.0) { o.z = heldNeighbourOff(cell.x, cell.z - 1); }
+    if (hz1 > 0.0) { o.w = heldNeighbourOff(cell.x, cell.z + 1); }
+    slope += vec2f(o.x - o.y, o.z - o.w) * 0.5;
+  }
 
   // Ripples on top of the macro slope, in world metres (waterWaveNormal).
   // Damping is applied PER WAVE against its own wavelength inside
@@ -11330,6 +11358,7 @@ const SIDE_WALL : u32 = 0u;
 const SIDE_RISER : u32 = 1u;
 const SIDE_SHEET : u32 = 2u;
 fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
+  if (gHeldKind != 0u) { return heldSideKind(cell, out); }
   let n = cell + out;
   var level = -1.0;   // out of the window: open, and falling
   if (inBounds(n)) {
@@ -11355,6 +11384,249 @@ fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
   }
   return select(SIDE_RISER, SIDE_SHEET, liquidFullnessAt(cell) - level >= FALL_SHEET_MIN_DROP);
 }
+// ---- HELD STEPS ARE NOT WATERFALLS UNLESS WATER FALLS (2026-10-17) ---------
+// Tickets 2026-10-17_11-26-13 ("vertical waterfall column things") and
+// 11-37-20 ("a sheer frozen waterfall"). HELD water -- a map river, lake or
+// sea, or a stream sim_stream.wgsl adopted -- never moves, so a frozen stream
+// or a spill fan is a static staircase of columns, and the plain rule above
+// drew every step of 0.75 cell or more as a falling sheet: a fan of white
+// curtains where the water was really sliding down a mound. For a held
+// column the face is a sheet only where the water really FALLS: the water
+// (or the floor) outside stands at least HELD_SHEET_MIN_DROP cells under this
+// column's surface, or there is open air down past HELD_SHEET_LOOK cells in
+// front (an overhang, a cliff, the river bake's curtain, whose drops are tens
+// of voxels). A step of a cell or two is a RISER: lit as surface, so the
+// stream reads as a sloped, rippled, running sheet. Unheld (live CA) water
+// keeps the plain rule: its spill really is in flight. gHeldKind is set by
+// heldColumnT8 for the pixel being shaded (fs, before shadeWater); a pixel
+// that never asked (the MPM path, the far field) is unheld.
+// Reads: up to 3 cells down the column in front, up to 2 up its own.
+const HELD_SHEET_MIN_DROP : f32 = 2.5;
+const HELD_SHEET_LOOK : i32 = 3;
+fn heldSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
+  let n = cell + out;
+  if (!inBounds(n)) { return SIDE_SHEET; }
+  // The level outside, in cells from this cell's floor: walk down the column
+  // in front to the first liquid (its surface) or floor (its top).
+  var level = 0.0;
+  var found = false;
+  for (var i = 0; i < HELD_SHEET_LOOK; i++) {
+    let c = n - vec3<i32>(0, i, 0);
+    if (!inBounds(c)) { break; }
+    let w = voxWordAt(c);
+    let m = voxMat(w);
+    if (m == MAT_AIR) { continue; }
+    let k = materials[m].klass;
+    if (k == CLASS_GAS) { continue; }
+    if (k == CLASS_LIQUID) {
+      level = f32(voxState(w) + 1u) / 8.0 - f32(i);
+    } else {
+      if (i == 0) { return SIDE_WALL; }
+      level = 1.0 - f32(i);
+    }
+    found = true;
+    break;
+  }
+  if (!found) { return SIDE_SHEET; }
+  // This column's surface over the same floor: up to two cells over it.
+  var top = liquidFullnessAt(cell);
+  if (top >= 0.999) {
+    let f1 = liquidFullnessAt(cell + vec3<i32>(0, 1, 0));
+    top += f1;
+    if (f1 >= 0.999) { top += liquidFullnessAt(cell + vec3<i32>(0, 2, 0)); }
+  }
+  return select(SIDE_RISER, SIDE_SHEET, top - level >= HELD_SHEET_MIN_DROP);
+}
+
+// ---- THE FROZEN STREAM PLAYS BACK (2026-10-17, ticket 2026-10-17_11-37-20) --
+// "The frozen water should have this shape, but the voxels that represent
+// active current should visually be FLICKERING, to look almost identical to
+// actual flowing water." HELD water never moves: an ADOPTED stream
+// (docs/PLAN_running_water.md phase 2/3) and a map RIVER sit at their targets
+// for good, a glassy staircase, where the same water live was a field of top
+// cells at scattered fullness flickering as the CA moved it. So the RENDERER
+// moves it: a running held column's surface is drawn at T8 + o(t) eighths
+// instead of T8, where o is
+//   * an adopted stream's RECORDING (STILL_ECHO, written by sim_stream.wgsl
+//     as the stream adopts): 8 signed byte samples of its live surface
+//     relative to the target, one every 4 ticks, played back at the sim's
+//     rate from a per-column phase and stepped in whole eighths, as the CA
+//     stepped them; a sample of -128 is "no water" (the bed shows);
+//   * or, for a stream with no recording (both words 0) and for a map river
+//     column (its STILL_MOUTH word set: worldgen writes it for river water
+//     only, never a lake or the sea), a procedural flicker of the same kind:
+//     a hash of (column, sample) over -3..+3 eighths, mean 0 -- on a river
+//     scaled by its current (RIVER_FLICKER_V0..V1), so a slack reach stays
+//     glassy and a fast one churns.
+// RENDER-ONLY: nothing is written; the voxels stay held (swimming, fire,
+// buoyancy, the sim all see T8). The surface is moved in fs by intersecting
+// the ray with the column's box topped at the drawn height
+// (streamSurfaceHit): a lowered column lets the ray down onto its lower
+// surface (or out of its side onto the next column, drawn as surface: a
+// riser), a raised one is met earlier, through its top or its side, and a
+// column drawn dry shows its bed. waterNormal tilts the surface by the
+// neighbours' drawn heights exactly as the CA's fullness gradient tilts a
+// live partial cell -- most of what makes a live stream read as moving water
+// is that patchwork of per-cell tilts changing every few ticks.
+// What it cannot draw: a raised column seen only past its own water (a ray
+// that never entered the column's real water misses the extra eighths: a
+// silhouette error of under a cell), and the far field (past the handoff the
+// water is drawn as held).
+// Cost: the table's tag + map word on every CA water pixel seen from the air
+// (2..4 loads); on a stream's pixel its echo words, on a river's the mouth
+// word and one current sample; on either, its four neighbours' target / mouth
+// (+ echo) words for the normal.
+@group(0) @binding(50) var<storage, read> stillWater : array<u32>;
+// worldgen.wgsl STILL_WORDS / stillTag / STILL_MOUTH; sim_stream.wgsl's
+// STILL_ECHO (two words a column after the mouth words): must agree with the
+// writers.
+const RM_STILL_WORDS : u32 = 4u;
+const RM_STILL_MOUTH : u32 = WORLD_N * WORLD_N * RM_STILL_WORDS + 4u;
+const RM_STILL_ECHO : u32 = RM_STILL_MOUTH + WORLD_N * WORLD_N;
+const ECHO_RATE : f32 = 7.5;          // samples a second: 30 Hz, 4 ticks a sample
+const ECHO_DRY : i32 = -128;          // a sample with no water in the column
+const ECHO_DRY_DROP8 : f32 = -64.0;   // ...drawn as the surface 8 cells down: the bed
+// Each column's playback starts at its own phase (a hash), so the loop's
+// wrap is never one pulse across the whole stream.
+const ECHO_PHASE_JITTER : bool = true;
+// A map river's flicker, by its current (m/s, waterCurrentAt): none under V0,
+// the whole -3..+3 eighths from V1.
+const RIVER_FLICKER_V0 : f32 = 0.08;
+const RIVER_FLICKER_V1 : f32 = 0.6;
+// DEBUG (keep false): synthesise both echo words from a hash, to exercise
+// the recorded-playback decode before the sim writes any recordings.
+const ECHO_DEBUG_FILL : bool = false;
+// Both looks (the held side rule above and the playback) off: the
+// pre-2026-10-17 image, for an A/B. No other switch reads the table.
+const HELD_WATER_LOOK : bool = true;
+// 0 = not held, 1 = held by the map (a river, a lake, the sea), 2 = an
+// adopted stream. Set per shaded pixel by heldColumnT8.
+var<private> gHeldKind : u32 = 0u;
+// The shaded river column's flicker scale (0 off a river), set by
+// heldDrawnOff8 for its neighbours' share in waterNormal.
+var<private> gRiverAmp : f32 = 0.0;
+fn rmStillCol(x : i32, z : i32) -> u32 {
+  return bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK);
+}
+// The column's held surface in eighths, and gHeldKind; 0 if none. The same
+// test as sim_step.wgsl stillLevel8 (the tag, the map's word, else a
+// stream's target and liquid), minus its sim.stillWaterRelax switch.
+fn heldColumnT8(c : vec3<i32>, mat : u32) -> i32 {
+  gHeldKind = 0u;
+  gRiverAmp = 0.0;
+  if (!HELD_WATER_LOOK) { return 0; }
+  let si = rmStillCol(c.x, c.z) * RM_STILL_WORDS;
+  let tx = bitcast<u32>(c.x >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  let tz = bitcast<u32>(c.z >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  if (stillWater[si] != (1u | (tx << 1u) | (tz << 16u))) { return 0; }
+  let v = stillWater[si + 1u];
+  if (v != 0u) {
+    if ((v >> 20u) != mat) { return 0; }
+    gHeldKind = 1u;
+    return bitcast<i32>(v << 12u) >> 12u;
+  }
+  let d = stillWater[si + 2u];
+  if (d == 0u || (stillWater[si + 3u] & 0xFFFu) != mat) { return 0; }
+  gHeldKind = 2u;
+  return bitcast<i32>(d << 12u) >> 12u;
+}
+// Sample k (0..7) of a recording: a signed byte.
+fn echoSample(e0 : u32, e1 : u32, k : u32) -> i32 {
+  let w = select(e0, e1, k >= 4u);
+  return bitcast<i32>(w << (24u - 8u * (k & 3u))) >> 24u;
+}
+// The procedural stand-in: -3..+3 eighths (two dice, so 0 is the commonest),
+// a fresh draw every sample.
+fn echoProc(col : u32, k : u32) -> i32 {
+  let h = pcg((col * 0x9E3779B1u) ^ pcg(k + 0x5157EC40u));
+  return i32(h & 3u) + i32((h >> 2u) & 3u) - 3;
+}
+// The drawn offset of window column `col` from its target now, in eighths (a
+// whole number of them, as the CA's surface is): an adopted stream's
+// recording if it has one (`stream`), else the procedural flicker times
+// `amp`.
+fn columnOff8(col : u32, stream : bool, amp : f32) -> f32 {
+  var e0 = 0u;
+  var e1 = 0u;
+  if (stream) {
+    e0 = stillWater[RM_STILL_ECHO + 2u * col];
+    e1 = stillWater[RM_STILL_ECHO + 2u * col + 1u];
+    if (ECHO_DEBUG_FILL) {
+      let hh = pcg(col ^ 0xEC40u);
+      e0 = (hh & 0x01010101u) * 0xFFu;   // 0 or -1 eighths a sample ...
+      e1 = pcg(hh) & 0x02020202u;        // ... 0 or +2
+    }
+  }
+  var s = R.time * ECHO_RATE;
+  if (ECHO_PHASE_JITTER) { s += f32(pcg(col + 0x7A5Eu) & 0xFFFFu) * (8.0 / 65536.0); }
+  let k = u32(floor(s));
+  let f = s - floor(s);
+  if ((e0 | e1) == 0u) {
+    return round(mix(f32(echoProc(col, k)), f32(echoProc(col, k + 1u)), f) * amp);
+  }
+  let a = echoSample(e0, e1, k & 7u);
+  let b = echoSample(e0, e1, (k + 1u) & 7u);
+  // A dry sample is a jump, not a slide through the bed.
+  if (a == ECHO_DRY || b == ECHO_DRY) {
+    let n = select(a, b, f >= 0.5);
+    return select(f32(n), ECHO_DRY_DROP8, n == ECHO_DRY);
+  }
+  return round(mix(f32(a), f32(b), f));
+}
+// The SHADED column's drawn offset (eighths; 0 = drawn as held), after
+// heldColumnT8 found it held: a stream plays back; a map river column flickers
+// by its current at `p` (and sets gRiverAmp); a lake or the sea is still.
+fn heldDrawnOff8(c : vec3<i32>, p : vec3f) -> f32 {
+  let col = rmStillCol(c.x, c.z);
+  if (gHeldKind == 2u) { return columnOff8(col, true, 1.0); }
+  if (gHeldKind != 1u || stillWater[RM_STILL_MOUTH + col] == 0u) { return 0.0; }
+  let sp = length(waterCurrentAt(p).xz) * VOXEL_METERS;
+  gRiverAmp = smoothstep(RIVER_FLICKER_V0, RIVER_FLICKER_V1, sp);
+  if (gRiverAmp <= 0.0) { return 0.0; }
+  return columnOff8(col, false, gRiverAmp);
+}
+// A NEIGHBOUR column's drawn offset, in cells: a stream's (its target word
+// set) or, around a flickering river column, a river's (its mouth word set);
+// else 0. Its tag and liquid are not checked -- a neighbour's offset only
+// tilts the shaded column's normal.
+fn heldNeighbourOff(x : i32, z : i32) -> f32 {
+  let col = rmStillCol(x, z);
+  if (stillWater[col * RM_STILL_WORDS + 2u] != 0u) {
+    return max(columnOff8(col, true, 1.0), -8.0) / 8.0;
+  }
+  if (gRiverAmp > 0.0 && stillWater[RM_STILL_MOUTH + col] != 0u) {
+    return columnOff8(col, false, gRiverAmp) / 8.0;
+  }
+  return 0.0;
+}
+// The ray against column (col.x, col.y)'s water drawn up to `topY` (voxels):
+// the box [x, x+1] x (-inf, topY] x [z, z+1]. Returns (t, axis, sign of rd
+// on it, 1) where the ray enters it; if the ray passes over it (a column
+// drawn lower than the ray crosses it), (t, 1, -1, 0) at the point the ray
+// leaves the column, drawn as surface (the next column's riser).
+fn streamSurfaceHit(ro : vec3f, rd : vec3f, col : vec2<i32>, topY : f32) -> vec4f {
+  let inv = vec3f(1.0) / select(rd, vec3f(1e-9), abs(rd) < vec3f(1e-9));
+  let lo = vec2f(col);
+  let ax0 = (lo.x - ro.x) * inv.x;
+  let ax1 = (lo.x + 1.0 - ro.x) * inv.x;
+  let az0 = (lo.y - ro.z) * inv.z;
+  let az1 = (lo.y + 1.0 - ro.z) * inv.z;
+  let txn = min(ax0, ax1);
+  let tzn = min(az0, az1);
+  let tOut = min(max(ax0, ax1), max(az0, az1));
+  let ty = (topY - ro.y) * inv.y;
+  var tyn = -1e30;
+  var tyf = 1e30;
+  if (rd.y < 0.0) { tyn = ty; } else { tyf = ty; }
+  let tn = max(max(txn, tzn), tyn);
+  if (tn <= min(tOut, tyf)) {
+    if (tyn >= max(txn, tzn)) { return vec4f(tn, 1.0, -1.0, 1.0); }
+    if (txn >= tzn) { return vec4f(tn, 0.0, sign(rd.x), 1.0); }
+    return vec4f(tn, 2.0, sign(rd.z), 1.0);
+  }
+  return vec4f(tOut, 1.0, -1.0, 0.0);
+}
+
 // How far under its crest a falling face is, in metres: up the face's own
 // column while it stays liquid, in strides of FALL_CREST_STRIDE cells (a held
 // curtain is solid water to the lip; a CA spill in flight has gaps, and a
@@ -11706,7 +11978,6 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   // pixels back and forth across the threshold and the surface breaks into
   // per-pixel speckle instead of reading as one continuous sheet.
   let horizon = smoothstep(-0.06, 0.02, rr.y);
-  if (horizon <= 0.0) { return reflectionSkyBlur(rr, blur); }
   // Step budget, not distance: this is one secondary ray per water pixel and a
   // lake can fill the screen, so this number is a direct frame-time multiplier
   // on water-heavy views. Rays that run out return sky, which is what a long
@@ -11727,16 +11998,28 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   // material and the palette variant, and a coarse hit has no word (a 4^3
   // block holds up to 64 materials). Every caller that reads `word` passes
   // 1e30; see the traceOpaque header in common.wgsl.
-  let h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
-                      &occupancy, &materials);
-  rsAdd(RS_REFLECT, h.steps);
-  if (!h.hit) { return reflectionSkyBlur(rr, blur); }
+  //
+  // ONE reflectionSkyBlur CALL SITE (2026-10-17, shader slimming). The three
+  // exits -- below the horizon blend, a miss, a hit mixed over the sky -- all
+  // want reflectionSkyBlur(rr, blur), and as three call sites it was three
+  // inlined copies of the sky (airglow, night glow, stars, cloud env) in each
+  // of the fragment shader's five traceReflection copies. Every path still
+  // evaluates it exactly once, AFTER the trace exactly as the hit path's
+  // mix() did, so nothing new is live across the reflected march.
+  var h : OpaqueHit;
+  h.hit = false;
+  if (horizon > 0.0) {
+    h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
+                    &occupancy, &materials);
+    rsAdd(RS_REFLECT, h.steps);
+  }
+  let sky = reflectionSkyBlur(rr, blur);
+  if (!h.hit) { return sky; }
 
   // Reflected geometry is seen across the water plus its own distance, so it
   // takes aerial perspective too — without this, a reflected far hillside is
   // sharper than the real one and the reflection reads as a decal.
-  return mix(reflectionSkyBlur(rr, blur), applyAerial(shadeSecondaryHit(h), rr, h.t),
-             horizon);
+  return mix(sky, applyAerial(shadeSecondaryHit(h), rr, h.t), horizon);
 }
 
 // Shade a SECONDARY ray's hit with the same terms as a primary hit, minus the
@@ -12317,7 +12600,11 @@ fn fallCueAt(cell : vec3<i32>) -> FallCue {
     let airOver = mistAirAt(cell + vec3<i32>(0, 1, 0));
     if (airOver && mistLiquidAt(above)) {
       cue.impact = smoothstep(1.5, 3.5, fallMassAt(above));
-    } else if (!airOver && mistLiquidAt(cell + vec3<i32>(0, 1, 0))) {
+    } else if (!airOver && mistLiquidAt(cell + vec3<i32>(0, 1, 0)) &&
+               (!HELD_WATER_LOOK || mistLiquidAt(cell + vec3<i32>(0, 2, 0)))) {
+      // (2026-10-17: and liquid TWO cells up -- a step of a cell or two in a
+      // frozen stream or spill fan is not a curtain (heldSideKind draws it
+      // as surface) and threw a plunge spray at every step.)
       // A HELD CURTAIN (docs/PLAN_running_water.md): a river's waterfall is a
       // standing sheet of water against the cliff -- liquid above, air in
       // front -- that never detaches, so neither test above sees it. Liquid
@@ -19980,14 +20267,49 @@ fn fs(in : VSOut) -> FSOut {
         caShadedLiquid = true;
       } else if (!mpmOwned) {
         rsAdd(RS_PX_WATER, 1u);
-        color = shadeWater(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
-                           h.liqPath + liqExtra, max(h.mediaSurf, 0.125), color,
-                           h.liqT, underwater);
-        if (SEAM_DBG >= 5u) { gDbgW0.x = 0.5; gDbgW0.y = h.liqT; }
-        color = bubbleComposite(color, R.camPos, rd, h.liqCell, h.liqFace, h.liqT);
-        color = applyAerial(color, rd, h.liqT);
-        caShadedLiquid = true;
-        veilT = h.liqT;
+        // Is the column held (a held step is a sheet only over a real drop:
+        // heldSideKind), and is it RUNNING -- an adopted stream or a map
+        // river -- so that its surface is drawn where its recording or the
+        // procedural flicker has it now (THE FROZEN STREAM PLAYS BACK)? The
+        // ray is re-met against the column's box at that height: the hit,
+        // its face, the water path and the top cell's fill move; a column
+        // drawn dry where the ray meets the bed first is not shaded as water.
+        var wT = h.liqT;
+        var wAxis = faceAxis(h.liqFace);
+        var wSgn = faceSgn(h.liqFace);
+        var wPath = h.liqPath + liqExtra;
+        var wFull = max(h.mediaSurf, 0.125);
+        var wDry = false;
+        let t8 = heldColumnT8(liqCell, lm);
+        var off8 = 0.0;
+        if (gHeldKind != 0u) { off8 = heldDrawnOff8(liqCell, hitP); }
+        if (off8 != 0.0) {
+          let topY = (f32(t8) + off8) / 8.0;
+          let sh = streamSurfaceHit(R.camPos, rd, liqCell.xz, topY);
+          // A pass-over is only ever further along than the real hit.
+          if (sh.w > 0.0 || sh.x >= h.liqT) {
+            wT = max(sh.x, 0.0);
+            wDry = h.hit && wT >= h.t;
+            wPath = max(wPath + (h.liqT - wT), 0.0);
+            wAxis = i32(sh.y);
+            wSgn = sh.z;
+            if (sh.w > 0.0) {
+              let fr = topY - floor(topY);
+              wFull = max(select(fr, 1.0, fr < 0.0625), 0.125);
+            }
+          }
+        }
+        if (!wDry) {
+          color = shadeWater(R.camPos + rd * wT, rd, lm, liqCell, wAxis, wSgn,
+                             wPath, wFull, color, wT, underwater);
+          if (SEAM_DBG >= 5u) { gDbgW0.x = 0.5; gDbgW0.y = wT; }
+          color = bubbleComposite(color, R.camPos, rd, h.liqCell, h.liqFace, wT);
+          color = applyAerial(color, rd, wT);
+          caShadedLiquid = true;
+          veilT = wT;
+        }
+        gHeldKind = 0u;
+        gRiverAmp = 0.0;
       }
       // mpmOwned && !viscous && !underwater: the MPM path below will shade it.
 

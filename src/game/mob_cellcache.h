@@ -8,17 +8,31 @@
 // the walk drive's ground probe reads (Mob::GroundHeightAt): a body forty
 // voxels from the camera must still know where the water is. A cache miss
 // asks for the chunk and answers Unknown; outside the residency window is
-// Solid, the sim's own rule.
+// Solid, the sim's own rule -- UNLESS `outside` is set (D11, below).
 //
-// (mob_swim.cpp still carries its own copy in its anonymous namespace; it was
-// claimed by a parallel session when this header was split out. Switch it to
-// this one when that file is next free.)
+// PAST THE WINDOW FACE, for a body that may leave the window (MobSystem::
+// OutsideGroundFor; docs/PLAN_distant_npcs.md section 8.1), the cell is the
+// DISTANT tier's: Solid where DistantGround carries weight, Liquid below its
+// water surface (WaterTop: the first cell above the liquid), Air above. The
+// same water a distant swimmer swims in, so a fish or a swimmer crosses the
+// face into the water it will swim in as a distant creature instead of
+// meeting a wall of "solid" at the face. Asked lazily (the first outside
+// cell), so a body that never nears a face never asks.
+//
+// (mob_swim.cpp used to carry its own copy of this struct in its anonymous
+// namespace; since D11 it uses this one, so the two swim readers cannot
+// disagree about the face.)
 
 #include <climits>
 #include <cstdint>
 #include <vector>
 
+#include "game/distant.h"   // DistantGround: the ground past the face (D11)
+#include "math3d.h"
 #include "sim/world.h"
+
+class Mob;
+class MobSystem;
 
 namespace mobwater {
 
@@ -30,10 +44,25 @@ struct CellCache {
   // already known, and must not put a single request into the one FIFO every
   // ground probe in the world waits on (World::FetchSource).
   bool fetch = true;
+  // D11: the body whose question this is, and its system -- set together, or
+  // past the face stays Solid. `outside` is resolved on the first cell past
+  // the face (MobSystem::OutsideGroundFor; null = the old answer).
+  const Mob* body = nullptr;
+  MobSystem* sys = nullptr;
+  DistantGround* outside = nullptr;
+  bool outsideAsked = false;
   const CachedChunk* cc = nullptr;
   int kx = INT_MIN, ky = INT_MIN, kz = INT_MIN;
+  // Out of line (mob_swim.cpp): it needs MobSystem whole.
+  DistantGround* Outside();
   CellKind At(IVec3 c) {
-    if (!world.CellInWindow(c)) return CellKind::Solid;
+    if (!world.CellInWindow(c)) {
+      DistantGround* g = Outside();
+      if (g == nullptr) return CellKind::Solid;
+      if (g->Solid(c.x, c.y, c.z)) return CellKind::Solid;
+      const int wt = g->WaterTop(c.x, c.z);
+      return wt != DistantGround::kNoWater && c.y < wt ? CellKind::Liquid : CellKind::Air;
+    }
     if (const CellKind m = world.KindAt(c, cls); m != CellKind::Unknown) return m;
     const int x = c.x >> 4, y = c.y >> 4, z = c.z >> 4;
     if (x != kx || y != ky || z != kz) {
@@ -51,6 +80,10 @@ struct CellCache {
         (uint32_t)(c.x & 15);
     return World::KindOfWord(cc->voxels[li], cls);
   }
+  CellKind At(Vec3 p) { return At(IVec3{ifloor(p.x), ifloor(p.y), ifloor(p.z)}); }
 };
 
 }  // namespace mobwater
+
+// (The cache a body's question uses -- its classes, and past the face the
+// distant tier's ground when it may swim out -- is MobSystem::WaterCache.)

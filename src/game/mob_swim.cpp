@@ -59,6 +59,7 @@
 #include <cmath>
 
 #include "game/mob.h"
+#include "game/mob_cellcache.h"
 #include "sim/rng.h"
 #include "sim/scale.h"
 #include "sim/tuning.h"
@@ -83,45 +84,12 @@ inline float HalfLifeK(float dt, float hl) {
   return hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
 }
 
-// THE MIRROR FIRST, THEN ONE CHUNK MEMO over the on-demand fetch cache. The
-// 3x3x3 mirror round the player is refreshed every tick, so near the player
-// (where a fish is being watched, and where it is hunting him) the answer is
-// the water as it is NOW -- a pool dug this second, a lake drained. Past the
-// mirror, the fetch cache the walk drive's ground probe reads
-// (Mob::GroundHeightAt): a fish forty voxels from the camera must still know
-// where the water is. A cache miss asks for the chunk and answers Unknown;
-// outside the residency window is Solid, the sim's own rule.
-struct CellCache {
-  World& world;
-  const std::vector<uint32_t>& cls;
-  // Ask for a missing chunk? A swimmer's own sense does: it needs the water.
-  // A WATCHER's question about somebody else (BodyImmersion, every actor every
-  // tick) does not -- it answers from what is already known, and must not put
-  // a single request into the one FIFO every ground probe in the world waits
-  // on (World::FetchSource: a flood from one consumer is starvation for all).
-  bool fetch = true;
-  const CachedChunk* cc = nullptr;
-  int kx = INT_MIN, ky = INT_MIN, kz = INT_MIN;
-  CellKind At(IVec3 c) {
-    if (!world.CellInWindow(c)) return CellKind::Solid;
-    if (const CellKind m = world.KindAt(c, cls); m != CellKind::Unknown) return m;
-    const int x = c.x >> 4, y = c.y >> 4, z = c.z >> 4;
-    if (x != kx || y != ky || z != kz) {
-      kx = x;
-      ky = y;
-      kz = z;
-      cc = world.Cached({x, y, z});
-      if (cc != nullptr && cc->voxels.size() != kChunkVol) cc = nullptr;
-      if (cc == nullptr && fetch)
-        world.RequestChunkFetch({x, y, z}, World::FetchSource::Mob);
-    }
-    if (cc == nullptr) return CellKind::Unknown;
-    const uint32_t li = ((uint32_t)(c.z & 15) * kChunk + (uint32_t)(c.y & 15)) * kChunk +
-                        (uint32_t)(c.x & 15);
-    return World::KindOfWord(cc->voxels[li], cls);
-  }
-  CellKind At(Vec3 p) { return At(IVec3{ifloor(p.x), ifloor(p.y), ifloor(p.z)}); }
-};
+// THE CELL READER is mobwater::CellCache (game/mob_cellcache.h): the mirror
+// first, then one chunk memo over the fetch cache, and -- since D11 -- the
+// distant tier's water and ground past the window face for a body that may
+// swim out. Built by MobSystem::WaterCache (below), the one place that knows
+// which body is asking. This file used to carry its own copy of the struct.
+using mobwater::CellCache;
 
 Vec3 DirOf(float heading, float pitch) {
   const float cp = std::cos(pitch);
@@ -129,6 +97,24 @@ Vec3 DirOf(float heading, float pitch) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// D11: the swim readers past the window face (game/mob_cellcache.h).
+// ---------------------------------------------------------------------------
+DistantGround* mobwater::CellCache::Outside() {
+  if (!outsideAsked) {
+    outsideAsked = true;
+    outside = sys != nullptr && body != nullptr ? sys->OutsideGroundFor(*body) : nullptr;
+  }
+  return outside;
+}
+
+mobwater::CellCache MobSystem::WaterCache(World& world, const Mob& mob, bool fetch) const {
+  // const_cast: OutsideGroundFor only fills DistantGround's pure caches and a
+  // counter -- a watcher's question (BodyImmersion, every actor every tick)
+  // changes no answer by asking it.
+  return mobwater::CellCache{world, mob.ClassOf(), fetch, &mob, const_cast<MobSystem*>(this)};
+}
 
 // ---------------------------------------------------------------------------
 // A launch while swimming: a surge (Mob::Launch routes here; the style's
@@ -156,14 +142,14 @@ const Mob* MobSystem::SwimStrikeTarget(const Mob& mob) const {
 
 bool MobSystem::SwimBlockedAt(const Mob& mob, IVec3 cell) const {
   if (world_ == nullptr) return false;
-  CellCache cache{*world_, mob.ClassOf()};
+  CellCache cache = WaterCache(*world_, mob);
   return cache.At(cell) == CellKind::Solid;
 }
 
 float MobSystem::BodyImmersion(const Mob& m) const {
   if (world_ == nullptr || m.def_ == nullptr) return 0.0f;
   const Vec3 ws = m.def_->worldSize;
-  CellCache cache{*world_, m.ClassOf(), /*fetch=*/false};
+  CellCache cache = WaterCache(*world_, m, /*fetch=*/false);
   const float x = m.origin_.x + ws.x * 0.5f, z = m.origin_.z + ws.z * 0.5f;
   int wet = 0;
   for (float f : {0.15f, 0.5f, 0.85f})
@@ -173,7 +159,7 @@ float MobSystem::BodyImmersion(const Mob& m) const {
 
 float MobSystem::PointImmersion(const Mob& m, Vec3 centre) const {
   if (world_ == nullptr) return 0.0f;
-  CellCache cache{*world_, m.ClassOf(), /*fetch=*/false};
+  CellCache cache = WaterCache(*world_, m, /*fetch=*/false);
   int wet = 0;
   for (float dy : {-1.5f, 0.0f, 1.5f})
     if (cache.At(Vec3{centre.x, centre.y + dy, centre.z}) == CellKind::Liquid)
@@ -236,7 +222,7 @@ void MobSystem::SenseWater(Mob& mob, const MobDef& def, World& world) {
   const Vec3 c = mob.origin_ + ws * 0.5f;
   const Vec3 f = mob.Forward3();
   const float halfLen = ws.z * 0.5f;
-  CellCache cache{world, mob.ClassOf()};
+  CellCache cache = WaterCache(world, mob);
   // Four samples down the axis and one on the back: a body with its dorsal
   // fin out is still swimming, one with half its length on the bank is not.
   int wet = 0, known = 0;
@@ -374,7 +360,7 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
   const float halfH = sw.trunkHalfH;
   const Vec3 c = mob.origin_ + ws * 0.5f;
   const float g = MetresToCells(CurrentTuning().physics.gravity);
-  CellCache cache{world, mob.ClassOf()};
+  CellCache cache = WaterCache(world, mob);
   const float speed = mob.swimVel_.len();
 
   // ---- 0. THE FINS IT HAS LEFT (SenseFins; MobDef::SwimDef::FinDef) ---------
@@ -733,7 +719,7 @@ void MobSystem::TickStranded(Mob& mob, const MobDef& def, World& world,
   const float u4 = (float)((h2 >> 16) & 0xFFFFu) / 65535.0f;
   const Vec3 ws = def.worldSize;
   const Vec3 c = mob.origin_ + ws * 0.5f;
-  CellCache cache{world, mob.ClassOf()};
+  CellCache cache = WaterCache(world, mob);
   float bestD = 1e9f, bestBearing = 0.0f;
   // Feeling for water: along each bearing at the height the body lies at,
   // and DOWN from there -- a fish on a ledge or a bank feels the water below

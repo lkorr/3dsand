@@ -2613,27 +2613,53 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
   // steepness and strips are not this water's, so they are walked again
   // without it -- only where two rivers' channels overlap, since the first
   // walk cannot know the winning surface until it has seen every piece.
+  //
+  // THE SURFACE IS BLENDED, not picked (2026-10-17, ticket 2026-10-17_11-37-20:
+  // "slowly becomes a sheer frozen waterfall"). The nearest piece alone is a
+  // Voronoi pick: on a WIDE river (hw ~155) down a steep stretch cut into
+  // short pieces, a column lies near the ends of half a dozen chords whose
+  // surfaces there differ by voxels, and wherever the nearest one changed the
+  // water stepped -- the default map's Silverrun stood in terraces of held
+  // water 6-7 voxels tall across its width (measured at (14452, -7280): seven
+  // claiming pieces, 3232..3456 eighths). Now every claiming channel of THIS
+  // water within twice the nearest's d2 (+64) is averaged, weighted by how
+  // much nearer it is than that cutoff -- a weight that falls to 0 at the
+  // cutoff, so the surface is continuous wherever the set changes. Integer,
+  // offsets from the nearest's surface clamped to RIVER_FOREIGN (weights
+  // >> 4 keep every sum inside i32); the CPU twin computes the same.
   var foreignHi = false;
   if (inCh) {
     let wv = (w8Min - 1) >> 3u;
     let tol = RIVER_FOREIGN + mNear;
     foreignHi = hiFS > wv + tol;
-    if (loFS < wv - tol) {
+    let reFloor = loFS < wv - tol;
+    if (reFloor) {
       floorMin = 1048576;
       mCh = 1;
       crest8 = -8388608;
       curt8 = -8388608;
-      for (var k = 0u; k < n; k++) {
-        let sid = wmSiteK(lst, k);
-        if (wmSiteKind(sid) != WM_SITE_RIVER) { continue; }
-        let p = rivPieceAt(sid, x, z);
-        if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol) { continue; }
+    }
+    let cut = 2 * chD2 + 64;
+    var wsum = 0;
+    var acc = 0;
+    for (var k = 0u; k < n; k++) {
+      let sid = wmSiteK(lst, k);
+      if (wmSiteKind(sid) != WM_SITE_RIVER) { continue; }
+      let p = rivPieceAt(sid, x, z);
+      if (!p.ok || p.d2 >= p.hw * p.hw || p.s + p.m < wv - tol || p.s - p.m > wv + tol) { continue; }
+      if (reFloor) {
         mCh = max(mCh, p.m);
         floorMin = min(floorMin, p.floorY);
         if (p.strip == 1) { crest8 = max(crest8, p.edgeT8); }
         if (p.strip == 2) { curt8 = max(curt8, p.edgeT8); }
       }
+      let wt = (cut - p.d2) >> 4u;
+      if (wt > 0) {
+        wsum += wt;
+        acc += wt * clamp(p.s8 - w8Min, -8 * RIVER_FOREIGN, 8 * RIVER_FOREIGN);
+      }
     }
+    if (wsum > 0) { w8Min += acc / wsum; }
   }
   var h = h0;
   var water = -1;
@@ -4404,68 +4430,67 @@ struct PlantCol {
 // Is (cx, cz) a place a tile plant may stand? The same exclusions the
 // ground-flora block applies to its own column, evaluated at the CENTRE, plus
 // "not in or against a trunk" and, for ferns, canopy cover.
-struct PlantSite { ok : bool, h : i32 };
-fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
-  var ps : PlantSite;
-  ps.ok = false;
-  ps.h = 0;
-  if (siteKeepOut(cx, cz) || dgSurfNear(cx, cz, 3)) { return ps; }   // 3: a tile plant's footprint overhangs its centre
-  if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
-  var L : LandCol;
-  landColumn(cx, cz, seed, &L);
-  ps.h = L.h;
-  if (L.h >= treelineAt(cx, cz, seed) || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
-  if (featureSteepAt(L.slope)) { return ps; }   // no tile plant on a cliff
-  if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
-  let ug = undergrowthSite(cx, cz, seed, &L.ponds);
-  if (ug.trunkD2 <= 4) { return ps; }
-  if (needCover && ug.cover < UG_COVER_MIN) { return ps; }
-  ps.ok = true;
-  return ps;
-}
-
-fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
+//
+// THE COLUMN'S OWN GROUND RIDES THE SAME LOOP (2026-10-17, shader slimming).
+// A tile plant's site test needs a whole landColumn at the plant's centre, and
+// genColumn needs one at its own column; every call site of landColumn is a
+// full inlined copy (pond scan, bowl, shore, roads, pads, rivers) in every
+// entry point that reaches genColumn -- `far`, `farpatch`, `fardown`, `farmap`
+// and `cols`. Written as genColumn's landColumn plus a plantSiteAt per species
+// it was three copies (scripts/spv_inline_tree.py: ~67k instructions each in
+// the expansion). So this is ONE fenced worklist with one landColumn in it:
+//   k 0  the asking column itself -> *L (genColumn's ground, as before);
+//   k 1  the fern tile's centre, when the column is in a fern footprint and
+//        bank (the patch mask the one-cell fern used), under real cover;
+//   k 2  the big toadstool's, when the column is in its footprint -- rare,
+//        anywhere in the wood; a fern bank is the wrong place for one, so a
+//        column whose fern site was accepted never gets here (`break`).
+// A site test that fails moves on to the next entry, exactly as the old
+// per-species blocks fell through. Same columns, same tests, same order.
+fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32,
+                 L : ptr<function, LandCol>) -> PlantCol {
   var pc : PlantCol;
   pc.mat = MAT_AIR;
   pc.base = 0;
   pc.top = -1;
-  if (!GROUND_COVER) { return pc; }
   // The tile plants belong to biomes with the ground-flora layer (the
   // world map's flag), not to two hard-coded ids.
-  if (!wmFlag(biome, WM_BF_GROUND_FLORA)) { return pc; }
-  // FERNS: the signature closed-canopy plant, in banks (the same patch mask
-  // the one-cell fern used), under real cover.
-  {
-    let pt = plantTileAt(x, z, seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
-                         PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH,
-                         PLANT_FERN_CHANCE);
-    let half = PLANT_FERN_FOOT / 2;
-    if (pt.present && abs(x - pt.cx) <= half && abs(z - pt.cz) <= half &&
-        vnoise(pt.cx, pt.cz, UG_FERN_PATCH_CELL, seed ^ 0xFE70u) > UG_FERN_PATCH) {
-      let site = plantSiteAt(pt.cx, pt.cz, seed, true);
-      if (site.ok) {
-        pc.mat = M_FERN;
-        pc.base = site.h;
-        pc.top = site.h + pt.h;
-        return pc;
-      }
+  let flora = GROUND_COVER && wmFlag(biome, WM_BF_GROUND_FLORA);
+  let fpt = plantTileAt(x, z, seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
+                        PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH,
+                        PLANT_FERN_CHANCE);
+  let fhalf = PLANT_FERN_FOOT / 2;
+  let fernHere = fpt.present && abs(x - fpt.cx) <= fhalf && abs(z - fpt.cz) <= fhalf &&
+                 vnoise(fpt.cx, fpt.cz, UG_FERN_PATCH_CELL, seed ^ 0xFE70u) > UG_FERN_PATCH;
+  let spt = plantTileAt(x, z, seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
+                        PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH,
+                        PLANT_SHROOM_CHANCE);
+  let shalf = PLANT_SHROOM_FOOT / 2;
+  let shroomHere = spt.present && abs(x - spt.cx) <= shalf && abs(z - spt.cz) <= shalf;
+  for (var k = unrollFenceU(); k < 3u; k++) {
+    let fern = k == 1u;
+    var px = x;
+    var pz = z;
+    if (k != 0u) {
+      if (!flora || !select(shroomHere, fernHere, fern)) { continue; }
+      px = select(spt.cx, fpt.cx, fern);
+      pz = select(spt.cz, fpt.cz, fern);
+      if (siteKeepOut(px, pz) || dgSurfNear(px, pz, 3)) { continue; }   // 3: a tile plant's footprint overhangs its centre
+      if (!wmFlag(biomeAt(px, pz, seed), WM_BF_GROUND_FLORA)) { continue; }
     }
-  }
-  // BIG TOADSTOOLS: rare, anywhere in the wood — a fern bank is the wrong
-  // place for one, so a column already in a fern footprint never gets here.
-  {
-    let pt = plantTileAt(x, z, seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
-                         PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH,
-                         PLANT_SHROOM_CHANCE);
-    let half = PLANT_SHROOM_FOOT / 2;
-    if (pt.present && abs(x - pt.cx) <= half && abs(z - pt.cz) <= half) {
-      let site = plantSiteAt(pt.cx, pt.cz, seed, false);
-      if (site.ok) {
-        pc.mat = M_MUSHROOM_LARGE;
-        pc.base = site.h;
-        pc.top = site.h + pt.h;
-      }
-    }
+    var C : LandCol;
+    landColumn(px, pz, seed, &C);
+    if (k == 0u) { *L = C; continue; }
+    if (C.h >= treelineAt(px, pz, seed) || C.pond >= 0 || C.inRim || C.inPoolFloor) { continue; }
+    if (featureSteepAt(C.slope)) { continue; }   // no tile plant on a cliff
+    if (C.near.onShore && C.near.past < wmWaterI(C.near.wp, WM_W_SHORE_BAND)) { continue; }
+    let ug = undergrowthSite(px, pz, seed, &C.ponds);
+    if (ug.trunkD2 <= 4) { continue; }
+    if (fern && ug.cover < UG_COVER_MIN) { continue; }
+    pc.mat = select(M_MUSHROOM_LARGE, M_FERN, fern);
+    pc.base = C.h;
+    pc.top = C.h + select(spt.h, fpt.h, fern);
+    break;
   }
   return pc;
 }
@@ -4783,10 +4808,12 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   // THE GROUND, and everything derived from it, in one call. This is the same
   // `h` World::TerrainHeight returns — that equality is the whole point of the
   // split (see the height contract above landColumn).
+  // (plantColumnAt fills L: its one landColumn call site serves this column
+  // and the tile plants' site tests -- see there.)
   var L : LandCol;
-  landColumn(x, z, seed, &L);
-  let h = L.h;
   let biome = biomeAt(x, z, seed);
+  let plant = plantColumnAt(x, z, seed, biome, &L);
+  let h = L.h;
   let tl = treelineAt(x, z, seed);
 
   // ---- the marsh fringe: landColumn's berm scan, narrowed ----
@@ -4844,7 +4871,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.nearWater = nearWater;
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
-  col.plant = plantColumnAt(x, z, seed, biome);
+  col.plant = plant;
   // A tile plant's cell over ground more than a voxel below its base is not
   // placed (featureSteepAt, rule 2): the rigid rosette / cap would float there.
   if (col.plant.mat != MAT_AIR && h < col.plant.base - 1) {
@@ -5041,40 +5068,48 @@ fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u3
 fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
              fine : bool, sedRun : i32) -> vec3<i32> {
   let h = (*col).h;
-  let a = colHeightAt(x + 1, z, seed);
-  let b = colHeightAt(x - 1, z, seed);
-  let c = colHeightAt(x, z + 1, seed);
-  let d = colHeightAt(x, z - 1, seed);
-  let lo = min(min(a, b), min(c, d));
-  let hi = max(max(a, b), max(c, d));
-  var top = min(h, lo + 1);
   let run = select(0, reposeRunOf(mat), mat != MAT_AIR);
   let runMax = max(run, sedRun);
+  // ONE colHeightAt CALL SITE (2026-10-17, shader slimming). colHeightAt is a
+  // whole landColumn, and this used to be five inlined copies of it (the four
+  // axis neighbours, then the slide's far columns): ~337k of the ~670k
+  // instructions `cols` expanded to (scripts/spv_inline_tree.py). Now one
+  // fenced loop over a worklist: j 0..3 are the axis neighbours (+x, -x, +z,
+  // -z: a, b, c, d), and, when a slide can reach past them (runMax >= 2),
+  // j 4.. are direction (j - 4) / (runMax - 1) at distance
+  // 2 + (j - 4) % (runMax - 1) -- the old nested (i, k) loop in its own
+  // order, asked only where that direction's lateral is open (g1 < top).
+  // Same heights, same tests, same answer.
+  var g = vec4<i32>(0);   // a, b, c, d
+  var lo = 0;
+  var hi = 0;
+  var top = h;
+  var slides = false;
   var slidesSed = false;
-  if (runMax >= 2) {
-    // A lateral (d, 0) at `top` is open only where that neighbour is exactly
-    // top - 1 (the step line forbids lower). Look past it.
-    var slides = false;
-    for (var i = 0; i < 4; i++) {
-      var dx = 0;
-      var dz = 0;
-      var g1 = a;
-      switch (i) {
-        case 0: { dx = 1; g1 = a; }
-        case 1: { dx = -1; g1 = b; }
-        case 2: { dz = 1; g1 = c; }
-        default: { dz = -1; g1 = d; }
+  let span = max(runMax - 1, 1);
+  let nAsk = 4 + select(0, 4 * (runMax - 1), runMax >= 2);
+  for (var j = unrollFence(); j < nAsk; j++) {
+    let i = select(j, (j - 4) / span, j >= 4);   // direction 0..3
+    let k = select(1, 2 + (j - 4) % span, j >= 4);
+    if (j >= 4 && g[i] >= top) { continue; }
+    let dx = select(0, select(-1, 1, i == 0), i < 2);
+    let dz = select(select(-1, 1, i == 2), 0, i < 2);
+    let gh = colHeightAt(x + k * dx, z + k * dz, seed);
+    if (j < 4) {
+      g = select(g, vec4<i32>(gh), vec4<i32>(j) == vec4<i32>(0, 1, 2, 3));
+      if (j == 3) {
+        lo = min(min(g.x, g.y), min(g.z, g.w));
+        hi = max(max(g.x, g.y), max(g.z, g.w));
+        top = min(h, lo + 1);
       }
-      if (g1 >= top) { continue; }
-      for (var k = 2; k <= runMax; k++) {
-        if (colHeightAt(x + k * dx, z + k * dz, seed) < top - 1) {
-          if (k <= run) { slides = true; }
-          if (k <= sedRun) { slidesSed = true; }
-        }
-      }
+    } else if (gh < top - 1) {
+      // A lateral (d, 0) at `top` is open only where that neighbour is
+      // exactly top - 1 (the step line forbids lower); this is past it.
+      if (k <= run) { slides = true; }
+      if (k <= sedRun) { slidesSed = true; }
     }
-    if (slides) { top = top - 1; }
   }
+  if (slides) { top = top - 1; }
   let sedTop = min(h, lo + 1) - select(0, 1, slidesSed);
   var mass = 8;
   if (mat != MAT_AIR && TUNE_POWDER_FINE_REPOSE != 0u && fine && lo < h) {
@@ -6181,12 +6216,18 @@ fn farCaveSealed(col : ptr<function, Col>, cave : ptr<function, CaveBands>, y : 
   let ground = min((*col).h - drop, nbrMin);
   return ground - (y + half) < (2 << shift);
 }
-fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
-                 mat : u32, fine : vec3<i32>, shift : u32, seed : u32,
-                 ground : u32, can : FarCanopy) -> u32 {
+// farSurfaceMat in two halves around its genCellCol asks (2026-10-17, shader
+// slimming), so that `far` can make those asks through the genCellIn call site
+// its row loop already has instead of a second inlined genCellIn (see the
+// sweep). farSurfacePre is everything before the asks: the final material,
+// or FAR_SURF_ASK when the cell needs them -- which is only ever the
+// column's topmost solid cell (fine.y <= h < fine.y + step).
+const FAR_SURF_ASK : u32 = 0xFFFFFFFFu;
+fn farSurfacePre(col : ptr<function, Col>, mat : u32, fine : vec3<i32>, shift : u32,
+                 can : FarCanopy) -> u32 {
   let k = materials[mat].klass;
   if (k != CLASS_SOLID && k != CLASS_POWDER) { return mat; }  // fluids keep their ID
-  var h = (*col).h;
+  let h = (*col).h;
   if (farCoverStalkDrop(col, mat, fine.y, shift)) { return MAT_AIR; }
   // "Topmost solid cell of this column": solid means center <= h, and the cell
   // above (center + 2^shift) samples past h. NOT "cell span contains h" — when
@@ -6201,6 +6242,51 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // crown (a shaped one only where it comes down to the ground), and the
   // cells over it in its span do too (farCanopyMat).
   if (shift >= FAR_CANOPY_MIN_SHIFT && farCanopyPaintsGround(can, h, shift)) { return can.mat; }
+  return FAR_SURF_ASK;
+}
+// The asks' surface-band test (the fluid over a bed thinner than the cell,
+// below): whether the topmost cell at `fineY` wears the fluid's surface.
+fn farSurfaceWetTop(col : ptr<function, Col>, fineY : i32, shift : u32) -> bool {
+  let ft = (*col).fluidTop;
+  return ft >= 0 && ft > (*col).h && fineY + (1 << shift) > ft &&
+         farCellIsSolid((*col).fluid);
+}
+// ...and everything after them, from their answers: `skin` (the column at h),
+// `pristine` (procgen at the sample; read only for FAR_GROUND_SAMPLE) and
+// `top` (the voxel at the fluid's surface; read only when wetTop).
+fn farSurfacePost(col : ptr<function, Col>, mat : u32, fine : vec3<i32>, shift : u32,
+                  ground : u32, skin : u32, pristine : u32, topIn : u32) -> u32 {
+  let wetTop = farSurfaceWetTop(col, fine.y, shift);
+  var top = topIn;
+  // A plant floating on the surface (a lily pad) is not far-solid: the fluid.
+  if (wetTop && !farCellIsSolid(top)) { top = (*col).fluid; }
+  // a stamp's hollow interior can be air at y == h; keep the body mat then
+  let skinOk = skin != MAT_AIR && materials[skin].klass != CLASS_GAS;
+  if (ground < FAR_GROUND_SAMPLE) {
+    // The live ground. Dug away, or holding gas / a plant: the cell's top is
+    // whatever the sample found under it. Something else than the skin's
+    // slot: that is what lies on the ground now.
+    if (!farCellIsSolid(ground)) { return mat; }
+    if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
+      return ground;
+    }
+    if (wetTop) { return top; }
+    return roadTint(col, skin, shift);
+  }
+  if (ground == FAR_GROUND_SAMPLE &&
+      matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
+    return mat;
+  }
+  if (wetTop) { return top; }
+  if (!skinOk) { return mat; }
+  return roadTint(col, skin, shift);
+}
+fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
+                 mat : u32, fine : vec3<i32>, shift : u32, seed : u32,
+                 ground : u32, can : FarCanopy) -> u32 {
+  let pre = farSurfacePre(col, mat, fine, shift, can);
+  if (pre != FAR_SURF_ASK) { return pre; }
+  let h = (*col).h;
   // MEADOW COVER IS NOT FLATTENED INTO THE SKIN (tried and taken out): the
   // strand palette painted over a far meadow reads darker than the near
   // field, where the eye sees the skin between thin blades. A blade thinner
@@ -6229,8 +6315,7 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // still read first: the live-ground and sample modes below compare against
   // it to tell an edited bed from an untouched one.
   let ft = (*col).fluidTop;
-  let wetTop = ft >= 0 && ft > h && fine.y + (1 << shift) > ft &&
-               farCellIsSolid((*col).fluid);
+  let wetTop = farSurfaceWetTop(col, fine.y, shift);
   var skin = MAT_AIR;
   var pristine = mat;
   var top = MAT_AIR;
@@ -6241,28 +6326,7 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
     let g = genCellCol(col, ponds, vec3<i32>(fine.x, y, fine.z), seed) & 0xFFFu;
     if (q == 0u) { skin = g; } else if (q == 1u) { pristine = g; } else { top = g; }
   }
-  // A plant floating on the surface (a lily pad) is not far-solid: the fluid.
-  if (wetTop && !farCellIsSolid(top)) { top = (*col).fluid; }
-  // a stamp's hollow interior can be air at y == h; keep the body mat then
-  let skinOk = skin != MAT_AIR && materials[skin].klass != CLASS_GAS;
-  if (ground < FAR_GROUND_SAMPLE) {
-    // The live ground. Dug away, or holding gas / a plant: the cell's top is
-    // whatever the sample found under it. Something else than the skin's
-    // slot: that is what lies on the ground now.
-    if (!farCellIsSolid(ground)) { return mat; }
-    if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
-      return ground;
-    }
-    if (wetTop) { return top; }
-    return roadTint(col, skin, shift);
-  }
-  if (ground == FAR_GROUND_SAMPLE &&
-      matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
-    return mat;
-  }
-  if (wetTop) { return top; }
-  if (!skinOk) { return mat; }
-  return roadTint(col, skin, shift);
+  return farSurfacePost(col, mat, fine, shift, ground, skin, pristine, top);
 }
 // A COVER STALK PAST THE STALK LEVELS IS COVERAGE, NOT A CELL (2026-10-14,
 // ticket 2026-10-14_11-20-12). A biome's solid cover row -- a crystal spire,
@@ -8123,19 +8187,57 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // bands are on in this run's range. A neighbour inside the level chunk is
   // another thread's column, whose `h` (wgFarColH, published above the
   // barrier) is the colHeightAt it would have paid a whole landColumn for;
-  // only one across the chunk's edge is computed (one call site, a fenced
-  // loop: see farCornerTop's note).
+  // only one across the chunk's edge is computed.
+  //
+  // AND THE SURFACE BAND'S CORNER MAX (farCornerTop), in the SAME loop. Both
+  // are "one landColumn per asked column", and every call site of landColumn
+  // is a full inlined copy (pond scan, bowl, shore, roads, pads, rivers): two
+  // fenced loops were two copies, ~67k instructions each in this entry's
+  // expansion (scripts/spv_inline_tree.py). One fenced worklist is one copy:
+  // j 0..3 the cave neighbours (-x, +x, -z, +z: the old order), j 4..7 the
+  // corners (farCornerTop's (x0|x1, z0|z1), in its order). The corner max is
+  // a pure function of the column, so it is taken here ONCE, exactly when an
+  // entry this group fills holds the band's row (bandHeld; THE COLUMN STACK's
+  // exactness note), and that entry reads it below instead of calling
+  // farCornerTop itself. Same columns, same landColumn, same max/min.
+  var bandHeld = false;
+  if (bcyBand) {
+    for (var e = grp; e < nRun; e += groups) {
+      let s = farList[hi + e] & FAR_SLOT_MASK;
+      let sc = vec3<i32>(vec3<u32>(s % FAR_NCHUNK, (s / FAR_NCHUNK) % FAR_NCHUNK,
+                                   s / (FAR_NCHUNK * FAR_NCHUNK)));
+      let by = farSlotToChunk(sc, origin).y * i32(CHUNK);
+      if (bcy >= by && bcy < by + i32(CHUNK)) { bandHeld = true; }
+    }
+  }
+  let caveAsk = (caveU.on1 || caveU.on2) && !col.inRim && !col.wet && yLoU <= col.h;
   var caveNbrMin = 2147483647;
-  if ((caveU.on1 || caveU.on2) && !col.inRim && !col.wet && yLoU <= col.h) {
-    for (var ni = unrollFenceU(); ni < 4u; ni++) {
-      let d = select(-1, 1, (ni & 1u) != 0u);
-      let nc = select(vec2<i32>(i32(cxi), i32(zi) + d), vec2<i32>(i32(cxi) + d, i32(zi)), ni < 2u);
+  var btopC = topC;
+  let cx0 = cc0.x << shift;
+  let cz0 = cc0.z << shift;
+  for (var j = select(0u, 4u, !caveAsk) + unrollFenceU(); j < select(4u, 8u, bandHeld); j++) {
+    var px = 0;
+    var pz = 0;
+    if (j < 4u) {
+      let d = select(-1, 1, (j & 1u) != 0u);
+      let nc = select(vec2<i32>(i32(cxi), i32(zi) + d), vec2<i32>(i32(cxi) + d, i32(zi)), j < 2u);
       if (all(nc >= vec2<i32>(0)) && all(nc < vec2<i32>(i32(CHUNK)))) {
         caveNbrMin = min(caveNbrMin, wgFarColH[u32(nc.y) * CHUNK + u32(nc.x)]);
-      } else {
-        caveNbrMin = min(caveNbrMin, colHeightAt(fx + (nc.x - i32(cxi)) * step,
-                                                 fz + (nc.y - i32(zi)) * step, T.seed));
+        continue;
       }
+      px = fx + (nc.x - i32(cxi)) * step;
+      pz = fz + (nc.y - i32(zi)) * step;
+    } else {
+      let ci = j - 4u;
+      px = select(cx0, cx0 + step - 1, (ci & 1u) != 0u);
+      pz = select(cz0, cz0 + step - 1, (ci & 2u) != 0u);
+    }
+    var L : LandCol;
+    landColumn(px, pz, T.seed, &L);
+    if (j < 4u) {
+      caveNbrMin = min(caveNbrMin, L.h);
+    } else {
+      btopC = max(btopC, farColTopFrom(L.h, L.fluidTop, px, pz));
     }
   }
   // The candidates, the canopy memo and the crown proxy in one tile walk
@@ -8242,7 +8344,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // one cc.y per column.
     var btop = topC;
     if (bcyBand && bcy >= base.y && bcy < base.y + i32(CHUNK)) {
-      btop = farCornerTop(topC, cc0.x, cc0.z, shift, T.seed);
+      btop = btopC;   // farCornerTop's answer, taken in the worklist above
     }
     let skyCeil = max(max(ceil0, btop), max(trees.top, can.top));
 
@@ -8252,17 +8354,48 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // into the owner's word in wgFarWords, genCellIn called with the valid
     // flags set exactly as genChunk does -- the flags pick the other spelling
     // of the SAME function, so the bytes are the unhoisted ones.
+    //
+    // THE SURFACE ASKS RIDE THE ROW LOOP (2026-10-17, shader slimming). The
+    // column's topmost solid cell is coloured from the skin at h and, over a
+    // submerged bed, from the voxel at the fluid's surface (farSurfaceMat's
+    // genCellCol asks). Asked from inside farSurfaceMat they were a SECOND
+    // inlined genCellIn in this entry -- ~35-50k of its instructions after
+    // the worldgen recipe (scripts/spv_sizes.sh, stubbing each in turn). So
+    // they are the loop's first two iterations, through its one genCellIn
+    // call site with the valid flags OFF (exactly genCellCol's arguments:
+    // genCellIn only READS cave/trees, and only when told they are valid),
+    // and the row that needs them takes farSurfacePre/Post around the
+    // answers. Asked only when this entry holds that row -- the one whose
+    // sample satisfies farSurfacePre's fine.y <= h < fine.y + step, i.e.
+    // (h - half) >> shift -- and not when the crown paints the ground (Pre's
+    // answer comes before the asks there). Same calls, same arguments, same
+    // byte.
+    let yiS = ((col.h - half) >> shift) - base.y;
+    let surfHeld = yiS >= 0 && yiS < i32(CHUNK) &&
+                   !(shift >= FAR_CANOPY_MIN_SHIFT && farCanopyPaintsGround(can, col.h, shift));
+    let wetS = surfHeld && farSurfaceWetTop(&col, ((base.y + yiS) << shift) + half, shift);
+    var skinS = MAT_AIR;
+    var fluidS = MAT_AIR;
     var count = 0u;
     var top = 0u;   // one plus the highest row with a non-empty cell, this thread
-    for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
+    for (var j = unrollFenceU(); j < CHUNK + 2u; j++) {
+      let ask = j < 2u;   // the surface asks: j 0 the skin at h, j 1 the fluid's top
+      let yi = j - 2u;    // the row (the asks never read it)
       // The row's floor.
       let yRow = (base.y + i32(yi)) << shift;
-      if (yRow > skyCeil) { break; }
-      let fine = vec3<i32>(fx, yRow + half, fz);
+      var fine = vec3<i32>(fx, yRow + half, fz);
+      if (ask) {
+        if (!surfHeld || (j == 1u && !wetS)) { continue; }
+        fine.y = select(col.fluidTop, col.h, j == 0u);
+      } else if (yRow > skyCeil) { break; }
       var mat = M_STONE;
-      if (fine.y > deepTop || (!col.inRim && !col.wet && caveIn(cave, fine.y) != 0)) {
-        mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
+      if (ask || fine.y > deepTop || (!col.inRim && !col.wet && caveIn(cave, fine.y) != 0)) {
+        mat = genCellIn(&col, &cave, !ask, &trees, !ask, &ponds, select(-1, canopyArg, !ask),
                         fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
+        if (ask) {
+          if (j == 0u) { skinS = mat; } else { fluidS = mat; }
+          continue;
+        }
         if (!farCellIsSolid(mat) && farCaveSealed(&col, &cave, fine.y, shift, caveNbrMin)) { mat = M_STONE; }
       }
       // THE DUNGEON at the sample: genChunk's own dgCell, skin, scatter and
@@ -8307,9 +8440,13 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         // What lands in the byte is the skin material's FAR PALETTE SLOT, not
         // its id (common.wgsl farCellByte), and it replaces the blocker: a
         // cell with a material blocks by having one.
-        byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&col, &ponds, mat, fine, shift,
-                                                                T.seed, FAR_GROUND_PROCGEN, can)),
-                            byteV);
+        var sm = farSurfacePre(&col, mat, fine, shift, can);
+        if (sm == FAR_SURF_ASK) {
+          // this is row yiS: the asks above answered it (pristine is read
+          // only for FAR_GROUND_SAMPLE)
+          sm = farSurfacePost(&col, mat, fine, shift, FAR_GROUND_PROCGEN, skinS, mat, fluidS);
+        }
+        byteV = farCellByte(matFarPal(&materials, sm), byteV);
       } else if (fine.y > col.h && fine.y <= peak) {
         // A summit between the sample columns (farPeakTop).
         byteV = farCellByte(matFarPal(&materials, farPeakMat(col.biome, peak, col.tl)), byteV);

@@ -2046,3 +2046,604 @@ corrections, now written into the sections above:
 | A11 | consistency | Near corpses parked and vanished while distant-killed ones stayed drawn. Corpses demote too. | §2.1, §2.8 |
 | A12 | structure | `Unpark` moves into `TickAuthority` with promotion, so both compete for one cap and one budget in one place. Plus: a mid-air demotion lands with fall damage instead of a free landing. | §2.1, §2.4 |
 
+
+## 8. The gaps, 2026-10-16: D7 multiplayer, D10 obstacles, D11 walk-out
+
+Owner, 2026-10-16, after the landing at `9dfac394`: "finish up the important
+pending work ... the known gaps you'll target and fix is multiplayer,
+obstacles, and creatures need to have the ability to walk out on their own
+(if they just aren't right now because of ai pathfinding or w/e and they just
+choose not to that's fine, but they need the ability to in the future if
+that's locked off)". Integration branch `distant-gaps` (worktree
+`.claude/worktrees/distant-gaps`), off main `10aefb3e`; one worktree per
+package off it; lands on main once.
+
+| Package | Branch | Needs | Size |
+|---|---|---|---|
+| D11 walk-out | `dg-d11` | `distant-gaps` | small |
+| D10 obstacles | `dg-d10` | `distant-gaps` | medium-large |
+| D7a the tier across machines | `dg-d7a` | `distant-gaps` | large |
+| D7b the edge across a peer's window | `dg-d7b` | D7a merged | large |
+
+D11, D10 and D7a run in parallel. Their file overlap is small (D11:
+`Mob::GroundHeightAt`, the swim cell readers; D10: `DistantGround` and new
+files; D7a: the tier's border logic, `persist.cpp`, `net/`, `main.cpp`'s net
+block); `selftest.cpp`'s `kOrder` and `tests/baseline.json` are merged by hand.
+
+### 8.1 D11: near creatures can walk out of the window
+
+**Why they cannot today** (read from the code, not measured again): every
+layer above the drive treats a column past the window face as OPEN -- the
+nav (`ai_nav.h:21-29`, `StepTo` lets a path onto an unknown column), the
+steering fan (`SenseGround`'s unknown probes are `clear`), `Deflect`, the
+footprint (`FootprintFooting` skips an unknown column). The ONLY refusal is
+`DriveLocomotion`'s `if (!sense.haveGround) return;` (`mob.cpp:9236`): the
+creature takes the one step that puts its whole footprint past the face
+(`9334-9339` accepts a destination with nothing known), and on the next tick
+`haveGround` is false and the drive never moves it again. That is D3
+deviation 1's "centre one voxel outside". Swimmers are walled separately:
+`mob_cellcache.h:36` and `mob_swim.cpp:106` answer `CellKind::Solid` for any
+cell outside the window. Nothing in `ai_*`, `steer.*` or `mob_*.cpp` clamps a
+goal to the window.
+
+**The fix: past the face, the near tier reads the distant tier's ground.**
+`Mob::GroundHeightAt`'s `supports` lambda (`mob.cpp:5181`) answers a cell
+outside the window from `MobSystem::DistantGroundMut().Solid(x, y, z)` --
+"known solid" or "known air", never unknown -- WHEN the creature leaving
+would be kept (`MobSystem::DistantReachable()`: `distant.enabled` and a
+demotion is possible -- a park function on this machine, or, after D7a, a
+client link to a host that holds the tier). Otherwise it stays "unknown", so a
+harness with no park function cannot walk every creature out of the window and
+erase it (`mob.cpp:10031` releases a creature with no park function). The same
+answer for `CellSupportsWeight` and the AI's blocked adapter where they test a
+cell outside the window, and for the swim cell readers (below the
+`DistantGround` support: solid; up to `WaterTop`: liquid; above: air). The
+reported ground material for such a cell is the column's surface material if a
+cheap CPU source exists, else a fixed "earth" id; `ShedCoat` must tolerate it.
+`DistantGround` is single-threaded: every `GroundHeightAt` caller is in the
+serial mob loop (the work-pool loops are bleed / burn / stain / splatter and
+do not probe ground); D11 asserts that rather than assuming it
+(`workpool::InTask()` -> answer unknown, counted).
+
+With that, the drive walks the creature through the 16-voxel pad on the
+worldgen ground (with D10, around its trees and houses), `settle()` /
+`UpdateFall` work against it, the park rule fires at `kPad` and
+`DemoteToDistant` classifies it SURFACE (its feet are on `TerrainTop + 1`),
+and its brain -- the Goto, the chase, the flee -- carries on at the distant
+tier. A creature that does not want to leave never does: nothing pushes
+anyone out. Known: no Jolt terrain exists past the face, so a creature
+ragdolled in the pad falls until the park rule's y test demotes it with
+`landPending` (today's behaviour for a thrown body).
+
+**Gate `distant-walkout`** (`selftest_distant.cpp`; through THE tick): (A) a
+humanoid on a Goto 64 voxels past a face walks out, is demoted at the pad
+(same id, brain, Goto), and reaches its goal as a distant creature; (B) with
+no park function (a rig whose `parking` is null) the same creature stops at
+the face exactly as today; (C) a swimmer in a lake that crosses the face does
+the same in water; (D) twice-run digest equal. Must stay green: `distant-walk`,
+`distant-edge`, `distant-overflow`, `mob-park`, `npc-strike`, `crowd`.
+
+### 8.2 D10: trees, buildings and ruins are obstacles at distance
+
+`DistantGround` gains a fifth source, THE WORLDGEN OVERLAY, between the stored
+chunk and `TerrainTop` in `Solid()`: per CHUNK, two 4,096-bit masks (cells
+worldgen makes SOLID above the height contract, cells it CARVES below it),
+built lazily from pure CPU sources and cached (LRU, `kGroundChunksMax`-like
+bound), dropped on the same epoch the base cache is (map serial, seed) plus the
+tree atlas and the edit layers. A stored chunk still wins (its bytes already
+hold the building). `AnyStored()` becomes "any non-procgen": a column whose
+chunk has a non-empty overlay leaves the `TerrainTop` fast path, so `Stand`,
+`ProbeGround` and `Land` see the matter (the drive, A*, the line test and the
+ground fan all pick it up unchanged). The sources, in worldgen's order (the
+overlay must answer what genCell would):
+
+1. **Lattice trees** -- a CPU TWIN of `treeSite` / `treeInfoBare`
+   (`worldgen.wgsl:2900-3160`): the tile lattice
+   (`treeatlas::CurrentTreeLattice()`), the gates (treeline, slope, the
+   biome's tree chance, species and variant picks, minY/maxY/maxSlope, the
+   patch noise, `crownMeetsPad`, `siteBlocksTrunk`, `dgSurfNear`,
+   `treePondOk`) and the variant's cells through `TreeAtlasCellAt`
+   (`treeatlas.h:276`) with `treeLocalXZ`'s transform. Only a LOW BAND of each
+   tree is an obstacle (its trunk, root flare, bush skirt and low branches:
+   cells `ly` in `[0, kTreeObstacleBandVox)`, 32 = 3.2 m); a crown overhead
+   does not stop a walker. Needs a process-wide accessor for the atlas
+   (`main.cpp:7388` local today) and exports of the `world.cpp` statics it
+   reads (`vnoise2d`, `landAt` or `TerrainHeight` for the base -- say which,
+   and why). Approximate where worldgen asks per ASKING column (`treePondOk`'s
+   disc edges): the twin must say where it is approximate, and the gate
+   measures it.
+2. **Authored tree sites** (`siteTree`, `worldgen.wgsl:3178`): species /
+   variant / rotation from the site.
+3. **Cacti** (`cactusInfoBare`, `worldgen.wgsl:3615`) if the port is the same
+   shape (it is a hashed tile too); else listed as the remaining gap.
+4. **Stamps** (village houses, authored structures: `CurrentWorldMap().sites`
+   with `kind == kSiteStamp`, through `SiteList(cx, cz)`) -- exact, the
+   `faredits.cpp:382-395` decoder lifted into a shared function (non-air
+   template cells overlay; template air leaves the terrain). DOORS: a closed
+   door is template voxels, so it would be a wall; a distant villager walking
+   its day (D5) goes through doors. Door cells (the refs' door boxes) read as
+   AIR in the overlay.
+5. **Dungeon / ruin matter** inside placed dungeon boxes
+   (`dungeon::TwinCell` / `twin::dgSolidAt`, exported as a small wrapper;
+   needs the packed world-map words, a `main.cpp` local today, behind an
+   accessor).
+6. **`.svedit` layers** (`sandvox::WorldEditLayer()`, after `Resolve(seed)`):
+   `HasChunk(wc)` + `ApplyToChunk(wc, words)` over a sentinel buffer, written
+   cells classified by the near tier's "carries weight" rule (they can carve
+   as well as add, hence the carve mask). Applied LAST, as worldgen applies
+   them.
+
+**Gate `distant-obstacles`** (`selftest_distant.cpp`): (A) AGREEMENT with the
+GPU: the voxregion machinery (`src/tools/voxregion.h`, what `--voxdump`
+uses) generates real boxes of the DEFAULT map (Tirnhallow: a forest patch,
+Harrowby's houses, a ruin, a locale's edited ground) and every cell's "carries
+weight" is compared with `DistantGround::Solid` in the band the overlay
+models: match rates per source in `last_run.json`, floors in
+`tests/baseline.json` (stamps and layers are exact: 100%; trees measured);
+(B) a distant walker on a straight Goto through Harrowby never stands in a
+house's solid and reaches the far side; one aimed at a trunk walks round it;
+(C) a villager's distant route through a door passes; (D) cost: overlay chunk
+build us and the `distant-walk` peaks walk's tick cost before / after;
+(E) twice-run identical. Must stay green: `distant-walk`, `distant-sleep`,
+`distant-schedule`, `distant-roundtrip`, `voxregion`, `trees`.
+
+### 8.3 D7: the tier across machines
+
+**Today, in a two-player game** (read from the code):
+- The client has no park function (`EntityParking::Bind(..., netRoleBoot !=
+  NetRole::Client)`, `main.cpp:16780`), so a creature that leaves the
+  CLIENT's window is released and destroyed (`mob.cpp:10031`) -- every NPC
+  that walks away from the second player is gone for good.
+- The host's tier knows only the host's window: it promotes only into it,
+  retires and activates by distance to its centre, holds at its line, and
+  publishes its band to its own near crowd. A host distant creature that
+  walks into the client's window is an invisible statue there, never
+  promoted; the client draws no statues at all.
+- A creature made live during a tick (promotion, unpark, spawn) can be ghosted
+  by `RefreshOwnership` before any `ScanHandoffs` has built its handoff, so its
+  state never reaches the owner and the ghost expires (`kGhostExpiryTicks`).
+  Latent today for unparks near a peer; D7 must not add a path into it.
+
+**The model: THE DISTANT WORLD IS THE HOST'S.** One machine -- the host,
+whose `ChunkStore` is the world's -- holds every distant creature, steps them,
+retires and activates them, and saves them. A client holds none of its own;
+it holds a VIEW of the host's tier near its window (statues, the edge band)
+and a WAITING ROOM of creatures the host handed it to promote. Every
+"the window" in the tier's border rules becomes "a window of the game": the
+set W = the host's window plus every connected peer's window
+(`PeerView.windowOrigin`, the very views `net::Authority` reads).
+
+**Host (generalised rules).**
+- *Demote*: unchanged (the host's park rule, the host's window); the radius
+  test is against the NEAREST window centre in W.
+- *Retire*: past `radius + hysteresis` of EVERY window centre in W.
+- *Activate*: parked records within the radius of ANY window centre; beyond
+  the host window's park pad as today, and ALSO inside a peer's window
+  (nothing else will ever unpark them there -- `persist.h`'s KNOWN GAP for
+  creatures closes here: they activate, then promote into the peer).
+- *Promote*: over the host's line -> local, as today. Over a PEER's line (and
+  the ownership rule names that peer for its feet, `ownershipFn_`) -> a REMOTE
+  PROMOTION: the patched record (with statuses), the brain on the wire
+  (`MobBrainWire`), the steer state, `movedWhileDistant`, the look key and the
+  id go to the peer as a `DistantHandIn`; the creature leaves the tier into an
+  IN-TRANSIT list (kept until the peer answers, restored on disconnect, saved
+  with the tier); one flip noted. Served under the peer's reported room
+  (`livingFree`, one u32 per batch, minus what is in transit) and the flip
+  budget, nearest to that peer's window centre first, `kUnparkPerCall` per
+  peer per tick.
+- *Hold*: the drive holds a waiting creature at the promotion line of the
+  window it is waiting on (PromoBox becomes a list).
+- *The view* (one `DistantView` per batch per peer): every tier creature
+  within `distant.radius` of the peer's window centre -- id, def name and
+  look key on first sight, then origin, heading, draw state, gait phase, dead;
+  sent on change with a keyframe (asleep ones cost nothing between
+  keyframes); a GONE when one leaves the set. Entries within
+  `kDistantEdgeBandVox` of the peer's window box also carry the actor
+  snapshot (`DistantSnap`'s fields) and the body box (D9's `DistantBox`).
+
+**Client.**
+- *Park rule*: a creature past the pad, connected, `distant.enabled` -> a
+  `DistantHandOut` to the host: `SaveOne` record, brain on the wire, steer,
+  velocity (and airborne), the statuses (`CaptureDistantVitals`), and the look
+  key the client bakes NOW from the live rig (kept locally, id -> key, for its
+  own statues). Then the rig is released as today. Not connected -> today's
+  release.
+- *Host on a hand-out*: `DistantFromRecord(record)` with the id KEPT (a
+  client-band id is fine: ids are unique across machines), the brain, steer,
+  velocity / `landPending`, statuses applied, `movedWhileDistant = true`,
+  insert. No room or outside every radius -> PARK it (the park function); a
+  creature is never lost to a refusal.
+- *Waiting room*: a `DistantHandIn` becomes a `DistantMob` in the client's own
+  `DistantMobs` (`DistantFromRecord` + the wire fields), flagged as held: the
+  client never steps, retires or activates anything (`TickDistant`,
+  `RetireDistant`, `ActivateParked`, `OverflowSwaps` are host-only); its
+  promotion pass (Unpark's distant pass, run on a client although its parking
+  is off) promotes it under the client's own waits (budget, living cap, ground
+  in ITS fetch cache, the snap). Promoted -> `DistantHandInDone{id,
+  promoted}`; still waiting after `kHandInMaxWaitTicks` -> sent back as a
+  hand-out and `DistantHandInDone{id, returned}`.
+- *The band and the statues* come from the received view:
+  `PublishDistantBand` publishes the view's band entries into the client's
+  actor list (`EdgeActor`, `DistantBoxes` keep working), and the frame loop
+  fills `distantDraw.Items()` from the view (look: the client's own key for
+  that id if it baked one, else the def's bare look, `DistantDraw::KeyOfDef`).
+- *Room*: the client reports `livingFree` (living cap minus living near minus
+  the waiting room) every batch.
+
+**Ownership, both machines.** `EntitySync` forgets a mob id's incumbent
+(`mobMem_`) the moment it enters the tier (a host demotion, a hand-out sent or
+received), so a stale incumbent cannot ghost it when it comes back. A creature
+made live on a machine this tick is not ghosted by `RefreshOwnership` before
+`ScanHandoffs` has had one chance to build its handoff (a born-this-tick
+latch), which fixes the latent case above for every path, not only D7's.
+
+**Wire**: one new record family (`src/net/distantsync.{h,cpp}`, `mobsync`'s
+shape): `DistantHandOut`, `DistantHandIn`, `DistantHandInDone`, `DistantView`
+(+ gones), `livingFree`; `EntityBatch` version 4 -> 5, the new vectors after
+`playerBodies` (the apply order: hand-ins before the view, the view before
+the tick's band).
+
+**D7a** is everything above. **D7b, the edge across a peer's window** (after
+D7a): the client sends its EDGE ACTORS (its near creatures within the band of
+its window, never a player; only while its view's band is non-empty) and the
+host puts them in the distant actor lists of the creatures in that band; near
+hits distant (`NearEdgeBlow` on the wire, the attacker's styles-only kit
+serialised); distant hits near (the host sends the swing -- attacker,
+styles-only kit, style, target, tick, distance -- and the CLIENT rolls it with
+the same `Hash3` keys against its live body and applies it through
+`ApplyEdgeBlow`); arrows both ways (an inbound flight crossing into the PEER's
+window -> `DistantArrowIn` to the peer, injected there; the peer's
+`NearArrowOut` / `NearArrowBoxHit` / `NearShotOut` -> the host's queues).
+
+**Gates.** `distant-mp` (D7a; `net-melee`'s construction: machine B is a
+second MobSystem + DebrisSystem on its own Physics, the wire carried as bytes
+both ways, B's window displaced by a test seam): (H) a creature leaving B's
+window reaches A's tier with the same id, brain target and every limb's hp;
+(P) a distant creature walking into B's window promotes ON B, not A (same id,
+the record round trip, the brain), and B drew it from the view before; (R)
+retire only past every window, activation near B's window; (W) a hand-in B
+cannot place within the wait comes back to A; (D) disconnect restores the
+in-transit creatures on A and lets B promote its waiting room; (T) twice-run
+digest equal. `distant-mp-edge` (D7b): blows both ways across B's face, an
+inbound arrow injected on B, B's arrow resolved on A. Then the two-process
+smoke (`--host` / `--join`, `SANDVOX_NET_SMOKE_MOBS=1`, the client flying
+away): hand-outs, hand-ins, view entries, zero lost creatures in the
+counters.
+
+**Not in D7.** The cap overflow (D8) on a client (a client's full cap waits;
+it does not swap), a peer of a peer (M9 is two machines), saving a client's
+waiting room separately (it is the host's in-transit list, saved by the host).
+
+### 8.4 D11 as landed (branch `dg-d11`, 2026-10-16)
+
+**What landed.** Past the window face the near tier reads the distant tier's
+ground. `MobSystem::DistantReachable()` (mob.h, beside the distant accessors):
+`distant.enabled` and a park function -- the leaver is KEPT (demoted, or
+parked when the tier is full / past the radius); D7a adds a client handing its
+leavers to the host here, and nothing else. `MobSystem::OutsideGroundFor(m)`
+hands out `distantGround_` for a creature that is alive, not a ghost and not
+player-driven, when `DistantReachable()`; null otherwise, and null inside a
+work-pool task (counted, `OutsideGroundTaskRefusals`). Its readers, each
+asking LAZILY on the first out-of-window cell it meets (a creature that never
+nears a face never calls it):
+
+- `Mob::GroundHeightAt`'s `supports` lambda: an out-of-window cell is
+  `DistantGround::Solid` -- known solid or known air, never unknown -- with
+  `MobSystem::OutsideGroundMat()` as its material ("dirt" by name, "stone" if
+  a table has none: no CPU source names a column's surface material, genCellIn
+  is WGSL only). So `FootprintFooting`, the steering fan (`SenseGround`),
+  `UpdateFall`, the planner's ground probe, foot IK and every other caller get
+  the answer unchanged in shape.
+- `Mob::CellSupportsWeight` (the footprint's headroom) and the planner's
+  `blocked` probe (`AiCellBlocked(..., readOutside = true)`).
+- The swim cell readers: `mob_swim.cpp`'s private copy of `CellCache` is gone;
+  both swimmers use `mobwater::CellCache` (`mob_cellcache.h`), built by
+  `MobSystem::WaterCache(world, mob, fetch)`. Past the face: `Solid` where
+  DistantGround carries weight, `Liquid` below its `WaterTop`, `Air` above.
+- `Mob::ShedCoat` prints nothing past the face (no op can write there; the
+  sole keeps its coat).
+
+`last_run.json`'s `distant` block gains `outsideGrounds` (grants),
+`nearPastFace` (near creature-ticks with the footprint centre outside the
+window box), `walkedOut` (park-rule demotions of a creature on its feet or
+afloat, at most kPad + 4 past the face -- a crossing by its own drive, not a
+window move's) and `outsideTaskRefusals`; the selftest loop prints
+`<gate>: N near creature(s) walked out of the window` for any gate that
+walked one out. Gate `distant-walkout` (`selftest_distant.cpp`, kOrder between
+`distant-walk` and `distant-sleep`, thresholds `distantWalkout.*`).
+
+**Deviations from 8.1.**
+1. **Line of sight past the face stays OPEN** (`AiCellBlocked(...,
+   readOutside = false)` for `AiLineOfSight`). 8.1 named "the AI's blocked
+   adapter" without separating its two users. The planner's headroom test
+   reads the distant ground (it must agree with the drive, ai_nav.h rule 2);
+   the eye does not: the distant tier's own sight is open-field (no line test),
+   so a look across the face keeps the fidelity of the tier it ends in, and
+   D3's near-vs-distant fights across the edge see each other exactly as
+   before. With D10, trees and houses past the face would otherwise block a
+   near creature's look at a distant one that sees straight back.
+2. **The swim readers are ONE struct now** (the old header's own TODO): the
+   two copies would otherwise have needed the same change twice.
+3. **The dead, ghosts and player-driven bodies keep the old face.** A corpse
+   does not walk (its ragdoll has no Jolt terrain past the face either way); a
+   ghost's window is its owner's to decide; a player is never distant.
+4. **The task assert answers "unknown" rather than aborting**: in a task the
+   creature sees the old face, which is deterministic. Measured 0 refusals.
+5. **(C) is a REAL swimmer at a real face, not the cell reader.** No fixture
+   lake reaches the home window's faces, so the gate moves the window six
+   chunks -X (a full regen) so its +X face cuts the harness map's
+   `harness_lake`, and runs every arm in that window: C1 a human AFLOAT
+   (`mob_afloat.cpp`, the duelist profile's Goto) and C2 a PIRANHA
+   (`mob_swim.cpp`'s fish drive; the piranha profile has no Goto weight, so
+   its wander anchor is placed past the face -- wander legs are 3..8 voxels,
+   so it swims out on its first leg).
+
+**Measured** (`--verify distant-walkout, distant-walk, distant-edge,
+distant-overflow, distant-roundtrip, mob-park, npc-strike, crowd`, 42.8 s, all
+PASS but `crowd` -- below; `distant-walkout` 1.65 s, both runs identical): A, a
+duelist 24 voxels inside the -Z face with a Goto 64 past it, demoted at phase
+tick 59 under the same id, profile and Goto (bit-equal goal), SURFACE, feet 1
+voxel off the centre column's `TerrainTop + 1` (the footprint's max), and
+reached the goal at the distant tier at tick 106. C1 demoted swimming at 78
+and reached its goal swimming at 105; C2 demoted at 100 and spent 90 distant
+ticks with 0 dry. B (the same walk, parking unbound) stood with its footprint
+centre at most 1.6 voxels past the face for 150 ticks -- D3's measured old
+face -- never demoted, still near. Per run: 3 walked out, 196 near
+creature-ticks in the pad, 9,899 `OutsideGroundFor` grants, 0 task
+refusals. The whole gate (two fresh worlds at the lake window, ~450 ticks
+each, the regen home) 1.65-2.3 s.
+
+**Behaviour that moved, by construction.** Only where a park function is
+bound AND a creature reaches a face. In the must-stay-green set that is
+`distant-edge` arm M (its near swordsman fights a distant one 3 voxels past
+the +X face and may now step after it): it passes, twice-run digest
+`f019adb2d4296bc4` against `49b0e0500a7b54fc` from main's own exe with this
+tree's assets (control run) -- M: near->distant 10 hits and distant->near 9
+applied (7 limbs carved) against 13 and 7 (6). Nobody crossed the pad line in
+it: `walkedOut` over the whole verify is 6, distant-walkout's two runs, and
+the per-gate walk-out line printed for that gate alone. What moved is near
+creatures standing in the pad on known ground instead of frozen at the face
+(1,322 near creature-ticks past a face across the other seven gates); not
+attributed further. Everything else reproduced its last package's numbers:
+`distant-walk` D1's (1,123 voxels walked, 1,118 progress, 27 replans; line
+0.58 deep, snap 3.70; crater dip 6.0, 1 drain), `distant-overflow` D8's
+digest `a5b6dab76075581b` (8 and 11 swaps); `distant-roundtrip`, `mob-park`,
+`npc-strike` pass. `crowd` FAILS at subset scope -- identically on main's
+own exe (`10aefb3e`, control run with this tree's assets: the four crowders
+never leave their spawn ring in either arm, min gap 18.38 = the ring's own
+spacing; a known subset-scope red since 2026-10-15). It binds no park
+function, so `DistantReachable` is false there and no D11 path runs.
+
+**Open.** No Jolt terrain past the face: a creature ragdolled in the pad falls
+until the park rule's y test demotes it (`landPending`), as a thrown body
+always has. A creature in the pad is on the distant ground at near fidelity:
+the matter passes (burn, stain, splatter, wash) read nothing past the face
+(no voxels there) for the <= 16 voxels it spends crossing. A footstep past
+the face is a footstep on dirt. LOS past the face is open (deviation 1). The
+gate cannot see trees past the face until D10 lands (the pad box has none).
+
+### 8.5 D10 as landed (branch `dg-d10`, finished on `distant-gaps` 2026-10-17)
+
+**What landed.** `game/distant_obstacles.{h,cpp}` (`GenOverlay`: per-column
+spans built lazily, per-cell records for dungeons and the layer,
+epoch-checked), `sim/worldgen_twin.h` + the twin at the end of `world.cpp`
+(lattice trees, authored tree sites, cacti, stamps -- beside the mirrored
+statics they read), `wgtwin::SetGenEnv` (Simulation records the uploaded tree
+atlas and packed world map, so no `main.cpp` local is needed), the stamp
+decoder lifted out of `faredits.cpp` and shared, `WorldEdits::Generation()`.
+`DistantGround::Solid` reads stored chunk -> overlay -> `TerrainTop`; the
+fast path of `Stand` / `ProbeGround` / `Land` leaves any column the overlay
+touches. Doors read as air. Gate `distant-obstacles`.
+
+**Measured** (`--gate distant-obstacles`, 9 real GPU boxes of the default map,
+5.4 M cells): tree 7,372/7,372, stamp 191,305/191,305, dungeon 24,995/24,995,
+layer 36,914/36,914, whole trees 9,210/9,210 -- every modelled source exact.
+Base 62 mismatches of 5.16 M, all `crystal_spire` / `crystal` (a worldgen
+feature outside the overlay's list; not obstacles a walker meets). Overlay
+column build 1.2 us mean; the `peaks` walk's tick cost 17.4 -> 44.7 us.
+
+**Deviations, finished by the orchestrator after the agent was cut off.**
+1. **The long replan** (`ai::WorldView::navRadiusLong`, `kDistantNavRadiusLong`
+   96, `NavParams::radiusCap` / `partialWhenClamped`): with obstacles real, a
+   distant creature's local plan (navRadius 22-30, and `FindPath` silently
+   capped every grid at 40) cannot see round a wall longer than its grid.
+   A failed local plan now retries once over 96 voxels, returning the route
+   to the reached cell nearest a goal that lies off the grid; a failure backs
+   off 90 ticks. Distant tier only (the near tier's fields keep their
+   defaults: no behaviour change near).
+2. **Arm B1 walks round ONE HOUSE** (the largest stamp of the locale no wider
+   than 48, crossed through its middle), not the most obstructed line across
+   the whole locale: that line ran into the middle of Harrowby's large walled
+   compound, a global route problem, and the walker (never inside matter)
+   simply never found the far gate. Measured: reached in 92 ticks, 0 ticks in
+   matter.
+3. **Arm C picks the first door whose house the shut control keeps out** (the
+   smithy is open-sided: with every leaf shut the walker still got in), and
+   the crossing test is a segment test (a stride jumps the one-cell leaf
+   between samples).
+4. **No cacti in the default map's boxes**: the cactus floor's cell minimum is
+   0 (`distantObstCactusCellsMin`); the twin is measured when a map has them.
+
+**Open.** A global (village-scale) route planner for distant creatures; the
+crystal spires; a creature whose goal lies inside a closed compound may still
+stall at its wall (it never walks through it).
+### 8.6 D7a as landed
+
+Branch `dg-d7a` (off `distant-gaps`). Code: `src/net/distantsync.{h,cpp}`
+(the four records and their codecs), the D7a section at the end of
+`src/game/distant.cpp` (role, W, hand-out / hand-in / done, the view, the
+in-transit list, the waiting room's helpers) plus the generalised borders
+in the same file (`DemoteToDistant`'s radius, `RetireDistant`,
+`ActivateParked`, the drive's line hold, `PublishDistantBand`'s client branch,
+`TickDistant`'s client early-out), the park rule's client branch and the
+ownership latch in `src/game/mob.cpp`, `EntityParking::PromoteWaitingRoom` /
+`RemotePromotions` call / in-transit save in `src/game/persist.cpp`,
+`EntityBatch` v5 + `PrepareDistant` / `BuildDistantView` in
+`src/net/entitysync.cpp`, the role at connect / disconnect, the statue fill
+and the `net: distant:` exit line in `src/main.cpp`. Gate `distant-mp`
+(`src/test/selftest_distant_mp.cpp`, kOrder after `distant-arrow`).
+
+**Deviations from 8.3.**
+1. **A RETURN carries no hand-out.** The client answers
+   `DistantHandInDone{returned}` alone and the host puts its own in-transit
+   copy back (`RestoreFromTransit`). The waiting room never steps, so that
+   copy IS the creature -- and it keeps the whole `ai::Brain`, where a
+   hand-out would have cut it to `MobBrainWire`'s five facts. A refusal on the
+   client (a def that does not fit, a duplicate id, a full room, a permanent
+   `PromoteDistant` refusal) is the same answer.
+2. **Whose remote promotion it is.** Over a peer's promotion line ALONE ->
+   that peer, with no ownership question; over the host's line AND a peer's ->
+   the ownership rule decides, asked at the body box's MIN CORNER -- the very
+   point the lines tested (`MobSystem::DistantGoesToPeer`; the
+   host's own pass and the overflow skip a creature it gives to a peer). Asked
+   as 8.3 wrote it ("the ownership rule names that peer"), a creature whose
+   ORIGIN chunk is over a peer's line while its FEET chunk sits on that
+   window's authority margin is owned by nobody (`kNoAuthority` -> the host),
+   is over no line the host promotes on, and is held at the peer's line for
+   ever. (Finished by the orchestrator: asked at the FEET, a creature over
+   both lines whose feet still stood in the windows' outermost z plane got
+   `kNoAuthority` and the host promoted it locally although the client was
+   eight chunks nearer -- `distant-mp` P and D failed on it.)
+3. **The flip bound is the host's alone.** A hand-out arriving (the creature
+   demoted on the client's side) and a hand-in sent are flips on the host's
+   log; a return is not (the creature never left the distant world); the
+   client's promotion of a hand-in does not wait on its own log. A creature a
+   client cannot place therefore ping-pongs at most three times per 600 ticks.
+4. **`livingFree` rides a batch when it changed and on a 1 s keyframe**, not
+   literally every batch: an entity batch with nothing else in it is not sent
+   (`EntityBatch::Empty`), so "every batch" would have been a batch every
+   tick. The host assumes no room until the first report (a corpse needs
+   none). Its estimate subtracts EVERY living creature in transit to that
+   peer -- including one the peer already counts in its waiting room -- so it
+   errs toward waiting, never toward overfilling.
+5. **Corpses travel too**: a client's corpse leaving its window used to decay
+   to debris; it is handed out and becomes a dead distant creature on the host
+   (`SavesAsRecord` decides, as for a park).
+6. **The waiting room is not published** to the client's near band (it is held
+   at the line and placed within a few ticks, or given back); the band is the
+   host's view only. Near hits on view creatures, view box hits and a client's
+   arrows past its face are dropped on the client (`TickDistant`'s client
+   early-out clears the edge queues; `QueueEdgeArrowBoxHit` counts
+   `boxHitsLost`) -- D7b's work.
+7. **The view's change test is a hash of the whole entry** (statue, actor,
+   box, shape); the SHAPE rides first sight AND every 1 s keyframe
+   (`kDistantViewKeyframeTicks`), so a client that lost its mirror re-learns
+   it. Gones go in ascending id; the bytes are a pure function of the tier and
+   the peer's window.
+8. **`Spawn` births a creature owned by the LOCAL player** (`owner_ =
+   localPlayerId_`; 0 in single player, so no change there). A client's
+   spawns used to be born owner 0 -- a ghost of the host's -- until the next
+   `RefreshOwnership`, which the latch would otherwise have held for a tick.
+9. **The born-this-tick latch is `Mob::ownLatch_`**: set by `Spawn`, consumed
+   by the first `RefreshOwnership` that runs with an ownership function
+   (keeping `owner_` as it is). It covers every path that makes a creature
+   live inside a tick, not only D7's.
+10. **Machine B's window is `MobSystem::SetTierWindowForTest`**: every border
+    rule a tier applies reads `TierWindowOrigin` (the World's window unless
+    the seam is set). The gate's geometry is in its header.
+11. **A client's `TickDistant` returns at once**, and after a disconnect its
+    leftover waiting room (`DistantMob::handIn`) is skipped by the step and the
+    band; it is still promoted by the waiting-room pass, never given back.
+12. `kHandInMaxWaitTicks` = 150 (5 s) and `kHandedLooksMax` = 1024 (the client's
+    id -> look memory) are constexprs in `distant.h`.
+
+**Measured** (`distant-mp`, 2.0 s, both runs fdb96028c0b4fee9): 327 ticks; H
+the round trip 6 ticks (hand-out, base hp bit-identical, target kept, bleed
+0.1487 carried); L the born latch held; P handed in after a 176-tick walk and
+promoted ON B 5 ticks later, hp and x/z bit-identical, snap dy 0; R kept /
+retired / activated / still parked as W says; W given back after 151 ticks;
+D 2 transits restored on A, B promoted its waiting room at once. The view:
+145 entries (13 with the shape), 17.6 KB in 145 batches = 122 B/batch, 54
+B/tick for a handful of creatures. Must-stay-green verified on the merged
+tree (D10 + D11 + D7a): mob-handoff, net-melee, net-corpse, authority,
+ops-exchange, determinism, distant-* (roundtrip, edge, save, schedule,
+overflow, arrow, walkout, obstacles), refs-npc-identity, mob-park,
+npc-catchup all PASS; `two-players` FAILS identically on main's exe
+(a6e01667: "last analytic tick 177 (want < 60)"), pre-existing.
+
+**The API D7b builds on.**
+- The role and W: `MobSystem::GetDistantNetRole()`, `DistantPeers()` (the
+  host's `DistantPeerWindow`s, set every tick by `EntitySync::PrepareDistant`),
+  `TierWindowOrigin`.
+- The client's mirror of the host's tier: `MobSystem::DistantViewMobs()`
+  (sorted by id; the actor and body box of every creature in its window's edge
+  band), from which the client's `DistantBand()` / `EdgeActor()` /
+  `DistantBoxes()` are published. A near stroke, a near arrow out of the
+  window, a box hit and a player's shot out are today DROPPED on a client:
+  `TickDistant`'s client early-out clears `edgeBlows_` / `edgeArrowsOut_` /
+  `edgeBoxHits_` / `edgeShotsOut_`, and `QueueEdgeBlow` / `QueueEdgeArrowOut` /
+  `QueueEdgeArrowBoxHit` look the target up in `distant_` (the waiting room),
+  not the mirror. D7b sends those four queues to the host instead (the target
+  exists in `viewMobs_`).
+- The host's distant tick reads only the HOST's near band (`TickDistant`'s
+  `nearActors`). D7b adds the client's edge actors to the lists of the tier
+  creatures in that client's band -- `BuildDistantView`'s band test (within
+  `kDistantEdgeBandVox` of the peer's window box) is the membership rule -- and
+  routes a distant swing whose target is one of them (today `strokeNoTarget`)
+  to the client to roll and apply.
+- The wire: `net/distantsync.h` (add records there, bump
+  `kDistantSyncVersion`) and `EntityBatch` (v5 -> v6, new vectors after
+  `livingFree`).
+- Ownership: `MobSystem::TakeTierEntries` (ids that entered a tier; drained by
+  `EntitySync::PrepareDistant` into `mobMem_.erase`) and `Mob::ownLatch_`.
+
+**Open.** ITEMS are not handed out (a ground item leaving a client's window is
+still released; persist.h's KNOWN GAP keeps that half). A hand-out's kit is
+`DistantFromRecord`'s (rest-pose reach, the cover's shell material) -- the
+client's live rig is gone by the time the host builds it. The host draws a
+handed-out creature through the client's look key, which it never baked: its
+producer falls back to the bare look. A client's own save writes its waiting
+room (its save is not the world's; the host's in-transit list is).
+
+### 8.7 D7b as landed (on `distant-gaps`, 2026-10-17, by the orchestrator)
+
+**What landed.** `DistantEdgeWire` (game/distant.h): one tick's edge traffic,
+carried as the last field of `EntityBatch` v6 (`net/distantsync` v2 codecs,
+field by field -- a kit travels as its styles, each `StrikeProfile` member by
+member: it has padding). Client -> host: its EDGE ACTORS (its own near
+creatures within `kDistantEdgeBandVox` of its window, never a player, never a
+ghost, at most 64, only while the host's view puts any creature in its band),
+its near strokes' blows at view creatures, its flights out of the window, box
+hits and shots past the face (D3 / D9's four hand-overs, which D7a dropped).
+Host -> client: distant swings at the client's creatures and inbound flights
+crossing into the client's window.
+
+- **Client.** `QueueEdgeBlow` / `QueueEdgeArrowOut` / `QueueEdgeArrowBoxHit`
+  look the target up in the host's view (`ViewMobAlive`); `TickDistant`'s
+  client branch forwards the four queues, builds the edge actors, hands the
+  host's inbound flights to `MobArcheryTick` (`edgeArrowsIn_`), and ROLLS the
+  host's swings itself (`ResolveRemoteSwing`): `ResolveStrike` with the
+  host's keys (attacker id, the swing's tick, the distance the host measured)
+  against the LIVE body, then D3's door (`ApplyDistantHitOnNear`, factored out
+  of the host's impact pass so both use one function).
+- **Host.** The peer's edge actors join the distant band (replacing a ghost of
+  the same creature: the owner's actor is its own tick-start state), trusted
+  for `kDistantEdgeActorTicks`. A swing or a loose at a creature that is not
+  this machine's to roll (a peer's edge actor, or a ghost) goes to the peer:
+  the swing as a `NearEdgeBlow` with `dist`, the flight with `toPeer` and the
+  peer's window, crossing into it (`ArrowStepOutside`'s new window argument)
+  instead of the host's. The peer's blows and arrows enter the host's own
+  queues and land at its next impact pass, exactly as its own near tier's.
+
+**Measured** (`distant-mp` arm E, both runs e66b63786ef2ac69): a blue swordsman
+B owns just inside B's -z face and a monster swordsman in A's tier 8 voxels
+past it: they engage within 100 ticks, B's stroke lands on A, A's swings are
+rolled on B (3) and one entered the swordsman's door, inside 129 ticks; 384
+edge actors over the arm. The whole verify (distant-mp, mob-handoff,
+net-melee, net-corpse, net-player-melee, authority, ops-exchange,
+determinism, distant-roundtrip / walkout / fight / edge / save / overflow /
+arrow / obstacles, archer, arrow): all PASS.
+
+**Deviations / open.**
+1. **The client rolls the host's swing a batch later than the host would
+   have** (the swing is resolved by the host's impact pass, then crosses):
+   the roll uses the host's keys, the defender's state is the client's own at
+   that tick. Deterministic on the client; a near defender meets a distant
+   blow D+1 ticks after the host decided it.
+2. **A player's shot that re-enters the CLIENT's window after flying past its
+   face** is still flown on the host and tested against the host's window
+   only (it lands or expires); the reverse case of D9 is not modelled.
+3. **The overflow (D8) and the player's ring are the host's**, as D7a left
+   them.
+4. Not run: the two-process `--host` / `--join` smoke. The in-process gate
+   carries every record as encoded bytes both ways.

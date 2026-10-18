@@ -154,6 +154,13 @@ const std::vector<Gate>& DistantGates();
 // schedules walked at distance, saves that keep distant damage
 // (selftest_distant_life.cpp, PLAN_distant_npcs D5+D6).
 const std::vector<Gate>& DistantLifeGates();
+// Trees, buildings and ruins are obstacles at distance: the worldgen overlay
+// against the GPU, walks round them, a door (selftest_distant_obstacles.cpp,
+// PLAN_distant_npcs D10).
+const std::vector<Gate>& DistantObstacleGates();
+// The distant tier across two machines (selftest_distant_mp.cpp,
+// PLAN_distant_npcs D7a): hand-outs, hand-ins, the view, a disconnect.
+const std::vector<Gate>& DistantMpGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -736,6 +743,13 @@ const char* const kOrder[] = {
     // arm. `distant-sleep` leaves the window where it found it (it ticks THE
     // tick but never moves or edits it).
     "distant-walk",
+    // NEAR CREATURES WALK OUT (docs/PLAN_distant_npcs.md D11). Between the two
+    // D1 gates on purpose: its exit is distant-walk's (tuning, items and the id
+    // counter restored, mobs / debris / tier reset, park function removed, the
+    // store cleared (OnRegen), the window back home and worldgen regenerated
+    // there -- it moves the window six chunks -X to put a face through the
+    // fixture lake), so `distant-sleep` after it starts where it always did.
+    "distant-walkout",
     "distant-sleep",
     // THE DISTANT TIER FIGHTS (docs/PLAN_distant_npcs.md D2b). After
     // `distant-sleep` for the same exit contract: tuning, items and the id
@@ -767,6 +781,14 @@ const char* const kOrder[] = {
     // window.
     "distant-overflow",
     "distant-arrow",
+    // THE TIER ACROSS MACHINES (docs/PLAN_distant_npcs.md D7a). After
+    // `distant-arrow` for the same exit contract plus net-melee's: machine B
+    // (a second MobSystem + DebrisSystem on its own Physics) destroyed before
+    // return, both ownership closures and the role cleared from the suite's
+    // MobSystem, the local player id put back, mobs / debris / tier / store
+    // reset, the park function removed, tuning and the id counter restored.
+    // It never moves the window (machine B's is a test seam on B alone).
+    "distant-mp",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1542,6 +1564,14 @@ const char* const kOrder[] = {
     // the way out, and only voxregion / worldedit (which regenerate again)
     // run after it.
     "distant-calib-matrix",
+    // THE DISTANT TIER'S OBSTACLES (docs/PLAN_distant_npcs.md D10). Here, as
+    // late as it can go, for voxregion's reason: it generates boxes of the
+    // GAME's map through BuildVoxRegion (which moves the window and resets
+    // the page table) and loads that map through ReloadEnvironment; it puts
+    // the harness map back and regenerates the window at home on the way
+    // out (village-harrowby's exit), and only voxregion / worldedit -- which
+    // regenerate again -- run after it.
+    "distant-obstacles",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -1569,7 +1599,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates(), &DistantLifeGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates(), &DistantLifeGates(), &DistantObstacleGates(), &DistantMpGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
@@ -1981,7 +2011,36 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"shotsOutGrounded\": " << ds.shotsOutGrounded
       << ", \"shotsOutReentered\": " << ds.shotsOutReentered
       << ", \"shotsOutExpired\": " << ds.shotsOutExpired
-      << ", \"edgeArrowsOutInWindow\": " << ds.edgeArrowsOutInWindow << "},\n";
+      << ", \"edgeArrowsOutInWindow\": " << ds.edgeArrowsOutInWindow
+      // D11: NEAR CREATURES WALK OUT -- probes answered past the face from the
+      // distant ground, creature-ticks in the pad, demotions under the
+      // creature's own power, and the refusals inside a work-pool task (must
+      // stay 0: OutsideGroundFor is single-threaded).
+      << ", \"outsideGrounds\": " << ds.outsideGrounds
+      << ", \"nearPastFace\": " << ds.nearPastFace << ", \"walkedOut\": " << ds.walkedOut
+      << ", \"outsideTaskRefusals\": " << MobSystem::OutsideGroundTaskRefusals()
+      // D7a: THE TIER ACROSS MACHINES -- a client's hand-outs and what became
+      // of the hand-ins its waiting room took; the host's hand-outs taken or
+      // parked, its remote promotions and the waits that held them, the
+      // answers it got, the transits a disconnect put back, the most in
+      // transit at once.
+      << ", \"handOutsSent\": " << ds.handOutsSent
+      << ", \"handInsReceived\": " << ds.handInsReceived
+      << ", \"handInsPromoted\": " << ds.handInsPromoted
+      << ", \"handInsReturned\": " << ds.handInsReturned
+      << ", \"handInGroundWaits\": " << ds.handInGroundWaits
+      << ", \"handOutsTaken\": " << ds.handOutsTaken
+      << ", \"handOutsParked\": " << ds.handOutsParked
+      << ", \"handOutsRefused\": " << ds.handOutsRefused
+      << ", \"handInsSent\": " << ds.handInsSent
+      << ", \"handInRoomWaits\": " << ds.handInRoomWaits
+      << ", \"handInBudgetWaits\": " << ds.handInBudgetWaits
+      << ", \"handInFlipWaits\": " << ds.handInFlipWaits
+      << ", \"donesPromoted\": " << ds.donesPromoted
+      << ", \"donesReturned\": " << ds.donesReturned
+      << ", \"donesUnknown\": " << ds.donesUnknown
+      << ", \"transitRestored\": " << ds.transitRestored
+      << ", \"transitPeak\": " << ds.transitPeak << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want
@@ -2402,7 +2461,14 @@ int Run(Ctx& c, const Options& opt) {
         return c.mobs.MicroSet() ? MicroBodyArtUsed(*c.mobs.MicroSet()) : 0;
       };
       const size_t leakArt = artCount();
+      const uint64_t walkedOut0 = DistantRunTotals().walkedOut;
       r.status = g->fn(c, detail);
+      // D11's attribution (CLAUDE.md rule 6): last_run.json's `distant` block
+      // sums the run, so a gate whose near creatures WALKED out of the window
+      // (and became distant) says so by name here.
+      if (DistantRunTotals().walkedOut != walkedOut0)
+        std::printf("selftest: %s: %llu near creature(s) walked out of the window\n", g->name,
+                    (unsigned long long)(DistantRunTotals().walkedOut - walkedOut0));
       {
         const IVec3 wo = c.world.WindowOrigin();
         std::string leak;
