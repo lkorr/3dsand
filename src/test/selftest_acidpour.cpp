@@ -28,7 +28,9 @@
 // Asserted: the acid did something (bed eaten, gas seen); the gas peak is at
 // most acidPour.gasPeakMax cells and the awake peak acidPour.awakePeakMax;
 // and at the end at most acidPour.maxAwake chunks are awake. Thresholds live
-// in tests/baseline.json. Leaves the pristine world behind (the `rivers`
+// in tests/baseline.json -- where the three gas / wake bounds are set OUT OF
+// REACH for now (owner, 2026-10-18: chunks waking with the gas is acceptable
+// for the moment; `_acidPour_about` says how to re-arm them). Leaves the pristine world behind (the `rivers`
 // exit).
 
 #include <algorithm>
