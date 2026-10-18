@@ -25949,6 +25949,23 @@ one inside the other, and three changes:
   and in `exciteScratch[7]`. The reservoir takes it back as it takes a GIVE;
   a breach's rush is then a pour, not a jet. (Absorbing particles in the
   surface band on their way down as well was measured and is not needed.)
+* **...and dilutes another liquid's particles buried in it** (2026-10-18,
+  ticket 2026-10-17_00-04-26). A particle of a DIFFERENT liquid inside a
+  settled cell of a map column's held water, at or under its top cell (at
+  most `SEAM_DILUTE_DEPTH`, 48, under it), is absorbed the same way: the
+  refill buried it in a body the window holds a few metres of. Nothing else
+  can take it (a submerged cell is solid to the solver, water to the CA, and
+  the settle walk must not merge it, below). Acid that SETTLES on the river
+  stays acid, sinks and eats the bed.
+* **Two liquids do not merge in a settle walk** (`settleColumn`, same
+  ticket). A settled cell of another liquid than the arriving content (the
+  pool from below, or the cell's own bin) is FOREIGN: left untouched, and the
+  content is carried up through it to the first cell that can hold it; an
+  emptied pool carries no identity up. Before, the walk's identity was a
+  running max, so acid (id 13) settling in a river re-placed the water column
+  above it as acid and the reservoir refilled it: `acid-pour` measured 9,840
+  cells poured, 33,856 standing 600 ticks later and 53,707 bed cells eaten;
+  with the walk fix, 1,037-5,866 eaten and the awake peak 770 -> 241-422.
 * **The top cell over its target is at rest** (`sim_step.wgsl` `heldRest`,
   map columns only). With the seam out of it, C still ran forever with NO
   particle involved: TAKE 12.5k / GROW 5.8k / GIVE 1.9k eighths in the first
