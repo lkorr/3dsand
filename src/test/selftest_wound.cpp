@@ -8871,10 +8871,13 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
         a.lowest = std::min(a.lowest, com.y);
         a.final = com.y;
         if (i % 120 == 0) {
-          const Vec3 cur = sandvox::CurrentOnFloater(com, com.y - 2.0f,
-                                                     com.y + 2.0f, (float)(waterTop + 1));
-          a.drift += Format(" (%.1f,%.1f cur %.2f,%.2f)", com.x - (float)site.x,
-                            com.z - (float)site.z, cur.x, cur.z);
+          const sandvox::FloaterCurrent fc = sandvox::CurrentOnFloaterSplit(
+              com, com.y - 2.0f, com.y + 2.0f, (float)(waterTop + 1));
+          a.drift += Format(" (%.1f,%.1f cur %.2f,%.2f = standing %.2f,%.2f + measured "
+                            "%.2f,%.2f)",
+                            com.x - (float)site.x, com.z - (float)site.z, fc.total.x,
+                            fc.total.z, fc.standing.x, fc.standing.z, fc.measured.x,
+                            fc.measured.z);
         }
         if (i % 60 == 0) {
           const char* r = m->DeadAwakeReason();
@@ -8939,10 +8942,13 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
           limp.final = com.y;
           if (i % 30 == 0) limp.trace += Format(" %.1f", com.y);
           if (i % 60 == 0) {
-            const Vec3 cur = sandvox::CurrentOnFloater(
+            const sandvox::FloaterCurrent fc = sandvox::CurrentOnFloaterSplit(
                 com, com.y - 2.0f, com.y + 2.0f, (float)(waterTop + 1));
-            limp.drift += Format(" (%.1f,%.1f cur %.2f,%.2f)", com.x - (float)site.x,
-                                 com.z - (float)site.z, cur.x, cur.z);
+            limp.drift += Format(" (%.1f,%.1f cur %.2f,%.2f = standing %.2f,%.2f + "
+                                 "measured %.2f,%.2f)",
+                                 com.x - (float)site.x, com.z - (float)site.z,
+                                 fc.total.x, fc.total.z, fc.standing.x, fc.standing.z,
+                                 fc.measured.x, fc.measured.z);
           }
         }
       }
