@@ -1826,6 +1826,10 @@ Status GateRivers(Ctx& c, std::string& detail) {
         const uint64_t diag0Off = (uint64_t(kWorldN) * kWorldN * 4u + 4u + 11u * uint64_t(kWorldN) * kWorldN) * 4u;
         uint32_t dPrev[8] = {};
         rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), diag0Off, dPrev, sizeof dPrev, "riversDiag0");
+        // ...and the excitation by trigger (exciteScratch [11..15], EX_BY_*: fall
+        // / perch / step / shell / wake), cumulative, diffed per sample.
+        uint32_t byPrev[5] = {};
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.fluidExciteScratch, 11u * 4u, byPrev, sizeof byPrev, "riversBy0");
         auto chanVol = [&]() {
           long long v = 0;
           for (const auto& xz : byCols)
@@ -1856,22 +1860,30 @@ Status GateRivers(Ctx& c, std::string& detail) {
           bool any = false;
           std::string ln = Format("\n      %4d:", k);
           rows.clear();
-          for (int r = -1; r <= 3; r++) {
-            const PP& p = path[kOwn + r];
-            ln += r == 0 ? " ||" : " |";
+          // ...the head's five rows, then (after `>>`) the channel's last
+          // four own rows and main's first row.
+          int kEnd = kOwn;
+          while (kEnd + 1 < static_cast<int>(path.size()) &&
+                 worldmap::WaterColumnAt(path[kEnd + 1].x, path[kEnd + 1].z, kDefaultSeed).water < 0)
+            kEnd++;
+          const int rowsK[10] = {kOwn - 1, kOwn, kOwn + 1, kOwn + 2, kOwn + 3, kEnd - 3, kEnd - 2, kEnd - 1, kEnd, kEnd + 1};
+          for (int ri = 0; ri < 10; ri++) {
+            if (rowsK[ri] < 0 || rowsK[ri] >= static_cast<int>(path.size())) continue;
+            const PP& p = path[rowsK[ri]];
+            ln += ri == 5 ? " >>" : (ri == 1 ? " ||" : " |");
             for (int dx = -1; dx <= 1; dx++) {
               const int x = p.x + dx, z = p.z;
               const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
               const uint32_t d = tab[ci * 4 + 2];
-              if (r >= 0 && d != 0u) any = true;
+              if (ri >= 1 && ri <= 4 && d != 0u) any = true;
               int s8 = -1;
-              for (int y = lakeLevel + 2; y >= p.y - 2; y--) {
+              for (int y = std::max(lakeLevel + 2, p.y + 12); y >= p.y - 2; y--) {
                 const uint32_t w = voxRaw(x, y, z);
                 if ((w & 0xFFFu) == mWater) { s8 = 8 * y + static_cast<int>((w >> 12) & 15u) + 1; break; }
-                if ((w & 0xFFFu) != 0u && y < lakeLevel - 1) break;
+                if ((w & 0xFFFu) != 0u && y < p.y + 6) break;
               }
               const std::string sv = s8 < 0 ? std::string(".") : std::to_string(s8);
-              if (r < 0 || d == 0u) ln += Format(" -:%s", sv.c_str());
+              if (d == 0u) ln += Format(" -:%s", sv.c_str());
               else ln += Format(" %d/%u:%s", static_cast<int>(d << 12) >> 12, d >> 20, sv.c_str());
             }
           }
@@ -1895,14 +1907,17 @@ Status GateRivers(Ctx& c, std::string& detail) {
             adopted = adoptedCount();
             lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            uint32_t dNow[8] = {};
+            uint32_t dNow[8] = {}, byNow[5] = {};
             rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), diag0Off, dNow, sizeof dNow, "riversDiag1");
+            rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.fluidExciteScratch, 11u * 4u, byNow, sizeof byNow, "riversBy1");
             curve += Format(" %d:%d/%d(%dP)/%d/%u vol %lld [give %u take %u grow %u | excited over %u bank %u unheld %u "
-                            "stream %u held %u] [why%s]",
+                            "stream %u held %u; by fall %u perch %u step %u shell %u wake %u] [why%s]",
                             k, wet, adopted, poolN, awake, floodMax, vol, dNow[0] - dPrev[0], dNow[1] - dPrev[1],
                             dNow[2] - dPrev[2], dNow[3] - dPrev[3], dNow[4] - dPrev[4], dNow[5] - dPrev[5], dNow[6] - dPrev[6],
-                            dNow[7] - dPrev[7], whyS.c_str());
+                            dNow[7] - dPrev[7], byNow[0] - byPrev[0], byNow[1] - byPrev[1], byNow[2] - byPrev[2],
+                            byNow[3] - byPrev[3], byNow[4] - byPrev[4], whyS.c_str());
             std::copy(dNow, dNow + 8, dPrev);
+            std::copy(byNow, byNow + 5, byPrev);
           }
         }
         c.ctx.WaitIdle();
@@ -2020,7 +2035,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
                     "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
                     flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
-        std::printf("rivers:   S head trace (tick: | the lake's last row || the channel's first own row | the next three; "
+        std::printf("rivers:   S head trace (tick: | the lake's last row || the channel's first own row | the next three >> its "
+                    "last four own rows | main's first row; "
                     "each column target/hop:water top, 8 y + f, or -:top when not held):%s\n",
                     headTrace.empty() ? " nothing held" : headTrace.c_str());
         c.ctx.WaitIdle();
