@@ -255,13 +255,13 @@ fn seamRestT8(x : i32, z : i32, mat : u32) -> i32 {
 // the CA's own spill into the hole never happens: a loop that delivers
 // nothing. MEASURED, `rivers` S (a channel dug from a map lake to a river):
 // 11-13k eighths of the lake's and the river's held water excited every 150
-// ticks at the channel's two ends for as long as the stream ran, and their
-// particles' wake churned the stream itself through the seam (25-45k eighths
-// of its own water every 150 ticks, its volume swinging 1,400 to 3,600
-// eighths between samples), so no column of it ever held still for the
-// natural test (sim_stream.wgsl). The CA spills such a cell into the hole
-// like any water and the reservoir refills it; the spilled water is the
-// seam's like any unheld water.
+// ticks at the channel's two ends for as long as the stream ran, all of it
+// absorbed back; 0 after. The CA spills such a cell into the hole like any
+// water and the reservoir refills it; the spilled water is the seam's like
+// any unheld water. (Which is why S's stream still churns through the seam
+// with this gone -- ~40k eighths of its own water every 150 ticks, by the
+// wake trigger, seeded by its falls -- see `rivers` S, which measures the
+// held stream with excitation off.)
 // A STREAM's column over a hole is its own riser's spill (sim_stream.wgsl
 // restingSurface's step), at rest: no exception.
 fn seamBreachEdge(c : vec3<i32>, mat : u32) -> bool {

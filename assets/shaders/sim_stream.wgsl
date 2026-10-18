@@ -281,7 +281,9 @@ fn ledgerSnap() -> i32 { return bitcast<i32>(stillWater[STREAM_LEDGER + 1u]); }
 //     every 50-200 ticks, and nothing above it was ever still.)
 //   * the run must last sim.streamSteadyTicks of windows in which most
 //     visits found a resting surface (3 of 4) and few found water in flight
-//     (a quarter at most);
+//     (a quarter at most), and in which the anchor has not DRIFTED more than
+//     STREAM_RUN_DRIFT (half a voxel) from where the run began (THE RUN IS A
+//     LEVEL, NOT A WINDOW, at the run's update);
 //   * NOTHING DOWNSTREAM moved for as long: every column keeps the newest
 //     fine and coarse event stamp among its own and its DOWNSTREAM
 //     neighbours' (open beside its surface, no water standing over it there:
@@ -301,7 +303,8 @@ fn ledgerSnap() -> i32 { return bitcast<i32>(stillWater[STREAM_LEDGER + 1u]); }
 // gone (DRAINED) -- something below took more than the stream brings, or the
 // stream above stopped feeding it. NOT on news from below: a held map-fed
 // stream is not refilled from the reservoir (sim_step.wgsl stillWant, A
-// MAP-FED STREAM IS NOT REFILLED), so it delivers into a dig or a draining
+// MAP-FED STREAM IS NOT REFILLED -- except its HEAD, hop 1, the column the
+// map's own water feeds), so it delivers into a dig or a draining
 // basin as the live stream would, its water running down through it, and it
 // rests again when nothing below takes water. (Released on the first new
 // wet column below, as the first cut was, it let go whenever an established

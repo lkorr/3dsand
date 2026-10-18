@@ -4795,11 +4795,13 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   // the head's top row is submerged (no sideways levelling, THE HYDROSTATIC
   // INVARIANT) and the one over it would pour over the head's target (held,
   // refused) -- the live head was fed by exactly that spill from the map's
-  // top layer. MEASURED, `rivers` S (a channel dug two cells under a lake's
-  // surface): its head held, starved, more than a voxel under its target
-  // within a few hundred ticks, released DRAINED, and the 75 columns held
-  // below it let go for want of support. What it delivers on is still the
-  // held stream's own CA, column to column.
+  // top layer. MEASURED, `rivers` S (a channel dug into a lake, its head a
+  // few cells under the lake's surface): the head held, then stood more than
+  // a voxel under its target, was released DRAINED, and the 75 columns held
+  // below it let go for want of support; refilled, the head stood at its
+  // target to the eighth for the 1,500 ticks the gate's head trace followed
+  // it. What it delivers on is still the held stream's own CA, column to
+  // column (`stream-natural` E: held and live deliver at the same rate).
   let si = stillIndex(c.x, c.z);
   if (stillWater[si + 1u] == 0u && (stillWater[si + 3u] & STILL_POOL_BIT) == 0u &&
       (stillWater[si + 2u] >> 20u) != 1u) { return STILL_NONE; }
