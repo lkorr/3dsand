@@ -1039,6 +1039,20 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
       word = mat | pool | (over << STREAM_OVER_SHIFT) |
              select((reason << STREAM_REASON_SHIFT) | (STREAM_ACT_RELEASE << 30u), 0u, held);
     }
+    // WHERE ITS WATER STOOD WHEN IT WAS LET GO (diagnostic, STREAM_OBS [7]
+    // byte 2, which is the observer's run drift only while the column is
+    // observed -- a fresh anchor zeroes it): its resting surface minus its
+    // target, eighths, clamped to +-63, bit 7 set when it had none (then the
+    // floor's level minus the target; -64 = neither). `rivers` S prints the
+    // lake-most released column's [7].
+    if ((word >> 30u) == STREAM_ACT_RELEASE && pool == 0u) {
+      var d = -64;
+      if (r.ok) { d = clamp(r.s8 - t8, -63, 63); }
+      else if (r.hasFloor) { d = clamp(r.floor8 - t8, -63, 63); }
+      let b = (bitcast<u32>(d) & 0x7Fu) | select(0x80u, 0u, r.ok);
+      let o7 = stillWater[oi + 7u];
+      stillWater[oi + 7u] = (o7 & 0xFF00FFFFu) | (b << 16u);
+    }
   } else {
     // THE CONDUIT's own observation ([3]: surface | age), for POOL streams
     // only -- with sim.streamPoolRoot off no POOL column can exist, and the
