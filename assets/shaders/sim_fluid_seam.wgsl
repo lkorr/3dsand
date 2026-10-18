@@ -890,6 +890,15 @@ fn seamExcitedEighths(c : vec3<i32>) -> u32 {
   if (bm == 0u) { return 0u; }
   return u32(clamp(fluidGridR[seamNodeBase(bm, c)] >> 10u, 0, 8));
 }
+// The raw Q10 node mass at cell c (last substep of last tick), 0 where the
+// chunk has no MPM block. THE SPOUT JET's drop test.
+fn seamNodeMassAt(c : vec3<i32>) -> i32 {
+  let wsl = chunkSlotOf(worldChunkOf(c), T.origin);
+  if (wsl == SLOT_NONE) { return 0; }
+  let bm = atomicLoad(&fluidBlockMapR[wsl]);
+  if (bm == 0u) { return 0; }
+  return fluidGridR[seamNodeBase(bm, c)];
+}
 
 // A neighbour cell as the geometry sees it: .x = 1 if the cell BLOCKS flow
 // (solid, powder, an out-of-window cell, or a liquid this seam does not own),
@@ -1064,6 +1073,14 @@ fn spoutJetCode(c : vec3<i32>, mat : u32) -> u32 {
   // has none, so the throw stops when the head does; a cell under it still
   // excites, at rest, as before.
   if (head < SPOUT_MOUTH_HEAD) { return 0u; }
+  // ...AND A REAL DROP: no meaningful MPM mass in the cell it falls into (the
+  // solver's own floor, SEAM_MASS_MIN, not seamExcitedEighths' whole
+  // particles: sparse spray rounds to 0 eighths). The head alone still threw
+  // at the seam's edge, a settled column standing 3+ rows beside a cell lying
+  // on the particle body -- `flow-measure` attribution: 380 thrown births in
+  // the tail (+600..900), every one from this trigger. The jet carries ~12%
+  // of a spout's throw (the mouth the rest), so this costs a spout little.
+  if (seamNodeMassAt(c + vec3<i32>(0, -1, 0)) >= SEAM_MASS_MIN) { return 0u; }
   return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | dir;
 }
 
