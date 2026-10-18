@@ -7133,6 +7133,56 @@ neighbors, so this needs an explicit connectivity pass:
   This is rule #2 (cost scales with activity) applied to the CPU side: without
   it, one burning forest converts an unbounded amount of the world into Jolt
   bodies and the frame time collapses.
+- **Outside the window a body lies on the ANALYTIC GROUND (2026-10-18,
+  ticket 2026-10-17_00-12-10, gate `debris-outside`).** Terrain patches are
+  built from fetched voxels, so outside the residency window there are none.
+  Two consequences used to follow. (1) A patch on a window face read every
+  out-of-window cell as SOLID (the sim's rule for a cell it cannot see), which
+  for a COLLIDER is an invisible wall up every side face and a floor across the
+  bottom face: a limb that rolled off a cliff came to rest in mid-air on it.
+  The out-of-window border of a patch's 18^3 box now reads
+  `World::TerrainHeight` -- solid at or below the column's ground, air above --
+  so a face continues the slope it cuts and opens where the ground is lower
+  than the window (one TerrainHeight per column, only for patches on a face).
+  (2) A body that got outside had nothing to land on and fell to the cull 32
+  voxels out (or, asleep, hung wherever the window left it).
+  `DebrisSystem::PostStep` now lays a body MOVING outside the window on the
+  analytic ground under its footprint (highest of four corners + middle; down
+  only, so a body in a cave the window cut through is left where it is) and
+  puts it to sleep (`DropOutside`). It stays a body -- drawn, saved, kept out
+  to half a window past the face (`kOutsideKeepVox`), culled past it; ground
+  items still park at the pad as before -- skips terrain upkeep and
+  settle-back while outside, and when the window returns the first patch built
+  under it wakes it (`WakeInBox`) to settle on the real voxels, which differ
+  from the column only where the world was dug, built on or roofed. Not
+  dropped: ghosts, strapped followers, fixtures, welded shards.
+- **Floaters are carried by the water (2026-10-18, ticket 2026-10-17_20-54-57,
+  gate `float-current`).** `Physics::ApplyBuoyancy` takes the water's velocity
+  (`sandvox::CurrentOnFloater`: `CurrentAtCpuSim` -- the solved river/lake
+  field, a breach's measured flow, the sim-licensed primitives -- over the
+  body's submerged span, keel to waterline) and runs Jolt's still-water
+  buoyancy IN THE WATER'S FRAME: the current is taken out of the body's
+  velocity, the impulse applied, the current put back. Not through Jolt's own
+  fluid-velocity argument: Jolt clamps the drag's velocity change to the
+  body's current speed, so a floater at rest would never be moved. Debris
+  (`FloatBodies`), corpses and limp rigs (`Mob::FloatLimpLimbs`) all pass it.
+  A floater ASLEEP in water is looked at every 8 ticks and woken when the
+  current there is at least `physics.waterCurrentWake` (0.05 m/s; debris in
+  `FloatBodies`, a corpse via `Mob::CurrentWakesDead`, `DeadWokeHow` 5); one
+  the last wake carried nowhere (pinned on a bank) is not woken again where it
+  lies, so a pinned floater costs one wake, not one per stride.
+- **Standing on a body is standing (2026-10-18, ticket 2026-10-17_21-33-53,
+  gate `player-stand-body`).** The player's ground probe reads voxels and
+  cannot see a rigid body; `Player::ApplyPush` (the end-of-tick
+  `PlayerPushOut`) holds the player up and set `grounded`, but the next
+  `Update` re-probed the voxels and put it back to false BEFORE the avatar's
+  air clock read it, so a player standing on a felled log was "in the air" for
+  as long as they stood there and went limp at `ragdoll.fallSeconds`. The push
+  now also sets `Player::bodySupport`, which the next `Update` folds into its
+  end-of-move `grounded` once (a jump or a swim still reads airborne), and
+  while it holds the step-hysteresis voxel reach is off -- that reach found the
+  ground under a log thinner than a step and the snap pulled the player down
+  through it every tick.
 - **Settle-back (2026-08-19, implemented):** the reverse handoff. A body asleep
   for 2 s whose rotation is within ~20° of a signed-permutation orientation
   snaps to the lattice and stamps its voxels back into the grid as exact-cell

@@ -1315,7 +1315,12 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // stops `grounded` flickering as the body crests sub-voxel noise, and it
     // keeps us attached walking down a rough slope instead of bouncing off it.
     bool rising = vel.y > nonJumpSpeed;
-    float reach = grounded ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
+    // ...NOT WHILE A BODY HOLDS US UP. The extended reach is a VOXEL probe: on
+    // a log thinner than a step it found the ground under the log, the snap
+    // below pulled the player down through the body (the sweeps cannot see
+    // it), and the push-out lifted them back -- a jitter every tick. Standing
+    // on a body, voxel ground counts only within the plain 0.1.
+    float reach = grounded && !heldByBody ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
     float drop = rising ? -1.0f : GroundProbe(pos, reach, b, kindAt);
 
     // ---- wading vs swimming (see kSwimSubmersion) -------------------------
