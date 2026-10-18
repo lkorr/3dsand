@@ -2367,6 +2367,235 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-off -----------------------------------------------------------
+// THE MPM MASTER SWITCH (sim.fluidEnabled, tuning.h; owner 2026-10-18: "a
+// toggle ... to just turn MPM water on/off from appearing in the game world").
+// fluid-excite's sealed two-chamber box, three claims on one fixture:
+//   A. OFF from the start: carving the plug excites NOTHING (0 eighths, 0
+//      live particles on every tick the seam ran), the CA drains the water
+//      instead, and a pour of 32 eighths of spawn ops + 4 ghost ops lands as
+//      32 eighths of CA water (SubmitTick's FluidSpawnsAsCells) with the
+//      ghosts dropped. Interior mass: 4056 + 32, exact.
+//   B. Back ON on the same world: the same carve excites again (the switch
+//      restores excitation), then OFF mid-drain: no eighth is excited after the
+//      flip, every live particle is force-settled back into CA voxels within
+//      `fluidOffDrainTicks` (baseline.json), and the interior holds exactly
+//      4056 eighths with 0 particles alive.
+//   C. The whole story twice, world hash compared (the switch is a TickParams
+//      input, so the same inputs must give the same world).
+// Hand-ticked with SubmitTick like the other fluid gates: the claim is about
+// the tick input stream (TickParams + the fluid spawn stream), which is
+// exactly what SubmitTick builds.
+Status GateFluidOff(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  const Tuning saved = CurrentTuning();
+  Tuning tOn = saved;
+  tOn.dayNight.freeze = 1;
+  tOn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);  // both water sinks off
+  tOn.sim.fluidExciteMode = 1;   // the shipped excite policy, so ON excites
+  tOn.sim.fluidEnabled = 1;
+  Tuning tOff = tOn;
+  tOff.sim.fluidEnabled = 0;
+  const int drainDeadline =
+      std::max(1, (int)BaselineNumber("fluidOffDrainTicks", 60.0));
+
+  // fluid-excite's box (see there): interior x,z in [-6,6] round (96,.,96),
+  // double shell, catch chamber 110..118, upper floor 119..120 with a 4x4
+  // plug, water 121..123, roof 126..127.
+  const int px = 96, pz = 96, RB = 8;
+  const int floorY = 109, upperY = 119, roofY = 126;
+  const int kCarveTick = 30;
+  const uint32_t kWaterEighths = 13u * 13u * 3u * 8u;  // 4056
+  const uint32_t kPourEighths = 4u * 8u;
+  std::vector<CellOp> box, carve;
+  auto put = [&](int x, int y, int z, uint32_t m, uint32_t state = 0) {
+    box.push_back({World::SlotCellIndex({x, y, z}), (m & 0xFFFu) | (state << 12)});
+  };
+  for (int y = floorY - 1; y <= roofY + 1; y++)
+    for (int z = -RB; z <= RB; z++)
+      for (int x = -RB; x <= RB; x++) {
+        const bool shell = x <= -RB + 1 || x >= RB - 1 || z <= -RB + 1 ||
+                           z >= RB - 1 || y <= floorY || y >= roofY ||
+                           y == upperY || y == upperY + 1;
+        if (shell) put(px + x, y, pz + z, kMatStone);
+        else if (y >= upperY + 2 && y <= upperY + 4) put(px + x, y, pz + z, waterId, 7u);
+        else put(px + x, y, pz + z, kMatAir);
+      }
+  for (int z = -2; z < 2; z++)
+    for (int x = -2; x < 2; x++) {
+      carve.push_back({World::SlotCellIndex({px + x, upperY, pz + z}), 0u});
+      carve.push_back({World::SlotCellIndex({px + x, upperY + 1, pz + z}), 0u});
+    }
+  // The pour: 8 particles in each of 4 cells of the upper chamber's air
+  // (y 124, above the 121..123 water), the mpm tool's sub-lattice, plus 4
+  // ghost ops (the scoop stream's picture: no mass, must vanish).
+  std::vector<FluidSpawnOp> pour;
+  for (int z = -1; z < 1; z++)
+    for (int x = -1; x < 1; x++)
+      for (int k = 0; k < 8; k++) {
+        FluidSpawnOp op{};
+        op.px = ((px + x) << 16) + ((k & 1) ? 49152 : 16384);
+        op.py = (124 << 16) + ((k & 2) ? 49152 : 16384);
+        op.pz = ((pz + z) << 16) + ((k & 4) ? 49152 : 16384);
+        op.vy = -19661;
+        op.mat = waterId;
+        pour.push_back(op);
+      }
+  for (int k = 0; k < 4; k++) {
+    FluidSpawnOp g{};
+    g.px = (px << 16) + 32768; g.py = (125 << 16) + 32768; g.pz = (pz << 16) + 32768;
+    g.flags = (1u << 8) | (30u << 16);   // kFluidOpGhost, 30-tick life
+    g.mat = waterId;
+    pour.push_back(g);
+  }
+
+  auto interiorEighths = [&]() {
+    uint32_t e = 0;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+      for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
+        for (int cx2 = (px - RB) / 16; cx2 <= (px + RB) / 16; cx2++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx2, cy, cz2}), 1,
+                         cbuf.data(), "fluidOffVox");
+          for (uint32_t i = 0; i < kChunkVol; i++) {
+            const int lx = (int)(i % 16) + cx2 * 16, ly = (int)((i / 16) % 16) + cy * 16,
+                      lz = (int)(i / 256) + cz2 * 16;
+            if (lx < px - RB + 2 || lx > px + RB - 2 || lz < pz - RB + 2 ||
+                lz > pz + RB - 2 || ly <= floorY || ly >= roofY)
+              continue;
+            if ((cbuf[i] & 0xFFFu) == waterId) e += ((cbuf[i] >> 12) & 0xFu) + 1u;
+          }
+        }
+    return e;
+  };
+
+  struct Arm {
+    uint32_t aExcited = 0, aLiveMax = 0, aSeamTicks = 0, aMass = 0;
+    uint64_t aPlaced = 0, aUnplaced = 0, aGhosts = 0;
+    uint32_t bExcitedOn = 0, bLiveAtFlip = 0, bExcitedOff = 0, bMass = 0, bLiveEnd = ~0u;
+    int bDrainTicks = -1;
+    uint32_t hash = 0;
+  } arm[2];
+  static const std::vector<FluidSpawnOp> kNoPour;
+  for (int run = 0; run < 2; run++) {
+    Arm& r = arm[run];
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t ft = 50000, liveEst = 0;
+    // One tick; returns the live count the seam published, 0 when the seam
+    // was not recorded this tick (no particle can be born outside it, and
+    // the stage would still hold an older tick's words).
+    auto step = [&](const std::vector<CellOp>& cops,
+                    const std::vector<FluidSpawnOp>& fsp, uint32_t& excited) {
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {}, cops, false,
+                 {6, 7, 6}, false, false, {}, 0, fsp, liveEst);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      excited = 0;
+      if (!sim.FluidSeamRecorded()) { liveEst = 0; return 0u; }
+      uint32_t fa[32] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                            128, "fluidOffArgs");
+      excited = fa[11];
+      liveEst = std::min(fa[7], kFluidCap);
+      return liveEst;
+    };
+
+    // ---- A: OFF from the first tick ------------------------------------
+    SetCurrentTuning(tOff);
+    const MpmOffStats s0 = GetMpmOffStats();
+    for (int i = 0; i < 200; i++) {
+      std::vector<CellOp> cops;
+      if (i == 0) cops = box;
+      else if (i == kCarveTick) cops = carve;
+      uint32_t ex = 0;
+      const uint32_t live = step(cops, i == 120 ? pour : kNoPour, ex);
+      if (sim.FluidSeamRecorded()) r.aSeamTicks++;
+      r.aExcited += ex;
+      r.aLiveMax = std::max(r.aLiveMax, live);
+    }
+    const MpmOffStats s1 = GetMpmOffStats();
+    r.aPlaced = s1.eighthsPlaced - s0.eighthsPlaced;
+    r.aUnplaced = s1.eighthsUnplaced - s0.eighthsUnplaced;
+    r.aGhosts = s1.ghostsDropped - s0.ghostsDropped;
+    r.aMass = interiorEighths();
+
+    // ---- B: back ON, the same carve, then OFF mid-drain ----------------
+    SetCurrentTuning(tOn);
+    const int kFlip = kCarveTick + 15;
+    for (int i = 0; i <= kFlip; i++) {
+      std::vector<CellOp> cops;
+      if (i == 0) cops = box;
+      else if (i == kCarveTick) cops = carve;
+      uint32_t ex = 0;
+      const uint32_t live = step(cops, kNoPour, ex);
+      r.bExcitedOn += ex;
+      if (i == kFlip) r.bLiveAtFlip = live;
+    }
+    SetCurrentTuning(tOff);
+    int quiet = 0;
+    for (int k = 1; k <= 200 && quiet < 30; k++) {
+      uint32_t ex = 0;
+      const uint32_t live = step({}, kNoPour, ex);
+      r.bExcitedOff += ex;
+      r.bLiveEnd = live;
+      if (live == 0 && r.bDrainTicks < 0) r.bDrainTicks = k;
+      quiet = live == 0 ? quiet + 1 : 0;
+    }
+    r.bMass = interiorEighths();
+    r.hash = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    if (run == 1)
+      std::printf("  fluid-off A (off): %u eighths excited, max %u live, seam "
+                  "ran %u ticks, pour %llu placed / %llu unplaced / %llu ghosts "
+                  "dropped, interior %u of %u\n"
+                  "  fluid-off B (on, off at carve+15): %u excited while on, %u "
+                  "live at the flip, %u excited after it, 0 live after %d "
+                  "tick(s), %u live at end, interior %u of %u\n",
+                  r.aExcited, r.aLiveMax, r.aSeamTicks,
+                  (unsigned long long)r.aPlaced, (unsigned long long)r.aUnplaced,
+                  (unsigned long long)r.aGhosts, r.aMass,
+                  kWaterEighths + kPourEighths, r.bExcitedOn, r.bLiveAtFlip,
+                  r.bExcitedOff, r.bDrainTicks, r.bLiveEnd, r.bMass, kWaterEighths);
+  }
+  SetCurrentTuning(saved);
+
+  const Arm& r = arm[1];
+  const bool aOff = r.aExcited == 0 && r.aLiveMax == 0;
+  const bool aPour = r.aPlaced == kPourEighths && r.aUnplaced == 0 && r.aGhosts == 4;
+  const bool aMass = r.aMass == kWaterEighths + kPourEighths;
+  const bool bOn = r.bExcitedOn > 0 && r.bLiveAtFlip > 0;
+  const bool bOff = r.bExcitedOff == 0 && r.bLiveEnd == 0 && r.bDrainTicks > 0 &&
+                    r.bDrainTicks <= drainDeadline;
+  const bool bMass = r.bMass == kWaterEighths;
+  const bool det = arm[0].hash == arm[1].hash && arm[0].aMass == arm[1].aMass &&
+                   arm[0].bMass == arm[1].bMass &&
+                   arm[0].bDrainTicks == arm[1].bDrainTicks;
+  const bool ok = aOff && aPour && aMass && bOn && bOff && bMass && det;
+  std::printf("fluid off: %s (A off: %u excited / %u live, pour %llu of %u "
+              "eighths as CA, mass %u of %u; B on: %u excited, %u live at the "
+              "flip; off: %u excited, drained in %d tick(s) (limit %d), mass %u "
+              "of %u; world hash %s)\n",
+              ok ? "PASS" : "FAIL", r.aExcited, r.aLiveMax,
+              (unsigned long long)r.aPlaced, kPourEighths, r.aMass,
+              kWaterEighths + kPourEighths, r.bExcitedOn, r.bLiveAtFlip,
+              r.bExcitedOff, r.bDrainTicks, drainDeadline, r.bMass,
+              kWaterEighths, det ? "matches" : "DIVERGED");
+  detail = Format("A %u ex/%u live, pour %llu/%u, mass %u; B %u ex, %u live@flip, "
+                  "drain %d t, mass %u, det %s",
+                  r.aExcited, r.aLiveMax, (unsigned long long)r.aPlaced,
+                  kPourEighths, r.aMass, r.bExcitedOn, r.bLiveAtFlip,
+                  r.bDrainTicks, r.bMass, det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- fluid-onwater -------------------------------------------------------
 // PARTICLE WATER MEETS SETTLED WATER — the one question none of the five lab
 // pour scenes can ask, because every one of them pours into an EMPTY basin.
@@ -7505,6 +7734,7 @@ const std::vector<Gate>& SimGates() {
       {"fluid-identity", "sim", {}, false, GateFluidIdentity},
       {"fluid-settle", "sim", {}, false, GateFluidSettle},
       {"fluid-excite", "sim", {}, false, GateFluidExcite},
+      {"fluid-off", "sim", {}, false, GateFluidOff},
       {"fluid-onwater", "sim", {}, false, GateFluidOnWater},
       {"fluid-spout", "sim", {}, false, GateFluidSpout},
       {"debris-float", "sim", {}, false, GateDebrisFloat},

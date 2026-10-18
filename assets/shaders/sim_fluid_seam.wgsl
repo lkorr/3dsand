@@ -192,8 +192,9 @@ const PT_KERNEL : u32 = PT_K_FLUIDSEAM;
 // floodMax 3221 vs 863). That is sim_stream.wgsl's to retune; see DESIGN.md.
 // The MAP's water only (the still record's word [1]), not a stream that
 // sim_stream.wgsl adopted (its columns are that kernel's to judge) and not a
-// POOL stream's (its ledger is exact). Not another liquid's particles either
-// (acid splashed into a river stays acid). RULE 1: pure reads of the still
+// POOL stream's (its ledger is exact). Another liquid's particles only where
+// they are BURIED in the held water (consumeApply's dilution arm, 2026-10-18):
+// acid splashed onto a river and settling there stays acid. RULE 1: pure reads of the still
 // table, the voxels and the particle's own state; a particle kills only
 // itself. RULE 2: both only remove work.
 // STILL_WORDS / stillIndex / stillTag / STILL_UNHELD / stillLevel8 are
@@ -274,6 +275,10 @@ fn seamBreachEdge(c : vec3<i32>, mat : u32) -> bool {
 // pool under its bed carries the column's record too), and is left to the
 // solver as anywhere else.
 const SEAM_ABSORB_DEPTH : i32 = 8;
+// How deep under a held surface's top cell another liquid's buried particles
+// are diluted (consumeApply), in cells: the deepest authored river (the
+// default map's are 30 voxels) and a margin.
+const SEAM_DILUTE_DEPTH : i32 = 48;
 // exciteScratch [7]: DIAGNOSTIC, never read by the sim -- CUMULATIVE eighths
 // held water absorbed (consumeApply). `held-splash` reads it.
 const EX_ABSORBED : u32 = 7u;
@@ -890,6 +895,15 @@ fn seamExcitedEighths(c : vec3<i32>) -> u32 {
   if (bm == 0u) { return 0u; }
   return u32(clamp(fluidGridR[seamNodeBase(bm, c)] >> 10u, 0, 8));
 }
+// The raw Q10 node mass at cell c (last substep of last tick), 0 where the
+// chunk has no MPM block. THE SPOUT JET's drop test.
+fn seamNodeMassAt(c : vec3<i32>) -> i32 {
+  let wsl = chunkSlotOf(worldChunkOf(c), T.origin);
+  if (wsl == SLOT_NONE) { return 0; }
+  let bm = atomicLoad(&fluidBlockMapR[wsl]);
+  if (bm == 0u) { return 0; }
+  return fluidGridR[seamNodeBase(bm, c)];
+}
 
 // A neighbour cell as the geometry sees it: .x = 1 if the cell BLOCKS flow
 // (solid, powder, an out-of-window cell, or a liquid this seam does not own),
@@ -1051,6 +1065,27 @@ fn spoutJetCode(c : vec3<i32>, mat : u32) -> u32 {
   if (!seamIsMat(u, mat)) { u = u + up; }
   if (!seamIsMat(u, mat)) { return 0u; }   // the push was the other axis'
   let head = spoutHead(u, back, c.y, mat);
+  // A REAL HEAD, the mouth's own bound (SPOUT_MOUTH_HEAD). Trigger (a) asks
+  // only for an air VOXEL below, and over a flood that voxel is air with the
+  // flood's particles in it: a cell lying on the moving water, its "source"
+  // the flood's own surface beside it, one or two rows over it. Seeded at
+  // rest (every excite until the jet) that re-wake is dissipative; thrown,
+  // each one handed the body a fresh Torricelli kick and settle/excite became
+  // an energy pump. MEASURED, `flow-measure` R (a dam breach that must
+  // relax): 1.97 cells/s left at the gap/ring after 900 ticks with the throw,
+  // 0.37 at chance 0. A spout has water STANDING over its lip -- a reservoir
+  // behind a dam, a tank behind a hole -- and a drained or equalised breach
+  // has none, so the throw stops when the head does; a cell under it still
+  // excites, at rest, as before.
+  if (head < SPOUT_MOUTH_HEAD) { return 0u; }
+  // ...AND A REAL DROP: no meaningful MPM mass in the cell it falls into (the
+  // solver's own floor, SEAM_MASS_MIN, not seamExcitedEighths' whole
+  // particles: sparse spray rounds to 0 eighths). The head alone still threw
+  // at the seam's edge, a settled column standing 3+ rows beside a cell lying
+  // on the particle body -- `flow-measure` attribution: 380 thrown births in
+  // the tail (+600..900), every one from this trigger. The jet carries ~12%
+  // of a spout's throw (the mouth the rest), so this costs a spout little.
+  if (seamNodeMassAt(c + vec3<i32>(0, -1, 0)) >= SEAM_MASS_MIN) { return 0u; }
   return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | dir;
 }
 
@@ -1083,9 +1118,14 @@ fn spoutHead(u0 : vec3<i32>, back : vec3<i32>, cy : i32, mat : u32) -> i32 {
 // head is what makes it a spout and not a film on a ramp: `ca-slope-hybrid`'s
 // sealed ramp, the reason the perch trigger is off, has no water standing
 // over its treads. Then it is excited with a throw toward the drop, rolled
-// like the fall cells. It is still a subset of what settleCheck's stability
-// veto refuses (that tests the FULL perch predicate), so the hysteresis
-// guarantee holds: settle can never build what this takes. 0 = not a mouth.
+// like the fall cells. NOT a strict subset of settleCheck's stability veto:
+// the veto's perch predicate counts excited mass in the drop as water, this
+// asks for air VOXELS, because a pouring spout's drop is full of its own
+// stream (the mass-aware test measured 55 thrown particles on `fluid-spout`,
+// +0.24 cells for a +0.50 floor). So settle can rebuild a mouth cell beside a
+// particle-filled drop and this takes it again; what bounds that is the head
+// -- each take drains the reservoir, and under SPOUT_MOUTH_HEAD it stops.
+// 0 = not a mouth.
 const SPOUT_MOUTH_HEAD : i32 = 3;
 fn spoutMouthCode(c : vec3<i32>, mat : u32) -> u32 {
   if (spoutChanceQ() == 0u || spoutGainQ() == 0) { return 0u; }
@@ -1310,7 +1350,10 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
   let pe = pageTable[ci];
   let paged = (pe & PT_SENTINEL_BIT) == 0u;
   let pageBase = pe * CHUNK_VOL;
-  for (var s = 0u; s < 16u && paged; s++) {
+  // THE MASTER SWITCH OFF (seamMpmOff, sim.fluidEnabled 0): no cell is looked
+  // at, so EVERY trigger below -- fall, spout, perch, step, drain shell and
+  // progressive wake -- takes nothing and no particle can be born here.
+  for (var s = 0u; s < 16u && paged && !seamMpmOff(); s++) {
     // LANE-CONSECUTIVE cells, so a warp's loads coalesce. It was li * 16 + s,
     // a 64-byte stride between lanes; measured on a forest fire (thousands of
     // awake smoke chunks, not one liquid cell among them) the pass cost
@@ -2049,6 +2092,42 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
       fluidParticles[gid.x].attr = 0u;
       return;
     }
+  } else {
+    // ...AND DILUTES ANOTHER LIQUID'S PARTICLES BURIED IN IT (ticket
+    // 2026-10-17_00-04-26). A particle of a DIFFERENT liquid inside a settled
+    // cell of a held column's water, at or under its top cell: the reservoir
+    // refilled the column ON it (the overlap again), so it is mixed INTO a
+    // body the window holds a few metres of, and the river carries it off,
+    // diluted to nothing. Nothing else could ever take it: a submerged cell
+    // is solid to the solver (sim_fluid FSOLID_SUBM), so it is calm and
+    // stays put; the CA sees the cell as water, so it never reacts; and a
+    // settle walk must not merge it into the water (TWO LIQUIDS DO NOT MERGE)
+    // and has nowhere to carry it when the column holds buried water
+    // particles too. Measured, `acid-pour` without this arm: 18k of the 79k
+    // eighths poured stuck as live acid inside the river for good, their
+    // chunks awake. Acid that SETTLES on the river (a voxel over or at the
+    // surface) is not touched: it sinks through the water and eats the bed,
+    // as acid does, and is spent doing it. SEAM_DILUTE_DEPTH bounds it to the
+    // river itself (a cave pool under the bed carries the column's record
+    // too). Counted as an absorption, so the books still balance.
+    let vw = voxWordAt(cell);
+    let vm = voxMat(vw);
+    // (No material-table read: a held record names a liquid by construction,
+    // so seamHeldT8 matching the cell's material is the liquid test, and this
+    // pass's row binds no `materials`.)
+    if (vm != MAT_AIR && vm != mat) {
+      let ht = seamHeldT8(cell.x, cell.z, vm);
+      if (ht != STILL_UNHELD) {
+        let yt = (ht - 1) >> 3u;
+        if (cell.y <= yt && cell.y >= yt - SEAM_DILUTE_DEPTH) {
+          atomicAdd(&fluidArgs[FA_CONSUMED], fpFullness(p.attr));
+          atomicAdd(&fluidArgs[FA_DEAD], 1u);
+          atomicAdd(&exciteScratch[EX_ABSORBED], fpFullness(p.attr));
+          fluidParticles[gid.x].attr = 0u;
+          return;
+        }
+      }
+    }
   }
   let bm = atomicLoad(&fluidBlockMapR[csl]);
   if (bm == 0u) { return; }
@@ -2496,7 +2575,7 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
       // second pass: the walk is the expensive part and both answers come off
       // one load. The `asleep` guard above covers this too, so a world with no
       // particles still costs nothing (rule 2).
-      if (SEAM_STUCK_TICKS > 0u && (cw >> 16u) >= SEAM_STUCK_TICKS) { nf += 1u; }
+      if (seamStuckTicks() > 0u && (cw >> 16u) >= seamStuckTicks()) { nf += 1u; }
     }
   }
   ssPart[li] = n;
@@ -2567,13 +2646,15 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   // reach any chunk in its own column — the test drops the `dw.y` term
   // entirely and refuses to share an (x,z) column with ANY pick, forced or not.
   var forced = 0u;
+  // (seamStuckTicks / seamForceBlocks: the shipped knobs, or THE MASTER
+  // SWITCH's drain values while MPM is off -- see seamMpmOff.)
   for (var t = 0u; t < 256u && count < SETTLE_MAX &&
-                   forced < SEAM_FORCE_BLOCKS; t++) {
+                   forced < seamForceBlocks(); t++) {
     if (ssForce[t] == 0u) { continue; }
     for (var s = t * span; s < (t + 1u) * span && count < SETTLE_MAX &&
-                           forced < SEAM_FORCE_BLOCKS; s++) {
+                           forced < seamForceBlocks(); s++) {
       let cw = atomicLoad(&fluidCalm[s]);
-      if (SEAM_STUCK_TICKS == 0u || (cw >> 16u) < SEAM_STUCK_TICKS) { continue; }
+      if (seamStuckTicks() == 0u || (cw >> 16u) < seamStuckTicks()) { continue; }
       // A slot the calm phase already took is settling normally this tick;
       // leave it alone rather than converting its pick into a forced one.
       if ((atomicLoad(&settleScratch[SP_MARK + s]) & MARK_SETTLING) != 0u) {
@@ -2802,6 +2883,22 @@ fn seamSetCalm(slot : u32, calm : u32) {
 fn seamResetAge(slot : u32) {
   atomicStore(&fluidCalm[slot], atomicLoad(&fluidCalm[slot]) & CALM_MASK);
 }
+// ---- THE MASTER SWITCH: sim.fluidEnabled (MPM water in the world) ---------
+// support.cpp SubmitTick packs it into TickParams._padSplash2 bit 0, SET = MPM
+// OFF (so a TickParams built anywhere else reads as ON). OFF: exciteDetect looks
+// at no cell, and every particle still alive is DRAINED back into CA voxels by
+// the force-settle path above with its gates opened: a slot is a forced
+// candidate after SEAM_DRAIN_TICKS ticks holding particles instead of
+// SEAM_STUCK_TICKS, and up to SETTLE_MAX forced blocks are taken per tick
+// instead of SEAM_FORCE_BLOCKS. The forced walk is the ordinary all-or-nothing
+// walk (mass conserved by construction) with the excite veto skipped AND its
+// floor test lifted (settleColumn): water at rest and water in flight alike
+// become CA liquid where they stand, and the CA carries on from there.
+// ON, every value below is the shipped one, so the switch is an identity.
+const SEAM_DRAIN_TICKS : u32 = 2u;
+fn seamMpmOff() -> bool { return (T._padSplash2 & 1u) != 0u; }
+fn seamStuckTicks() -> u32 { return select(SEAM_STUCK_TICKS, SEAM_DRAIN_TICKS, seamMpmOff()); }
+fn seamForceBlocks() -> u32 { return select(SEAM_FORCE_BLOCKS, SETTLE_MAX, seamMpmOff()); }
 var<workgroup> wgFill : array<u32, 768>;   // [col*3 + y/8], nibble (y%8)*4
 var<workgroup> wgBlk : array<u32, 256>;    // bit y = level y blocks flow
 // bit y = level y is BYTE-IDENTICAL to the voxel already there: this settle
@@ -2819,6 +2916,15 @@ fn wgSameAt(col : u32, y : i32) -> bool {
   return (wgSame[col] & (1u << u32(y))) != 0u;
 }
 
+// One settling cell's bin: (eighths, packed identity). Cells of the settling
+// block's own 16 rows only (the spill rows above have no bins).
+fn settleBinAt(listIdx : u32, c : vec3<i32>) -> vec2<u32> {
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
+  return vec2<u32>(atomicLoad(&settleScratch[b]), atomicLoad(&settleScratch[b + 1u]));
+}
+
 fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
                 write : bool, rec : bool, col : u32, force : bool) -> bool {
   // THE FORCED WALK IS THE SAME WALK, ONLY TALLER. A submerged column's own 24
@@ -2834,6 +2940,7 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
   var poolMatStain = 0u; // packed identity of the pooled content
   for (var y = 0; y <= yTop; y++) {
     var blocked = y == yTop;               // the spill ceiling ends the walk
+    var foreign = false;                   // settled liquid of another material
     var w = 0u;
     var idx = PT_NO_WORD;
     if (y < yTop) {
@@ -2853,6 +2960,28 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       }
       let mat = voxMat(w);
       if (mat != MAT_AIR && !seamLiquid(mat)) { blocked = true; }
+      // TWO LIQUIDS DO NOT MERGE (ticket 2026-10-17_00-04-26). A cell already
+      // holding settled liquid of ANOTHER material than the content arriving
+      // in it -- the pool carried up from below, or this cell's own bin -- is
+      // FOREIGN to that content: the walk leaves it exactly as it is and
+      // carries the content up THROUGH it (the FOREIGN arm below), to the
+      // first cell that can hold it -- the free surface, where buried mass
+      // belongs (the forced walk's rule). It used to be an open cell, and the
+      // walk's identity is a running max: acid (id 13) settling in a river
+      // (water, id 5) re-placed the river cell it landed in AND every water
+      // cell above it in the column as ACID, and the held river's reservoir
+      // refilled the water. Measured, `acid-pour` before this: 9,840 cells of
+      // acid poured, 33,856 standing in the world 600 ticks later, 53,707 bed
+      // cells eaten under the river. Now a settle writes only the eighths it
+      // was given, as the material they were (the CA's density displacement
+      // then sinks denser acid back through the water, a cell at a time).
+      // One liquid on itself -- every water-only scene -- never reaches it.
+      if (mat != MAT_AIR && !blocked) {
+        var fb = vec2<u32>(0u, 0u);
+        if (y < 16) { fb = settleBinAt(listIdx, base + vec3<i32>(cx, y, cz)); }
+        foreign = (fb.x > 0u && (fb.y >> 16u) != mat) ||
+                  (pool > 0u && (poolMatStain >> 16u) != mat);
+      }
       // An unmapped word can only mean the coverage guarantee failed (the
       // walk stays inside the settling chunk + its materialized N26 ring);
       // treating it as a blocker refuses the block instead of dropping mass
@@ -2889,6 +3018,35 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       }
       continue;
     }
+    // FOREIGN: another liquid's settled cell (TWO LIQUIDS DO NOT MERGE,
+    // above). Untouched -- not written, not counted, recorded to the
+    // stability test as the unchanged fill it is -- and the content passes
+    // up through it: the cell's own bin joins the pool when it is the pool's
+    // material (or starts it), and the pool goes on to the next cell, which
+    // rests on this one. Refused only where three materials would meet in
+    // one pool, or where the bin is the cell's OWN liquid buried under a
+    // foreign pool -- neither has one right answer, and a refusal leaves
+    // the particles as they are.
+    if (foreign) {
+      if (y < 16) {
+        let fb = settleBinAt(listIdx, base + vec3<i32>(cx, y, cz));
+        if (fb.x > 0u) {
+          let bm = fb.y >> 16u;
+          if (bm == voxMat(w) || (pool > 0u && bm != (poolMatStain >> 16u))) {
+            if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
+            return false;
+          }
+          if (pool == 0u) { poolMatStain = fb.y; } else { poolMatStain = max(poolMatStain, fb.y); }
+          pool += fb.x;
+        }
+      }
+      if (rec && y < SETTLE_LEVELS) {
+        wgFill[col * 3u + u32(y) / 8u] |= (voxState(w) + 1u) << ((u32(y) % 8u) * 4u);
+        wgSame[col] |= 1u << u32(y);
+      }
+      floorOk = true;
+      continue;
+    }
     // Open cell: pool its content, then place bottom-first as we walk. A
     // cell's own binned + existing eighths join the pool at its own height,
     // and the pool drains into the LOWEST open cells — that is the
@@ -2909,8 +3067,15 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     let mat = voxMat(w);
     var existing = 0u;
     if (mat != MAT_AIR) { existing = voxState(w) + 1u; }
+    // An EMPTIED pool carries no identity up: the content placed from here is
+    // this cell's own (a different liquid meeting a non-empty pool took the
+    // FOREIGN arm above). Without the reset the running max
+    // relabelled every settled cell above the first higher id it passed --
+    // and the UNTOUCHED test below assumes exactly this (nw == w).
+    if (pool == 0u) { poolMatStain = 0u; }
     // Existing settled water keeps its identity; binned content brings its
-    // own. Max keeps the pick deterministic when the two differ.
+    // own. Max keeps the pick deterministic when the two differ (the same
+    // liquid with a different stain).
     var idHere = packed;
     if (existing > 0u) {
       idHere = max(idHere, (mat << 16u) | (voxStainAmt(w) << 3u) |
@@ -2933,7 +3098,12 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       atomicSub(&fluidArgs[FA_SETTLED], existing);
       atomicSub(&fluidArgs[FA_SETWROTE], existing);   // mass books, cumulative
     }
-    if (pool > 0u && !floorOk) {
+    // THE MASTER SWITCH's drain (seamMpmOff) lifts this ONE test for a forced
+    // walk: water in flight is written where it is, as CA liquid, and the CA
+    // drops it. The refusal exists because excite would take an unsupported
+    // cell straight back (the fall trigger); with MPM off nothing can, and a
+    // sealed box's spray would otherwise hold its block as particles forever.
+    if (pool > 0u && !floorOk && !(force && seamMpmOff())) {
       if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
       return false;
     }

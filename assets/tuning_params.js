@@ -358,6 +358,7 @@ const TUNING_PARAMS = {
   'sim.fluidExciteStep':{t:'i',def:2,min:0,max:8,wgsl:'TUNE_FLUID_EXCITE_STEP'},
   'sim.fluidSpoutGain':{t:'f',def:0.3,min:0,max:1},
   'sim.fluidSpoutChance':{t:'f',def:0.6,min:0,max:1},
+  'sim.fluidEnabled':{t:'i',def:1,min:0,max:1},
   'sim.fluidSettledMass':{t:'f',def:1,min:0,max:2,wgsl:'TUNE_FLUID_SETTLED_MASS'},
   'sim.fluidSubmergedSolid':{t:'i',def:1,min:0,max:1,wgsl:'TUNE_FLUID_SUBMERGED_SOLID'},
   'sim.fluidSettleEps':{t:'f',def:6,min:0.05,max:20,wgsl:'TUNE_FLUID_SETTLE_EPS'},

@@ -8126,6 +8126,7 @@ int main(int argc, char** argv) {
     ui.fSprayDensity     = fs.fluidSprayDensity;
     ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
     ui.fExciteMode       = fs.fluidExciteMode;
+    ui.fMpmEnabled       = fs.fluidEnabled != 0;
     ui.windGasScale      = fs.windGasScale;
     ui.windPartScale     = fs.windPartScale;
     ui.windDragRef       = fs.windDragRef;
@@ -15390,6 +15391,7 @@ int main(int argc, char** argv) {
           ui.fSprayDensity     = fs.fluidSprayDensity;
           ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
           ui.fExciteMode       = fs.fluidExciteMode;
+          ui.fMpmEnabled       = fs.fluidEnabled != 0;
           ui.windGasScale      = fs.windGasScale;
           ui.windPartScale     = fs.windPartScale;
           ui.windDragRef       = fs.windDragRef;
@@ -20732,6 +20734,15 @@ int main(int argc, char** argv) {
       // A slider that recompiled every shader on each frame of a drag would be
       // unusable, which is the whole reason they are on the tick stream and
       // are NO_WGSL rows of tuning_params.def.
+      // The MPM master switch (sim.fluidEnabled): same shape as the wind
+      // latch below, for the same reason -- it rides TickParams._padSplash2,
+      // so the next tick sees it and nothing recompiles.
+      if (ui.fluidEnableDirty) {
+        ui.fluidEnableDirty = false;
+        Tuning t = CurrentTuning();
+        t.sim.fluidEnabled = ui.fMpmEnabled ? 1 : 0;
+        SetCurrentTuning(t);
+      }
       if (ui.windTuningDirty) {
         ui.windTuningDirty = false;
         Tuning t = CurrentTuning();

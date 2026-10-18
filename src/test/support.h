@@ -183,6 +183,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 bool vizActive = false,
                 const IVec3* mirrorChunk = nullptr);
 
+// ---- THE MPM MASTER SWITCH's CPU ledger (sim.fluidEnabled 0) -------------
+// Cumulative since process start, never cleared (a gate differences it): the
+// eighths SubmitTick turned from fluid spawn ops into CA cell ops, the eighths
+// it could not place because their cell was not resident, and the ghost ops
+// it dropped. A cell op the GPU refuses (its cell was not air) is not visible
+// here; the gate that cares audits the voxels.
+struct MpmOffStats {
+  uint64_t eighthsPlaced = 0;
+  uint64_t eighthsUnplaced = 0;
+  uint64_t ghostsDropped = 0;
+};
+const MpmOffStats& GetMpmOffStats();
+
 // ---- THE DRAFT BOXES (audit DJ-1, 2026-10-14; DESIGN.md "Drafts") ----------
 // WHERE A PLAYER'S SHELTER BOX GOES: a pure function of the player's chunk on
 // a FIXED WORLD LATTICE -- snapped to EVEN chunks, so the box moves (and
