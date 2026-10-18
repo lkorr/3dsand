@@ -18263,7 +18263,8 @@ where you hear from either (§12b, "The ears are on the character").
   goes quiet, because the pending bit outlives the dirty flag. It used to be
   every tick a chunk was written: 4.6 ms of the slope pour's tick and 10.0 ms
   of the dam breach's (tickets 2026-10-16_11-14-41 / 2026-10-17_21-03-25;
-  `--perf dam` farField at a cadence of 4: 7.8 ms, of 16: 4.5 ms — a wet chunk
+  `--perf dam` farField at a cadence of 4: 7.8 ms, of 8: 6.6 ms, of 16: 4.5 ms
+  — a wet chunk
   is rewritten every few ticks, not every tick, so 4 barely bites). A settled world selects nothing and dispatches nothing — and re-derives
   from the LIVE voxel grid every cascade cell whose sample point falls in a
   chunk that changed. It samples the identical center voxel the sieve does, so

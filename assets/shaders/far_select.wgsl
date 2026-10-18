@@ -53,7 +53,7 @@
 // at the 30 Hz tick, so the cascade's image of running water (drawn past the
 // ~20 m handoff) lags it by at most ~0.25 s. Measured on --perf dam (ticket
 // 21-03-25's breach, farField ms/tick): every tick 10.0, every 4th 7.8, every
-// 16th 4.5 -- a wet chunk is rewritten every few ticks, not every tick, so a
+// 8th 6.6, every 16th 4.5 -- a wet chunk is rewritten every few ticks, not every tick, so a
 // cadence of 4 barely bites. 8 is the middle, chosen for the handoff seam: a
 // flood front moving ~1 m/s would stand ~0.25 m apart across it.
 const FAR_DOWN_EVERY : u32 = 8u;

@@ -935,7 +935,9 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
                             kMatGlass});
     }
   const bool preYard = validAt(reskin.x + 1, reskin.z + 1);
-  for (uint32_t t = 1; t <= 4; t++) {
+  // 4 + kFarDownEvery: an edit reaches the cascades within the far downsample
+  // cadence (world.h kFarDownEvery), not necessarily on the tick it lands.
+  for (uint32_t t = 1; t <= 4 + kFarDownEvery; t++) {
     std::vector<BrushOp> ops;
     if (t == 1) {
       ops.push_back({crater.x, crater.y, crater.z, 3, kMatAir, 1u, 0, 0});
@@ -1281,7 +1283,7 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
     const Feat& k = feats[ci];
     // Radius 1 one voxel over the base: the plant's voxels, never the ground
     // two under the centre.
-    for (uint32_t tk = 1; tk <= 4; tk++) {
+    for (uint32_t tk = 1; tk <= 4 + kFarDownEvery; tk++) {
       std::vector<BrushOp> ops;
       if (tk == 1) ops.push_back({t.x, t.top + 2, t.z, 1, kMatAir, 1u, 0, 0});
       SubmitTick(ctx, world, sim, tk, seed, ops, {}, {}, false, dChunk, false,
@@ -1436,7 +1438,9 @@ Status GateFarLayer(Ctx& c, std::string& detail) {
           put(v, x, yo, z, oil, 7u);
     tick(v);
   }
-  for (int i = 0; i < 3; i++) tick({});
+  // + kFarDownEvery: the last of the oil reaches the cascades within the far
+  // downsample cadence (world.h), not on the tick it was written.
+  for (int i = 0; i < 3 + (int)kFarDownEvery; i++) tick({});
   ctx.WaitIdle();
 
   // ---- the live grid over the tub, one chunk at a time ---------------------

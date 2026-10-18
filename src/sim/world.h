@@ -4389,6 +4389,13 @@ static_assert((uint64_t)kFarLevels * kFarVox < (1ull << 32),
 static_assert(((uint64_t)(kFarLevels - 1) << kFarSlotShift) < (1ull << 32),
               "fill-queue packing (level-1)<<kFarSlotShift | slot must fit u32");
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
+// THE FAR DOWNSAMPLE CADENCE (World::farDownState, far_select.wgsl): a chunk
+// that keeps changing is re-downsampled at most every kFarDownEvery ticks, and
+// its last state lands within kFarDownEvery - 1 ticks of its last write. MUST
+// AGREE with far_select.wgsl FAR_DOWN_EVERY (scripts/check_invariants.py); the
+// C++ side reads it only to know how long an edit may take to reach the
+// cascades (the far gates settle that long).
+constexpr uint32_t kFarDownEvery = 8;
 
 // ---- cascade EDIT PATCHES (far-field edit persistence; src/sim/faredits.h) --
 // The sieve fills a level chunk from pristine procgen, which used to un-do the
