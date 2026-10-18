@@ -885,7 +885,7 @@ const RFLAG_GAS : u32 = 8u;
 const RFLAG_GASFAR : u32 = 32u;
 
 // ---- WATER COST PROBES (dev panel, View page, 2026-10-18) ------------------
-// R.flags bits 8..13, written by WriteRenderParams from SetWaterFxProbe
+// R.flags bits 8..19, written by WriteRenderParams from SetWaterFxProbe
 // (support.h). Each bit switches one liquid-shading effect OFF at runtime so
 // the owner can flip it live and compare picture and raymarch ms. A uniform
 // branch keeps its registers, so a probe prices the work, not occupancy --
@@ -898,6 +898,15 @@ const RFLAG_NO_SHEETS : u32 = 2048u;     // waterSideKind: every side face a pla
 // Bits 12..13: traced-reflection step budget shift (0 = TUNE_REFLECTION_STEPS,
 // 1 = half, 2 = quarter, 3 = eighth).
 const RFLAG_REFL_STEP_SHIFT : u32 = 12u;
+// Bits 14..19: the BASE water shade's per-pixel terms, each replaced by a
+// constant so its own cost shows (dev panel "base shade" probes). The picture
+// is wrong with these on, on purpose: they are a measurement, not a look.
+const RFLAG_NO_OPENNESS : u32 = 16384u;   // waterOpenness -> 1 (12-read ring)
+const RFLAG_NO_DEPTH : u32 = 32768u;      // waterDepthM -> 1 m (column walk)
+const RFLAG_NO_SLOPE : u32 = 65536u;      // waterNormal's 4 liquidColumn reads -> flat
+const RFLAG_NO_SOLUTE : u32 = 131072u;    // solPathLook -> body optics, no walk
+const RFLAG_NO_RIPPLE : u32 = 262144u;    // waterWaveNormal: no current/ripple bands
+const RFLAG_NO_VEIL : u32 = 524288u;      // writeWaterVeil: no 7-word store
 fn reflStepBudget() -> i32 {
   return TUNE_REFLECTION_STEPS >> ((R.flags >> RFLAG_REFL_STEP_SHIFT) & 3u);
 }
@@ -10695,6 +10704,7 @@ fn liquidColumn(c : vec3<i32>) -> f32 {
 // sensitive to; resolution at 2 m is not, because tanh has already saturated.
 // A linear 26-tap probe would spend 18 extra taps buying nothing.
 fn waterDepthM(cell : vec3<i32>) -> f32 {
+  if ((R.flags & RFLAG_NO_DEPTH) != 0u) { return 1.0; }
   var d = 0;
   var step = 1;
   for (var i = 0; i < 8; i++) {
@@ -10728,6 +10738,7 @@ fn waterDepthM(cell : vec3<i32>) -> f32 {
 //
 // 12 taps on a 2-voxel spacing, primary up-facing water hits only.
 fn waterOpenness(cell : vec3<i32>) -> f32 {
+  if ((R.flags & RFLAG_NO_OPENNESS) != 0u) { return 1.0; }
   var n = 0.0;
   for (var i = 0; i < 12; i++) {
     // Two rings at 2 and 4 voxels: the inner one separates a droplet from a
@@ -11258,10 +11269,16 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 
   // Central differences of the column height across X and Z. dh/dx in voxels
   // per voxel is already a slope, so the normal is (-dh/dx, 1, -dh/dz).
-  let hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0));
-  let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
-  let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
-  let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
+  var hx0 = 0.0;
+  var hx1 = 0.0;
+  var hz0 = 0.0;
+  var hz1 = 0.0;
+  if ((R.flags & RFLAG_NO_SLOPE) == 0u) {
+    hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0));
+    hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
+    hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
+    hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
+  }
   var slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
   // Downhill is where the column heights fall: +x when hx0 > hx1.
   // A held column only (RUNNING WATER'S OWN CURRENT): live water has the measured flow.
@@ -11334,6 +11351,9 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 // sim's flux. `depthM` is the VERTICAL water depth under the hit, metres.
 fn waterWaveNormal(hitP : vec3f, macroSlope : vec2f, depthM : f32, openness : f32,
                    flux : vec2f) -> vec3f {
+  if ((R.flags & RFLAG_NO_RIPPLE) != 0u) {
+    return normalize(vec3f(-macroSlope.x, 1.0, -macroSlope.y));
+  }
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
   let flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
   if (gFlowSlack < 0.0) { gWaveFlow = vec3f(flowMS.x, 1.0, flowMS.y); }
@@ -13784,7 +13804,7 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32,
   o.scatter = baseS;
   let path = max(pathVox, 0.0);
   let span = min(path, LIQ_VIS_M / VOXEL_METERS);
-  if (span <= 0.0) { return o; }
+  if (span <= 0.0 || (R.flags & RFLAG_NO_SOLUTE) != 0u) { return o; }
   // A zero component would make a face division -inf on the near side; a
   // tiny POSITIVE stand-in picks the far face and gives +huge (never taken).
   let rdS = select(rd, vec3f(1e-30), abs(rd) < vec3f(1e-30));
@@ -15301,6 +15321,7 @@ struct FSOut {
 // trace() costs registers in the one place this shader has none.
 fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
                   fogF : f32) {
+  if ((R.flags & RFLAG_NO_VEIL) != 0u) { return; }
   let b = veilBase(fragXY, &R);
   if (b == 0xFFFFFFFFu || b + VEIL_WORDS > arrayLength(&waterVeil)) { return; }
   let k = gVK * (1.0 - fogF);

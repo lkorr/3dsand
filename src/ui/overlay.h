@@ -93,6 +93,9 @@ struct UIState {
   bool wfxNoCaustic = false;   // caustic web on the bed (looking down + lit bed)
   bool wfxNoSheets = false;    // side faces never falling sheets / risers
   int wfxReflShift = 0;        // reflection step budget >> n (0..3)
+  // Base-shade probes: each replaces one per-pixel term with a constant.
+  bool wfxNoOpenness = false, wfxNoDepth = false, wfxNoSlope = false,
+       wfxNoSolute = false, wfxNoRipple = false, wfxNoVeil = false;
   // Effective draw distance in METRES, written by main each frame for the
   // panel readout: the cascade's filled radius normally, the short-range
   // ceiling while the mode is on. Read-only in the UI — it is evidence that

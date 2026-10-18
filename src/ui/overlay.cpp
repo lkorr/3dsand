@@ -2817,9 +2817,37 @@ void Overlay::DrawDevView(UIState& s) {
     ImGui::SetItemTooltip(
         "waterSideKind: every side face of a liquid is a plain wall - no\n"
         "white falling sheet, no riser lit as surface.");
+    ImGui::SeparatorText("base shade (cost only - the look is wrong)");
+    ImGui::Checkbox("openness = 1", &s.wfxNoOpenness);
+    ImGui::SetItemTooltip("waterOpenness: the 12-cell ring around each surface\n"
+                          "cell (how open the water is; scales the waves).");
+    ImGui::Checkbox("depth = 1 m", &s.wfxNoDepth);
+    ImGui::SetItemTooltip("waterDepthM: the walk down the column (up to 8 reads).");
+    ImGui::Checkbox("flat column slope", &s.wfxNoSlope);
+    ImGui::SetItemTooltip("waterNormal: the four neighbour column heights\n"
+                          "(up to 12 reads) that tilt the surface.");
+    ImGui::Checkbox("no solute walk", &s.wfxNoSolute);
+    ImGui::SetItemTooltip("solPathLook: the second walk through the water for\n"
+                          "dissolved matter (blood, brine, ink tint).");
+    ImGui::Checkbox("no ripples / current", &s.wfxNoRipple);
+    ImGui::SetItemTooltip("waterWaveNormal: the flow-field lookup and the ripple\n"
+                          "bands (trig per band). The surface goes mirror-flat.");
+    ImGui::Checkbox("no veil write", &s.wfxNoVeil);
+    ImGui::SetItemTooltip("writeWaterVeil: the 7-word per-pixel store that lets\n"
+                          "mobs and items behind water be tinted. They will look\n"
+                          "un-watered with this on.");
     if (ImGui::Button("all on (shipped look)")) {
       s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = s.wfxNoSheets = false;
+      s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = false;
+      s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = false;
       s.wfxReflShift = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("all off")) {
+      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = s.wfxNoSheets = true;
+      s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = true;
+      s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = true;
+      s.wfxReflShift = 3;
     }
   }
   if (Section("Debug draw")) {

@@ -886,7 +886,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
              (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u) |
              (GasFarRenderActive() ? 32u : 0u) |
              (CurrentTuning().render.horizon ? 128u : 0u) |
-             // Bits 8..13: the dev panel's water cost probes (support.h).
+             // Bits 8..19: the dev panel's water cost probes (support.h).
              WaterFxProbe();
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
