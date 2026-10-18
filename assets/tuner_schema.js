@@ -964,6 +964,7 @@ const TUNING_SCHEMA = [
       {k:'debrisAngularDamping', n:'angular damping', d:'How quickly tumbling debris stops spinning.', step:0.01, u:'/s'},
       {k:'waterLinearDrag', n:'water drag', d:'How hard a liquid resists a rigidbody moving through it - Jolt’s quadratic drag against the submerged frontal area. This is what stops a floating log from wallowing forever and lets it go to sleep; which way it goes in the first place comes from the material’s density against the liquid’s.', step:0.05},
       {k:'waterAngularDrag', n:'water spin drag', d:'How hard a liquid damps a rigidbody’s tumble. Separate axis from the linear drag: a log can be sliding and not rolling.', step:0.05},
+      {k:'waterCurrentWake', n:'current wakes floaters', d:'A floating body (debris, a severed limb, a corpse) that has fallen asleep in water is woken when the current at it is at least this fast, so a river carries what lands in it and a body the current reaches later still drifts. Below it the water counts as still and floaters sleep. 0 = a current never wakes a sleeping floater.', step:0.01, u:'m/s'},
       {k:'terrainFriction', n:'terrain friction', d:'Grip of static terrain collision surfaces.', step:0.01},
       {k:'playerProxyFriction', n:'player friction', d:'Friction of the player capsule against bodies. Kept low so the player does not drag debris around.', step:0.01},
       {k:'explosionImpulseScale', n:'blast impulse', d:'How hard an explosion throws debris — the how-far-does-a-plank-fly knob.', step:0.005},

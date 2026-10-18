@@ -3023,7 +3023,8 @@ class Mob {
   int DeadDryWokeLimb() const { return dryWokeLimb_; }
   // How it was last woken from outside a damage entry point: 1 Jolt active
   // (PreTick), 2 the chunks round it changed, 3 Jolt active after the step
-  // (PostStep), 4 a drying visit wrote something else; 0 = never.
+  // (PostStep), 4 a drying visit wrote something else, 5 a water current
+  // (CurrentWakesDead); 0 = never.
   uint8_t DeadWokeHow() const { return deadWokeHow_; }
   // Limb-ticks FloatLimpLimbs has pushed up, ever (diagnostic, for gates).
   uint32_t FloatedLimbs() const { return floatedLimbs_; }
@@ -4972,6 +4973,15 @@ class Mob {
   // it: the residency window and the version of every cached chunk the body's
   // box overlaps. Equal = nothing around it changed.
   uint64_t DeadWakeKey(World& world) const;
+  // A SLEEPING CORPSE IN RUNNING WATER WAKES (ticket 2026-10-17_20-54-57).
+  // DeadWakeKey only sees the chunks change, and a lake's solved current or
+  // a current primitive moves no voxel, so a corpse that fell asleep afloat
+  // stayed frozen in a river. True when the root limb (or the first limb with
+  // a body) sits in liquid whose current there (sandvox::CurrentOnFloater) is
+  // at least physics.waterCurrentWake -- and the last such wake did not find
+  // the body in this same spot (pinned against a bank: one wake, not one per
+  // stride). Records the wake when it returns true. MobSystem asks on a stride.
+  bool CurrentWakesDead(World& world);
   // Is the rig moving in Jolt? The root limb stands for the island: a jointed
   // ragdoll sleeps and wakes as one.
   bool RigActive() const;
@@ -5835,6 +5845,10 @@ class Mob {
   float tuckHemY_ = 0.0f, tuckMargin_ = 0.0f;
   Vec3 tuckCentre_{};
   bool deadAsleep_ = false;    // see DeadAsleep()
+  // CurrentWakesDead's pinned-body memo: where the last current wake found
+  // the root limb. Derived, never saved.
+  Vec3 currentWokeAt_{};
+  bool currentWoke_ = false;
   uint16_t deadQuiet_ = 0;     // consecutive ticks DeadQuietNow() held
   // Asleep with a passive coat still drying: the tick of the next visit
   // (NextDryTick), and the coat.decayScale it was computed under -- an F5

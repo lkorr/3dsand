@@ -922,6 +922,17 @@ struct Tuning {
     // log stop wallowing and go to sleep instead of bobbing forever.
     float waterLinearDrag = TPD(physics, waterLinearDrag);
     float waterAngularDrag = TPD(physics, waterAngularDrag);
+    // A FLOATER ASLEEP IN A CURRENT WAKES (m/s; ticket 2026-10-17_20-54-57).
+    // The water's velocity is in the drag (Physics::ApplyBuoyancy), so an
+    // AWAKE floater drifts with a river; but a body that came to rest in
+    // still water -- or that the current reached after it slept -- is asleep
+    // in Jolt, and buoyancy never wakes a sleeper (rule 2). Debris
+    // (DebrisSystem::FloatBodies) and corpses (MobSystem's dead branch) look
+    // at their sleepers on a stride and wake one sitting in water whose
+    // current is at least this fast. Below it the water counts as still and
+    // a floater sleeps. A body that a wake carried nowhere (pinned on a bank)
+    // is not woken again where it lies. 0 = currents never wake a sleeper.
+    float waterCurrentWake = TPD(physics, waterCurrentWake);
     float terrainFriction = TPD(physics, terrainFriction);
     float playerProxyFriction = TPD(physics, playerProxyFriction);
     float explosionImpulseScale = TPD(physics, explosionImpulseScale);

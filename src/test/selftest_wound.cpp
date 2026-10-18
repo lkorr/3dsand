@@ -79,6 +79,7 @@
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "game/bodyreg.h"  // heal-restore's optional picture sequence
 #include "gpu/resources.h"  // CreateBuffer, ditto
+#include "sim/currentprim.h"  // float-current: a stream through the basin
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
 #include "phys/floatrho.h"    // corpse-float: the one floating-density rule
@@ -9119,6 +9120,505 @@ Status GateWaterEntry(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// The three body tickets of 2026-10-17 (gates added 2026-10-18)
+// ---------------------------------------------------------------------------
+
+// A pose for a debris body lying flat, turned `yawDeg` about Y, whose lattice
+// box (`dims`, voxels) is centred on `centre`. Turned on purpose: a body
+// within ~20 degrees of the lattice axes settles back into the grid after two
+// seconds asleep (DebrisSystem::SettleBodies), and a log that became voxels
+// would be ground the voxel probe can see -- the opposite of the fixture.
+static BodyTransform LyingPose(Vec3 centre, IVec3 dims, float yawDeg) {
+  const float a = yawDeg * 3.14159265f / 180.0f;
+  const float ca = std::cos(a), sa = std::sin(a);
+  const Vec3 half{0.5f * (float)dims.x, 0.5f * (float)dims.y,
+                  0.5f * (float)dims.z};
+  // R_y(a) applied to the half extent: (x cos + z sin, y, -x sin + z cos).
+  const Vec3 rh{half.x * ca + half.z * sa, half.y, -half.x * sa + half.z * ca};
+  BodyTransform xf{};
+  xf.pos = Vec3{centre.x - rh.x, centre.y - rh.y, centre.z - rh.z};
+  xf.quat[0] = 0.0f;
+  xf.quat[1] = std::sin(0.5f * a);
+  xf.quat[2] = 0.0f;
+  xf.quat[3] = std::cos(0.5f * a);
+  return xf;
+}
+
+static std::vector<DebrisVoxel> SolidBox(IVec3 dims, uint32_t mat) {
+  std::vector<DebrisVoxel> vox;
+  for (int z = 0; z < dims.z; z++)
+    for (int y = 0; y < dims.y; y++)
+      for (int x = 0; x < dims.x; x++)
+        vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 1u, (uint16_t)mat});
+  return vox;
+}
+
+// The cells of a stamped fixture go in over as many ticks as kMaxCellOpsPerTick
+// needs (water-entry's stamp).
+static void StampCells(support::TickRig& rig, const std::vector<CellOp>& cells) {
+  const size_t step = kMaxCellOpsPerTick / 2;
+  for (size_t at = 0; at < cells.size(); at += step) {
+    const size_t end = std::min(cells.size(), at + step);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(cells.begin() + at, cells.begin() + end);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// player-stand-body: standing on a toppled log is standing
+// ---------------------------------------------------------------------------
+// Owner, ticket 2026-10-17_21-33-53: "standing on top of rigidbody objects
+// that are knocked over right now counts for 'in air time' which will knock
+// you over after a few seconds. it should not". The voxel ground probe cannot
+// see a rigid body; ApplyPush (Physics::PlayerPushOut) held the player up and
+// set `grounded`, but AFTER the tick's Update, which had already re-probed the
+// voxels and reported "airborne" to the avatar's air clock. At
+// ragdoll.fallSeconds the clock knocked the player down.
+//
+// The fixture, on THE tick (the rig's own session, made a walking player with
+// an avatar and a capsule proxy): a flat stone pad, a wooden log lying on it
+// turned 35 degrees (so it cannot settle back into the grid and become voxel
+// ground), the player stood on the log's middle with no input for
+// standBodyTicks (default 10 s, over three times ragdoll.fallSeconds). Claims:
+//   * the avatar never goes limp;
+//   * the player is still ON the log at the end (feet within 1.5 voxels of its
+//     top, the log under them) -- what held them up was the body, not a fall
+//     through to the pad;
+//   * `grounded` after the tick's Update read true on >= standBodyGroundedPct
+//     of the ticks (Player::bodySupport carries the push into it).
+Status GatePlayerStandBody(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const uint32_t mStone = MatIdOf(c, "stone"), mWood = MatIdOf(c, "wood");
+  if (!mStone || !mWood) {
+    detail = "stone / wood missing from materials.json";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  c.mobs.Reset();
+  c.debris.Reset();
+  constexpr int R = 12;
+  IVec3 site{};
+  int hMax = 0;
+  std::string siteWhy;
+  if (!FindDryLowSite(c, R, (int)BaselineNumber("corpseFloatMaxGround", 205),
+                      site, hMax, siteWhy)) {
+    detail = "no dry, low site: " + siteWhy;
+    return Status::Fail;
+  }
+  int hLo = hMax;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      hLo = std::min(hLo, World::TerrainHeight(x, z, kDefaultSeed));
+  // A flat stone pad, its top face at `floorTop`, and clear air above it.
+  const int floorTop = hMax + 2;
+  std::vector<CellOp> pad;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = hLo - 1; y <= floorTop + 40; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        pad.push_back({World::SlotCellIndex(cc),
+                       y < floorTop ? PackVoxNew(mStone, 0u) : PackVoxNew(0u, 0u)});
+      }
+  const IVec3 pchunk{site.x >> 4, floorTop >> 4, site.z >> 4};
+  support::TickRig rig(c, 73000u, pchunk);
+  StampCells(rig, pad);
+  support::RunTicks(rig, 20);
+
+  // THE LOG: 30 x 6 x 8 voxels of wood (~860 kg: far past PlayerPushOut's
+  // kick-it-aside floor), lying on the pad.
+  const IVec3 dims{30, 6, 8};
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+  const std::vector<DebrisVoxel> vox = SolidBox(dims, mWood);
+  const BodyTransform xf =
+      LyingPose(Vec3{(float)site.x + 0.5f, (float)floorTop + 0.5f * (float)dims.y + 0.05f,
+                     (float)site.z + 0.5f},
+                dims, 35.0f);
+  const uint64_t log = c.phys.CreateDebrisBodyXf(vox, xf, dens);
+  if (log == 0) {
+    detail = "the log body would not build";
+    return Status::Fail;
+  }
+  c.debris.AdoptBody(log, vox, xf);
+  support::RunTicks(rig, 30);  // the log comes to rest on the pad
+  Vec3 logCom{};
+  c.phys.BodyCenterOfMass(log, logCom);
+  float lmn[3], lmx[3];
+  c.phys.BodyWorldBoundsM(log, lmn, lmx);
+  const float logTop0 = (float)floorTop + (float)dims.y;
+
+  // THE PLAYER: the rig's session, made a walking body standing on the log.
+  PlayerSession& s = rig.Session();
+  Player& pl = s.player;
+  PlayerAvatar& av = s.avatar;
+  av.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  if (!av.HasDef()) {
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return Status::Fail;
+  }
+  pl.fly = false;
+  pl.vel = Vec3{};
+  pl.pos = Vec3{logCom.x, logTop0 + Player::kHalfY + 0.2f, logCom.z};
+  pl.grounded = true;
+  pl.SnapRender();
+  s.playerBody = c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  c.phys.MovePlayerBody(s.playerBody, pl.pos, kTickDt);
+  const bool spawned = av.Spawn(pl, 0.0f);
+
+  const int kTicks = (int)BaselineNumber("standBodyTicks", 300);
+  int limpAt = -1, groundedTicks = 0, supportTicks = 0;
+  float feetLo = 1e9f, feetHi = -1e9f;
+  std::string trace;
+  for (int i = 0; spawned && i < kTicks; i++) {
+    support::RunTicks(rig, 1);
+    // `bodySupport` after the tick is what the NEXT Update will fold into
+    // `grounded`; `grounded` after the tick has the push's own write on top
+    // of Update's, so it is the support count that says the carry happened.
+    if (pl.grounded) groundedTicks++;
+    if (pl.bodySupport) supportTicks++;
+    const float feet = pl.pos.y - Player::kHalfY;
+    feetLo = std::min(feetLo, feet);
+    feetHi = std::max(feetHi, feet);
+    if (av.Ragdolled() && limpAt < 0) limpAt = i;
+    if (i % 30 == 0)
+      trace += Format(" %.1f%s", feet, av.Ragdolled() ? "L" : "");
+  }
+  Vec3 logEnd{};
+  const bool logThere = c.phys.BodyCenterOfMass(log, logEnd);
+  const float feetEnd = pl.pos.y - Player::kHalfY;
+  const float dxz = std::sqrt((pl.pos.x - logEnd.x) * (pl.pos.x - logEnd.x) +
+                              (pl.pos.z - logEnd.z) * (pl.pos.z - logEnd.z));
+  av.Despawn();
+  c.phys.RemoveBody(s.playerBody);
+  s.playerBody = 0;
+  pl.fly = true;
+  c.mobs.Reset();
+  c.debris.Reset();
+  PrepareWorld(c);
+
+  const float pct = kTicks > 0 ? 100.0f * (float)supportTicks / (float)kTicks : 0.0f;
+  const float minPct = (float)BaselineNumber("standBodyGroundedPct", 90);
+  const bool onLog = logThere && std::fabs(feetEnd - logTop0) <= 1.5f && dxz < 12.0f;
+  const bool ok = spawned && limpAt < 0 && onLog && pct >= minPct;
+  detail = Format(
+      "site [%s] pad top y%d, log top y%.0f (bounds y%.1f..%.1f) | %s: limp %s, "
+      "feet end y%.2f (lowest %.2f, highest %.2f), %.1f vox from the log's "
+      "centre, body support %d/%d ticks (%.0f%%, want >= %.0f%%), grounded "
+      "after the push %d; feet every 30:%s",
+      siteWhy.c_str(), floorTop, logTop0, lmn[1] / kVoxelMeters,
+      lmx[1] / kVoxelMeters, spawned ? "spawned" : "AVATAR DID NOT SPAWN",
+      limpAt < 0 ? "never" : Format("at tick %d", limpAt).c_str(), feetEnd,
+      feetLo, feetHi, dxz, supportTicks, kTicks, pct, minPct, groundedTicks,
+      trace.c_str());
+  std::printf("player-stand-body: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// float-current: a floating limb and a floating corpse drift with the water
+// ---------------------------------------------------------------------------
+// Owner, ticket 2026-10-17_20-54-57: "limbs are frozen when they should be
+// moving in the direction of water current; water current doesnt seem to be
+// moving some physics objects when it should". Physics::ApplyBuoyancy aimed
+// its drag at STILL water (Jolt's fluid velocity was zero), so every rigid
+// body afloat -- debris, a severed limb, a corpse's limbs -- was braked to
+// rest where it went in and fell asleep there; and asleep, nothing woke it.
+//
+// One stamped basin (stone, kDepth of water), a human floated in it whose
+// right arm is cut off first (the arm is DEBRIS, DebrisSystem::FloatBodies;
+// the corpse is a dead Mob, Mob::FloatLimpLimbs: both paths). Three phases on
+// THE tick:
+//   A. STILL, floatCurrentSettleTicks: both come to rest -- the cut arm asleep
+//      in Jolt, the corpse asleep as a corpse -- and drift less than
+//      floatCurrentStillMax over the phase's last 150 ticks.
+//   B. A +x CURRENT (a sim-licensed stream primitive, 0.5 m/s, through the
+//      basin) for floatCurrentTicks: both drift +x at least
+//      floatCurrentMinDrift voxels. They start ASLEEP, so this is also the
+//      claim that a current wakes a sleeper (physics.waterCurrentWake).
+//   C. STILL AGAIN, floatCurrentSettleTicks: both settle back to sleep.
+Status GateFloatCurrent(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  if (!mStone || !mWater) {
+    detail = "stone / water missing from materials.json";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  mobs.Reset();
+  c.debris.Reset();
+  CurrentPrims().Clear();
+  constexpr int R = 26, kDepth = 12;
+  IVec3 site{};
+  int hMax = 0;
+  std::string siteWhy;
+  if (!FindDryLowSite(c, R, (int)BaselineNumber("corpseFloatMaxGround", 205),
+                      site, hMax, siteWhy)) {
+    detail = "no dry, low site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMax + 1;
+  const int waterTop = bedY + kDepth;
+  std::vector<CellOp> basin;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= waterTop + 22; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 ||
+                          std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= bedY || wall) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop) w = (mWater & 0xFFFu) | (7u << 12);
+        basin.push_back({World::SlotCellIndex(cc), w});
+      }
+  const IVec3 pchunk{site.x >> 4, waterTop >> 4, site.z >> 4};
+  support::TickRig rig(c, 74000u, pchunk);
+  StampCells(rig, basin);
+  support::RunTicks(rig, 20);  // the water settles; the mirror fetches it
+
+  const int d = mobs.FindDef("human");
+  if (d < 0) {
+    detail = "no human def";
+    return Status::Fail;
+  }
+  // Upstream of the middle, so the current has room to carry them.
+  const uint64_t id = mobs.Spawn(d, {site.x - 14, waterTop + 3, site.z});
+  Mob* m = id ? mobs.FindMobById(id) : nullptr;
+  if (!m || !m->Def() || m->Def()->rootLimb < 0) {
+    detail = "the human would not spawn";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  const int root = m->Def()->rootLimb;
+  int armLimb = -1;
+  for (int li = 0; li < (int)m->Def()->limbs.size(); li++)
+    if (m->Def()->limbs[li].name == "armU.R") armLimb = li;
+  if (armLimb < 0) {
+    detail = "the human has no armU.R";
+    return Status::Fail;
+  }
+  const uint64_t arm = mobs.LimbBody(id, armLimb);  // kept across the sever
+  mobs.Sever(id, armLimb);
+  if (Mob* mm = mobs.FindMobById(id)) mm->Die();
+
+  struct Track {
+    Vec3 armAt{}, rootAt{};
+    bool armOk = false, rootOk = false;
+  };
+  auto sample = [&]() {
+    Track t;
+    t.armOk = arm != 0 && c.phys.BodyCenterOfMass(arm, t.armAt);
+    const uint64_t rh = mobs.LimbBody(id, root);
+    t.rootOk = rh != 0 && c.phys.BodyCenterOfMass(rh, t.rootAt);
+    return t;
+  };
+  auto flat = [](Vec3 a, Vec3 b) {
+    return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.z - b.z) * (a.z - b.z));
+  };
+  auto corpseAsleep = [&]() {
+    const Mob* mm = mobs.FindMobById(id);
+    return mm != nullptr && mm->DeadAsleep();
+  };
+  const int kSettle = (int)BaselineNumber("floatCurrentSettleTicks", 600);
+  const int kCarry = (int)BaselineNumber("floatCurrentTicks", 180);
+  const float stillMax = (float)BaselineNumber("floatCurrentStillMax", 1.5);
+  const float minDrift = (float)BaselineNumber("floatCurrentMinDrift", 4.0);
+
+  // ---- A. STILL ----
+  Track a150{};
+  for (int i = 0; i < kSettle; i++) {
+    support::RunTicks(rig, 1);
+    if (i == kSettle - 150) a150 = sample();
+  }
+  const Track aEnd = sample();
+  const bool aArmAsleep = aEnd.armOk && !c.phys.IsActive(arm);
+  const bool aCorpseAsleep = corpseAsleep();
+  const float aArmDrift = aEnd.armOk && a150.armOk ? flat(aEnd.armAt, a150.armAt) : 1e9f;
+  const float aRootDrift =
+      aEnd.rootOk && a150.rootOk ? flat(aEnd.rootAt, a150.rootAt) : 1e9f;
+
+  // ---- B. THE CURRENT ----
+  const auto fp0 = c.debris.Floaters();
+  {
+    CurrentPrim st;
+    st.kind = kCurrentPrimStream;
+    st.flags = kCurrentPrimSim;
+    st.x = site.x; st.y = waterTop; st.z = site.z;
+    st.radius = 64;
+    st.reach = 64;
+    st.decayTicks = kCurrentPrimForever;
+    st.ownerId = 0x7E5Au;
+    CurrentPrimAim(st, Vec3{1.0f, 0.0f, 0.0f}, 0.5f);
+    CurrentPrims().Spawn(st);
+  }
+  const Vec3 field = CurrentAtCpuSim(Vec3{(float)site.x, (float)waterTop, (float)site.z});
+  std::string bTrace;
+  for (int i = 0; i < kCarry; i++) {
+    support::RunTicks(rig, 1);
+    if (i % 30 == 29) {
+      const Track t = sample();
+      bTrace += Format(" %.1f/%.1f", t.armOk ? t.armAt.x - aEnd.armAt.x : -99.0f,
+                       t.rootOk ? t.rootAt.x - aEnd.rootAt.x : -99.0f);
+    }
+  }
+  const Track bEnd = sample();
+  const auto fp1 = c.debris.Floaters();
+  const Mob* mb = mobs.FindMobById(id);
+  const int wokeHow = mb ? (int)mb->DeadWokeHow() : -1;
+  const float bArmDrift = bEnd.armOk && aEnd.armOk ? bEnd.armAt.x - aEnd.armAt.x : -1e9f;
+  const float bRootDrift =
+      bEnd.rootOk && aEnd.rootOk ? bEnd.rootAt.x - aEnd.rootAt.x : -1e9f;
+
+  // ---- C. STILL AGAIN ----
+  CurrentPrims().Clear();
+  for (int i = 0; i < kSettle; i++) support::RunTicks(rig, 1);
+  const Track cEnd = sample();
+  const bool cArmAsleep = cEnd.armOk && !c.phys.IsActive(arm);
+  const bool cCorpseAsleep = corpseAsleep();
+
+  mobs.Reset();
+  c.debris.Reset();
+  CurrentPrims().Clear();
+  PrepareWorld(c);
+
+  const bool aOk = aArmAsleep && aCorpseAsleep && aArmDrift <= stillMax &&
+                   aRootDrift <= stillMax;
+  const bool bOk = bArmDrift >= minDrift && bRootDrift >= minDrift;
+  const bool cOk = cArmAsleep && cCorpseAsleep;
+  const bool ok = aOk && bOk && cOk;
+  detail = Format(
+      "site [%s] bed y%d waterline y%d | A still: arm %s drift %.2f, corpse %s "
+      "drift %.2f (max %.1f) | B current %.2f vox/s +x at the middle: arm "
+      "+%.1f, corpse root +%.1f (want >= %.1f); debris %u current wakes, %u "
+      "pinned, %u carried impulses; corpse woke how %d (5 = current); "
+      "arm/root dx every 30:%s | C still: arm %s, corpse %s",
+      siteWhy.c_str(), bedY, waterTop, aArmAsleep ? "asleep" : "AWAKE",
+      aArmDrift, aCorpseAsleep ? "asleep" : "AWAKE", aRootDrift, stillMax,
+      field.x, bArmDrift, bRootDrift, minDrift,
+      fp1.currentWakes - fp0.currentWakes, fp1.currentPinned - fp0.currentPinned,
+      fp1.currentCarried - fp0.currentCarried, wokeHow, bTrace.c_str(),
+      cArmAsleep ? "asleep" : "AWAKE", cCorpseAsleep ? "asleep" : "AWAKE");
+  std::printf("float-current: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// debris-outside: a body that leaves the window lands on the ground out there
+// ---------------------------------------------------------------------------
+// Owner, ticket 2026-10-17_00-12-10: "limb was melted by acid and fell off a
+// mountain, then when progressing down a lod seam to find the limb again its
+// floating in the air". Two halves, one fixture:
+//   * a terrain patch on a window face read everything outside the window as
+//     SOLID, which for a collider is an invisible wall up every side face and
+//     a floor across the bottom one -- a limb rolling off a cliff could come
+//     to rest in mid-air on it. Outside is now the analytic ground
+//     (World::TerrainHeight): solid below it, air above;
+//   * a body that does get outside had nothing to collide with and fell to the
+//     cull, or hung asleep where the window left it. It is now laid on the
+//     analytic ground, asleep, and kept (DebrisSystem::DropOutside).
+// A 3x3x3 wooden block launched at 6 m/s from just inside the +x face, high
+// over the ground, through the face. Claims: it crosses the face (no wall);
+// it is still a body when the arm ends (kept, not culled); it is asleep; and
+// it rests ON the analytic ground under it -- its bottom within
+// [-0.5, debrisOutsideBand] voxels of that ground's top face.
+Status GateDebrisOutside(Ctx& c, std::string& detail) {
+  const uint32_t mWood = MatIdOf(c, "wood");
+  if (!mWood) {
+    detail = "wood missing from materials.json";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  c.mobs.Reset();
+  c.debris.Reset();
+  const IVec3 wo = c.world.WindowOrigin();
+  const int faceX = wo.x * (int)kChunk + (int)kWorldN;  // first x outside
+  const int fz = wo.z * (int)kChunk + (int)kWorldN / 2;
+  const int fx = faceX - 6;
+  // High over everything between the start and well past the face.
+  int hTop = INT_MIN;
+  for (int x = fx - 4; x <= faceX + 40; x++)
+    for (int z = fz - 3; z <= fz + 3; z++)
+      hTop = std::max(hTop, World::TerrainHeight(x, z, kDefaultSeed));
+  const int startY = hTop + 24;
+  const int winTop = wo.y * (int)kChunk + (int)kWorldN;
+  if (startY + 4 >= winTop || startY <= wo.y * (int)kChunk) {
+    detail = Format("the +x face's ground (y%d) leaves no room in the window "
+                    "(y%d..%d)", hTop, wo.y * (int)kChunk, winTop);
+    return Status::Fail;
+  }
+  support::TickRig rig(c, 75000u, IVec3{fx >> 4, startY >> 4, fz >> 4});
+  support::RunTicks(rig, 10);
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+  const std::vector<DebrisVoxel> vox = SolidBox({3, 3, 3}, mWood);
+  BodyTransform xf{};
+  xf.pos = Vec3{(float)fx - 1.0f, (float)startY, (float)fz - 1.0f};
+  xf.quat[3] = 1.0f;
+  const uint64_t h = c.phys.CreateDebrisBodyXf(vox, xf, dens);
+  if (h == 0) {
+    detail = "the block would not build";
+    return Status::Fail;
+  }
+  c.debris.AdoptBody(h, vox, xf);
+  c.phys.SetBodyVelocities(h, Vec3{60.0f, 0.0f, 0.0f}, Vec3{});
+  const auto s0 = c.debris.Settle();
+  const int kTicks = (int)BaselineNumber("debrisOutsideTicks", 90);
+  float maxX = -1e9f;
+  int outAt = -1;
+  std::string trace;
+  for (int i = 0; i < kTicks; i++) {
+    support::RunTicks(rig, 1);
+    Vec3 p{};
+    if (!c.phys.BodyCenterOfMass(h, p)) break;
+    maxX = std::max(maxX, p.x);
+    if (p.x >= (float)faceX && outAt < 0) outAt = i;
+    if (i % 10 == 0) trace += Format(" (%.1f,%.1f)", p.x - (float)faceX, p.y);
+  }
+  Vec3 end{};
+  const bool alive = c.phys.BodyCenterOfMass(h, end);
+  const bool asleep = alive && !c.phys.IsActive(h);
+  float mn[3] = {0, 0, 0}, mx[3] = {0, 0, 0};
+  if (alive) c.phys.BodyWorldBoundsM(h, mn, mx);
+  const float bottom = mn[1] / kVoxelMeters;
+  int ground = INT_MIN;
+  if (alive) {
+    const float lo[2] = {mn[0] / kVoxelMeters, mn[2] / kVoxelMeters};
+    const float hi[2] = {mx[0] / kVoxelMeters, mx[2] / kVoxelMeters};
+    const float xs[5] = {lo[0], hi[0], lo[0], hi[0], 0.5f * (lo[0] + hi[0])};
+    const float zs[5] = {lo[1], lo[1], hi[1], hi[1], 0.5f * (lo[1] + hi[1])};
+    for (int k = 0; k < 5; k++)
+      ground = std::max(ground, World::TerrainHeight(ifloor(xs[k]), ifloor(zs[k]),
+                                                     kDefaultSeed));
+  }
+  const auto s1 = c.debris.Settle();
+  c.debris.Reset();
+  PrepareWorld(c);
+
+  const float band = (float)BaselineNumber("debrisOutsideBand", 2.0);
+  const float above = bottom - (float)(ground + 1);
+  const bool crossed = outAt >= 0 && alive && end.x > (float)faceX;
+  const bool onGround = alive && above >= -0.5f && above <= band;
+  const bool ok = crossed && alive && asleep && onGround;
+  detail = Format(
+      "face x%d, start y%d over ground y%d | %s, %s: crossed the face %s, "
+      "max x face%+.1f, end (face%+.1f, y%.1f), bottom y%.2f vs analytic ground "
+      "top y%d (%+.2f, band [-0.5, %.1f]); %u drops (last fell %.1f vox), %u "
+      "kept-outside steps, %u culled; (dx, y) every 10:%s",
+      faceX, startY, hTop, alive ? "kept" : "GONE", asleep ? "asleep" : "AWAKE",
+      outAt >= 0 ? Format("at tick %d", outAt).c_str() : "NEVER",
+      maxX - (float)faceX, end.x - (float)faceX, end.y, bottom, ground + 1,
+      above, band, s1.outsideDrops - s0.outsideDrops, s1.lastDropFell,
+      s1.outsideKept - s0.outsideKept, s1.outsideCulled - s0.outsideCulled,
+      trace.c_str());
+  std::printf("debris-outside: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateCorpseCap(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -13878,6 +14378,12 @@ const std::vector<Gate>& WoundGates() {
       // A corpse in water floats or sinks by its matter (Mob::FloatLimpLimbs).
       {"corpse-float", "mob", {}, false, GateCorpseFloat, false},
       {"water-entry", "mob", {}, false, GateWaterEntry, false},
+      // The body tickets of 2026-10-17: standing on a log is standing, a
+      // floater drifts with the current, a body outside the window lies on
+      // the ground out there.
+      {"player-stand-body", "mob", {}, false, GatePlayerStandBody, false},
+      {"float-current", "mob", {}, false, GateFloatCurrent, false},
+      {"debris-outside", "mob", {}, false, GateDebrisOutside, false},
       {"player-corpse", "mob", {}, false, GatePlayerCorpse, false},
   };
   return g;

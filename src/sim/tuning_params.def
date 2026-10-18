@@ -1754,6 +1754,8 @@ TP_F(physics, debrisLinearDamping, NO_WGSL, 0.05f, 0.0f, 2.0f)
 TP_F(physics, debrisAngularDamping, NO_WGSL, 0.15f, 0.0f, 2.0f)
 TP_F(physics, waterLinearDrag, NO_WGSL, 0.8f, 0.0f, 4.0f)
 TP_F(physics, waterAngularDrag, NO_WGSL, 0.25f, 0.0f, 4.0f)
+// m/s: a floater asleep in water wakes when the current at it is this fast
+TP_F(physics, waterCurrentWake, NO_WGSL, 0.05f, 0.0f, 2.0f)
 TP_F(physics, terrainFriction, NO_WGSL, 0.85f, 0.0f, 2.0f)
 TP_F(physics, playerProxyFriction, NO_WGSL, 0.3f, 0.0f, 2.0f)
 TP_F(physics, explosionImpulseScale, NO_WGSL, 0.15f, 0.0f, 2.0f)

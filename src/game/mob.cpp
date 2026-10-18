@@ -31,6 +31,7 @@
 #include "sim/bodyreact.h"
 #include "sim/oprecord.h"  // BrushAuthorScope: a landing's ops (ApplyFallDamage)
 #include "sim/coatrule.h"
+#include "sim/currentprim.h"  // CurrentOnFloater: a floating limb drifts
 #include "sim/reactcpu.h"
 #include "sim/rainexpo.h"  // RainExposedCpu: the rain fall-line lattice
 #include "sim/rng.h"
@@ -10208,10 +10209,19 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // lifted (FloatLimpLimbs' `rouse`).
       bool roused = false;
       if (mob.deadAsleep_) {
+        // The current wake is on a stride (Mob::CurrentWakesDead): a corpse
+        // asleep on dry land pays two mirror reads every kCurrentWakeStride
+        // ticks to find out it is not in water.
+        constexpr uint32_t kCurrentWakeStride = 8;
         if (mob.RigActive() || mob.DeadWakeKey(world) != mob.deadWakeKey_) {
           mob.WakeDead();
           mob.deadWokeHow_ = mob.RigActive() ? 1 : 2;
           roused = mob.deadWokeHow_ == 2;
+        } else if ((tick + (uint32_t)mob.id_) % kCurrentWakeStride == 0u &&
+                   mob.CurrentWakesDead(world)) {
+          mob.WakeDead();
+          mob.deadWokeHow_ = 5;
+          roused = true;   // FloatLimpLimbs activates the sleeping limbs
         } else {
           if ((tick + (uint32_t)mob.id_) % kDeadAnchorStride == 0) {
             mob.RegisterTerrainAnchor();
@@ -29863,8 +29873,12 @@ void Mob::FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2) {
     const float sub = std::clamp(((float)surfY - keel) /
                                      std::max(topY - keel, 1e-3f),
                                  0.0f, 1.0f);
+    // THE WATER'S OWN VELOCITY over the limb's submerged span (ticket
+    // 2026-10-17_20-54-57; sandvox::CurrentOnFloater): a corpse in a river
+    // drifts with it instead of being braked to rest where it went in.
+    const Vec3 cur = sandvox::CurrentOnFloater(com, keel, topY, (float)surfY);
     if (phys_->ApplyBuoyancy(l.body, (float)surfY, buoy,
-                             entering ? 0.0f : linDrag, angDrag, dt)) {
+                             entering ? 0.0f : linDrag, angDrag, dt, cur)) {
       floatedLimbs_++;
       floatSurfaceY_ = (float)surfY;
       massWet += limbMass * sub;
@@ -30083,6 +30097,55 @@ const char* Mob::DeadAwakeCriterion(bool passiveDrySleeps) const {
     }
   }
   return nullptr;
+}
+
+bool Mob::CurrentWakesDead(World& world) {
+  const float wake = CurrentTuning().physics.waterCurrentWake;
+  if (wake <= 0.0f || !phys_ || !sys_ || !def_) return false;
+  // The root limb stands for the island (RigActive's argument); a corpse
+  // that lost it is asked about its first limb with a body.
+  int li = def_->rootLimb;
+  if (li < 0 || li >= (int)limbs_.size() || !limbs_[li].body) {
+    li = -1;
+    for (size_t i = 0; i < limbs_.size() && li < 0; i++)
+      if (limbs_[i].body && limbs_[i].wornHost < 0) li = (int)i;
+  }
+  if (li < 0) return false;
+  const uint64_t h = limbs_[li].body;
+  Vec3 com;
+  float bmin[3], bmax[3];
+  if (!phys_->BodyCenterOfMass(h, com) || !phys_->BodyWorldBoundsM(h, bmin, bmax))
+    return false;
+  const std::vector<MaterialGpu>& mg = sys_->matGpu_;
+  auto matAt = [&](int x, int y, int z) -> uint32_t {
+    if (!world.CellInWindow({x, y, z})) return 0u;
+    const CachedChunk* cc = world.Cached({x >> 4, y >> 4, z >> 4});
+    if (!cc || cc->voxels.size() != kChunkVol) return 0u;
+    return cc->voxels[((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) *
+                          kChunk + (uint32_t)(x & 15)] & 0xFFFu;
+  };
+  auto isLiquid = [&](uint32_t m) {
+    return m != 0 && m < mg.size() && mg[m].klass == CLASS_LIQUID;
+  };
+  // FloatLimpLimbs' wet test and waterline walk, for one limb.
+  const int cx = (int)std::floor(com.x), cz = (int)std::floor(com.z);
+  const float keel = MetresToCells(bmin[1]), topY = MetresToCells(bmax[1]);
+  int seedY = (int)std::floor(keel);
+  if (!isLiquid(matAt(cx, seedY, cz))) {
+    seedY = (int)std::floor(com.y);
+    if (!isLiquid(matAt(cx, seedY, cz))) return false;  // dry
+  }
+  int surfY = seedY + 1;
+  for (int k = 0; k < 96 && isLiquid(matAt(cx, surfY, cz)); k++) surfY++;
+  const Vec3 cur = sandvox::CurrentOnFloater(com, keel, topY, (float)surfY);
+  if (std::sqrt(cur.x * cur.x + cur.z * cur.z) < MetresToCells(wake))
+    return false;  // still water: a floating corpse may sleep
+  const Vec3 d = com - currentWokeAt_;
+  if (currentWoke_ && d.x * d.x + d.y * d.y + d.z * d.z < 1.0f)
+    return false;  // pinned: the last wake carried it nowhere
+  currentWoke_ = true;
+  currentWokeAt_ = com;
+  return true;
 }
 
 uint64_t Mob::DeadWakeKey(World& world) const {

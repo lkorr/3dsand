@@ -651,6 +651,7 @@ const TUNING_PARAMS = {
   'physics.debrisAngularDamping':{t:'f',def:0.15,min:0,max:2},
   'physics.waterLinearDrag':{t:'f',def:0.8,min:0,max:4},
   'physics.waterAngularDrag':{t:'f',def:0.25,min:0,max:4},
+  'physics.waterCurrentWake':{t:'f',def:0.05,min:0,max:2},
   'physics.terrainFriction':{t:'f',def:0.85,min:0,max:2},
   'physics.playerProxyFriction':{t:'f',def:0.3,min:0,max:2},
   'physics.explosionImpulseScale':{t:'f',def:0.15,min:0,max:2},

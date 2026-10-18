@@ -221,6 +221,7 @@
     "debrisAngularDamping": 0.15,
     "waterLinearDrag": 0.8,
     "waterAngularDrag": 0.25,
+    "waterCurrentWake": 0.05,
     "terrainFriction": 0.85,
     "playerProxyFriction": 0.3,
     "explosionImpulseScale": 0.15,

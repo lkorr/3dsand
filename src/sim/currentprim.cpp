@@ -370,6 +370,14 @@ Vec3 CurrentAtCpuSim(Vec3 posVox, float wetLo, float wetHi) {
                           std::max(wetLo, wetHi));
 }
 
+Vec3 CurrentOnFloater(Vec3 comVox, float keelY, float topY, float surfY) {
+  const float lo = keelY;
+  const float hi = std::max(lo, std::min(topY, surfY));
+  const Vec3 c = CurrentAtCpuSim(Vec3{comVox.x, 0.5f * (lo + hi), comVox.z},
+                                 lo, hi);
+  return Vec3{c.x, 0.0f, c.z};
+}
+
 static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
                              float wetHi) {
   // The terrain flow field first: rivers and lakes (flowfield.h). A pure

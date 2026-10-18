@@ -1279,6 +1279,17 @@ class DebrisSystem {
     // First builds a fast creature anchor's urgent lane took past the build
     // budget (ManageTerrain, kTerrainUrgentBuilds).
     uint32_t terrainUrgentBuilds = 0;
+    // ---- OUTSIDE THE WINDOW (ticket 2026-10-17_00-12-10) -------------------
+    // `outsideDrops`: bodies PostStep found moving outside the residency
+    // window and laid on the analytic ground there, asleep (DropOutside).
+    // `outsideKept`: bodies outside the window this step that the cull kept
+    // (inside kOutsideKeepVox). `outsideCulled`: bodies destroyed for being
+    // past it. `lastDropFell`: how far the last drop moved its body down,
+    // voxels -- the height it would otherwise have hung at.
+    uint32_t outsideDrops = 0;
+    uint32_t outsideKept = 0;
+    uint32_t outsideCulled = 0;
+    float lastDropFell = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
   // Diagnostic: the mirror version the terrain collider for `wc` was last
@@ -1511,6 +1522,16 @@ class DebrisSystem {
     // The last waterline FloatBodies acted on, so a gate can say WHERE a body
     // is floating rather than only that something was pushed.
     float floatLastSurfaceY = 0;
+    // ---- the current (ticket 2026-10-17_20-54-57) --------------------------
+    // `currentCarried`: buoyancy impulses that had a nonzero water velocity in
+    // them (the carry is reaching bodies at all). `currentWakes`: sleepers a
+    // current woke (physics.waterCurrentWake). `currentPinned`: sleepers in a
+    // current NOT woken because the last wake carried them nowhere (a bank).
+    // `currentLastSpeed`: the last carrying current, cells/s.
+    uint32_t currentCarried = 0;
+    uint32_t currentWakes = 0;
+    uint32_t currentPinned = 0;
+    float currentLastSpeed = 0;
   };
   const FloaterProbe& Floaters() const { return floaters_; }
   // The density body `handle` floats at (FloatBodies' rhoBody: its matter,
@@ -1783,6 +1804,17 @@ class DebrisSystem {
     // the way Mob::LimbFloatDensity keys a limb's. Derived, never saved.
     float floatRho = 0;
     uint32_t floatRhoKey = 0;
+    // Where the last CURRENT WAKE found this body asleep (FloatBodies,
+    // physics.waterCurrentWake): a sleeper the current woke and carried
+    // nowhere -- pinned against a bank -- is not woken again where it lies, so
+    // a pinned floater costs one wake and not one per stride. Derived.
+    Vec3 currentWokeAt{};
+    bool currentWoke = false;
+    // Its centre of mass is outside the residency window (PostStep, each
+    // step). Such a body is held asleep on the analytic ground (DropOutside)
+    // and skips terrain upkeep and settle-back: there is no patch and no grid
+    // out there to build or stamp. Derived.
+    bool outside = false;
     uint32_t lastImpactStep = 0;  // rate limit, in PostStep counts (30 Hz)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
@@ -2195,6 +2227,10 @@ class DebrisSystem {
   // culled, settled, dissolved or split without freeing its brick leaks pool
   // words that nothing will ever reclaim, and the pool is a hard ceiling.
   void ReleaseBody(Body& b);
+  // A body moving outside the residency window: lay it on the ANALYTIC ground
+  // (World::TerrainHeight under its footprint, the height worldgen built
+  // with) and put it to sleep. See the note at the call (PostStep).
+  void DropOutside(Body& b);
   // Put every follower back on its host, LAST in PostStep — after the cull, so
   // a host that left the window this tick is already gone and its garment
   // unstraps instead of being driven off a dead handle, and after the readback,

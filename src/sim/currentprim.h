@@ -311,6 +311,16 @@ Vec3 CurrentAtCpu(Vec3 posVox);
 // is the span of a point.
 Vec3 CurrentAtCpuSim(Vec3 posVox, float wetLo, float wetHi);
 Vec3 CurrentAtCpuSim(Vec3 posVox);
+// THE CURRENT A FLOATING RIGID BODY FEELS (2026-10-18, ticket
+// 2026-10-17_20-54-57): debris, a severed limb, a corpse's or a limp rig's
+// limb -- everything Physics::ApplyBuoyancy carries. CurrentAtCpuSim over the
+// body's SUBMERGED span, keel to waterline (`surfY` = the first cell above
+// the water, the FloatBodies column walk's answer), probed at the middle of
+// that span: the terrain flow field reads zero 1.5 cells above the top water
+// cell, so a floater's centre, riding in the air, would read still water --
+// the reason the player's stroke samples its wet span too (Player::Update).
+// Horizontal only, cells/s.
+Vec3 CurrentOnFloater(Vec3 comVox, float keelY, float topY, float surfY);
 
 // ---- the arrow overlay's lattice -------------------------------------------
 // THIS FORMULA IS MIRRORED in debug_current.wgsl's vertex shader, which derives
