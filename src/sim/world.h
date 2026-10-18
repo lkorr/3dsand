@@ -6038,6 +6038,27 @@ class World {
   // 15.4 ms/frame of fardown). Derived, zero-initialised; FarField zeroes it
   // on every reset / full refill so a re-filled level is downsampled afresh.
   rhi::Buffer farSig;
+  // THE FAR DOWNSAMPLE CADENCE (2026-10-18, tickets 2026-10-16_11-14-41 /
+  // 2026-10-17_21-03-25; assets/shaders/far_select.wgsl). `fardown` used to run
+  // over every chunk written THIS tick, so a chunk that running water writes
+  // every tick was re-downsampled into all eight cascade levels every tick
+  // (2.2 ms of a 9.6 ms tick on the slope pour). Now `farDownSelect` picks the
+  // tick's work list from dirtyOut: a written chunk is marked PENDING, and a
+  // pending chunk is downsampled once at least FAR_DOWN_EVERY ticks have passed
+  // since its last downsample -- immediately for a one-off edit, every
+  // FAR_DOWN_EVERY ticks while it keeps changing, and within that many ticks
+  // of its last write once it goes quiet (the pending bit outlives the dirty
+  // flag, which is what makes the LAST state land).
+  //   farDownState: one u32 per slot, bit 31 pending | bits 0..30 the tick of
+  //                 its last downsample. Derived, zero-initialised.
+  //   farDownList:  the selected slots (what `fardown` and its three follow-up
+  //                 phases dispatch over, bound where dirtyList used to be).
+  //   farDownArgsStage / farDownArgs: the list's indirect args, written by the
+  //                 select's atomics and copied, the argsStage/dispatchArgs pair.
+  rhi::Buffer farDownState;
+  rhi::Buffer farDownList;
+  rhi::Buffer farDownArgsStage;
+  rhi::Buffer farDownArgs;
   // The far SURFACE MAP (kFarMap* above): per-level fine-resolution column
   // heights + skin, the raymarcher's refine data. CopySrc for the far-surface
   // gate only.

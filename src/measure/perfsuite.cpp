@@ -1640,11 +1640,14 @@ std::string DamNote(const DamHoles& h) {
                 kDamHoleR, h.wall[0], h.lake[0], h.wall[1], h.lake[1]);
   return buf;
 }
-// Water census of the breach: CA water cells OUTSIDE the lake (below the
-// wall's foot side of it -- the half-space before the wall face along the
-// heading) within 40 m, split by fullness. "Water running" is counted, not
-// assumed.
-std::string DamCensus(Scene& s, const DamHoles& h) {
+// Water census of the breach: CA water cells on the near side of the wall's
+// plane (the half-space before the wall face along the heading) within 40 m,
+// split by fullness, against the same count taken before the carve: the
+// half-space also holds parts of Mirrormere's wiggly shore, so the number that
+// says "water ran out" is the difference. Counted, not assumed.
+struct DamCount { uint64_t full = 0, part = 0; uint32_t chunks = 0; };
+DamCount g_damPre;
+DamCount DamCount1(Scene& s, const DamHoles& h) {
   const uint32_t water = MatId(s.mats, "water");
   const float yaw = kDamYawDeg * 0.0174532925f;
   const float fx = std::cos(yaw), fz = std::sin(yaw);
@@ -1676,11 +1679,18 @@ std::string DamCensus(Scene& s, const DamHoles& h) {
         chunks += wet;
       }
     }
-  char out[200];
+  return {full, part, chunks};
+}
+std::string DamCensus(Scene& s, const DamHoles& h) {
+  const DamCount c = DamCount1(s, h);
+  const long long d = (long long)(c.full + c.part) - (long long)(g_damPre.full + g_damPre.part);
+  const long long dp = (long long)c.part - (long long)g_damPre.part;
+  char out[240];
   std::snprintf(out, sizeof out,
-                "%llu water cells out of the lake within 40 m (%llu partial = %.0f%%) in %u chunks",
-                (unsigned long long)(full + part), (unsigned long long)part,
-                full + part ? 100.0 * (double)part / (double)(full + part) : 0.0, chunks);
+                "%+lld water cells outside the wall since the carve (%+lld of them partial; "
+                "%llu before, in %u chunks; %u wet chunks now)",
+                d, dp, (unsigned long long)(g_damPre.full + g_damPre.part), g_damPre.chunks,
+                c.chunks);
   return out;
 }
 DamHoles g_damHoles;
@@ -1692,6 +1702,7 @@ bool SetupDamImpl(Scene& s, std::string& why, DamView v) {
   s.stream.OnRegen();
   CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
   if (!DamFindHoles(s, g_damHoles, why)) return false;
+  g_damPre = DamCount1(s, g_damHoles);
   DamEye(s, v);
   s.fireTick = 0;
   s.note = DamNote(g_damHoles);
@@ -3270,6 +3281,19 @@ const RenderArm kExtraArms[] = {
      [](Tuning& t) { t.debug.perfExp = 12; }, true, 1,
      "whatever experiment 12 in the shaders is — see TUNE_PERF_EXP",
      false, false, /*anyCamera=*/true},
+    // 13..15: the rest of the knob's range (tuning_params.def max 15).
+    {"exp13", "debug.perfExp 0 -> 13",
+     [](Tuning& t) { t.debug.perfExp = 13; }, true, 1,
+     "whatever experiment 13 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp14", "debug.perfExp 0 -> 14",
+     [](Tuning& t) { t.debug.perfExp = 14; }, true, 1,
+     "whatever experiment 14 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp15", "debug.perfExp 0 -> 15",
+     [](Tuning& t) { t.debug.perfExp = 15; }, true, 1,
+     "whatever experiment 15 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
     // The baseline AGAIN, last: arms share one world and one set of render
     // caches (shadow cache, GI cache, openness), so an arm that changes what
     // those caches hold hands the NEXT arm a different warm state. `base2`
@@ -3687,6 +3711,7 @@ bool CamDamImpl(Scene& s, uint32_t& tick, std::string& why, DamView v) {
     s.stream.OnRegen();
     CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
     if (!DamFindHoles(s, g_damHoles, why)) return false;
+    g_damPre = DamCount1(s, g_damHoles);
     const IVec3 pc{(int)std::floor(s.eye.x) >> 4, (int)std::floor(s.eye.y) >> 4,
                    (int)std::floor(s.eye.z) >> 4};
     s.fluidLive = 0;

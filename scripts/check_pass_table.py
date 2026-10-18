@@ -134,6 +134,7 @@ PIPE_TO_MEMBER = {
     "PIPE_FAR_DOWN_CLAIM": "farDownClaim_",
     "PIPE_FAR_DOWN_STALK": "farDownStalk_",
     "PIPE_FAR_DOWN_FEAT": "farDownFeat_",
+    "PIPE_FAR_DOWN_SELECT": "farDownSelect_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
     "PIPE_GLOW_SRC": "glowSrc_",
@@ -332,7 +333,14 @@ BUF_TO_WGSL = {
     # docs/PLAN_async_compute.md).
     "RenderUBOTick": {"RT"},
     "Reactions": {"reactions"},
-    "DirtyList": {"dirtyList", "farDirty"},
+    "DirtyList": {"dirtyList"},
+    # The far downsample cadence (world.h farDownState, far_select.wgsl): the
+    # list is `farDirty` (read) in worldgen's group 1 and `farDirtyW` (written)
+    # in far_select's; FarDownArgs is indirect-only and never bound.
+    "FarDownList": {"farDirty", "farDirtyW"},
+    "FarDownState": {"farDownState"},
+    "FarDownArgsStage": {"farDownArgs"},
+    "FarDownArgs": set(),
     "ArgsStage": {"args"},
     "CellOps": {"cellOps"},
     "Support": {"supportOut"},
@@ -590,7 +598,10 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps", "farVox", "farP"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch", "farSig",
-               "farMap"}
+               "farMap",
+               # The far downsample cadence (far_select.wgsl): its list's
+               # writable view, its per-slot state, its args.
+               "farDirtyW", "farDownState", "farDownArgs"}
 # Gas particles (docs/PLAN_gas_particles.md stage 1). farVox + farP are in this
 # group as well as the far one: a parcel outside the residency window asks the
 # cascade what it is drifting into, and that is the whole reason gas has a
