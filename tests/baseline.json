@@ -31,6 +31,7 @@
   "rivers.maxAwake": "32",
   "rivers.settleTicks": "3000",
   "rivers.holdTicks": "600",
+  "rivers.streamTicks": "3000",
   "rivers.streamReleasePerColMax": "1",
   "rivers.maxAwakeWater": "4",
   "_rivers_solute_about": "rivers pass V (selftest_rivers.cpp PassSoluteCarried, sim_solute.wgsl THE HELD FLOW CARRIES WHAT IS DISSOLVED IN IT; ticket 2026-10-16_11-11-51): soluteUnits of ink poured twice above falls' first waterfall; after soluteCarryTicks at least soluteBelowMin of it must stand in columns more than 4 voxels under the upper reach; by then the layer must have moved by exactly the ledger with the dilution floor discarding at most soluteDiscardMax of it (and the ledger must still be exact at the end); and (soluteRequireSleep 1) within soluteSettleTicks no awake chunk may carry solute, or (0) every solute chunk asleep OR the carry terminated: no carried pair has work left anywhere (what may stay awake is the level diffusion at the species' own pace and the fixture's own moving water, which the report's CONTROL counts).",

@@ -504,8 +504,13 @@ fn echoShift(ei : u32, d : i32) {
     if (o != v) { stillWater[ei + w] = o; }
   }
 }
-// One echo sample into slot (tick / 4) % 8.
+// One echo sample into slot (tick / 4) % 8, taken on the slot's FIRST tick
+// only (a visit on the other three would only overwrite it: the recording is
+// one sample every 4 ticks, 7.5 a second, as raymarch.wgsl plays it back).
+// A column whose chunk slept through a slot's first tick keeps the sample
+// that slot held 32 ticks earlier.
 fn echoSample(ei : u32, v : i32) {
+  if ((T.tick & 3u) != 0u) { return; }
   let slot = (T.tick >> 2u) & 7u;
   let wi = ei + (slot >> 2u);
   let sh = 8u * (slot & 3u);
