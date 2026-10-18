@@ -2871,6 +2871,17 @@ void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
       b.currentWokeAt = com;
       b.inactiveTicks = 0;
       phys_->ActivateBody(b.handle);
+      // ...AT THE WATER'S SPEED. A floater at rest in a current is a state
+      // only sleeping produces, and the drag alone is far too gentle to undo
+      // it in time: a 1 m limb starts at ~4 mm/s a tick, Jolt's sleep test
+      // (0.5 s under ~1.5 cm of travel) put it straight back to sleep, and the
+      // pinned memo then kept it there (measured, float-current: 15 impulses,
+      // +0.2 voxels). Handed the current outright, a free floater moves with
+      // the water from the first tick and a pinned one is stopped by the bank
+      // it is pinned against -- which is what the memo is for.
+      Vec3 lin{}, ang{};
+      if (phys_->GetBodyVelocities(b.handle, lin, ang))
+        phys_->SetBodyVelocities(b.handle, Vec3{cur.x, lin.y, cur.z}, ang);
       floaters_.currentWakes++;
     }
     if (phys_->ApplyBuoyancy(b.handle, (float)surfY, buoy, linDrag, angDrag,
