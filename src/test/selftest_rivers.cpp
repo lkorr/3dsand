@@ -1707,23 +1707,18 @@ Status GateRivers(Ctx& c, std::string& detail) {
             if (nWho) whyS += Format(" events from %d:%s", nWho, who.c_str());
           }
           whyS += Format(" run<=%u newest-event %s", runMax, ageMin == 0xFFFFFFFFu ? "none" : std::to_string(ageMin).c_str());
-          // ...and every release by reason (STREAM_OBS [7]: support | flood | - |
-          // drained, a byte each) plus, for the support releases, what the
-          // column's neighbours were at the last one (byte 2, streamSupportWhy:
-          // bit 0 a record under the target, 1 a hop not under ours, 2 a wall at
-          // the row, 3 no record at all; high nibble the column's own hop),
-          // lake-side first.
+          // ...and every release by reason (STREAM_OBS [7]: support | flood |
+          // (the observer's run drift) | drained, a byte each), and the
+          // lake-most released column's word.
           relWhyS.clear();
           {
             int byReason[4] = {};
-            std::map<uint32_t, int> lostWhy;
             int firstRelZ = 0;
             uint32_t firstRel = 0;
             for (const auto& xz : byCols) {
               const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
               const uint32_t o7 = obs[ci * 8 + 7];
               for (int b = 0; b < 4; b++) byReason[b] += static_cast<int>((o7 >> (8 * b)) & 0xFFu);
-              if (o7 & 0xFFu) lostWhy[(o7 >> 16) & 0xFFu]++;
               const int dz = std::abs(xz.second - zA);
               if ((obs[ci * 8 + 6] & 0xFFu) != 0u && (firstRel == 0u || dz < firstRelZ)) {
                 firstRelZ = dz;
@@ -1731,9 +1726,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
                 relWhyS = Format(" lake-most (%d,%d) 0x%08x;", xz.first, xz.second, o7);
               }
             }
-            relWhyS += Format(" by reason support %d flood %d drained %d; support lost as", byReason[0], byReason[1],
-                              byReason[3]);
-            for (const auto& [k, v] : lostWhy) relWhyS += Format(" %02x:%d", k, v);
+            relWhyS += Format(" by reason support %d flood %d drained %d", byReason[0], byReason[1], byReason[3]);
             // WHERE the unheld columns are: (x, distance from the lake end)
             // why/run, lake-side first, at most 24.
             std::vector<std::pair<int, std::string>> un;
@@ -1842,8 +1835,58 @@ Status GateRivers(Ctx& c, std::string& detail) {
             }
           return v;
         };
+        // THE HEAD'S TRACE (CLAUDE.md rule 6): the lake's last row and the
+        // channel's first four own rows, three columns each, every 10 ticks
+        // while any of those twelve columns is held (and the sample after the
+        // last one is let go): per column its held target / hop (or `-`) and
+        // its water's top, 8 y + f, walking down from over the lake's surface
+        // (`.` dry to the floor). What a held head does to its water -- and
+        // why it is let go -- is a trajectory, not a count.
+        int kOwn = 0;
+        while (kOwn < static_cast<int>(path.size()) &&
+               worldmap::WaterColumnAt(path[kOwn].x, path[kOwn].z, kDefaultSeed).water >= 0)
+          kOwn++;
+        bool traceWas = false;
+        int traceLines = 0;
+        std::string headTrace;
+        auto traceHead = [&](int k) {
+          if (kOwn < 1 || kOwn + 3 >= static_cast<int>(path.size())) return;
+          std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
+          rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversHeadStill");
+          bool any = false;
+          std::string ln = Format("\n      %4d:", k);
+          rows.clear();
+          for (int r = -1; r <= 3; r++) {
+            const PP& p = path[kOwn + r];
+            ln += r == 0 ? " ||" : " |";
+            for (int dx = -1; dx <= 1; dx++) {
+              const int x = p.x + dx, z = p.z;
+              const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
+              const uint32_t d = tab[ci * 4 + 2];
+              if (r >= 0 && d != 0u) any = true;
+              int s8 = -1;
+              for (int y = lakeLevel + 2; y >= p.y - 2; y--) {
+                const uint32_t w = voxRaw(x, y, z);
+                if ((w & 0xFFFu) == mWater) { s8 = 8 * y + static_cast<int>((w >> 12) & 15u) + 1; break; }
+                if ((w & 0xFFFu) != 0u && y < lakeLevel - 1) break;
+              }
+              const std::string sv = s8 < 0 ? std::string(".") : std::to_string(s8);
+              if (r < 0 || d == 0u) ln += Format(" -:%s", sv.c_str());
+              else ln += Format(" %d/%u:%s", static_cast<int>(d << 12) >> 12, d >> 20, sv.c_str());
+            }
+          }
+          if ((any || traceWas) && traceLines < 160) {
+            headTrace += ln;
+            traceLines++;
+          }
+          traceWas = any;
+        };
         for (int k = 1; k < streamTicks; k++) {
           tick();
+          if (k % 10 == 0) {
+            c.ctx.WaitIdle();
+            traceHead(k);
+          }
           if (k % 150 == 0) {
             c.ctx.WaitIdle();
             wet = wetCount();
@@ -1977,6 +2020,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
                     "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
                     flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
+        std::printf("rivers:   S head trace (tick: | the lake's last row || the channel's first own row | the next three; "
+                    "each column target/hop:water top, 8 y + f, or -:top when not held):%s\n",
+                    headTrace.empty() ? " nothing held" : headTrace.c_str());
         c.ctx.WaitIdle();
         rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), seamDiagOff, seamDiag1,
                               sizeof seamDiag1, "riversSeamDiag");

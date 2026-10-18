@@ -357,7 +357,8 @@ const STILL_ECHO : u32 = STREAM_MOUTH_END;
 //   [1] the window: sum of (s8 - anchor) (14 bits signed) | visits << 14 |
 //       visits with no resting surface << 21 | wet (the column's class at the
 //       last window end) bit 28 | anchored bit 29 | moved this window bit 30 |
-//       moved in the last window bit 31
+//       moved in the last window bit 31. HELD: the drain count (scan,
+//       DRAINED)
 //   [2] the newest event stamps, own and downstream (fine | coarse << 16),
 //       SCRATCH: written by `scan`
 //   [3] the same, PUBLISHED: copied by `commit`; what neighbours read
@@ -1012,8 +1013,17 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
       // side lane got wet for the first time after thousands of ticks --
       // measured, `stream-natural`: 238 columns held, all released 100
       // ticks later, by two outlet columns of an established chute.)
-      let drained = (r.ok && r.mat == mat && r.s8 < t8 - 8) || (r.known && !r.ok && r.hasFloor && r.floor8 < t8 - 8);
-      if (drained && yt <= top) {
+      // ...for a WINDOW, not a visit (2026-10-18): STREAM_OBS [1] is the held
+      // column's DRAIN COUNT (`commit` zeroes it on adoption; the observer's
+      // [1] is not read while the column is held), up on a drained visit,
+      // down on any other, released at STREAM_SUB. A held column hands its
+      // water on and gets it back from the held column above it a few visits
+      // later -- the CA's own pace, the live stream's -- and one drained visit
+      // in between let the whole stream below it go.
+      let drainedNow = (r.ok && r.mat == mat && r.s8 < t8 - 8) || (r.known && !r.ok && r.hasFloor && r.floor8 < t8 - 8);
+      if (drainedNow && yt <= top) { o1 = min(o1 + 1u, STREAM_SUB); }
+      else if (o1 > 0u) { o1 = o1 - 1u; }
+      if (o1 >= STREAM_SUB) {
         held = false;
         reason = STREAM_REL_DRAINED;
       }
@@ -1038,20 +1048,6 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
     } else {
       word = mat | pool | (over << STREAM_OVER_SHIFT) |
              select((reason << STREAM_REASON_SHIFT) | (STREAM_ACT_RELEASE << 30u), 0u, held);
-    }
-    // WHERE ITS WATER STOOD WHEN IT WAS LET GO (diagnostic, STREAM_OBS [7]
-    // byte 2, which is the observer's run drift only while the column is
-    // observed -- a fresh anchor zeroes it): its resting surface minus its
-    // target, eighths, clamped to +-63, bit 7 set when it had none (then the
-    // floor's level minus the target; -64 = neither). `rivers` S prints the
-    // lake-most released column's [7].
-    if ((word >> 30u) == STREAM_ACT_RELEASE && pool == 0u) {
-      var d = -64;
-      if (r.ok) { d = clamp(r.s8 - t8, -63, 63); }
-      else if (r.hasFloor) { d = clamp(r.floor8 - t8, -63, 63); }
-      let b = (bitcast<u32>(d) & 0x7Fu) | select(0x80u, 0u, r.ok);
-      let o7 = stillWater[oi + 7u];
-      stillWater[oi + 7u] = (o7 & 0xFF00FFFFu) | (b << 16u);
     }
   } else {
     // THE CONDUIT's own observation ([3]: surface | age), for POOL streams
@@ -1494,6 +1490,8 @@ fn commit(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index
       stillWater[si + 2u] = (w3 & 0xFFFFFu) | (((w3 >> 20u) & STREAM_HOP_MAX) << 20u);
       stillWater[si + 3u] = (s.mat & 0xFFFu) | select(0u, STREAM_POOL_BIT, act == STREAM_ACT_ADOPT_POOL);
       stillWater[oi + 5u] = T.tick;
+      // [1] is the held column's DRAIN COUNT from here (scan's adopted branch).
+      stillWater[oi + 1u] = 0u;
       let o6 = stillWater[oi + 6u];
       stillWater[oi + 6u] = (o6 & 0xFFFF00FFu) | (min(((o6 >> 8u) & 0xFFu) + 1u, 0xFFu) << 8u);
     } else {
