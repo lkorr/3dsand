@@ -2112,10 +2112,7 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
     // too). Counted as an absorption, so the books still balance.
     let vw = voxWordAt(cell);
     let vm = voxMat(vw);
-    // (No material-table read: a held record names a liquid by construction,
-    // so seamHeldT8 matching the cell's material is the liquid test, and this
-    // pass's row binds no `materials`.)
-    if (vm != MAT_AIR && vm != mat) {
+    if (vm != MAT_AIR && vm != mat && materials[vm].klass == CLASS_LIQUID) {
       let ht = seamHeldT8(cell.x, cell.z, vm);
       if (ht != STILL_UNHELD) {
         let yt = (ht - 1) >> 3u;
