@@ -1090,8 +1090,8 @@ branch 1.6, flat normal 1.7, foam 1.4, traced reflection 1.2, streaks 0.4-0.9.
    cadence of 4 measured 7.8, of 16 4.5: wet chunks are rewritten every few
    ticks, not every tick, so the cadence must be several ticks to bite; 8 is
    the conservative middle for the LOD handoff seam, where a flood front
-   moving ~1 m/s stands ~0.25 m apart across it). `--perf slope`: 4.6 -> see
-   the commit. World hash unchanged (c8931fcd dam, 7b87586a slope: the
+   moving ~1 m/s stands ~0.25 m apart across it). `--perf slope`: farField
+   4.56 -> 3.15 ms, frame p50 25.97 -> 24.77. World hash unchanged (c8931fcd dam, 7b87586a slope: the
    cascade carries no sim requirement since 2026-10-06). The far gates that
    read the cascade a fixed 3 ticks after an edit settle `kFarDownEvery` more
    (world.h, check_invariants "far downsample cadence").
