@@ -8758,6 +8758,13 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     std::string limbs;      // each limb's final y / density
     float surf = -1;        // the waterline it was last pushed against
     int wokeHow = 0;        // Mob::DeadWokeHow at the end (rule 6)
+    // WHAT MOVED IN THE MIRROR (rule 6): "last woken how 2" means a chunk
+    // round the corpse re-versioned, which is every cause at once. Over the
+    // basin's chunks, every version bump the watch saw, split by the field
+    // that moved (material / liquid fullness / stain / bits 16-23 only),
+    // plus the last moved cell's old and new word.
+    uint32_t bumps = 0, cMat = 0, cFull = 0, cStain = 0, cOther = 0;
+    std::string lastMoved;
   };
   Arm arms[] = {{"human", "human"},
                 {"automaton", "tinker"},
@@ -8779,8 +8786,38 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     const int root = m->Def()->rootLimb;
     m->Die();
     a.ran = true;
+    std::unordered_map<uint64_t, std::pair<uint32_t, std::vector<uint32_t>>> seen;
+    auto watchMirror = [&](bool count) {
+      for (int cy = (bedY - 1) >> 4; cy <= (waterTop + 22) >> 4; cy++)
+        for (int cz = (site.z - R) >> 4; cz <= (site.z + R) >> 4; cz++)
+          for (int cx = (site.x - R) >> 4; cx <= (site.x + R) >> 4; cx++) {
+            const IVec3 wc{cx, cy, cz};
+            const CachedChunk* cc = c.world.Cached(wc);
+            if (!cc || cc->voxels.size() != kChunkVol) continue;
+            auto& e = seen[World::PackChunkKey(wc)];
+            if (e.second.size() == kChunkVol && e.first != cc->version && count) {
+              a.bumps++;
+              for (uint32_t k = 0; k < kChunkVol; k++) {
+                const uint32_t o = e.second[k], n = cc->voxels[k];
+                if (o == n) continue;
+                if ((o ^ n) & 0xFFFu) a.cMat++;
+                else if ((o ^ n) & 0xF000u) a.cFull++;
+                else if ((o ^ n) & 0xFF000000u) a.cStain++;
+                else { a.cOther++; continue; }
+                a.lastMoved = Format(
+                    "(%d,%d,%d) 0x%08x->0x%08x v%u", cx * 16 + (int)(k & 15),
+                    cy * 16 + (int)((k >> 4) & 15), cz * 16 + (int)(k >> 8), o,
+                    n, cc->version);
+              }
+            }
+            e.first = cc->version;
+            e.second = cc->voxels;
+          }
+    };
+    watchMirror(false);
     for (int i = 0; i < kTicks; i++) {
       support::RunTicks(rig, 1);
+      watchMirror(true);
       m = mobs.FindMobById(id);
       if (!m) break;
       Vec3 com{};
@@ -8961,10 +8998,14 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   auto line = [&](const Arm& a) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
-                  "rig %s, corpse %s (%s, last woken how %d), y every 60:%s; ",
+                  "rig %s, corpse %s (%s, last woken how %d), mirror bumps %u "
+                  "(cells moved: mat %u, fullness %u, stain %u, stamp-only %u; "
+                  "last %s), y every 60:%s; ",
                   a.rho, a.lowest, a.final, a.pushes,
                   a.rigActive ? "MOVING" : "still",
                   a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.wokeHow,
+                  a.bumps, a.cMat, a.cFull, a.cStain, a.cOther,
+                  a.lastMoved.empty() ? "-" : a.lastMoved.c_str(),
                   a.trace.c_str())
            + " | limbs" + a.limbs + "; ";
   };
