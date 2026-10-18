@@ -1824,16 +1824,42 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // down the whole stream) -- measured monotone (0 lost) when it works;
         // a first cut of the flood release took it to 22, 45, 27, 15, 69, 12 ...
         int lost = 0;
+        // IS THE STREAM STEADY (CLAUDE.md rule 6)? Per sample: the eighths
+        // standing in the channel's own columns (floor .. floor + 6), and the
+        // MPM seam's excite census since the last sample (STILL_DIAG [3..7]:
+        // held over its top / bank / unheld / stream / held at or under its
+        // top -- at a breach, or its top cell over the target) with the
+        // reservoir's GIVE / TAKE / GROW ([0..2]).
+        const uint64_t diag0Off = (uint64_t(kWorldN) * kWorldN * 4u + 4u + 11u * uint64_t(kWorldN) * kWorldN) * 4u;
+        uint32_t dPrev[8] = {};
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), diag0Off, dPrev, sizeof dPrev, "riversDiag0");
+        auto chanVol = [&]() {
+          long long v = 0;
+          for (const auto& xz : byCols)
+            for (int y = floorOf[xz]; y <= floorOf[xz] + 6; y++) {
+              const uint32_t w = voxRaw(xz.first, y, xz.second);
+              if ((w & 0xFFFu) == mWater) v += ((w >> 12) & 15u) + 1u;
+            }
+          return v;
+        };
         for (int k = 1; k < streamTicks; k++) {
           tick();
           if (k % 150 == 0) {
             c.ctx.WaitIdle();
             wet = wetCount();
+            const long long vol = chanVol();
             const int prevAdopted = adopted;
             adopted = adoptedCount();
             lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            curve += Format(" %d:%d/%d(%dP)/%d/%u [why%s]", k, wet, adopted, poolN, awake, floodMax, whyS.c_str());
+            uint32_t dNow[8] = {};
+            rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), diag0Off, dNow, sizeof dNow, "riversDiag1");
+            curve += Format(" %d:%d/%d(%dP)/%d/%u vol %lld [give %u take %u grow %u | excited over %u bank %u unheld %u "
+                            "stream %u held %u] [why%s]",
+                            k, wet, adopted, poolN, awake, floodMax, vol, dNow[0] - dPrev[0], dNow[1] - dPrev[1],
+                            dNow[2] - dPrev[2], dNow[3] - dPrev[3], dNow[4] - dPrev[4], dNow[5] - dPrev[5], dNow[6] - dPrev[6],
+                            dNow[7] - dPrev[7], whyS.c_str());
+            std::copy(dNow, dNow + 8, dPrev);
           }
         }
         c.ctx.WaitIdle();

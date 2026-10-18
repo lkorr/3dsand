@@ -4548,7 +4548,8 @@ fn ledgerNote(dep : u32, wd : u32) {
 // them; a dense worldgen Fill clears them with the table): [0] GIVE, [1]
 // TAKE, [2] GROW, the eighths the reservoir wrote (non-POOL and POOL alike);
 // [3..14] the MPM seam's excite census (sim_fluid_seam.wgsl writes them
-// through its own alias of this buffer); [15] spare. `held-splash` and
+// through its own alias of this buffer); [15] one excited held cell at or
+// under its top row, packed (sim_fluid_seam.wgsl WHERE). `held-splash` and
 // `rivers` S read them.
 const STILL_DIAG : u32 = WORLD_N * WORLD_N * STILL_WORDS + 4u + 11u * WORLD_N * WORLD_N;
 fn stillNote(want : u32, eighths : u32) {

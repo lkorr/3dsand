@@ -1367,6 +1367,21 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     var cls = 5u;
     if (heldT8 != STILL_UNHELD) {
       cls = select(3u, 7u, c.y <= ((heldT8 - 1) >> 3u));
+      // WHERE (STILL_DIAG [15], diagnostic): one class-7 cell, packed
+      // x & 1023 | z & 1023 << 10 | y & 255 << 20 | why << 28 (0 its top cell
+      // over the target, 1 air under it, 2 an open unheld neighbour) | the
+      // trigger << 30 (0 fall, 1 perch, 2 step, 3 shell/wake); atomicMax, so
+      // which one is a function of the set, not of the order.
+      if (cls == 7u) {
+        var why = 0u;
+        if (8 * c.y + i32(voxState(w) + 1u) <= heldT8) {
+          let bb = c - vec3<i32>(0, 1, 0);
+          why = select(2u, 1u, cellResident(bb, T.origin) && voxMat(voxWordAt(bb)) == MAT_AIR);
+        }
+        let pk = (bitcast<u32>(c.x) & 1023u) | ((bitcast<u32>(c.z) & 1023u) << 10u) |
+                 ((bitcast<u32>(c.y) & 255u) << 20u) | (why << 28u) | (min(kind, 3u) << 30u);
+        atomicMax(&stillLedger[STILL_DIAG + 15u], pk);
+      }
     } else if (stillLevel8(c.x, c.z, mat) != STILL_UNHELD) {
       cls = 6u;
     } else {

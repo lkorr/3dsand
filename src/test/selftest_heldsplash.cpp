@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -332,7 +333,17 @@ Status GateHeldSplash(Ctx& c, std::string& detail) {
     tick(ops);
     std::string curve;
     uint32_t firstExcited = 0, lateExcited = 0, awake = 0;
+    const uint64_t whereOff = (uint64_t(kWorldN) * kWorldN * 4u + 4u + 11u * uint64_t(kWorldN) * kWorldN + 15u) * 4u;
+    bool whereReset = false;
     for (int done = 1; done < ticks;) {
+      // WHERE (sim_fluid_seam.wgsl, STILL_DIAG [15]): cleared as the late
+      // window opens, so what it names at the end is a cell the late
+      // excitation took. A diagnostic word the sim never reads.
+      if (!whereReset && done > ticks - lateTicks) {
+        const uint32_t zero = 0u;
+        c.ctx.queue.WriteBuffer(c.sim.StillWaterBuffer(), whereOff, &zero, 4u);
+        whereReset = true;
+      }
       const int n = std::min(step, ticks - done);
       for (int i = 0; i < n; i++) tick();
       done += n;
@@ -351,6 +362,60 @@ Status GateHeldSplash(Ctx& c, std::string& detail) {
       prev = k;
     }
     curve += "\n    " + streamCensus(sx, sz);
+    // ...and the late window's excited held cell, with the voxels round it:
+    // its 3 x 3 columns from 3 under to 2 over it, each cell `.` air, `#` a
+    // solid, `w<f>` the liquid at fullness f, `p` a powder, plus each column's
+    // held target (T8, eighths; - none) -- what it stood over and beside.
+    {
+      c.ctx.WaitIdle();
+      uint32_t pk = 0;
+      rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), whereOff, &pk, 4u, "hsWhere");
+      if (pk != 0u) {
+        auto unwrap = [](int v, int ref, int bits) {
+          const int m = 1 << bits;
+          int d = (v - ref) & (m - 1);
+          if (d >= m / 2) d -= m;
+          return ref + d;
+        };
+        const int ex = unwrap(int(pk & 1023u), sx, 10), ez = unwrap(int((pk >> 10) & 1023u), sz, 10);
+        const int ey = unwrap(int((pk >> 20) & 255u), my, 8);
+        static const char* kWhy[4] = {"its top cell over the target", "air under it", "an open unheld neighbour", "?"};
+        static const char* kTrig[4] = {"fall", "perch", "step", "shell/wake"};
+        std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), 0, tab.data(), tab.size() * 4, "hsStillW");
+        std::map<uint32_t, std::vector<uint32_t>> chunks;
+        auto word = [&](int x, int y, int z) {
+          const uint32_t s = World::SlotChunkIndex(IVec3{x >> 4, y >> 4, z >> 4});
+          auto it = chunks.find(s);
+          if (it == chunks.end()) {
+            std::vector<uint32_t> v(kChunkVol);
+            sandvox::ReadVoxelsSync(c.ctx, c.world, s, 1, v.data(), "hsWhereVox");
+            it = chunks.emplace(s, std::move(v)).first;
+          }
+          return it->second[(uint32_t(z & 15) * kChunk + uint32_t(y & 15)) * kChunk + uint32_t(x & 15)];
+        };
+        std::string pic = Format("\n    late excited held cell (%d,%d,%d) by %s, %s; columns (dx,dz) T8 [y-3..y+2]:", ex, ey,
+                                 ez, kTrig[pk >> 30], kWhy[(pk >> 28) & 3u]);
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dx = -1; dx <= 1; dx++) {
+            const int x = ex + dx, z = ez + dz;
+            const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
+            const uint32_t a = tab[ci * 4 + 1], d = tab[ci * 4 + 2];
+            std::string t = "-";
+            if (a != 0u) t = Format("map %d", static_cast<int>(a << 12) >> 12);
+            else if (d != 0u) t = Format("stream %d", static_cast<int>(d << 12) >> 12);
+            pic += Format("\n      (%+d,%+d) %s:", dx, dz, t.c_str());
+            for (int y = ey - 3; y <= ey + 2; y++) {
+              const uint32_t w = word(x, y, z), m = w & 0xFFFu;
+              if (m == 0u) pic += " .";
+              else if (m == mWater) pic += Format(" w%u", ((w >> 12) & 15u) + 1u);
+              else if (m < c.mats.size() && c.mats[m].gpu.klass == CLASS_POWDER) pic += " p";
+              else pic += " #";
+            }
+          }
+        curve += pic;
+      }
+    }
     const uint32_t absorbed = prev.absorbed - k0.absorbed;
     const uint32_t total = prev.excited - k0.excited;
     const bool ok = firstExcited > 0 && lateExcited <= lateMax && prev.live <= liveMax && awake <= maxAwake;
