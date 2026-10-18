@@ -5067,9 +5067,15 @@ excited particles born each tick: how many carry a throw, where, how fast):
   (measured, `flow-measure` R, a breach that must relax: 1.97 cells/s left
   after 900 ticks, vs 0.37 with the throw off, and 2.10 with the throw kept
   but refused over a drop holding excited mass, since sparse spray reads as
-  empty). With the head bound R relaxes and the throw stops once the breach
-  equalises (the gate prints throws per settle phase); such cells still excite,
-  at rest.
+  empty). The head alone still threw at the seam's edge (a settled column 3+
+  rows beside a cell lying on the particle body: `flow-measure`'s SPOUT THROWS
+  attribution, 380 thrown births in the +600..900 tail, 20 of 24 box chunks
+  awake), so the fall cell also needs A REAL DROP: no node mass >=
+  `SEAM_MASS_MIN` in the cell under it. Head + drop measured 2026-10-18: R
+  0.71, tail throws 40, 10 of 24 chunks awake (the chance-0 figure), but
+  `fluid-spout` +0.49 cells against its 0.50 floor (head alone: +0.58) --
+  UNFINISHED: the package was stopped here, before that was tuned. Such cells
+  still excite, at rest.
 - **THE NOZZLE.** A thrown cell is born one cell from SETTLED water, whose
   nodes `clearGrid` seeds with zero-velocity mass; the particle's quadratic
   support still gathers ~28% from that node, so each substep kept ~72% of the
