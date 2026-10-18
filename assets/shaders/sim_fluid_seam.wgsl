@@ -2819,6 +2819,15 @@ fn wgSameAt(col : u32, y : i32) -> bool {
   return (wgSame[col] & (1u << u32(y))) != 0u;
 }
 
+// One settling cell's bin: (eighths, packed identity). Cells of the settling
+// block's own 16 rows only (the spill rows above have no bins).
+fn settleBinAt(listIdx : u32, c : vec3<i32>) -> vec2<u32> {
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
+  return vec2<u32>(atomicLoad(&settleScratch[b]), atomicLoad(&settleScratch[b + 1u]));
+}
+
 fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
                 write : bool, rec : bool, col : u32, force : bool) -> bool {
   // THE FORCED WALK IS THE SAME WALK, ONLY TALLER. A submerged column's own 24
@@ -2853,6 +2862,30 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       }
       let mat = voxMat(w);
       if (mat != MAT_AIR && !seamLiquid(mat)) { blocked = true; }
+      // TWO LIQUIDS DO NOT MERGE (ticket 2026-10-17_00-04-26). A cell already
+      // holding settled liquid of ANOTHER material than the content arriving
+      // in it -- the pool carried up from below, or this cell's own bin -- is
+      // a blocker to that content, exactly as a solid is: the arriving mass
+      // stops under it (pool > 0: the column is refused) or, if it was binned
+      // INSIDE it, pops up and rests on it (the blocker arm below). It used to
+      // be an open cell, and the walk's identity is a running max: acid
+      // (id 13) settling on a river (water, id 5) re-placed the river cell it
+      // landed in AND every water cell above it in the column as ACID, and
+      // the held river's reservoir refilled the water. Measured, `acid-pour`
+      // before this: 9,840 cells of acid poured, 33,856 standing in the world
+      // 600 ticks later. Now a settle writes only the eighths it was given,
+      // as the material they were (the CA's density displacement sinks
+      // denser acid through the water afterwards, a cell at a time). One
+      // liquid on itself -- every water-only scene -- is untouched.
+      if (mat != MAT_AIR && !blocked && y < 16) {
+        let fb = settleBinAt(listIdx, base + vec3<i32>(cx, y, cz));
+        if ((fb.x > 0u && (fb.y >> 16u) != mat) ||
+            (pool > 0u && (poolMatStain >> 16u) != mat)) {
+          blocked = true;
+        }
+      } else if (mat != MAT_AIR && !blocked && pool > 0u && (poolMatStain >> 16u) != mat) {
+        blocked = true;
+      }
       // An unmapped word can only mean the coverage guarantee failed (the
       // walk stays inside the settling chunk + its materialized N26 ring);
       // treating it as a blocker refuses the block instead of dropping mass
@@ -2909,8 +2942,15 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     let mat = voxMat(w);
     var existing = 0u;
     if (mat != MAT_AIR) { existing = voxState(w) + 1u; }
+    // An EMPTIED pool carries no identity up: the content placed from here is
+    // this cell's own (the blocker test above already refused a different
+    // liquid meeting a non-empty pool). Without the reset the running max
+    // relabelled every settled cell above the first higher id it passed --
+    // and the UNTOUCHED test below assumes exactly this (nw == w).
+    if (pool == 0u) { poolMatStain = 0u; }
     // Existing settled water keeps its identity; binned content brings its
-    // own. Max keeps the pick deterministic when the two differ.
+    // own. Max keeps the pick deterministic when the two differ (the same
+    // liquid with a different stain).
     var idHere = packed;
     if (existing > 0u) {
       idHere = max(idHere, (mat << 16u) | (voxStainAmt(w) << 3u) |
