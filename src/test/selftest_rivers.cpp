@@ -1599,7 +1599,28 @@ Status GateRivers(Ctx& c, std::string& detail) {
       // rivers: a stream that never sleeps on its own. It must (a) run,
       // (b) be ADOPTED column by column and fall asleep, and (c) once its
       // mouth is plugged with stone, be RELEASED and drain.
+      // MPM EXCITATION is rivers.streamExciteMode (default 0, OFF), as in
+      // `stream-natural` and `stream-pool`: the claim is the held stream's.
+      // With it on (1, the game's default) the seam turns this channel into a
+      // perpetual MPM torrent -- measured 2026-10-18: ~40k eighths of the
+      // stream's own water woken into particles every 150 ticks (the wake
+      // trigger; fall ~1k and step ~0.8k seed it, at the lake's drop into the
+      // channel and over its risers), its volume 1,400 to 3,600 eighths between
+      // samples, waves up to five cells over the lake's surface at its head --
+      // which the natural rules (a surface steady for sim.streamSteadyTicks)
+      // rightly do not freeze. That is the seam's behaviour, gated by its own
+      // gates; set the knob to 1 to measure it here.
+      struct ExciteMode {
+        Tuning saved = CurrentTuning();
+        explicit ExciteMode(int mode) {
+          Tuning t = saved;
+          t.sim.fluidExciteMode = mode;
+          SetCurrentTuning(t);
+        }
+        ~ExciteMode() { SetCurrentTuning(saved); }
+      };
       {
+        const ExciteMode streamExcite(static_cast<int>(BaselineNumber("rivers.streamExciteMode", 0)));
         const auto& Lm = rMain->line;
         size_t im = 0;
         for (size_t i = 0; i < Lm.size(); i++)
@@ -1806,8 +1827,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
         first.cells = dig;
         tick(first);
         std::printf("rivers:   S channel: lake (%d,%d) y%d -> main (%d,%d) y%d, %zu columns (%zu its own), %zu wall ops, "
-                    "%zu dig ops\n",
-                    lakeX, zA, yA, lakeX, zB, yB, floorOf.size(), byCols.size(), byWalls.size(), dig.size());
+                    "%zu dig ops; MPM excitation %s (rivers.streamExciteMode)\n",
+                    lakeX, zA, yA, lakeX, zB, yB, floorOf.size(), byCols.size(), byWalls.size(), dig.size(),
+                    CurrentTuning().sim.fluidExciteMode != 0 ? "on" : "off");
         const int streamTicks = static_cast<int>(BaselineNumber("rivers.streamTicks", 1800));
         std::string curve;
         int wet = 0, adopted = 0, awake = 0;
@@ -2035,10 +2057,13 @@ Status GateRivers(Ctx& c, std::string& detail) {
                     "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
                     flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
-        std::printf("rivers:   S head trace (tick: | the lake's last row || the channel's first own row | the next three >> its "
-                    "last four own rows | main's first row; "
-                    "each column target/hop:water top, 8 y + f, or -:top when not held):%s\n",
-                    headTrace.empty() ? " nothing held" : headTrace.c_str());
+        // (Printed only when S fails: a held stream fills it with 160 lines.)
+        if (!sOk) {
+          std::printf("rivers:   S head trace (tick: | the lake's last row || the channel's first own row | the next three >> its "
+                      "last four own rows | main's first row; "
+                      "each column target/hop:water top, 8 y + f, or -:top when not held):%s\n",
+                      headTrace.empty() ? " nothing held" : headTrace.c_str());
+        }
         c.ctx.WaitIdle();
         rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), seamDiagOff, seamDiag1,
                               sizeof seamDiag1, "riversSeamDiag");
