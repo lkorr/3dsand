@@ -1176,6 +1176,9 @@ const char* const kOrder[] = {
     "chem-sodium", "chem-acid-fumes", "chem-electrolysis", "chem-toxic",
     // Package E (the creative expansion): same fixture discipline.
     "chem-gunpowder", "chem-thermite", "chem-frost", "chem-holy-water", "chem-recipes",
+    // Blood pools on a sealed surface (ticket 2026-10-17_00-19-10): same
+    // fixture discipline (own basins, regenerates on the way out).
+    "blood-pool",
     // Electricity E3: a forced weather strike on a rod-and-collar fixture,
     // run twice; same fixture discipline (own pad, regenerates on the way out).
     "elec-strike",

@@ -4389,6 +4389,13 @@ static_assert((uint64_t)kFarLevels * kFarVox < (1ull << 32),
 static_assert(((uint64_t)(kFarLevels - 1) << kFarSlotShift) < (1ull << 32),
               "fill-queue packing (level-1)<<kFarSlotShift | slot must fit u32");
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
+// THE FAR DOWNSAMPLE CADENCE (World::farDownState, far_select.wgsl): a chunk
+// that keeps changing is re-downsampled at most every kFarDownEvery ticks, and
+// its last state lands within kFarDownEvery - 1 ticks of its last write. MUST
+// AGREE with far_select.wgsl FAR_DOWN_EVERY (scripts/check_invariants.py); the
+// C++ side reads it only to know how long an edit may take to reach the
+// cascades (the far gates settle that long).
+constexpr uint32_t kFarDownEvery = 8;
 
 // ---- cascade EDIT PATCHES (far-field edit persistence; src/sim/faredits.h) --
 // The sieve fills a level chunk from pristine procgen, which used to un-do the
@@ -6038,6 +6045,28 @@ class World {
   // 15.4 ms/frame of fardown). Derived, zero-initialised; FarField zeroes it
   // on every reset / full refill so a re-filled level is downsampled afresh.
   rhi::Buffer farSig;
+  // THE FAR DOWNSAMPLE CADENCE (2026-10-18, tickets 2026-10-16_11-14-41 /
+  // 2026-10-17_21-03-25; assets/shaders/far_select.wgsl). `fardown` used to run
+  // over every chunk written THIS tick, so a chunk that running water keeps
+  // rewriting was re-downsampled into all eight cascade levels every time
+  // (farField 4.6 ms/tick on the slope pour, 10.0 on the dam breach). Now
+  // `farDownSelect` picks the
+  // tick's work list from dirtyOut: a written chunk is marked PENDING, and a
+  // pending chunk is downsampled once at least FAR_DOWN_EVERY ticks have passed
+  // since its last downsample -- immediately for a one-off edit, every
+  // FAR_DOWN_EVERY ticks while it keeps changing, and within that many ticks
+  // of its last write once it goes quiet (the pending bit outlives the dirty
+  // flag, which is what makes the LAST state land).
+  //   farDownState: one u32 per slot, bit 31 pending | bits 0..30 the tick of
+  //                 its last downsample. Derived, zero-initialised.
+  //   farDownList:  the selected slots (what `fardown` and its three follow-up
+  //                 phases dispatch over, bound where dirtyList used to be).
+  //   farDownArgsStage / farDownArgs: the list's indirect args, written by the
+  //                 select's atomics and copied, the argsStage/dispatchArgs pair.
+  rhi::Buffer farDownState;
+  rhi::Buffer farDownList;
+  rhi::Buffer farDownArgsStage;
+  rhi::Buffer farDownArgs;
   // The far SURFACE MAP (kFarMap* above): per-level fine-resolution column
   // heights + skin, the raymarcher's refine data. CopySrc for the far-surface
   // gate only.

@@ -992,7 +992,9 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
                             kMatGlass});
     }
   const bool preYard = validAt(reskin.x + 1, reskin.z + 1);
-  for (uint32_t t = 1; t <= 4; t++) {
+  // 4 + kFarDownEvery: an edit reaches the cascades within the far downsample
+  // cadence (world.h kFarDownEvery), not necessarily on the tick it lands.
+  for (uint32_t t = 1; t <= 4 + kFarDownEvery; t++) {
     std::vector<BrushOp> ops;
     if (t == 1) {
       ops.push_back({crater.x, crater.y, crater.z, 3, kMatAir, 1u, 0, 0});
@@ -1338,7 +1340,7 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
     const Feat& k = feats[ci];
     // Radius 1 one voxel over the base: the plant's voxels, never the ground
     // two under the centre.
-    for (uint32_t tk = 1; tk <= 4; tk++) {
+    for (uint32_t tk = 1; tk <= 4 + kFarDownEvery; tk++) {
       std::vector<BrushOp> ops;
       if (tk == 1) ops.push_back({t.x, t.top + 2, t.z, 1, kMatAir, 1u, 0, 0});
       SubmitTick(ctx, world, sim, tk, seed, ops, {}, {}, false, dChunk, false,
@@ -1495,6 +1497,19 @@ Status GateFarLayer(Ctx& c, std::string& detail) {
     tick(v);
   }
   for (int i = 0; i < 3; i++) tick({});
+  // THE FAR DOWNSAMPLE CADENCE (world.h kFarDownEvery) lets a chunk that keeps
+  // changing lag the live grid by up to kFarDownEvery - 1 ticks, and this oil
+  // is still spreading when the gate reads it -- so the cascade would be
+  // compared against a live grid a few ticks newer than the one it holds.
+  // This gate tests what the downsample WRITES for a layer, not when, so it
+  // marks every slot pending-and-due (bit 31, last tick 0) and runs one more
+  // tick: every chunk whose far matter changed is downsampled from exactly
+  // the grid the comparison below reads.
+  {
+    const std::vector<uint32_t> due(kNumSlots, 0x80000000u);
+    ctx.queue.WriteBuffer(world.farDownState, 0, due.data(), due.size() * 4);
+    tick({});
+  }
   ctx.WaitIdle();
 
   // ---- the live grid over the tub, one chunk at a time ---------------------

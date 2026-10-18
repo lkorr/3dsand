@@ -1104,6 +1104,119 @@ Status GateChemRecipes(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// blood-pool (ticket 2026-10-17_00-19-10): "on some materials like ice, where
+// blood doesn't stain, it should probably never disappear ... pools of blood
+// being able to form on certain materials would be good". Two stone-footed
+// basins side by side, one layer of blood poured into each: one floored and
+// walled with GLASS (`absorb: {sealed: true}`), one floored with DIRT
+// (absorb capacity 10). After `ticks`:
+//   * the glass basin still holds every eighth of its blood (blood's drying
+//     rule does not fire on a cell resting on a sealed surface, sim_step.wgsl
+//     restsOnSealed) and its glass carries no stain (stainStep refuses a
+//     sealed surface);
+//   * the dirt basin's blood has soaked in and dried away as before (at most
+//     `dirtLeftMax` cells), leaving its floor stained blood;
+//   * and the world sleeps (<= awakeMax chunks): a pool that stays must not
+//     hold its chunk awake (rule 2).
+// Glass rather than ice for the claim: ice melts over 4 degrees, and the
+// harness's air is not pinned below that.
+// ---------------------------------------------------------------------------
+Status GateBloodPool(Ctx& c, std::string& detail) {
+  int mStone, mGlass, mDirt, mBlood;
+  std::string missing;
+  if (ResolveAll(c, {{&mStone, "stone"}, {&mGlass, "glass"}, {&mDirt, "dirt"}, {&mBlood, "blood"}}, missing)) {
+    detail = "missing " + missing;
+    return Status::Fail;
+  }
+  const uint32_t bloodType = c.mats[mBlood].gpu.stainPack & kStainPackTypeMask;
+  Regenerate(c);
+  const int half = 3;
+  const IVec3 s = Site(c, 300, 11, 3);
+  const Box aIn{{s.x - 6 - half, s.y + 1, s.z - half}, {s.x - 6 + half, s.y + 4, s.z + half}};
+  const Box bIn{{s.x + 6 - half, s.y + 1, s.z - half}, {s.x + 6 + half, s.y + 4, s.z + half}};
+  std::vector<CellOp> build, pour;
+  // The dirt floor FIRST: two cell ops on one cell in one tick keep the first
+  // (sim/oprecord.h), and the vessel's own floor would otherwise win.
+  Fill(build, Box{{bIn.lo.x, bIn.lo.y - 1, bIn.lo.z}, {bIn.hi.x, bIn.lo.y - 1, bIn.hi.z}}, (uint32_t)mDirt, 0);
+  Vessel(build, aIn, aIn.hi.y, (uint32_t)mGlass, (uint32_t)mStone);
+  Vessel(build, bIn, bIn.hi.y, (uint32_t)mStone, (uint32_t)mStone);
+  Fill(pour, Box{aIn.lo, {aIn.hi.x, aIn.lo.y, aIn.hi.z}}, (uint32_t)mBlood, 7u);
+  Fill(pour, Box{bIn.lo, {bIn.hi.x, bIn.lo.y, bIn.hi.z}}, (uint32_t)mBlood, 7u);
+  // Walk a box through the page table: blood eighths, blood cells, and floor
+  // cells (the layer under the box) carrying a blood stain / any stain.
+  struct Look {
+    uint32_t eighths = 0, cells = 0, floorStained = 0, floorAnyStain = 0, floorN = 0;
+  };
+  auto look = [&](const Box& in) {
+    Look L;
+    const Box b{{in.lo.x - 1, in.lo.y - 1, in.lo.z - 1}, {in.hi.x + 1, in.hi.y, in.hi.z + 1}};
+    std::vector<uint32_t> buf(kChunkVol);
+    for (int cz = b.lo.z >> 4; cz <= (b.hi.z >> 4); cz++)
+      for (int cy = b.lo.y >> 4; cy <= (b.hi.y >> 4); cy++)
+        for (int cx = b.lo.x >> 4; cx <= (b.hi.x >> 4); cx++) {
+          ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({cx, cy, cz}), 1, buf.data(), "bloodPool");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const int x = (int)(k % 16) + cx * 16, y = (int)((k / 16) % 16) + cy * 16, z = (int)(k / 256) + cz * 16;
+            if (!b.Has(x, y, z)) continue;
+            const uint32_t w = buf[k];
+            if ((w & 0xFFFu) == (uint32_t)mBlood) {
+              L.cells++;
+              L.eighths += ((w >> 12) & 15u) + 1u;
+            }
+            const bool floor = y == in.lo.y - 1 && x >= in.lo.x && x <= in.hi.x && z >= in.lo.z && z <= in.hi.z;
+            if (!floor) continue;
+            L.floorN++;
+            if (VoxStainAmt(w) > 0) L.floorAnyStain++;
+            if (VoxStainType(w) == bloodType && VoxStainAmt(w) > 0) L.floorStained++;
+          }
+        }
+    return L;
+  };
+  uint32_t t = 78000;
+  support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
+  tick(std::vector<BrushOp>{}, build);
+  tick(std::vector<BrushOp>{}, pour);
+  const Look a0 = look(aIn), b0 = look(bIn);
+  const int ticks = (int)BaselineNumber("bloodPool.ticks", 1500);
+  for (int i = 0; i < ticks; i++) tick();
+  const Look a1 = look(aIn), b1 = look(bIn);
+  // The FIXTURE's chunks (both basins, a cell of margin) awake at the end --
+  // the claim -- and the window's total beside it for attribution: the
+  // regenerated harness world is still settling elsewhere after 1500 ticks
+  // (measured 61 window-wide, which says nothing about the pools).
+  uint32_t awakeFix = 0, awakeAll = 0;
+  {
+    std::vector<uint32_t> flags(kNumSlots, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, flags.data(), kNumSlots * 4,
+                          "bloodPoolActive");
+    const IVec3 lo{(aIn.lo.x - 2) >> 4, (s.y - 3) >> 4, (aIn.lo.z - 2) >> 4};
+    const IVec3 hi{(bIn.hi.x + 2) >> 4, (aIn.hi.y + 2) >> 4, (bIn.hi.z + 2) >> 4};
+    for (uint32_t sl = 0; sl < kNumSlots; sl++) {
+      if (flags[sl] == 0) continue;
+      awakeAll++;
+      const IVec3 wc = c.world.SlotToWorldChunk(sl);
+      if (wc.x >= lo.x && wc.x <= hi.x && wc.y >= lo.y && wc.y <= hi.y && wc.z >= lo.z && wc.z <= hi.z) awakeFix++;
+    }
+  }
+  Regenerate(c);
+  const uint32_t dirtLeftMax = (uint32_t)BaselineNumber("bloodPool.dirtLeftMax", 2);
+  const uint32_t awakeMax = (uint32_t)BaselineNumber("bloodPool.awakeMax", 0);
+  const bool pools = a0.eighths > 0 && a1.eighths == a0.eighths && a1.floorAnyStain == 0;
+  const bool soaks = b0.eighths > 0 && b1.cells <= dirtLeftMax && b1.floorStained * 2 > b1.floorN;
+  const bool sleeps = awakeFix <= awakeMax;
+  const bool ok = pools && soaks && sleeps;
+  detail = Format(
+      "GLASS %s: blood %u -> %u eighths (%u cells) after %d ticks, %u of %u floor cells stained | DIRT %s: blood %u -> "
+      "%u eighths (%u cells, <= %u), %u of %u floor cells blood-stained | SLEEPS %s: %u of the fixture's chunks awake "
+      "(<= %u; %u window-wide)",
+      pools ? "pools" : "FAIL", a0.eighths, a1.eighths, a1.cells, ticks, a1.floorAnyStain, a1.floorN,
+      soaks ? "soaks" : "FAIL", b0.eighths, b1.eighths, b1.cells, dirtLeftMax, b1.floorStained, b1.floorN,
+      sleeps ? "ok" : "FAIL", awakeFix, awakeMax, awakeAll);
+  std::printf("blood-pool: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ChemGates() {
@@ -1118,6 +1231,8 @@ const std::vector<Gate>& ChemGates() {
       {"chem-frost", "sim", {}, false, GateChemFrost},
       {"chem-holy-water", "mob", {}, false, GateChemHolyWater},
       {"chem-recipes", "sim", {}, false, GateChemRecipes},
+      // Ticket 2026-10-17_00-19-10: blood pools on a sealed surface.
+      {"blood-pool", "sim", {}, false, GateBloodPool},
   };
   return g;
 }

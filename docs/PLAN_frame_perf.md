@@ -1013,3 +1013,114 @@ noticing.
    in raymarch (drift risk) and is not done.
 5. The macro slope's 1.7 ms is mostly the flow it switches on (gSlopeFlow),
    not its reads.
+
+## 10. Handoff 2026-10-18: the breached dam (ticket 2026-10-17_21-03-25), the slope's far downsample (11-14-41)
+
+**The scene, permanent** (perfsuite.cpp, `DamFindHoles` and friends). The
+default map's Mirrormere where its south rim is a 2 m stone wall with 3.5 m of
+lake standing over the ground outside it, at the ticket's --at pose. Two r9
+breaches are CARVED (overwrite-air spheres every 4 voxels from the wall face
+to past the lake's edge, through the queue) where shot 1 shows the owner's
+holes; the wall and the lake are found along each hole's line from the
+voxels, so a map repaint moves the scene with the wall or refuses it. 600
+ticks of pour, then:
+
+- `--render-budget --budget-cams dam,damlake,damground`: shot 1 (the wall and
+  both falls), shot 2 (over the lake behind the wall at -35.6 deg, the measured
+  flow pulling it toward the breaches: the owner's "flow vector field" view),
+  and the shot-1 eye turned round to the ground (the owner's no-water
+  control). The three share one pour. Arms `kArmsDam`.
+- `--perf --scenario dam` / `damground`: the tick under the breach beside the
+  raymarch of it (600 warm ticks, 300 frames, one tick a frame). The verify
+  note prints the CA water that ran out of the lake since the carve (counted
+  against a pre-carve census: the wall's half-space also holds parts of the
+  lake's wiggly shore).
+- The pour's MPM state differs boot to boot (the warm loop feeds the readback
+  `fluidLive` back, as `slope` does), so a `dam` picture compared across
+  boots carries spray-particle noise; compare `damlake`, or compare in one
+  process.
+
+**What it costs (1080p, RTX 3060 Ti).** Render, exclusive: `dam` 25.7 ms,
+`damlake` 17.4, `damground` 4.1. The tick (`--perf dam`, GPU ms per tick):
+**42.7** -- caLoop 15.0, MLS-MPM 11.5 (fluidGridUp 2.3, fluidClear 2.2, g2p
+1.9, p2g1 1.9, p2g2 1.2: nine substeps over the falls' padded blocks), farField
+10.0. At 30 ticks a second that tick alone is more GPU than the frame has: the
+owner's 21 -> 40 ms is mostly this, plus the render below on top of it.
+
+`dam` (shot 1) render attribution, `debug.perfExp` arms in one process
+(baseline 21.6, base2 drift 0.7; "runtime" = the branch gated on a runtime
+value so the code stays resident, which separates work from footprint):
+
+| part | ms |
+|---|---|
+| everything MPM (march + every MPM shade, runtime) | 12.7 |
+| . shadeMpmFluid's work (runtime; the const arm is the same 8.0: no footprint tax) | 8.2 |
+| . . the CALM-RAFT shadeWater on MPM pixels (a second full water shade, `lakeW`) | 4.8 |
+| . . fluidNormalAt (4 field samples) | 2.4 |
+| . . the traced refraction + reflection | 2.0 |
+| . march + deferred thickness walk (0.7) + lake-ownership sample | ~4.5 |
+| noshadow / nofar | 1.7 / 1.8 |
+
+The pour's pixels pay TWO water shades wherever its particles float on CA
+water: the falls in front of the lake seen through the holes and the pool at
+the foot of the wall. That double shade is the design of the calm raft (§7
+item 4), not a defect, and nothing here changes it: the cheap versions of it
+change the picture (§7's E). It is the largest single render lever left on a
+breach.
+
+`damlake` (shot 2): water is 82% of the pixels, 30.5 primary steps and 25.7
+media (water) cells a pixel. Arms (a slow boot: baseline 30.6, base2 30.2, so
+read the deltas, not the totals): shadeWater whole 8.2; **the current field
+off (waterCurrentAt and the convergence return 0) 2.9** -- the flow vector
+field the owner suspected is ~10% of this view; the flowing two-copy wave
+branch 1.6, flat normal 1.7, foam 1.4, traced reflection 1.2, streaks 0.4-0.9.
+`nofar` 2.15, `noreflect` 1.0 (exclusive boot).
+
+### LANDED
+
+1. **The far downsample cadence** (`far_select.wgsl`, `World::farDownState`,
+   DESIGN.md §9 "Edits reach the far field"). farDown rode compactNext's
+   dirtyOut list, so every chunk written that tick was re-downsampled into all
+   eight levels; now a written slot goes PENDING and a pending slot is
+   downsampled once 8 ticks have passed since its last downsample (a one-off
+   edit: the tick it lands; a quiet chunk's last state: within 7 ticks). The
+   hash-tick backstop rows are gone (the select reads the dirtyOut flags on
+   every tick, which also covers the writes from outside the active set the
+   backstop missed). `--perf dam` farField per tick: **10.0 -> 6.6 ms** (a
+   cadence of 4 measured 7.8, of 16 4.5: wet chunks are rewritten every few
+   ticks, not every tick, so the cadence must be several ticks to bite; 8 is
+   the conservative middle for the LOD handoff seam, where a flood front
+   moving ~1 m/s stands ~0.25 m apart across it). `--perf slope`: farField
+   4.56 -> 3.15 ms, frame p50 25.97 -> 24.77. World hash unchanged (c8931fcd dam, 7b87586a slope: the
+   cascade carries no sim requirement since 2026-10-06). `far-surface` settles
+   `kFarDownEvery` more ticks after its edits (world.h, check_invariants "far
+   downsample cadence"); `far-layer`, whose oil is still spreading when it
+   reads the cascade, marks every slot pending-and-due for its last tick (it
+   tests what the downsample writes, not when). The 12 far / water gates and
+   determinism (4993b9b0, unchanged) pass in one --verify.
+2. **raymarch, exact up to float rounding:** a lake pixel's 10 m depth cap
+   that falls INSIDE a liquid span box is found in one step (the exit of the
+   cell holding the cap point; the media sums telescope) instead of the
+   cell walk to it; a wave band the footprint has faded to exactly 0 skips its
+   cos/sin pairs; the foam lines ask the distance fade before their two shear
+   taps of the current. In one process: `damlake` **15.89 -> 14.95 ms**
+   (base2 drift 0.17), `dam` -0.15..-0.3, `damground` 0.00. Pictures (old vs
+   new path, bmpdiff): damlake 668 px differ, 0 over 2, max 1. raymarch fs
+   still **128 registers / 128 B local** (`--shader-stats`).
+
+### Left, ranked
+
+1. **The tick.** MLS-MPM 11.5 ms for 8000 particles: clear + gridUpdate are
+   per-block per-substep (nine substeps over every padded block of a tall
+   fall), and the clear re-seeds settled-liquid static mass from the voxels
+   every substep. caLoop 15 ms is the CA lane (held water / streams).
+2. **The calm raft's second water shade** on MPM pixels, 4.8 ms on `dam`.
+   Deciding the raft weight before the MPM shade, and what the MPM shade may
+   skip when the raft dominates, is a look call (§7 item 4).
+3. **The MPM march over a fall** (~4.5 ms incl. thickness): rays toward the
+   wall cross class-1 blocks of the fall's padded region and fine-step them.
+   An XZ occupancy mask per block (the Y mask's sibling, built in
+   gridUpdate's workgroup fold) would let those rays skip the empty columns.
+4. The current field on `damlake` (~2.9 ms): convergence's four taps and the
+   foam lines' two shear taps each re-fetch two bilinear grids; sharing one
+   2x2 node fetch when the taps share a node cell is exact (§9 item 4).

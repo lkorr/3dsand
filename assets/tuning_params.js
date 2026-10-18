@@ -1029,6 +1029,7 @@ const TUNING_PARAMS = {
   'sim.currentSinkSpeed':{t:'f',def:3,min:0,max:20},
   'sim.currentStreamScale':{t:'f',def:1.2,min:0,max:20},
   'sim.currentMeasuredCarry':{t:'f',def:1,min:0,max:4,wgsl:'TUNE_CURRENT_MEASURED_CARRY'},
+  'sim.currentMeasuredReach':{t:'i',def:4,min:1,max:6,wgsl:'TUNE_CURRENT_MEASURED_REACH'},
   'dayNight.cycleMinutes':{t:'i',def:20,min:1,max:240},
   'dayNight.freeze':{t:'i',def:0,min:0,max:1},
   'dayNight.freezePhase':{t:'i',def:32768,min:0,max:65535},
