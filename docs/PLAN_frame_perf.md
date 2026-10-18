@@ -1261,6 +1261,25 @@ no hashed state). Every number below is `--render-budget`, 1080p, RTX 3060 Ti,
    picture diff 1/255; `dam`/`slope` within noise (their foam is on fewer
    pixels).
 
+### The round's result, in one process (the final tree, merged with main f4c4c4b3)
+
+`perfExp` arm = items 1 and 2 reverted (old raft mix + old convergence);
+`SANDVOX_BUDGET_REPEAT=2`, exclusive, ms:
+
+| camera | before (arm) | after (baseline) | base2 (drift) | change |
+|---|---|---|---|---|
+| dam | 21.59 / 21.80 | 18.48 / 18.57 | 18.27 / 18.90 | **-3.2 (-15%)** |
+| damlake | 16.44 / 15.62 | 15.04 / 15.33 | 15.23 / 15.72 | -0.3 .. -1.4 |
+| damground | 3.84 / 3.68 | 3.84 / 3.70 | 3.91 / 3.70 | 0 |
+| slope | 20.91 / 21.66 | 20.09 / 20.09 | 21.36 / 20.22 | -0.8 .. -1.6 |
+
+Separate boots (main's assets vs this branch, same exe) are NOT usable for
+this: the same `before` boot read dam 20.14 and 22.2, damlake 14.45 and 16.1
+an hour apart (the MPM pour differs boot to boot, and the machine drifts);
+one cross-boot run was also taken while the owner's game held the GPU at 99%
+and is discarded. `--shader-stats` on the final tree: raymarch fs **128
+registers / 128 B local** (unchanged).
+
 ### MEASURED, NOT CHANGED (attribution arms in one process, after item 1)
 
 | arm (ms saved) | dam 18.0 | damlake 14.5 | slope 18.7 |
