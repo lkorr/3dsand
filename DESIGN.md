@@ -4241,6 +4241,30 @@ EMPTY lateral neighbour whose own below-cell is also empty, i.e. the water is
 perched on a ledge and could fall diagonally. **Default OFF since WP5**
 (`sim.fluidExcitePerch`), on the EXCITE side only — see below.
 
+**THE MASTER SWITCH: `sim.fluidEnabled`** (2026-10-18; the owner's "MPM
+water in world" checkbox in the F1 tool panel's MPM fluid section and the MPM
+Fluid Tuning window). 1 = everything above, unchanged. 0 = no MLS-MPM particle
+is born anywhere, and the ones alive go back to the CA. It is NOT
+`fluidExciteMode` (which gates triggers (a)-(d) only and needs a shader
+reload): it rides `TickParams._padSplash2` bit 0 (SET = off, so a TickParams
+built elsewhere reads as on), packed per tick by `SubmitTick`, so it is live,
+on the tick input stream and in the op record. Off, in full: `SubmitTick` also
+zeroes `fluidExciteEnable` and the water bodies' discharge block
+(`waterDrainBodies`, so the ledger refuses every discharge); `exciteDetect`
+looks at no cell (so the drain shell and progressive wake, which sit outside
+the excite gate, are off too); a CPU spawn op becomes plain CA liquid
+(`FluidSpawnsAsCells`: one eighth per op summed per cell, a full or
+other-liquid cell passes the rest up its column, fill-air-only cell ops, so a
+pour aimed into standing water is refused there like a prefab paint) and a
+ghost op is dropped; and `settleScan` DRAINS the pool through the force-settle
+path with its gates opened — a slot is forced after 2 ticks holding particles
+(not `fluidStuckTicks`), up to 16 forced blocks a tick (not
+`fluidForceBlocks`), and the forced walk's floor test is lifted, so water in
+flight is written where it stands as CA liquid and the CA drops it (excite
+cannot take it back; there is nothing to oscillate with). The walk is still
+the all-or-nothing one, so the drain conserves mass exactly. Gate:
+`fluid-off`.
+
 **WP5: THE FLIP, AND WHAT IT COSTS** (2026-08-25; world hash 7b01cfd8 →
 58b27f33). `sim.fluidExciteMode` ships at 1, so world water responds to being
 dug under. The plan's other half — deleting the CA's liquid movement — was

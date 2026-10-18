@@ -6186,7 +6186,10 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       // plus every spawn batch it has not seen yet. Settles decay it (the
       // snapshot count shrinks); excites grow it one snapshot late, which the
       // seam's recording predicate covers (Simulation::EncodeTick).
-      if (!fluidSpawns.empty())
+      // MPM off (sim.fluidEnabled 0): SubmitTick placed these as CA liquid,
+      // so they are not particles the snapshot has yet to see.
+      const bool mpmOn = CurrentTuning().sim.fluidEnabled != 0;
+      if (!fluidSpawns.empty() && mpmOn)
         fluidPendingSpawns.push_back({tick, (uint32_t)fluidSpawns.size()});
       {
         const WorldSnapshot& fsn = world.Snap();
@@ -6199,7 +6202,7 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
           for (const auto& p : fluidPendingSpawns) pend += p.second;
           fluidCount = std::min(fsn.fluidLive + pend, kFluidCap);
         } else {
-          fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(),
+          fluidCount = std::min(fluidCount + (mpmOn ? (uint32_t)fluidSpawns.size() : 0u),
                                 kFluidCap);
         }
       }
