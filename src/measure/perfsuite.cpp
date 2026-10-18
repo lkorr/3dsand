@@ -1474,6 +1474,17 @@ void DriveSlope(Scene& s, uint32_t, TickOps& out) {
   SlopeTickOps(s, s.fireTick++, out);
 }
 std::string MpmNodeCensus(Scene& s);
+// One timed pass of a RECORDED frame into the per-pass table (see Run::passStats).
+void AddRecordedPass(std::vector<PassTimer::Stat>& t, const PassSample& ps) {
+  const char* nm = ps.name ? ps.name : "?";
+  for (PassTimer::Stat& st : t)
+    if (st.name == nm) { st.totalNs += ps.ns; st.samples++; return; }
+  PassTimer::Stat st;
+  st.name = nm;
+  st.totalNs = ps.ns;
+  st.samples = 1;
+  t.push_back(st);
+}
 void VerifySlope(Scene& s) {
   s.note += "; at the end: " + SlopeCensus(s);
   s.note += "; " + MpmNodeCensus(s);
@@ -2236,6 +2247,13 @@ struct Run {
   std::vector<double> farMapMs, farFillMs;
   // Per-pass totals, kept beside the node rollup so the page can drill from
   // "fluidSys cost 3 ms" to "of which seam_settle_scan was 2.1".
+  //
+  // RECORDED FRAMES ONLY (2026-10-18). This used to be timer_.Stats(), which
+  // accumulates from the ResetStats() BEFORE the warm-up, while the JSON
+  // divides by the recorded sample count -- so a scenario with 600 warm ticks
+  // and 300 frames printed every pass at 3x its cost (`dam`: "caLoop 15.4 ms,
+  // MLS-MPM 11.5" for a tick whose own per-frame series said 5.2 and 4.0).
+  // It is now summed in postFrame from exactly the frames the series holds.
   std::vector<PassTimer::Stat> passStats;
   uint64_t unattributedNs = 0;
   std::vector<std::string> unattributedNames;
@@ -2785,6 +2803,7 @@ Run PerfRunner::Record(const Scenario& scIn) {
       if (si < 0) return;   // a warmup frame: its numbers are not recorded
       PerfSample& dst = r.samples[(size_t)si];
       for (const PassSample& ps : passes) {
+        AddRecordedPass(r.passStats, ps);
         const int node = PerfNodeForTimedName(ps.name);
         if (node < 0) {
           r.unattributedNs += ps.ns;
@@ -2835,6 +2854,7 @@ Run PerfRunner::Record(const Scenario& scIn) {
           if (frameToSample_[pf.tag] < 0) continue;
           PerfSample& dst = r.samples[(size_t)frameToSample_[pf.tag]];
           for (const PassSample& ps : pf.passes) {
+            AddRecordedPass(r.passStats, ps);
             const int node = PerfNodeForTimedName(ps.name);
             if (node < 0) { r.unattributedNs += ps.ns; continue; }
             dst.gpuMs[node] += (double)ps.ns / 1e6;
@@ -2849,7 +2869,6 @@ Run PerfRunner::Record(const Scenario& scIn) {
   if (sc.verify) sc.verify(s);
   r.note = s.note;
 
-  r.passStats = timer_.Stats();
   r.warmupMs = (NowSeconds() - runStart) * 1000.0;
   r.worldHash = HashWorldNow(ctx_, world_, sim_, kDefaultSeed);
   ctx_.WaitIdle();
@@ -5268,6 +5287,15 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       }();
       ArmResult r = runner.Measure(*arm, base, scene, /*warm=*/kWarm,
                                    /*frames=*/48);
+      // SANDVOX_BUDGET_ARM_SHOTS=1: every arm's picture as well, taken while
+      // the arm's shaders are still bound, so an exact render change A/B'd as
+      // a perfExp arm can be diffed against `baseline` IN ONE PROCESS -- the
+      // only comparison a scene with live MPM spray allows (its particles
+      // differ boot to boot). build/render_budget_<cam>_<arm>.bmp.
+      if (r.ok && std::getenv("SANDVOX_BUDGET_ARM_SHOTS")) {
+        const std::string p = std::string("build/render_budget_") + id + "_" + arm->id + ".bmp";
+        runner.Shot(scene, p.c_str());
+      }
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
       else std::printf("%7.2f ms  (pre %.2f, p10 %.2f)\n", r.gpuP50, r.preP50, r.gpuP10);

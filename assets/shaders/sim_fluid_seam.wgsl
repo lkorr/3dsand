@@ -2073,6 +2073,27 @@ fn seamReactWake(cell : vec3<i32>, slot : u32, m : Material) {
 // block's Y-mask word — the per-cell atomicOr (every liquid cell of a pool)
 // and the FA_STAINED add are folded in workgroup memory and published once.
 // OR and integer add commute: the words are unchanged (rule 1).
+// ---- THE XZ-COLUMN HALF OF THE OCCUPANCY WORD (2026-10-18) ---------------
+// The Y-mask word (common.wgsl fbmYMaskIndex) uses bits 0..15. Bits 16..31 are
+// its sibling: one bit per 4x4 group of the chunk's 16x16 columns, bit
+// 16 + gx + 4*gz, lit for every node/cell the Y half lights, dilated +-2 cells
+// in x and z exactly as the Y half is in y. A clear bit therefore proves no
+// node of the block within 2 columns of that group carries >= FLUID_MASS_MIN
+// and no settled liquid voxel stands there: the raymarch's MPM march
+// (raymarch.wgsl fluidMarch) reads a sample whose whole tap box lies in such a
+// group as empty without its taps. Set ONLY together with Y bits, so every
+// `word != 0` test of the mask is unchanged. Render-only, retired with the Y
+// half by alloc's phase A. THE SAME DECLARATION LIVES IN sim_fluid.wgsl,
+// sim_fluid_seam.wgsl AND raymarch.wgsl (kept out of common.wgsl on purpose).
+fn fbmXZBits(lx : i32, lz : i32) -> u32 {
+  let x0 = u32(clamp(lx - 2, 0, 15)) >> 2u;
+  let x1 = u32(clamp(lx + 2, 0, 15)) >> 2u;
+  let z0 = u32(clamp(lz - 2, 0, 15)) >> 2u;
+  let z1 = u32(clamp(lz + 2, 0, 15)) >> 2u;
+  let xm = ((2u << x1) - 1u) & ~((1u << x0) - 1u);
+  return ((xm << (4u * z0)) | (xm << (4u * z1))) << 16u;
+}
+
 var<workgroup> saYMask : atomic<u32>;
 var<workgroup> saStained : atomic<u32>;
 
@@ -2131,7 +2152,7 @@ fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
   // walks every active-block cell with the voxel word in hand.
   var ybits = 0u;
   if (nmat != MAT_AIR && materials[nmat].klass == CLASS_LIQUID) {
-    ybits = fbmYBits(lo.y);
+    ybits = fbmYBits(lo.y) | fbmXZBits(lo.x, lo.z);
   }
   if (sType == 0u || sAmt == 0u) { return vec2<u32>(ybits, 0u); }
   if (nmat == MAT_AIR) { return vec2<u32>(ybits, 0u); }

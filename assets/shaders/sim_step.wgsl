@@ -6372,7 +6372,21 @@ fn caRow(first : u32, total : u32, t : u32) -> CaRow {
   let wi = ci * CA_MASK_STRIDE + u32(y >> 1) + 8u * u32(z);
   let sh = 16u * u32(y & 1);
   var bits = caRowBits(start.x);
-  if (gCaSub != 0u || fluidBlockMapS[ci] == 0u) {
+  // An MPM chunk's AIR is taken on substep 0 only in the y rows that can hold
+  // excited fluid (2026-10-18, water perf round 2). excitedReact is a no-op
+  // unless fluidOccMat finds >= 1024 of node volume in the cell, and the
+  // chunk's Y-OCCUPANCY MASK (common.wgsl fbmYMaskIndex) is a dilated superset
+  // of every y level where ANY node of the block carried >= FLUID_MASS_MIN
+  // (16) at ANY substep of last tick -- the same tick whose last substep left
+  // the grid word fluidOccMat reads (the CA runs before this tick's
+  // PT_FLUIDMAP retires the mask). So a clear bit proves every air site of
+  // the row would return from excitedReact at once; the row takes the mask
+  // like any other chunk's. Measured on `--perf dam`: an MPM block is
+  // allocated FLUID_MARK_PAD cells around the particles, so most of a fall's
+  // chunks are air rows nothing can react in, and substep 0 cost twice
+  // substep 1 visiting them.
+  if (gCaSub != 0u || fluidBlockMapS[ci] == 0u ||
+      ((fluidBlockMapS[fbmYMaskIndex(ci)] >> u32(y)) & 1u) == 0u) {
     bits &= (caMask[wi] >> sh) & 0xFFFFu;
   }
   let gas = bits & (caMask[wi + CA_MASK_WORDS] >> sh);

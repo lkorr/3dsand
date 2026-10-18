@@ -1217,6 +1217,27 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
 // OR and the SUM are folded in workgroup memory and published once. OR and
 // integer add are associative and commutative, so the words end up bit-for-bit
 // what the per-node atomics produced (rule 1).
+// ---- THE XZ-COLUMN HALF OF THE OCCUPANCY WORD (2026-10-18) ---------------
+// The Y-mask word (common.wgsl fbmYMaskIndex) uses bits 0..15. Bits 16..31 are
+// its sibling: one bit per 4x4 group of the chunk's 16x16 columns, bit
+// 16 + gx + 4*gz, lit for every node/cell the Y half lights, dilated +-2 cells
+// in x and z exactly as the Y half is in y. A clear bit therefore proves no
+// node of the block within 2 columns of that group carries >= FLUID_MASS_MIN
+// and no settled liquid voxel stands there: the raymarch's MPM march
+// (raymarch.wgsl fluidMarch) reads a sample whose whole tap box lies in such a
+// group as empty without its taps. Set ONLY together with Y bits, so every
+// `word != 0` test of the mask is unchanged. Render-only, retired with the Y
+// half by alloc's phase A. THE SAME DECLARATION LIVES IN sim_fluid.wgsl,
+// sim_fluid_seam.wgsl AND raymarch.wgsl (kept out of common.wgsl on purpose).
+fn fbmXZBits(lx : i32, lz : i32) -> u32 {
+  let x0 = u32(clamp(lx - 2, 0, 15)) >> 2u;
+  let x1 = u32(clamp(lx + 2, 0, 15)) >> 2u;
+  let z0 = u32(clamp(lz - 2, 0, 15)) >> 2u;
+  let z1 = u32(clamp(lz + 2, 0, 15)) >> 2u;
+  let xm = ((2u << x1) - 1u) & ~((1u << x0) - 1u);
+  return ((xm << (4u * z0)) | (xm << (4u * z1))) << 16u;
+}
+
 var<workgroup> guYMask : atomic<u32>;
 var<workgroup> guClamped : atomic<u32>;
 
@@ -1275,7 +1296,8 @@ fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
   // This node carries mass: light its y level in the chunk's Y-occupancy mask
   // (common.wgsl). Render-only derived data, folded per workgroup by the entry
   // point above; the word is retired once per tick by `alloc`'s phase A.
-  let ybits = fbmYBits(i32((localIdx >> 4u) & 15u));
+  let ybits = fbmYBits(i32((localIdx >> 4u) & 15u)) |
+              fbmXZBits(i32(localIdx & 15u), i32(localIdx >> 8u));
   var clamped = 0u;
   var v : vec3<i32>;
   // Momentum is MASS-weighted (p2g1), so divide by the node's mass, not its
