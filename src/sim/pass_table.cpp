@@ -137,6 +137,7 @@ namespace {
 #define PIPE_FLUID_P2G2      Pipe::FluidP2G2
 #define PIPE_FLUID_GRIDUP    Pipe::FluidGridUp
 #define PIPE_FLUID_G2P       Pipe::FluidG2P
+#define PIPE_FLUID_FINISH    Pipe::FluidFinish
 #define PIPE_FLUID_COMPACT_COUNT   Pipe::FluidCompactCount
 #define PIPE_FLUID_COMPACT_SCAN    Pipe::FluidCompactScan
 #define PIPE_FLUID_COMPACT_SCATTER Pipe::FluidCompactScatter

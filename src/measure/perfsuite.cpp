@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1471,8 +1473,21 @@ bool SetupSlope(Scene& s, std::string& why) {
 void DriveSlope(Scene& s, uint32_t, TickOps& out) {
   SlopeTickOps(s, s.fireTick++, out);
 }
+std::string MpmNodeCensus(Scene& s);
+// One timed pass of a RECORDED frame into the per-pass table (see Run::passStats).
+void AddRecordedPass(std::vector<PassTimer::Stat>& t, const PassSample& ps) {
+  const char* nm = ps.name ? ps.name : "?";
+  for (PassTimer::Stat& st : t)
+    if (st.name == nm) { st.totalNs += ps.ns; st.samples++; return; }
+  PassTimer::Stat st;
+  st.name = nm;
+  st.totalNs = ps.ns;
+  st.samples = 1;
+  t.push_back(st);
+}
 void VerifySlope(Scene& s) {
   s.note += "; at the end: " + SlopeCensus(s);
+  s.note += "; " + MpmNodeCensus(s);
   if (!s.prevMap.empty()) {
     std::string why;
     if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
@@ -1716,8 +1731,100 @@ void DriveDam(Scene& s, uint32_t, TickOps& out) {
   if (s.fireTick++ == 0) DamBreachOps(g_damHoles, out.ops);
   out.particlesActive = true;
 }
+// ---------------------------------------------------------------------------
+// THE MPM NODE CENSUS (water perf round 2, 2026-10-18). The fluid's per-tick
+// GPU time is two kinds of pass: per PARTICLE (p2g1, p2g2, g2p: live x
+// substeps) and per NODE (clear, gridUpdate: every node of every allocated
+// block x substeps). `--perf dam` reported 4.5 ms of node passes and the bare
+// block count says nothing about how many of those nodes any particle can
+// reach. This reads the end-of-run state ONCE (blocking, after the timed
+// frames: a measurement tool, never the frame path) and says how much of the
+// block set the particles' supports actually cover, at node and brick
+// granularity, both instantaneous (the 3^3 B-spline support this substep) and
+// padded by FLUID_MARK_PAD (a whole tick's CFL-capped travel, which is the
+// set `mark` allocates).
+std::string MpmNodeCensus(Scene& s) {
+  World& w = s.world;
+  uint32_t fa[kFluidArgsWords] = {};
+  if (!rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidArgsStage, 0, fa,
+                             sizeof fa, "mpmCensusArgs"))
+    return "mpm census: args readback failed";
+  const uint32_t live = std::min(fa[7], kFluidCap);
+  const uint32_t blocks = std::min(fa[3], kFluidBlocks);
+  if (blocks == 0 || live == 0) return "mpm census: no live blocks";
+  std::vector<uint32_t> list(blocks);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidBlockList, 0, list.data(),
+                        blocks * 4, "mpmCensusList");
+  std::vector<uint32_t> ymask(kNumSlots);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidBlockMap, (uint64_t)kNumSlots * 4,
+                        ymask.data(), (size_t)kNumSlots * 4, "mpmCensusY");
+  std::vector<int32_t> grid((size_t)blocks * kChunkVol * 8);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidGrid, 0, grid.data(),
+                        grid.size() * 4, "mpmCensusGrid");
+  std::vector<int32_t> parts((size_t)live * 32);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidParticles[s.sim.Page()], 0,
+                        parts.data(), parts.size() * 4, "mpmCensusParts");
+  // chunk -> block index
+  auto key = [](IVec3 c) {
+    return ((uint64_t)(uint32_t)(c.x + (1 << 20)) << 42) |
+           ((uint64_t)(uint32_t)(c.y + (1 << 20)) << 21) | (uint64_t)(uint32_t)(c.z + (1 << 20));
+  };
+  std::unordered_map<uint64_t, uint32_t> blockOf;
+  for (uint32_t b = 0; b < blocks; b++) blockOf[key(w.SlotToWorldChunk(list[b]))] = b;
+  uint32_t yEmpty = 0;
+  for (uint32_t b = 0; b < blocks; b++) yEmpty += (ymask[list[b]] & 0xFFFFu) == 0 ? 1 : 0;
+  uint64_t massNodes = 0;
+  for (size_t n = 0; n < (size_t)blocks * kChunkVol; n++) massNodes += grid[n * 8] >= 16 ? 1 : 0;
+  // supports
+  std::unordered_set<uint64_t> sup, brick4, brick8, brick4pad, brick8pad, partBlocks;
+  constexpr int kPad = 5;   // FLUID_MARK_PAD at the 9-substep default
+  uint32_t alive = 0;
+  auto fdiv = [](int a, int d) { return a >= 0 ? a / d : -((-a + d - 1) / d); };
+  for (uint32_t i = 0; i < live; i++) {
+    const int32_t* p = &parts[(size_t)i * 32];
+    if ((p[18] & 0xFFF) == 0) continue;
+    alive++;
+    IVec3 base{(p[0] - 65536) >> 16, (p[1] - 65536) >> 16, (p[2] - 65536) >> 16};
+    IVec3 cell{p[0] >> 16, p[1] >> 16, p[2] >> 16};
+    partBlocks.insert(key(IVec3{cell.x >> 4, cell.y >> 4, cell.z >> 4}));
+    for (int k = 0; k < 3; k++)
+      for (int j = 0; j < 3; j++)
+        for (int a = 0; a < 3; a++) {
+          IVec3 n{base.x + a, base.y + j, base.z + k};
+          sup.insert(key(n));
+          brick4.insert(key(IVec3{n.x >> 2, n.y >> 2, n.z >> 2}));
+          brick8.insert(key(IVec3{n.x >> 3, n.y >> 3, n.z >> 3}));
+        }
+    for (int d = 4; d <= 8; d += 4) {
+      IVec3 lo{fdiv(base.x - kPad, d), fdiv(base.y - kPad, d), fdiv(base.z - kPad, d)};
+      IVec3 hi{fdiv(base.x + 2 + kPad, d), fdiv(base.y + 2 + kPad, d), fdiv(base.z + 2 + kPad, d)};
+      for (int z = lo.z; z <= hi.z; z++)
+        for (int y = lo.y; y <= hi.y; y++)
+          for (int x = lo.x; x <= hi.x; x++)
+            (d == 4 ? brick4pad : brick8pad).insert(key(IVec3{x, y, z}));
+    }
+  }
+  const double nodes = (double)blocks * kChunkVol;
+  char buf[640];
+  std::snprintf(buf, sizeof buf,
+                "mpm census: %u live (%u alive) in %u blocks (%u hold a particle, %u Y-mask "
+                "empty); nodes/substep %.0f, with mass>=16 %llu (%.1f%%), in an instantaneous "
+                "support %zu (%.1f%%); bricks 4^3 touched %zu of %u (%.1f%%), padded %zu "
+                "(%.1f%%); bricks 8^3 touched %zu of %u (%.1f%%), padded %zu (%.1f%%)",
+                live, alive, blocks, (unsigned)partBlocks.size(), yEmpty, nodes,
+                (unsigned long long)massNodes, 100.0 * (double)massNodes / nodes, sup.size(),
+                100.0 * (double)sup.size() / nodes, brick4.size(), blocks * 64,
+                100.0 * (double)brick4.size() / (blocks * 64.0), brick4pad.size(),
+                100.0 * (double)brick4pad.size() / (blocks * 64.0), brick8.size(), blocks * 8,
+                100.0 * (double)brick8.size() / (blocks * 8.0), brick8pad.size(),
+                100.0 * (double)brick8pad.size() / (blocks * 8.0));
+  std::printf("  %s\n", buf);
+  return buf;
+}
+
 void VerifyDam(Scene& s) {
   s.note += "; at the end: " + DamCensus(s, g_damHoles);
+  s.note += "; " + MpmNodeCensus(s);
   if (!s.prevMap.empty()) {
     std::string why;
     if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
@@ -2140,6 +2247,13 @@ struct Run {
   std::vector<double> farMapMs, farFillMs;
   // Per-pass totals, kept beside the node rollup so the page can drill from
   // "fluidSys cost 3 ms" to "of which seam_settle_scan was 2.1".
+  //
+  // RECORDED FRAMES ONLY (2026-10-18). This used to be timer_.Stats(), which
+  // accumulates from the ResetStats() BEFORE the warm-up, while the JSON
+  // divides by the recorded sample count -- so a scenario with 600 warm ticks
+  // and 300 frames printed every pass at 3x its cost (`dam`: "caLoop 15.4 ms,
+  // MLS-MPM 11.5" for a tick whose own per-frame series said 5.2 and 4.0).
+  // It is now summed in postFrame from exactly the frames the series holds.
   std::vector<PassTimer::Stat> passStats;
   uint64_t unattributedNs = 0;
   std::vector<std::string> unattributedNames;
@@ -2689,6 +2803,7 @@ Run PerfRunner::Record(const Scenario& scIn) {
       if (si < 0) return;   // a warmup frame: its numbers are not recorded
       PerfSample& dst = r.samples[(size_t)si];
       for (const PassSample& ps : passes) {
+        AddRecordedPass(r.passStats, ps);
         const int node = PerfNodeForTimedName(ps.name);
         if (node < 0) {
           r.unattributedNs += ps.ns;
@@ -2739,6 +2854,7 @@ Run PerfRunner::Record(const Scenario& scIn) {
           if (frameToSample_[pf.tag] < 0) continue;
           PerfSample& dst = r.samples[(size_t)frameToSample_[pf.tag]];
           for (const PassSample& ps : pf.passes) {
+            AddRecordedPass(r.passStats, ps);
             const int node = PerfNodeForTimedName(ps.name);
             if (node < 0) { r.unattributedNs += ps.ns; continue; }
             dst.gpuMs[node] += (double)ps.ns / 1e6;
@@ -2753,7 +2869,6 @@ Run PerfRunner::Record(const Scenario& scIn) {
   if (sc.verify) sc.verify(s);
   r.note = s.note;
 
-  r.passStats = timer_.Stats();
   r.warmupMs = (NowSeconds() - runStart) * 1000.0;
   r.worldHash = HashWorldNow(ctx_, world_, sim_, kDefaultSeed);
   ctx_.WaitIdle();
@@ -2974,6 +3089,11 @@ struct RenderArm {
   // pair only means something under precipitation — pin it for the run with
   // SANDVOX_WEATHER=rain (or storm, for the steep lean).
   bool noRainMap = false;
+  // OR'd into RenderParams.fluidCount (raymarch.wgsl fluidStage): the MPM
+  // surface's own attribution stages, the lab's (lab.cpp FluidArm) on a budget
+  // camera. 1 = coarse march only, 3 = + thickness walk, 4 = the step heatmap
+  // (a picture, not a cost: read it with SANDVOX_BUDGET_ARM_SHOTS=1).
+  uint32_t fluidBits = 0;
 };
 
 const RenderArm kRenderArms[] = {
@@ -3294,6 +3414,17 @@ const RenderArm kExtraArms[] = {
      [](Tuning& t) { t.debug.perfExp = 15; }, true, 1,
      "whatever experiment 15 in the shaders is — see TUNE_PERF_EXP",
      false, false, /*anyCamera=*/true},
+    // The MPM surface's stages (fluidBits above): full minus mpmcoarse is
+    // refine + thickness + shade, mpmthick minus mpmcoarse the thickness walk.
+    {"mpmcoarse", "MPM surface: coarse march only (a hit reads as a miss)", nullptr,
+     true, 1, "everything the MPM surface costs past its coarse march", false, false,
+     /*anyCamera=*/true, false, 1u << 28},
+    {"mpmthick", "MPM surface: march + thickness walk, no shade", nullptr, true, 1,
+     "the MPM shade (and lake-ownership test) past the march + thickness", false,
+     false, /*anyCamera=*/true, false, 3u << 28},
+    {"mpmheat", "MPM surface: the step heatmap (picture only)", nullptr, true, 1,
+     "nothing: r = march iterations, g = field samples, b = empty strides, /96",
+     false, false, /*anyCamera=*/true, false, 4u << 28},
     // The baseline AGAIN, last: arms share one world and one set of render
     // caches (shadow cache, GI cache, openness), so an arm that changes what
     // those caches hold hands the NEXT arm a different warm state. `base2`
@@ -4586,7 +4717,7 @@ class RenderBudgetRunner {
       // actually played in.
       WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
                         arm.shadows, kBudgetAnimTime, kFarFogDensity, (float)H,
-                        skyTick_, s.fluidLive);
+                        skyTick_, s.fluidLive | (s.fluidLive ? arm.fluidBits : 0u));
       rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
       uint32_t pb = 0, pe = 0, rb = 0, re = 0;
       const bool timedPre = timer_.AllocPassPair("pre", pb, pe);
@@ -4666,11 +4797,12 @@ class RenderBudgetRunner {
   // exists for exactly one reason: `build/render_budget.bmp` is the path
   // everything downstream already knows, and the noon camera has to keep
   // writing it even though it now also writes render_budget_noon.bmp.
-  void Shot(const Scene& s, const char* path, const char* alsoPath = nullptr) {
+  void Shot(const Scene& s, const char* path, const char* alsoPath = nullptr,
+            uint32_t fluidBits = 0) {
     const uint32_t W = opt_.width, H = opt_.height;
     WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
                       /*shadows=*/true, kBudgetAnimTime, kFarFogDensity,
-                      (float)H, skyTick_, s.fluidLive);
+                      (float)H, skyTick_, s.fluidLive | (s.fluidLive ? fluidBits : 0u));
     rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
     {
       rhi::RenderPass rp = sim_.BeginRenderPass(
@@ -5172,6 +5304,15 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       }();
       ArmResult r = runner.Measure(*arm, base, scene, /*warm=*/kWarm,
                                    /*frames=*/48);
+      // SANDVOX_BUDGET_ARM_SHOTS=1: every arm's picture as well, taken while
+      // the arm's shaders are still bound, so an exact render change A/B'd as
+      // a perfExp arm can be diffed against `baseline` IN ONE PROCESS -- the
+      // only comparison a scene with live MPM spray allows (its particles
+      // differ boot to boot). build/render_budget_<cam>_<arm>.bmp.
+      if (r.ok && std::getenv("SANDVOX_BUDGET_ARM_SHOTS")) {
+        const std::string p = std::string("build/render_budget_") + id + "_" + arm->id + ".bmp";
+        runner.Shot(scene, p.c_str(), nullptr, arm->fluidBits);
+      }
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
       else std::printf("%7.2f ms  (pre %.2f, p10 %.2f)\n", r.gpuP50, r.preP50, r.gpuP10);

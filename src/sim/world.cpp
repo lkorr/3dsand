@@ -373,15 +373,20 @@ void World::Init(const rhi::Device& device) {
   // at the head of PT_FLUIDMAP clears all of it, which is what the mask and
   // the bits need (and a zeroed box can only describe chunks far outside any
   // window, i.e. no fluid).
+  // Then THE BRICK LEDGER (sim_fluid.wgsl fbmBrickFull / fbmBrickWord): one
+  // flag word and one word per 4^3 brick of every block, solver-only; then THE
+  // MARK BITMAP (fbmMarkWord), one bit per slot, set by mark, cleared by alloc.
+  // CopySrc: --perf's MPM node census reads the map and the grid back.
   fluidBlockMap = CreateBuffer(
-      device, ((uint64_t)kNumSlots * 2 + 8 + (kNumSlots + 31) / 32) * 4,
-                               U::Storage | U::CopyDst, "fluidBlockMap");
+      device, ((uint64_t)kNumSlots * 2 + 8 + (kNumSlots + 31) / 32 + 1 +
+               (uint64_t)kFluidBlocks * 64 + (kNumSlots + 31) / 32) * 4,
+                               U::Storage | U::CopyDst | U::CopySrc, "fluidBlockMap");
   fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4,
                                 U::Storage | U::CopySrc, "fluidBlockList");
   // 8 i32 words per node (FLUID_GW in sim_fluid.wgsl): mass, momentum xyz,
   // per-species mass x3, foam — 32 MiB of per-substep scratch at 256 blocks.
   fluidGrid = CreateBuffer(device, (uint64_t)kFluidBlocks * kChunkVol * 32,
-                           U::Storage, "fluidGrid");
+                           U::Storage | U::CopySrc, "fluidGrid");
   // The FA_* word map (kFluidArgsWords, world.h). CopyDst: the seam relies on a
   // zeroed live count after worldgen/reset (fill-cleared there).
   fluidArgsStage = CreateBuffer(device, kFluidArgsBytes,
