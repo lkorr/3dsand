@@ -30137,8 +30137,9 @@ bool Mob::CurrentWakesDead(World& world) {
   }
   int surfY = seedY + 1;
   for (int k = 0; k < 96 && isLiquid(matAt(cx, surfY, cz)); k++) surfY++;
-  const Vec3 cur = sandvox::CurrentOnFloater(com, keel, topY, (float)surfY);
-  if (std::sqrt(cur.x * cur.x + cur.z * cur.z) < MetresToCells(wake))
+  const sandvox::FloaterCurrent fc =
+      sandvox::CurrentOnFloaterSplit(com, keel, topY, (float)surfY);
+  if (!fc.Wakes(MetresToCells(wake)))
     return false;  // still water: a floating corpse may sleep
   const Vec3 d = com - currentWokeAt_;
   if (currentWoke_ && d.x * d.x + d.y * d.y + d.z * d.z < 1.0f)

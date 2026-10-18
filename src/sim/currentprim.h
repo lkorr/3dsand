@@ -321,6 +321,23 @@ Vec3 CurrentAtCpuSim(Vec3 posVox);
 // the reason the player's stroke samples its wet span too (Player::Update).
 // Horizontal only, cells/s.
 Vec3 CurrentOnFloater(Vec3 comVox, float keelY, float topY, float surfY);
+// ...SPLIT, for the question "may this current WAKE a sleeping floater?".
+// `standing` is the map's solved field plus the sim-licensed primitives --
+// currents that are there whether or not anything moved; `measured` is the
+// measured flow's share (x sim.currentMeasuredCarry); `total` is
+// CurrentOnFloater. A sleeper wakes for a standing current of at least the
+// threshold, or for a MEASURED one of at least flowfield::kFlowMeasTakeover
+// (where the renderer lets the measured flow take over from the solved field:
+// a breach, a flood) -- not for the measured flow's small change. The record
+// is the water's every move, and a body bobbing at rest makes some of its
+// own: waking on that kept a floating corpse cycling awake and asleep every
+// few seconds in still water (corpse-float, 2026-10-18). Cells/s.
+struct FloaterCurrent {
+  Vec3 total{}, standing{}, measured{};
+  bool Wakes(float wakeVoxPerSec) const;
+};
+FloaterCurrent CurrentOnFloaterSplit(Vec3 comVox, float keelY, float topY,
+                                     float surfY);
 
 // ---- the arrow overlay's lattice -------------------------------------------
 // THIS FORMULA IS MIRRORED in debug_current.wgsl's vertex shader, which derives

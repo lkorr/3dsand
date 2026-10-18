@@ -2853,13 +2853,14 @@ void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
     // current primitives, over the submerged span. Until 2026-10-18 the drag
     // aimed at still water, so a floating limb in a river was braked to rest
     // where it fell in and went to sleep there.
-    const Vec3 cur =
-        sandvox::CurrentOnFloater(com, com.y - b.radiusVoxels,
-                                  com.y + b.radiusVoxels,
-                                  (float)surfY);
+    const sandvox::FloaterCurrent fc = sandvox::CurrentOnFloaterSplit(
+        com, com.y - b.radiusVoxels, com.y + b.radiusVoxels, (float)surfY);
+    const Vec3 cur = fc.total;
     const float curSpeed = std::sqrt(cur.x * cur.x + cur.z * cur.z);
     if (asleep) {
-      if (curSpeed < wakeVox) continue;  // still water: a floater may sleep
+      // Still water -- or only the measured flow's small change, which a
+      // body at rest makes some of itself (FloaterCurrent::Wakes): sleep on.
+      if (!fc.Wakes(wakeVox)) continue;
       // PINNED: the last wake found it right here and the current carried it
       // nowhere (against a bank, wedged in reeds). One wake, not one a stride.
       const Vec3 d = com - b.currentWokeAt;

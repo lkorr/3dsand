@@ -8757,6 +8757,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     std::string trace;      // pelvis y every 60 ticks (rule 6)
     std::string limbs;      // each limb's final y / density
     float surf = -1;        // the waterline it was last pushed against
+    int wokeHow = 0;        // Mob::DeadWokeHow at the end (rule 6)
   };
   Arm arms[] = {{"human", "human"},
                 {"automaton", "tinker"},
@@ -8817,6 +8818,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       a.rigActive = hr != 0 && c.phys.IsActive(hr);
       const char* w = m->DeadAwakeReason();
       a.why = w ? w : "";
+      a.wokeHow = m->DeadWokeHow();
     }
   }
   // THE LIVE LIMP ARM. Same basin, same drop; StartRagdoll instead of Die,
@@ -8959,9 +8961,11 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   auto line = [&](const Arm& a) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
-                  "rig %s, corpse %s (%s), y every 60:%s; ", a.rho,
-                  a.lowest, a.final, a.pushes, a.rigActive ? "MOVING" : "still",
-                  a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.trace.c_str())
+                  "rig %s, corpse %s (%s, last woken how %d), y every 60:%s; ",
+                  a.rho, a.lowest, a.final, a.pushes,
+                  a.rigActive ? "MOVING" : "still",
+                  a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.wokeHow,
+                  a.trace.c_str())
            + " | limbs" + a.limbs + "; ";
   };
   detail = Format("site [%s] bed y%d waterline y%d | ", siteWhy.c_str(), bedY,

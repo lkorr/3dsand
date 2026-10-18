@@ -7167,10 +7167,19 @@ neighbors, so this needs an explicit connectivity pass:
   body's current speed, so a floater at rest would never be moved. Debris
   (`FloatBodies`), corpses and limp rigs (`Mob::FloatLimpLimbs`) all pass it.
   A floater ASLEEP in water is looked at every 8 ticks and woken when the
-  current there is at least `physics.waterCurrentWake` (0.05 m/s; debris in
-  `FloatBodies`, a corpse via `Mob::CurrentWakesDead`, `DeadWokeHow` 5); one
-  the last wake carried nowhere (pinned on a bank) is not woken again where it
-  lies, so a pinned floater costs one wake, not one per stride.
+  STANDING current there (solved field + sim primitives) is at least
+  `physics.waterCurrentWake` (0.05 m/s), or the MEASURED flow is past
+  `flowfield::kFlowMeasTakeover` (a breach, a flood) -- not for the measured
+  flow's small change, which a body bobbing at rest makes some of itself and
+  which kept a floating corpse cycling awake and asleep in still water
+  (`sandvox::FloaterCurrent::Wakes`; debris in `FloatBodies`, a corpse via
+  `Mob::CurrentWakesDead`, `DeadWokeHow` 5). A woken debris floater is handed
+  the current outright: the drag alone starts a 1 m limb at a few mm/s a tick
+  and Jolt's sleep test put it straight back to sleep. One the last wake
+  carried nowhere (pinned on a bank) is not woken again where it lies, so a
+  pinned floater costs one wake, not one per stride. An AWAKE floater feels
+  the whole field, measured flow included, as the player and an NPC afloat
+  do.
 - **Standing on a body is standing (2026-10-18, ticket 2026-10-17_21-33-53,
   gate `player-stand-body`).** The player's ground probe reads voxels and
   cannot see a rigid body; `Player::ApplyPush` (the end-of-tick

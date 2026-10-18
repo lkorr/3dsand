@@ -4978,9 +4978,11 @@ class Mob {
   // a current primitive moves no voxel, so a corpse that fell asleep afloat
   // stayed frozen in a river. True when the root limb (or the first limb with
   // a body) sits in liquid whose current there (sandvox::CurrentOnFloater) is
-  // at least physics.waterCurrentWake -- and the last such wake did not find
-  // the body in this same spot (pinned against a bank: one wake, not one per
-  // stride). Records the wake when it returns true. MobSystem asks on a stride.
+  // at least physics.waterCurrentWake (a STANDING current; the measured flow
+  // only past its takeover speed: sandvox::FloaterCurrent::Wakes) -- and the
+  // last such wake did not find the body in this same spot (pinned against a
+  // bank: one wake, not one per stride). Records the wake when it returns
+  // true. MobSystem asks on a stride.
   bool CurrentWakesDead(World& world);
   // Is the rig moving in Jolt? The root limb stands for the island: a jointed
   // ragdoll sleeps and wakes as one.
