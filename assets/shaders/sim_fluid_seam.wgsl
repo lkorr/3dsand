@@ -1310,7 +1310,10 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
   let pe = pageTable[ci];
   let paged = (pe & PT_SENTINEL_BIT) == 0u;
   let pageBase = pe * CHUNK_VOL;
-  for (var s = 0u; s < 16u && paged; s++) {
+  // THE MASTER SWITCH OFF (seamMpmOff, sim.fluidEnabled 0): no cell is looked
+  // at, so EVERY trigger below -- fall, spout, perch, step, drain shell and
+  // progressive wake -- takes nothing and no particle can be born here.
+  for (var s = 0u; s < 16u && paged && !seamMpmOff(); s++) {
     // LANE-CONSECUTIVE cells, so a warp's loads coalesce. It was li * 16 + s,
     // a 64-byte stride between lanes; measured on a forest fire (thousands of
     // awake smoke chunks, not one liquid cell among them) the pass cost
@@ -2496,7 +2499,7 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
       // second pass: the walk is the expensive part and both answers come off
       // one load. The `asleep` guard above covers this too, so a world with no
       // particles still costs nothing (rule 2).
-      if (SEAM_STUCK_TICKS > 0u && (cw >> 16u) >= SEAM_STUCK_TICKS) { nf += 1u; }
+      if (seamStuckTicks() > 0u && (cw >> 16u) >= seamStuckTicks()) { nf += 1u; }
     }
   }
   ssPart[li] = n;
@@ -2567,13 +2570,15 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   // reach any chunk in its own column — the test drops the `dw.y` term
   // entirely and refuses to share an (x,z) column with ANY pick, forced or not.
   var forced = 0u;
+  // (seamStuckTicks / seamForceBlocks: the shipped knobs, or THE MASTER
+  // SWITCH's drain values while MPM is off -- see seamMpmOff.)
   for (var t = 0u; t < 256u && count < SETTLE_MAX &&
-                   forced < SEAM_FORCE_BLOCKS; t++) {
+                   forced < seamForceBlocks(); t++) {
     if (ssForce[t] == 0u) { continue; }
     for (var s = t * span; s < (t + 1u) * span && count < SETTLE_MAX &&
-                           forced < SEAM_FORCE_BLOCKS; s++) {
+                           forced < seamForceBlocks(); s++) {
       let cw = atomicLoad(&fluidCalm[s]);
-      if (SEAM_STUCK_TICKS == 0u || (cw >> 16u) < SEAM_STUCK_TICKS) { continue; }
+      if (seamStuckTicks() == 0u || (cw >> 16u) < seamStuckTicks()) { continue; }
       // A slot the calm phase already took is settling normally this tick;
       // leave it alone rather than converting its pick into a forced one.
       if ((atomicLoad(&settleScratch[SP_MARK + s]) & MARK_SETTLING) != 0u) {
@@ -2802,6 +2807,22 @@ fn seamSetCalm(slot : u32, calm : u32) {
 fn seamResetAge(slot : u32) {
   atomicStore(&fluidCalm[slot], atomicLoad(&fluidCalm[slot]) & CALM_MASK);
 }
+// ---- THE MASTER SWITCH: sim.fluidEnabled (MPM water in the world) ---------
+// support.cpp SubmitTick packs it into TickParams._padSplash2 bit 0, SET = MPM
+// OFF (so a TickParams built anywhere else reads as ON). OFF: exciteDetect looks
+// at no cell, and every particle still alive is DRAINED back into CA voxels by
+// the force-settle path above with its gates opened: a slot is a forced
+// candidate after SEAM_DRAIN_TICKS ticks holding particles instead of
+// SEAM_STUCK_TICKS, and up to SETTLE_MAX forced blocks are taken per tick
+// instead of SEAM_FORCE_BLOCKS. The forced walk is the ordinary all-or-nothing
+// walk (mass conserved by construction) with the excite veto skipped AND its
+// floor test lifted (settleColumn): water at rest and water in flight alike
+// become CA liquid where they stand, and the CA carries on from there.
+// ON, every value below is the shipped one, so the switch is an identity.
+const SEAM_DRAIN_TICKS : u32 = 2u;
+fn seamMpmOff() -> bool { return (T._padSplash2 & 1u) != 0u; }
+fn seamStuckTicks() -> u32 { return select(SEAM_STUCK_TICKS, SEAM_DRAIN_TICKS, seamMpmOff()); }
+fn seamForceBlocks() -> u32 { return select(SEAM_FORCE_BLOCKS, SETTLE_MAX, seamMpmOff()); }
 var<workgroup> wgFill : array<u32, 768>;   // [col*3 + y/8], nibble (y%8)*4
 var<workgroup> wgBlk : array<u32, 256>;    // bit y = level y blocks flow
 // bit y = level y is BYTE-IDENTICAL to the voxel already there: this settle
@@ -2933,7 +2954,12 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       atomicSub(&fluidArgs[FA_SETTLED], existing);
       atomicSub(&fluidArgs[FA_SETWROTE], existing);   // mass books, cumulative
     }
-    if (pool > 0u && !floorOk) {
+    // THE MASTER SWITCH's drain (seamMpmOff) lifts this ONE test for a forced
+    // walk: water in flight is written where it is, as CA liquid, and the CA
+    // drops it. The refusal exists because excite would take an unsupported
+    // cell straight back (the fall trigger); with MPM off nothing can, and a
+    // sealed box's spray would otherwise hold its block as particles forever.
+    if (pool > 0u && !floorOk && !(force && seamMpmOff())) {
       if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
       return false;
     }

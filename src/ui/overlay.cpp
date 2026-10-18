@@ -1789,6 +1789,22 @@ void KeyHint(const char* text) {
   ImGui::TextDisabled("%s", text);
 }
 
+// THE MPM MASTER SWITCH (sim.fluidEnabled): one bool, drawn in the tool
+// panel's MPM fluid section and at the top of the MPM Fluid Tuning window.
+// Applies on the next tick through its own latch (fluidEnableDirty, main.cpp)
+// -- no Apply button, no shader recompile.
+void MpmEnabledCheckbox(UIState& s) {
+  bool on = s.fMpmEnabled;
+  if (ImGui::Checkbox("MPM water in world", &on)) {
+    s.fMpmEnabled = on;
+    s.fluidEnableDirty = true;
+  }
+  ImGui::SetItemTooltip(
+      "Off: no particle water appears. Settled water never turns into MPM "
+      "particles (falls, splashes, breaches, explosions), the pour places "
+      "plain CA liquid, and live particles settle back into voxels.");
+}
+
 }  // namespace
 
 // ---- page: Paint -----------------------------------------------------------
@@ -1913,6 +1929,7 @@ void Overlay::DrawDevPaint(UIState& s) {
       ImGui::SetItemTooltip("key %d", k + 1);
       ImGui::PopID();
     }
+    MpmEnabledCheckbox(s);
     ImGui::Text("particles %u / 262144", s.fluidCount);
     ImGui::SameLine();
     if (ImGui::Button("clear (U)")) s.clearFluid = true;
@@ -3205,6 +3222,8 @@ void Overlay::Draw(UIState& s) {
     ImGui::SetNextWindowSize(ImVec2(340, 600), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("MPM Fluid Tuning", &s.fluidWindowOpen)) {
       ui::KeepWindowOnScreen(4.0f);  // a saved position may be off this monitor
+      MpmEnabledCheckbox(s);
+      ImGui::Separator();
       if (ImGui::Button("Apply")) s.fluidTuningDirty = true;
       ImGui::SameLine();
       ImGui::TextDisabled("recompiles shaders");

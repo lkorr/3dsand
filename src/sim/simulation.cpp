@@ -4537,7 +4537,11 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // What remains is exciteDetect over this tick's dirty chunks (real work:
   // it is the excite trigger) plus ~55 dispatches — 36 of them the substep
   // table's four rows x 9 — that are empty, one workgroup, or an early-out.
-  const bool exciteOn = CurrentTuning().sim.fluidExciteMode != 0;
+  // sim.fluidEnabled 0 (the MPM master switch) takes excite off too, exactly
+  // as SubmitTick's tp.fluidExciteEnable does: with no trigger able to birth a
+  // particle, the seam is needed only while particles live or spawns arrive.
+  const bool exciteOn = CurrentTuning().sim.fluidExciteMode != 0 &&
+                        CurrentTuning().sim.fluidEnabled != 0;
   const bool seamActive =
       fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);
   fluidSeamRecorded_ = seamActive;

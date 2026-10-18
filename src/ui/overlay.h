@@ -251,6 +251,13 @@ struct UIState {
   // startup.  The overlay draws sliders; main.cpp detects changes (via
   // fluidTuningDirty) and writes them back + reloads shaders.
   bool fluidWindowOpen = false;
+  // THE MASTER SWITCH (sim.fluidEnabled, tuning.h): "MPM water in world".
+  // Its OWN latch, like windTuningDirty: main.cpp writes it into the tuning
+  // with no shader reload (it rides TickParams), so it applies on the next
+  // tick. Drawn in the tool panel's MPM fluid section AND at the top of the
+  // MPM Fluid Tuning window; both edit this one bool.
+  bool fMpmEnabled = true;
+  bool fluidEnableDirty = false;
   // ---- sim tab ----
   float fGravity = 98.1f;
   float fStiffness = 5400.0f;

@@ -1198,14 +1198,65 @@ void SetTickDraftBoxes(uint32_t tick, const DraftBox* boxes, size_t n) {
 // happen once per tick, hence submit-per-tick). particlesActive must be
 // derived only from tick-deterministic inputs (explosion history + a settled
 // particle count), never from frame timing — see DESIGN.md §2/§4.
+// ---- THE MPM MASTER SWITCH: a spawn op as plain CA liquid ------------------
+// sim.fluidEnabled 0 (tuning.h THE MASTER SWITCH) means no MLS-MPM particle is
+// born, but a spawn op is a player's pour (the mpm tool, a flask, AT_POUR) and
+// its water must still arrive. Each live op is ONE EIGHTH of `mat` (the seam's
+// own unit, spawnAppend's fpPack(op.mat, 1u, ..)), so the ops are summed per
+// cell, in push order, into liquid words of fullness 1..8 and appended to the
+// cell stream as fill-air-only ops. A cell that already holds 8 eighths, or a
+// different liquid, passes the rest UP to the next cell in its column -- the
+// way a pour stacks -- so a full tick's pour keeps its mass. A cell outside
+// residency, or one the GPU finds not to be air when the op lands, refuses it
+// (kCellOpIfAir), exactly as a prefab paint is refused; refusals the CPU can
+// see are counted in g_mpmOff. Ghost ops (kFluidOpGhost, a picture with no
+// mass) are dropped. Pure function of the op list, so a replay of the record
+// (which carries the CONVERTED stream) reproduces it.
+namespace {
+MpmOffStats g_mpmOff;
+constexpr uint32_t kSpawnOpGhost = 1u << 8;   // game/container.h kFluidOpGhost
+void FluidSpawnsAsCells(const World& world, const std::vector<FluidSpawnOp>& in,
+                        std::vector<CellOp>& out) {
+  struct Acc { IVec3 c; uint32_t mat; uint32_t n; };
+  std::vector<Acc> acc;
+  std::map<std::tuple<int, int, int>, size_t> at;
+  for (const FluidSpawnOp& op : in) {
+    if (op.flags & kSpawnOpGhost) { g_mpmOff.ghostsDropped++; continue; }
+    const uint32_t mat = op.mat & 0xFFFu;
+    if (mat == 0) continue;
+    IVec3 c{op.px >> 16, op.py >> 16, op.pz >> 16};
+    // Climb the column to the first cell this pour can still add to. Bounded:
+    // a tick's spawn stream is <= kMaxFluidSpawnsPerTick eighths.
+    for (;;) {
+      auto it = at.find({c.x, c.y, c.z});
+      if (it == at.end()) {
+        at[{c.x, c.y, c.z}] = acc.size();
+        acc.push_back({c, mat, 1});
+        break;
+      }
+      Acc& a = acc[it->second];
+      if (a.mat == mat && a.n < 8) { a.n++; break; }
+      c.y++;
+    }
+  }
+  for (const Acc& a : acc) {
+    const uint32_t idx = world.ResidentCellIndex(a.c);
+    if (idx == World::kTicketSlotNone) { g_mpmOff.eighthsUnplaced += a.n; continue; }
+    out.push_back({idx, kCellOpIfAir | a.mat | ((a.n - 1u) << 12)});
+    g_mpmOff.eighthsPlaced += a.n;
+  }
+}
+}  // namespace
+const MpmOffStats& GetMpmOffStats() { return g_mpmOff; }
+
 void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t seed, const std::vector<BrushOp>& opsIn,
                 const std::vector<ExplosionOp>& expsIn,
-                const std::vector<CellOp>& cellsIn, bool hashEnable,
+                const std::vector<CellOp>& cellsArg, bool hashEnable,
                 IVec3 playerChunk, bool wantReadback, bool particlesActive,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
-                const std::vector<FluidSpawnOp>& fluidSpawns,
+                const std::vector<FluidSpawnOp>& fluidSpawnsArg,
                 uint32_t fluidLive,
                 bool vizActive,
                 const IVec3* mirrorChunk) {
@@ -1259,6 +1310,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // The parameters are renamed rather than the body rewritten: rebinding the
   // three names here means the four hundred lines below keep reading `ops`,
   // `exps` and `cells` and go on describing what actually reached the GPU.
+  // THE MPM MASTER SWITCH (sim.fluidEnabled, tuning.h), read ONCE per tick
+  // here, before every clamp: OFF, the fluid spawn stream is replaced by the
+  // same water as CA cell ops (FluidSpawnsAsCells, above) appended to the
+  // cell stream, so the dedupe, the caps, the upload and the op record below
+  // all see what really reached the GPU, and the fluid stream is empty.
+  const bool mpmOff = CurrentTuning().sim.fluidEnabled == 0;
+  std::vector<CellOp> cellsMerged;
+  static const std::vector<FluidSpawnOp> kNoFluidSpawns;
+  if (mpmOff && !fluidSpawnsArg.empty()) {
+    cellsMerged = cellsArg;
+    FluidSpawnsAsCells(world, fluidSpawnsArg, cellsMerged);
+  }
+  const std::vector<CellOp>& cellsIn = cellsMerged.empty() ? cellsArg : cellsMerged;
+  const std::vector<FluidSpawnOp>& fluidSpawns = mpmOff ? kNoFluidSpawns : fluidSpawnsArg;
   std::vector<BrushOp> opsClamp;
   std::vector<ExplosionOp> expsClamp;
   std::vector<CellOp> cellsCanon;
@@ -1513,8 +1578,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // precedent): tuning is read CPU-side, HERE, so replays and the twice-run
   // determinism gates capture it and a per-gate SetCurrentTuning overrides it
   // with no pipeline rebuild.
+  // The master switch (sim.fluidEnabled) OFF also takes the excite policy
+  // off: the CA owns all settled liquid then, which is what settleCheck's
+  // veto relaxation keys on (sim_fluid_seam.wgsl, SEAM_CA_SPREAD_MIN).
   tp.fluidExciteEnable =
-      CurrentTuning().sim.fluidExciteMode != 0 ? 1u : 0u;
+      CurrentTuning().sim.fluidExciteMode != 0 && !mpmOff ? 1u : 0u;
+  // ...and rides the THIRD pad, `_padSplash2` bit 0, SET = OFF, so a
+  // TickParams built anywhere else (worldgen) reads as ON, today's world.
+  // sim_fluid_seam.wgsl seamMpmOff() reads it: no excite trigger takes a cell
+  // and settleScan force-settles every particle still alive.
+  tp._padSplash2 = mpmOff ? 1u : 0u;
   tp.fluidSpawnCount = fluidSpawnCount;
   // Wind, the sim's copy (docs/RESEARCH_wind.md §4.2). Same tick, same seed and
   // the same WindWeather call the renderer makes in WriteRenderParams above —
@@ -1842,7 +1915,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // every tick it exists, so a standing reservation keeps fluidSpawnCount
     // non-zero forever, keeps the whole fluid seam recorded, and costs a lake
     // nobody has touched real milliseconds — see WaterBodyGpu::drainArmed.
-    if (g.drainArmed) drainBodies = std::min(g.bodyCount, drainRoom);
+    // MPM OFF (sim.fluidEnabled 0): no block, so the ledger refuses every
+    // discharge (`b < T.waterDrainBodies`) and no drain particle is born; a
+    // breached body leaves by the CA instead.
+    if (g.drainArmed && !mpmOff) drainBodies = std::min(g.bodyCount, drainRoom);
     tp.waterDrainSpawnBase = fluidSpawnCount;
     tp.waterDrainBodies = drainBodies;
     tp.waterDrainMax = wt.sim.drainMaxEighthsPerTick;

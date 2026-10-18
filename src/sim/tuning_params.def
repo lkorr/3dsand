@@ -1042,6 +1042,20 @@ TP_F(sim, fluidSpoutGain, NO_WGSL, 0.3f, 0.0f, 1.0f)
 // The chance each such lip cell is thrown at all; the rest fall straight down,
 // so a spout's stream frays instead of leaving as one rigid bar.
 TP_F(sim, fluidSpoutChance, NO_WGSL, 0.6f, 0.0f, 1.0f)
+// THE MASTER SWITCH for MPM water in the world (owner, 2026-10-18: "a toggle
+// in the MPM fluid menu to just turn MPM water on/off"). 1 = today's world,
+// exactly. 0 = no MLS-MPM particle is born: the seam's excite triggers (fall,
+// spout, perch, step, drain shell, progressive wake) take nothing, the water
+// bodies' discharge reserves no spawn block, a CPU spawn op (the mpm tool, a
+// flask pour, an AT_POUR) is placed as plain CA liquid instead (support.cpp
+// SubmitTick, FluidSpawnsAsCells), a ghost op is dropped, and every particle
+// already alive is FORCE-SETTLED back into CA voxels within a few ticks
+// (sim_fluid_seam.wgsl settleScan, THE MASTER SWITCH), mass conserved. Not the
+// same knob as fluidExciteMode, which only gates the disturbance triggers and
+// recompiles shaders. NO_WGSL: SubmitTick packs it into TickParams._padSplash2
+// bit 0 (set = OFF, so a TickParams built anywhere else means ON), so the
+// switch is live, on the tick stream and in the op record.
+TP_I(sim, fluidEnabled, NO_WGSL, 1, 0, 1)
 // How much of a SETTLED liquid cell's content the MPM grid carries as static
 // mass, as a fraction of rest density (1.0 = a full voxel reads exactly rest).
 // 0 restores the WP4 behaviour where the two representations pass through each
