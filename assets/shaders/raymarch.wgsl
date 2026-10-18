@@ -11085,7 +11085,9 @@ fn waterCurrentAt(p : vec3f) -> vec3f {
 // far pixel whose own current is in the deadband, none (no flow, no foam to
 // gather).
 fn waterConvergeAt(p : vec3f) -> f32 {
-  if (gFlowSlack < 0.0) { return currentConvergeAt(p, &R); }
+  // A window hit: currentConvergeAt's central difference, on shared node
+  // fetches (waterConvergeNear, below).
+  if (gFlowSlack < 0.0) { return waterConvergeNear(p); }
   if (R.currentRenderOn == 0u || !FLOW_BOUND) { return 0.0; }
   let c = waterCurrentAt(p);
   if (c.x == 0.0 && c.z == 0.0) { return 0.0; }
@@ -11095,6 +11097,110 @@ fn waterConvergeAt(p : vec3f) -> f32 {
   let vz1 = waterCurrentAt(p + vec3f(0.0, 0.0, e)).z;
   let vz0 = waterCurrentAt(p - vec3f(0.0, 0.0, e)).z;
   return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);
+}
+
+// ---- THE NEAR CONVERGENCE ON SHARED NODE FETCHES (2026-10-18, ticket
+// 2026-10-17_21-03-25) ----
+// currentConvergeAt (common.wgsl) is four currentAt taps 1.5 cells either side
+// of the point, and each tap fetches its own 2x2 nodes of BOTH grids (the
+// solved field and the measured one): 32 node reads and four inlined copies
+// of two bilinear loops, for one foam term. The grids' nodes are FLOW_STEP
+// (8) cells apart, so a tap 1.5 cells out lies in the centre's node cell on
+// an axis ~63% of the time, and its four nodes are the centre's. This is the
+// SAME arithmetic, term for term and in the same order (flowQuadSolved /
+// flowQuadMeas are flowGridAt / flowMeasAt with the node fetch hoisted), over
+// the centre cell's nodes fetched once per grid; a tap whose node cell
+// differs fetches its own, exactly as before. The answer is currentConvergeAt's
+// up to float contraction. common.wgsl's flowGridAt / flowMeasAt are the
+// truth: change them and these together.
+struct FlowQuad { w0 : vec4<u32>, w1 : vec4<u32>, ok : bool, }
+fn flowQuadAt(meas : bool, n : i32, ix : i32, iz : i32) -> FlowQuad {
+  var q : FlowQuad;
+  q.ok = !(ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1);
+  q.w0 = vec4<u32>(0u);
+  q.w1 = vec4<u32>(0u);
+  if (!q.ok) { return q; }
+  for (var c = 0; c < 4; c++) {
+    let k = FLOW_HEADER + 2u * u32((iz + (c >> 1u)) * n + (ix + (c & 1)));
+    q.w0[c] = select(flowWord(k), flowMeasWord(k), meas);
+    q.w1[c] = select(flowWord(k + 1u), flowMeasWord(k + 1u), meas);
+  }
+  return q;
+}
+// flowGridAt's body past its fetch (meas = false), or flowMeasAt's (true).
+fn flowQuadEval(q : FlowQuad, meas : bool, py : f32, tx : f32, tz : f32) -> vec3f {
+  if (!q.ok) { return vec3f(0.0); }
+  var v = vec2f(0.0);
+  var hi = -1e9;
+  var lo = 1e9;
+  for (var c = 0; c < 4; c++) {
+    let dx = c & 1;
+    let dz = c >> 1u;
+    let w1 = q.w1[c];
+    let s = flowI16Lo(w1);
+    if (s == FLOW_DRY) { continue; }
+    let w0 = q.w0[c];
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));
+    hi = max(hi, f32(s));
+    lo = min(lo, f32(flowI16Hi(w1)));
+  }
+  if (meas) {
+    if (hi < -1e8 || py > hi + 1.5 || py < lo - 1.5) { return vec3f(0.0); }
+    return vec3f(v.x, 0.0, v.y) / FLOW_VEL_Q;
+  }
+  if (hi < -1e8 || py > hi + 1.5 || py < lo - 0.5) { return vec3f(0.0); }
+  let hz = clamp((py - lo) / max(hi - lo, 1.0), 0.0, 1.0);
+  let prof = (0.75 + 0.25 * sqrt(hz)) / FLOW_VEL_Q;
+  return vec3f(v.x * prof, 0.0, v.y * prof);
+}
+fn waterConvergeNear(p : vec3f) -> f32 {
+  if (R.currentRenderOn == 0u) { return 0.0; }
+  let nG = i32(flowWord(2u));
+  let nM = select(0, i32(flowMeasWord(2u)), TUNE_CURRENT_MEASURED > 0.0);
+  if (R.currentPrimCount == 0u &&
+      (!FLOW_BOUND || (flowWord(2u) == 0u && flowMeasWord(2u) == 0u))) { return 0.0; }
+  let e = 1.5;
+  // Each grid's origin and the centre's node cell.
+  let oG = vec2f(f32(bitcast<i32>(flowWord(0u))), f32(bitcast<i32>(flowWord(1u))));
+  let oM = vec2f(f32(bitcast<i32>(flowMeasWord(0u))), f32(bitcast<i32>(flowMeasWord(1u))));
+  let cG = vec2<i32>(floor((p.xz - oG) / FLOW_STEP));
+  let cM = vec2<i32>(floor((p.xz - oM) / FLOW_STEP));
+  var qG : FlowQuad;
+  qG.ok = false;
+  if (FLOW_BOUND && nG > 0) { qG = flowQuadAt(false, nG, cG.x, cG.y); }
+  var qM : FlowQuad;
+  qM.ok = false;
+  if (FLOW_BOUND && nM > 0) { qM = flowQuadAt(true, nM, cM.x, cM.y); }
+  var tv = vec4f(0.0);   // vx(p+e), vx(p-e), vz(p+e), vz(p-e)
+  for (var j = 0; j < 4; j++) {
+    let ax = j < 2;
+    let sg = select(-e, e, (j & 1) == 0);
+    let q = p + select(vec3f(0.0, 0.0, sg), vec3f(sg, 0.0, 0.0), ax);
+    var solved = vec3f(0.0);
+    if (FLOW_BOUND && nG > 0) {
+      let fx = (q.x - oG.x) / FLOW_STEP;
+      let fz = (q.z - oG.y) / FLOW_STEP;
+      let ix = i32(floor(fx));
+      let iz = i32(floor(fz));
+      var qq = qG;
+      if (ix != cG.x || iz != cG.y) { qq = flowQuadAt(false, nG, ix, iz); }
+      solved = flowQuadEval(qq, false, q.y, fx - f32(ix), fz - f32(iz));
+    }
+    var measured = vec3f(0.0);
+    if (FLOW_BOUND && nM > 0) {
+      let fx = (q.x - oM.x) / FLOW_STEP;
+      let fz = (q.z - oM.y) / FLOW_STEP;
+      let ix = i32(floor(fx));
+      let iz = i32(floor(fz));
+      var qq = qM;
+      if (ix != cM.x || iz != cM.y) { qq = flowQuadAt(true, nM, ix, iz); }
+      measured = flowQuadEval(qq, true, q.y, fx - f32(ix), fz - f32(iz));
+    }
+    let v = currentPrimAt(q, &R) + flowBlend(solved, measured * TUNE_CURRENT_MEASURED);
+    tv[j] = select(v.z, v.x, ax);
+  }
+  return -((tv.x - tv.y) + (tv.z - tv.w)) / (2.0 * e);
 }
 
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
