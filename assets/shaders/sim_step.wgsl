@@ -6381,10 +6381,11 @@ fn caRow(first : u32, total : u32, t : u32) -> CaRow {
   // the grid word fluidOccMat reads (the CA runs before this tick's
   // PT_FLUIDMAP retires the mask). So a clear bit proves every air site of
   // the row would return from excitedReact at once; the row takes the mask
-  // like any other chunk's. Measured on `--perf dam`: an MPM block is
-  // allocated FLUID_MARK_PAD cells around the particles, so most of a fall's
-  // chunks are air rows nothing can react in, and substep 0 cost twice
-  // substep 1 visiting them.
+  // like any other chunk's (matter that ARRIVES there mid-substep is stamped
+  // by its mover, the argument THE AIR MASK already rests on). An MPM block is
+  // allocated FLUID_MARK_PAD cells around the particles, so a fall's blocks
+  // are mostly such rows. Measured on `--perf dam`: caLoop 5.21 -> 5.03 ms,
+  // world hash unchanged.
   if (gCaSub != 0u || fluidBlockMapS[ci] == 0u ||
       ((fluidBlockMapS[fbmYMaskIndex(ci)] >> u32(y)) & 1u) == 0u) {
     bits &= (caMask[wi] >> sh) & 0xFFFFu;
