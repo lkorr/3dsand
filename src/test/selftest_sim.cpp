@@ -2617,6 +2617,177 @@ Status GateFluidOnWater(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-spout -----------------------------------------------------------
+// THE SPOUT JET (sim_fluid_seam.wgsl; ticket 2026-10-17_11-44-48, owner
+// approved: "falling water has a bit of horizontal magnitude when it comes
+// from a spout"). Water the FALL trigger takes over a lip leaves with a
+// horizontal velocity away from the water behind it, sim.fluidSpoutGain x
+// sqrt(2 g h), for a sim.fluidSpoutChance share of those cells.
+//
+// FIXTURE: a sealed stone box. A reservoir (8 layers of water) stands on a
+// shelf 13 cells over the pit floor behind a dam wall; a 3-wide, 1-high hole
+// through the dam at the shelf's top row is the spout. Water comes through
+// the hole, goes over its outer lip and falls into the empty pit.
+//
+// THE ASSERTION IS A DIFFERENTIAL: the same pour with the knob at 0 (the
+// control: every fall excite at rest, so the stream slides down the dam's
+// face) and at the shipped tuning, on this build. The measure is where the
+// falling water IS low in its fall, over the pool it fills: the mean
+// distance, in cells, of live particles still FALLING in that band from the
+// dam's outer face, summed over the whole run. The shipped arm must be at least
+// `fluidSpout.minGain` cells farther out than the control. Both arms must
+// actually pour (`fluidSpout.minSamples` particle-samples in the band), and
+// the shipped arm runs twice: equal world hashes (rule 1).
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): this is a seam-only fixture in a box
+// no body, mob or op stream touches -- SubmitTick is the one phase under test,
+// exactly as fluid-onwater beside it.
+Status GateFluidSpout(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  const Tuning saved = CurrentTuning();
+  Tuning t = saved;
+  t.sim.fluidExciteMode = 1;   // the fall trigger the jet rides (game default)
+
+  // Box: x in [px-RX, px+RX], z in [pz-RZ, pz+RZ], y in [bedY, roofY], one
+  // cell of stone shell. Shelf (stone) under x <= damX-1 up to shelfY; the dam
+  // is the column x == damX, full height, but for the hole at y shelfY+1,
+  // |z - pz| <= 1. Reservoir: x in [px-RX+1, damX-1], y shelfY+1..shelfY+8.
+  const int px = 96, pz = 96, RX = 14, RZ = 4;
+  const int bedY = 104, shelfY = bedY + 13, roofY = shelfY + 12;
+  const int damX = px - 4;
+  const int resTop = shelfY + 8;
+  const int kTicks = (int)BaselineNumber("fluidSpout.ticks", 150);
+  const double minGain = BaselineNumber("fluidSpout.minGain", 1.0);
+  const double minSamples = BaselineNumber("fluidSpout.minSamples", 200);
+  // The band: the lower part of the FALL, over the pool the pit collects
+  // (the reservoir fills it ~5 deep, so a band on the floor measured the
+  // pool's spread, not the stream: control 4.8 cells there). Only particles
+  // still falling (vy below -minFallVy cells/tick) count.
+  const int bandLo = bedY + (int)BaselineNumber("fluidSpout.bandAboveBed", 7);
+  const int bandHi = shelfY - (int)BaselineNumber("fluidSpout.bandBelowShelf", 1);
+  const int32_t fallVy =
+      -(int32_t)(BaselineNumber("fluidSpout.minFallVy", 0.5) * 65536.0);
+  const double faceX = (double)(damX + 1);   // the dam's outer face
+
+  std::vector<CellOp> box;
+  auto put = [&](int x, int y, int z, uint32_t m, uint32_t state = 0) {
+    box.push_back({World::SlotCellIndex({x, y, z}), (m & 0xFFFu) | (state << 12)});
+  };
+  for (int y = bedY; y <= roofY; y++)
+    for (int z = pz - RZ; z <= pz + RZ; z++)
+      for (int x = px - RX; x <= px + RX; x++) {
+        const bool shell = x == px - RX || x == px + RX || z == pz - RZ ||
+                           z == pz + RZ || y == bedY || y == roofY;
+        const bool shelf = x < damX && y <= shelfY;
+        const bool hole = x == damX && y == shelfY + 1 && std::abs(z - pz) <= 1;
+        const bool dam = x == damX && !hole;
+        if (shell || shelf || dam) put(x, y, z, kMatStone);
+        else if ((x < damX && y <= resTop) || hole) put(x, y, z, waterId, 7u);
+        else put(x, y, z, kMatAir);
+      }
+
+  double meanDist[3] = {0, 0, 0};
+  uint64_t samples[3] = {0, 0, 0};
+  uint32_t peakLive[3] = {0, 0, 0};
+  uint32_t worldHash[2] = {0, 0};
+  for (int run = 0; run < 3; run++) {
+    Tuning a = t;
+    if (run == 0) a.sim.fluidSpoutGain = 0.0f;   // the CONTROL
+    SetCurrentTuning(a);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t ft = 60000, liveEst = 0;
+    double distSum = 0.0;
+    // ATTRIBUTION (CLAUDE.md rule 6): the excited particles BORN each tick
+    // (birthTick == the tick, FP_EXCITED), how many of them leave moving
+    // sideways, their mean outward speed, and where they are born.
+    uint64_t born = 0, bornThrown = 0, bornPit = 0, bornJet = 0;
+    uint64_t bornRow[4] = {0, 0, 0, 0};   // born at the lip row, 1, 2, >= 3 under
+    double bornVx = 0.0;
+    for (int i = 0; i < kTicks; i++) {
+      std::vector<CellOp> cops;
+      if (i == 0) cops = box;
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {}, cops, false,
+                 {6, 7, 6}, false, false, {}, 0, {}, liveEst);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      uint32_t fa[32] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                            128, "spoutArgs");
+      const uint32_t live = std::min(fa[7], kFluidCap);
+      liveEst = live;
+      peakLive[run] = std::max(peakLive[run], live);
+      if (live == 0) continue;
+      std::vector<uint32_t> pbuf((size_t)live * kFluidParticleWords);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidParticles[sim.Page()],
+                            0, pbuf.data(), pbuf.size() * 4, "spoutP");
+      for (uint32_t k = 0; k < live; k++) {
+        const uint32_t* p = &pbuf[(size_t)k * kFluidParticleWords];
+        if ((p[18] & 0xFFFu) != waterId || ((p[18] >> 12) & 0x7u) == 0u) continue;
+        if (p[19] == ft && (p[18] & (1u << 22)) != 0u) {
+          born++;
+          const int32_t vx = (int32_t)p[3];
+          bornVx += vx / 65536.0;
+          if (std::abs(vx) > 3277 || std::abs((int32_t)p[5]) > 3277) bornThrown++;
+          if ((double)(int32_t)p[0] / 65536.0 >= faceX) bornPit++;
+          if ((p[24] | p[25]) != 0u) bornJet++;   // _r4/_r5: the throw
+          const int under = shelfY + 1 - ((int32_t)p[1] >> 16);
+          bornRow[std::min(std::max(under, 0), 3)]++;
+        }
+        const int y = (int)((int32_t)p[1] >> 16);
+        if (y < bandLo || y > bandHi || (int32_t)p[4] > fallVy) continue;
+        const double x = (double)(int32_t)p[0] / 65536.0;
+        if (x < faceX) continue;   // not in the pit
+        distSum += x - faceX;
+        samples[run]++;
+      }
+    }
+    meanDist[run] = samples[run] ? distSum / (double)samples[run] : 0.0;
+    std::printf("  spout arm%d (gain %.2f chance %.2f): %llu band samples, mean "
+                "%.2f cells from the dam, peak live %u\n",
+                run, a.sim.fluidSpoutGain, a.sim.fluidSpoutChance,
+                (unsigned long long)samples[run], meanDist[run], peakLive[run]);
+    std::printf("    born excited %llu (%llu in the pit), %llu leaving sideways, mean "
+                "vx %.3f cells/tick; %llu carry a throw; born at the lip row %llu, "
+                "1 under %llu, 2 under %llu, deeper %llu\n",
+                (unsigned long long)born, (unsigned long long)bornPit,
+                (unsigned long long)bornThrown, born ? bornVx / (double)born : 0.0,
+                (unsigned long long)bornJet, (unsigned long long)bornRow[0],
+                (unsigned long long)bornRow[1], (unsigned long long)bornRow[2],
+                (unsigned long long)bornRow[3]);
+    if (run > 0) worldHash[run - 1] = HashWorldNow(ctx, world, sim, kDefaultSeed);
+  }
+  SetCurrentTuning(saved);
+
+  const bool poured = samples[0] >= (uint64_t)minSamples &&
+                      samples[1] >= (uint64_t)minSamples;
+  const double gain = meanDist[1] - meanDist[0];
+  const bool farther = gain >= minGain;
+  const bool same = meanDist[1] == meanDist[2] && samples[1] == samples[2];
+  const bool det = worldHash[0] == worldHash[1] && same;
+  const bool ok = poured && farther && det;
+  std::printf("fluid-spout: %s (falling water %.2f cells from the dam with the "
+              "jet vs %.2f without, +%.2f >= %.2f; samples %llu / %llu >= %.0f; "
+              "world hash %s)\n",
+              ok ? "PASS" : "FAIL", meanDist[1], meanDist[0], gain, minGain,
+              (unsigned long long)samples[1], (unsigned long long)samples[0],
+              minSamples, det ? "matches" : "DIVERGED");
+  detail = Format("jet %.2f vs control %.2f cells (+%.2f, need %.2f), samples "
+                  "%llu/%llu, det %s",
+                  meanDist[1], meanDist[0], gain, minGain,
+                  (unsigned long long)samples[1], (unsigned long long)samples[0],
+                  det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- debris-float --------------------------------------------------------
 // DEBRIS MEETS A POND (docs/PLAN_debris_buoyancy.md). Owner report, 2026-09-13:
 // explode a tree over water and the chips build a structure ON the surface —
@@ -7335,6 +7506,7 @@ const std::vector<Gate>& SimGates() {
       {"fluid-settle", "sim", {}, false, GateFluidSettle},
       {"fluid-excite", "sim", {}, false, GateFluidExcite},
       {"fluid-onwater", "sim", {}, false, GateFluidOnWater},
+      {"fluid-spout", "sim", {}, false, GateFluidSpout},
       {"debris-float", "sim", {}, false, GateDebrisFloat},
       {"fluid-stain", "sim", {}, false, GateFluidStain},
       {"fluid-react", "sim", {}, false, GateFluidReact},

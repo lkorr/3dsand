@@ -922,6 +922,17 @@ struct Tuning {
     // log stop wallowing and go to sleep instead of bobbing forever.
     float waterLinearDrag = TPD(physics, waterLinearDrag);
     float waterAngularDrag = TPD(physics, waterAngularDrag);
+    // A FLOATER ASLEEP IN A CURRENT WAKES (m/s; ticket 2026-10-17_20-54-57).
+    // The water's velocity is in the drag (Physics::ApplyBuoyancy), so an
+    // AWAKE floater drifts with a river; but a body that came to rest in
+    // still water -- or that the current reached after it slept -- is asleep
+    // in Jolt, and buoyancy never wakes a sleeper (rule 2). Debris
+    // (DebrisSystem::FloatBodies) and corpses (MobSystem's dead branch) look
+    // at their sleepers on a stride and wake one sitting in water whose
+    // current is at least this fast. Below it the water counts as still and
+    // a floater sleeps. A body that a wake carried nowhere (pinned on a bank)
+    // is not woken again where it lies. 0 = currents never wake a sleeper.
+    float waterCurrentWake = TPD(physics, waterCurrentWake);
     float terrainFriction = TPD(physics, terrainFriction);
     float playerProxyFriction = TPD(physics, playerProxyFriction);
     float explosionImpulseScale = TPD(physics, explosionImpulseScale);
@@ -3128,6 +3139,17 @@ struct Tuning {
     // churning at rest, set this to 0 first —
     // that is the differential.
     int fluidExciteStep = TPD(sim, fluidExciteStep);
+    // ---- THE SPOUT JET (ticket 2026-10-17_11-44-48) ------------------------
+    // Water the FALL trigger excites off a lip (air under it, its own water
+    // beside it) leaves with a horizontal velocity AWAY from that water:
+    // `fluidSpoutGain` x sqrt(2 g h), h the head of the water behind the lip
+    // (climbed up through a short tunnel to the reservoir's surface), for a
+    // `fluidSpoutChance` share of those cells. Velocity only -- no particle
+    // is added and no new cell is excited, so it is bounded by the fall
+    // trigger it rides and cannot make held water at rest move. NO_WGSL:
+    // SubmitTick packs both into TickParams._padSplash1.
+    float fluidSpoutGain = TPD(sim, fluidSpoutGain);
+    float fluidSpoutChance = TPD(sim, fluidSpoutChance);
     // ---- settled liquid as MPM boundary mass ------------------------------
     // WP4 shipped the two representations passing straight THROUGH each other:
     // sim_fluid.wgsl's fluidSolid() blocks solids and powders only, and a
@@ -3717,6 +3739,17 @@ struct Tuning {
     // 0 = bodies feel the solved field only (what they did before 2026-10-15);
     // the record stops only when this and render.currentMeasured are both 0.
     float currentMeasuredCarry = TPD(sim, currentMeasuredCarry);
+    // THE MEASURED FLOW's REACH, in flow nodes (0.8 m each; ticket
+    // 2026-10-17_20-56-48: "the arrows discretely change from the natural
+    // current of the lake to this manmade flow ... all arrows should be
+    // influencing other arrows"). flow_measure.wgsl's fold spreads each node's
+    // measured flux over a tent of this radius (normalised, so a broad flood
+    // reads the same) and adds it where it is stronger than the node's own
+    // 3 x 3 reading, so a breach or a pour bends the current around it for a
+    // few metres and fades into the map's solved field instead of ending on
+    // one node. 1 = the 3 x 3 tent alone (before 2026-10-18). Integer, and the
+    // fold is integer: the bodies feel the published grid.
+    int currentMeasuredReach = TPD(sim, currentMeasuredReach);
   } sim;
 
   // ---- day/night cycle ----

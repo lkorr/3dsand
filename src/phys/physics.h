@@ -161,8 +161,22 @@ class Physics {
   // the BodyInterface overload: a raft that has come to rest is meant to stay
   // asleep, and re-impulsing it every tick would mean nothing on water ever
   // sleeps again (CLAUDE.md rule 2).
+  //
+  // `currentVoxPerSec` is the water's own velocity at the body (world cells/s,
+  // horizontal; sandvox::CurrentOnFloater): the drag acts on the body's
+  // velocity RELATIVE TO THE WATER, so a floater in a river is carried at the
+  // river's speed and one in still water ({0,0,0}) is braked to rest exactly
+  // as before (ticket 2026-10-17_20-54-57). It is applied as a frame shift --
+  // the current is taken out of the body's velocity, Jolt's still-water
+  // buoyancy runs, the current is put back -- and NOT through Jolt's own
+  // fluid-velocity argument, because Jolt clamps the drag's velocity change to
+  // the body's current speed (its overshoot guard, written for still water):
+  // a floater at rest in a river would be given a clamp of zero and never
+  // move. In the water's frame that clamp is the right one: the drag can stop
+  // the body RELATIVE TO THE WATER and no more.
   bool ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy,
-                     float linearDrag, float angularDrag, float dt);
+                     float linearDrag, float angularDrag, float dt,
+                     Vec3 currentVoxPerSec = {});
 
   // ---- joints (PLAN §B1) ----
   enum class JointType { Fixed, Hinge, Ball };

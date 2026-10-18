@@ -1296,12 +1296,18 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     vel = wish.len() > 1e-3f ? wish.normalized() * speed : Vec3{0, 0, 0};
     pos += vel * dt;
     grounded = false;
+    bodySupport = false;  // fly ignores debris as it ignores the voxels
     hanging = false;  // no timer guards the grip, so fly must open it
     coyoteTimer = 0.0f;
     ResetViewSmooth();  // fly motion is deliberate: never smooth it
     impactDeltaV = {0, 0, 0};
   } else {
     const float nonJumpSpeed = T().nonJumpSpeed / kVoxelMeters;
+    // Consumed HERE, once a tick: the push that set it ran after the previous
+    // Update (see bodySupport in player.h), and the push this tick runs after
+    // this one and sets it again for as long as the body is still underfoot.
+    const bool heldByBody = bodySupport;
+    bodySupport = false;
 
     // ---- ground state, decided BEFORE the move (Source uses `oldground`) ----
     // Probe reach gets extended by the step height while we already believe we
@@ -1309,7 +1315,12 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // stops `grounded` flickering as the body crests sub-voxel noise, and it
     // keeps us attached walking down a rough slope instead of bouncing off it.
     bool rising = vel.y > nonJumpSpeed;
-    float reach = grounded ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
+    // ...NOT WHILE A BODY HOLDS US UP. The extended reach is a VOXEL probe: on
+    // a log thinner than a step it found the ground under the log, the snap
+    // below pulled the player down through the body (the sweeps cannot see
+    // it), and the push-out lifted them back -- a jitter every tick. Standing
+    // on a body, voxel ground counts only within the plain 0.1.
+    float reach = grounded && !heldByBody ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
     float drop = rising ? -1.0f : GroundProbe(pos, reach, b, kindAt);
 
     // ---- wading vs swimming (see kSwimSubmersion) -------------------------
@@ -1696,8 +1707,12 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // that reads this flag (the avatar's gait and air clock, footstep cues,
     // the next frame's step-up reach) should see a walking body, not a
     // floating one.
+    // ...OR A BODY HELD US UP (bodySupport, player.h): the voxel probe cannot
+    // see a log, and without this a player standing on one read as airborne
+    // to the avatar's air clock until ragdoll.fallSeconds knocked them down
+    // (ticket 2026-10-17_21-33-53).
     grounded = !rising && !swimming &&
-               GroundProbe(pos, 0.1f, b, kindAt) >= 0.0f;
+               (heldByBody || GroundProbe(pos, 0.1f, b, kindAt) >= 0.0f);
     if (grounded) coyoteTimer = T().coyoteTime;
 
     // ---- ledge grab latch (see the hanging block above) ----
@@ -1790,6 +1805,7 @@ void Player::ApplyPush(Vec3 push, const KindFn& kindAt) {
     // even though the voxel ground probe can't see rigidbodies
     vel.y = 0.0f;
     grounded = true;
+    bodySupport = true;  // carried into the next Update's `grounded`
     coyoteTimer = T().coyoteTime;
   }
 }

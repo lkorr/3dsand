@@ -1639,16 +1639,42 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   // the bank, oil, any unheld liquid still swaps as before. Pure reads of the
   // displaced word and the still table (rule 1); it only writes air where the
   // swap wrote water, so no move is added (rule 2).
+  //
+  // ONLY THE PART THAT WOULD STAND OVER THE TARGET GOES BACK (ticket
+  // 2026-10-17_11-45-30: "pouring gravel into water seems to delete all the
+  // water on top and make the water run in an alternate direction"). The rule
+  // above first sent EVERY displaced cell back, at any depth: a grain sinking
+  // through a 60-cell map lake deleted the water it passed at each step and
+  // left an AIR cell under the surface behind it -- a column of holes rising
+  // as bubbles, the surface caving in over the pour, and the reservoir's TAKE
+  // and the neighbours pouring in from every side to refill it. The volume a
+  // grain displaces is ITS OWN, one cell, and it belongs at the surface: under
+  // the surface the water simply changes places with the grain, exactly as an
+  // unheld pond's does. So the displaced eighths keep what fits UNDER the
+  // target at the cell they land in (the source column's target, or the held
+  // column's own where the source column is not held -- a grain off the bank)
+  // and only the excess over it returns to the reservoir. Deep in the lake
+  // that is all of it (a plain swap, conserved); at the surface it is none of
+  // it (air, as the rule above wants); at the top cell, the part under the
+  // target. Reads only the still table (rule 1).
   var back = tw;
   let tm = voxMat(tw);
   if (tm != MAT_AIR && materials[tm].klass == CLASS_LIQUID &&
       materials[voxMat(myWord)].klass != CLASS_LIQUID &&
       heldRest(dst, tm, voxState(tw) + 1u) == HELD_REST) {
-    back = packVox(MAT_AIR, 0u, 0u);
-    // The river's dissolved mass leaves with its water (counted, as every
-    // discard is).
-    let rd = solValueAt(dst);
-    if (rd != 0u && solStoreAt(dst, 0u)) { solDiscard(solMassOf(rd)); }
+    var t8 = stillLevel8(src.x, src.z, tm);
+    if (t8 == STILL_UNHELD) { t8 = stillLevel8(dst.x, dst.z, tm); }
+    let f = i32(voxState(tw)) + 1;
+    let fit = clamp(t8 - 8 * src.y, 0, f);
+    if (fit < f) {
+      back = packVox(MAT_AIR, 0u, 0u);
+      if (fit > 0) { back = (tw & ~0xF000u) | (u32(fit - 1) << 12u); }
+      // The river's dissolved mass leaves with its water (counted, as every
+      // discard is) -- all of it when any of the water goes back, so a
+      // shrunken cell never holds more mass than its fullness can carry.
+      let rd = solValueAt(dst);
+      if (rd != 0u && solStoreAt(dst, 0u)) { solDiscard(solMassOf(rd)); }
+    }
   }
   voxStore(si, packVoxKeepStain(voxMat(back), voxState(back), stamp, back));
   markVoxActive(si);
@@ -2772,6 +2798,31 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
 // capped at 6: a coat is not a seventh face, and an INVERTED ramp counts what
 // the cell is exposed to, which a film on it does not add to. `covered` hides
 // the six faces (a quenching coat is reacting; see coatReact), leaving the coat.
+// ---- A LIQUID STANDS ON A SEALED SURFACE (ticket 2026-10-17_00-19-10) -------
+// "on some materials like ice, where blood doesn't stain, it should probably
+// never disappear ... pools of blood being able to form on certain materials".
+// Blood's `blood -> air` is a DRYING rule (reactions.json `"drying": true`):
+// the world's abstraction of a spill soaking into the ground and drying off
+// it, which reads right on dirt and stone because the spill leaves its stain
+// behind. On ice, glass and metal it left nothing, so the blood just fell out
+// of the simulation. A substrate authored `"absorb": {"sealed": true}`
+// (materials.h kFluidPackSealedBit) holds what stands on it: a drying rule
+// (cond RCOND_DRYING, materials.h kCondDrying) does not fire on a cell
+// RESTING ON one -- the cell straight below is sealed -- and, skipped before
+// keepAwake, does not hold the chunk awake either, so the pool settles and
+// sleeps like any puddle (rule 2). Only the layer touching the surface is
+// held: a deep pool's upper cells still dry from their exposed face down to
+// a film. A read at distance 1 (rule 1). Behaviour is data: which surfaces
+// are sealed and which rules are drying is materials.json / reactions.json.
+const RCOND_DRYING : u32 = 0x20000000u;   // materials.h kCondDrying
+fn restsOnSealed(c : vec3<i32>) -> bool {
+  let b = c + vec3<i32>(0, -1, 0);
+  if (!inBounds(b)) { return false; }
+  let bm = voxMat(voxWordAt(b));
+  if (bm == MAT_AIR) { return false; }
+  return matFluidSealed(materials[bm]);
+}
+
 fn scaledChance(rule : Reaction, c : vec3<i32>, coat : u32, covered : bool) -> u32 {
   if ((rule.cond & RSCALE_ON) == 0u) { return rule.chance; }
   let invert = (rule.cond & RSCALE_INVERT) != 0u;
@@ -3375,6 +3426,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     let lightGated = (rule.cond & RCOND_GATES) != 0u;
 
     if (kind == RK_DECAY) {
+      // A DRYING rule on a sealed surface is inert: skipped before the roll
+      // and before keepAwake, so a pool standing on ice sleeps (rule 2).
+      if ((rule.cond & RCOND_DRYING) != 0u && restsOnSealed(c)) { continue; }
       // Neighbour-count scaling (frontier rules — see scaledChance). Returns
       // rule.chance untouched for the ordinary unscaled case; 0 means the cell
       // has no qualifying neighbours and the rule is inert here this tick.
