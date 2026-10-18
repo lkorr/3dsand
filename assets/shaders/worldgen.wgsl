@@ -9953,7 +9953,7 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
         if (sPhase == 3u && (dry || q > 3u)) { break; }
         if (!dry) { y = col.h; }
         // The far bound's slot when it is not known yet (dS past the field).
-        if (sHiS == 0xFFFFu) { y = top - sHi; }
+        else if (sHiS == 0xFFFFu) { y = top - sHi; }
         else { y = top - (sLo + sHi) / 2; }
       }
       if (q == 0u && !featLevel) { continue; }

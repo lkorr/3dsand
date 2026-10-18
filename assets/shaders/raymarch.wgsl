@@ -16831,8 +16831,11 @@ fn farWetBedAt(level : u32, p : vec3f) -> FarWetBed {
       (st & (FAR_STRATA_PRESENT | FAR_STRATA_WET)) != FAR_STRATA_WET) { return r; }
   r.ok = true;
   r.y = f32(farMapTop(e) + 1 - i32(st & 0xFFFFu));
-  let bs = (st >> 16u) & 0x7Fu;
-  if (bs != 0u) { r.mat = farPalMat(&materials, bs); }
+  // Only a bed that is ground: a slot naming a fluid would paint the bed
+  // the water's own colour.
+  let bm = farPalMat(&materials, (st >> 16u) & 0x7Fu);
+  let bk = materials[bm].klass;
+  if (bm != 0u && (bk == CLASS_SOLID || bk == CLASS_POWDER)) { r.mat = bm; }
   return r;
 }
 fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> FarBed {
