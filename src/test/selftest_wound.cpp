@@ -8764,7 +8764,11 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     // that moved (material / liquid fullness / stain / bits 16-23 only),
     // plus the last moved cell's old and new word.
     uint32_t bumps = 0, cMat = 0, cFull = 0, cStain = 0, cOther = 0;
-    std::string lastMoved;
+    // ...and where the stained cells were: a WALL (the stamp's outer ring),
+    // the FLOOR, or inside the basin; the y band they fell in; and how many
+    // were wetter after than before.
+    uint32_t sWall = 0, sFloor = 0, sIn = 0, sUp = 0, yLo = 1u << 30, yHi = 0;
+    std::string lastMoved, drift;   // drift: root x,z and current every 120
   };
   Arm arms[] = {{"human", "human"},
                 {"automaton", "tinker"},
@@ -8802,7 +8806,21 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                 if (o == n) continue;
                 if ((o ^ n) & 0xFFFu) a.cMat++;
                 else if ((o ^ n) & 0xF000u) a.cFull++;
-                else if ((o ^ n) & 0xFF000000u) a.cStain++;
+                else if ((o ^ n) & 0xFF000000u) {
+                  a.cStain++;
+                  const int wx = cx * 16 + (int)(k & 15),
+                            wy = cy * 16 + (int)((k >> 4) & 15),
+                            wz = cz * 16 + (int)(k >> 8);
+                  if (std::abs(wx - site.x) >= R - 1 || std::abs(wz - site.z) >= R - 1)
+                    a.sWall++;
+                  else if (wy <= bedY)
+                    a.sFloor++;
+                  else
+                    a.sIn++;
+                  if (((n >> 24) & 0xFu) > ((o >> 24) & 0xFu)) a.sUp++;
+                  a.yLo = std::min(a.yLo, (uint32_t)wy);
+                  a.yHi = std::max(a.yHi, (uint32_t)wy);
+                }
                 else { a.cOther++; continue; }
                 a.lastMoved = Format(
                     "(%d,%d,%d) 0x%08x->0x%08x v%u", cx * 16 + (int)(k & 15),
@@ -8825,6 +8843,12 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       if (h && c.phys.BodyCenterOfMass(h, com)) {
         a.lowest = std::min(a.lowest, com.y);
         a.final = com.y;
+        if (i % 120 == 0) {
+          const Vec3 cur = sandvox::CurrentOnFloater(com, com.y - 2.0f,
+                                                     com.y + 2.0f, (float)(waterTop + 1));
+          a.drift += Format(" (%.1f,%.1f cur %.2f,%.2f)", com.x - (float)site.x,
+                            com.z - (float)site.z, cur.x, cur.z);
+        }
         if (i % 60 == 0) {
           const char* r = m->DeadAwakeReason();
           a.trace += Format(" %.1f", com.y);
@@ -8999,14 +9023,16 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
                   "rig %s, corpse %s (%s, last woken how %d), mirror bumps %u "
-                  "(cells moved: mat %u, fullness %u, stain %u, stamp-only %u; "
-                  "last %s), y every 60:%s; ",
+                  "(cells moved: mat %u, fullness %u, stain %u [wall %u floor %u "
+                  "inside %u, wetter %u, y%u..%u], stamp-only %u; "
+                  "last %s), drift from centre every 120:%s, y every 60:%s; ",
                   a.rho, a.lowest, a.final, a.pushes,
                   a.rigActive ? "MOVING" : "still",
                   a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.wokeHow,
-                  a.bumps, a.cMat, a.cFull, a.cStain, a.cOther,
+                  a.bumps, a.cMat, a.cFull, a.cStain, a.sWall, a.sFloor, a.sIn,
+                  a.sUp, a.yLo == (1u << 30) ? 0u : a.yLo, a.yHi, a.cOther,
                   a.lastMoved.empty() ? "-" : a.lastMoved.c_str(),
-                  a.trace.c_str())
+                  a.drift.c_str(), a.trace.c_str())
            + " | limbs" + a.limbs + "; ";
   };
   detail = Format("site [%s] bed y%d waterline y%d | ", siteWhy.c_str(), bedY,

@@ -493,6 +493,9 @@ Status GateFloaters(Ctx& c, std::string& detail) {
   debris.Reset();
   const uint32_t settledBeforeB = debris.SettledBack();
   const uint32_t refusedBeforeB = debris.Floaters().settleWithoutSupport;
+  const uint32_t blockedBeforeB = debris.Floaters().settleTargetBlocked;
+  const uint32_t terrainWakesBeforeB = debris.Settle().terrainWakes;
+  const uint32_t blastWakesBeforeB = debris.Settle().blastWakes;
   uint64_t groundHandle = 0;
   {
     std::vector<DebrisVoxel> vox = StoneBlock();
@@ -504,8 +507,17 @@ Status GateFloaters(Ctx& c, std::string& detail) {
     bxf.quat[3] = 1;
     debris.AdoptBody(bh, vox, bxf);
   }
-  for (int i = 0; i < 360 && debris.BodyCount() > 0; i++)
+  int quietRun = 0, maxQuiet = 0, wakesB = 0;
+  for (int i = 0; i < 360 && debris.BodyCount() > 0; i++) {
     RunTick(c, t, fixtureChunk);
+    if (debris.BodyCount() == 0) break;
+    if (phys.IsActive(groundHandle)) {
+      if (quietRun > 0) wakesB++;
+      quietRun = 0;
+    } else {
+      maxQuiet = std::max(maxQuiet, ++quietRun);
+    }
+  }
   const uint32_t settledB = debris.SettledBack() - settledBeforeB;
   const uint32_t refusedB =
       debris.Floaters().settleWithoutSupport - refusedBeforeB;
@@ -536,11 +548,23 @@ Status GateFloaters(Ctx& c, std::string& detail) {
                        "floatersWhyB");
         gpuWord = ch[li];
       }
+      BodyTransform gx{};
+      phys.GetTransform(groundHandle, gx);
+      const DebrisSystem::SettleProbe& sp = debris.Settle();
       whyB = Format(
-          "; ground-block: refused %u, com (%.2f,%.2f,%.2f) %s, pad y%d, "
+          "; ground-block: refused %u, target-blocked %u, com (%.2f,%.2f,%.2f) "
+          "pos (%.2f,%.2f,%.2f) quat (%.3f,%.3f,%.3f,%.3f) %s, longest asleep "
+          "%d ticks, woken %d times (terrain %u blast %u, last t%u chunk "
+          "%d,%d,%d), pad y%d, "
           "below (%d,%d,%d) mirror %s0x%08x (v%u, tick %u) gpu 0x%08x",
-          refusedB, (double)com.x, (double)com.y, (double)com.z,
-          phys.IsActive(groundHandle) ? "ACTIVE" : "asleep", padY, below.x,
+          refusedB, debris.Floaters().settleTargetBlocked - blockedBeforeB,
+          (double)com.x, (double)com.y, (double)com.z, (double)gx.pos.x,
+          (double)gx.pos.y, (double)gx.pos.z, (double)gx.quat[0],
+          (double)gx.quat[1], (double)gx.quat[2], (double)gx.quat[3],
+          phys.IsActive(groundHandle) ? "ACTIVE" : "asleep", maxQuiet, wakesB,
+          sp.terrainWakes - terrainWakesBeforeB, sp.blastWakes - blastWakesBeforeB,
+          sp.lastWakeTick, sp.lastWakeChunk.x,
+          sp.lastWakeChunk.y, sp.lastWakeChunk.z, padY, below.x,
           below.y, below.z, cc ? "" : "UNCACHED ", mirrorWord,
           cc ? cc->version : 0u, t, gpuWord);
     } else {
