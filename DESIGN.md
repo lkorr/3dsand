@@ -26742,6 +26742,16 @@ any height:
   the breach, falling: their rows would smear where the water is drawn FROM).
   Integer adds, so still a function of the moves; a bin past 32767 total
   weight is too big to trust and pulls nothing vertically.
+  **Only CONFINED lateral moves count** (2026-10-18): a source with something
+  other than air directly on top of it (its own liquid under the surface, the
+  rock over a hole), and no falls. With MPM water off (the game as it ships)
+  the breach's own outflow is CA, and the flood it spreads over the floor
+  beyond a dam sits in the same 8-column bin whenever the dam is in that
+  bin's middle; with the free surface counted, the gate's submerged gap (rows
+  4..6 of 10) read as 6 +- 4 -- the top row over the hole INSIDE the pulling
+  water, so no pull down at all. Confined only: 6 +- 3, and the pull is back
+  (-0.76 above / +0.99 below). The look-up is one cell over the source, inside
+  the acting cell's reach-1 box, so it is deterministic (THE READ REACH).
 * **The fold** picks the PULLING bin -- the reach's heaviest contribution,
   the node's own bin included -- and takes its rows' centre `H` (the mean) and
   half-height `HW` (sqrt(3) x the spread: a uniform band of N rows reads N/2),
@@ -26764,6 +26774,36 @@ any height:
   through the buoyancy drag's water frame, so a submerged breach drags what
   floats over it down; their primitives' vertical stays out as before. A
   swimmer's stroke and an NPC afloat still read the horizontal only.
+* **The measured vertical flux** (2026-10-18, ticket 2026-10-18_15-21-34: "a
+  giant hole in the ground underwater ... pointing directly to the side
+  instead of down"). The tilt above needs a horizontal current to tilt, and a
+  vertical move was "no current", so the column over a floor hole -- all of
+  it falling -- was never measured and its arrows read only the sideways mix
+  round it. Now every move with a vertical part (a fall, a diagonal fall, a
+  partial descent) adds `eighths x dy` to ACC word 7 and its row to the band.
+  The fold takes it over the same 3 x 3 tent and conversion, divided by 2 x
+  the height of the water moving there (the horizontal's conversion assumes
+  a FLOWM_DEPTH 0.5 surface layer; a drained column moves every row a
+  little), follows it in time like the velocity (STATE word 7; word 6 now
+  packs D | ON << 16), and keeps the node's band while it moves even if its
+  horizontal is still. GRID gains a third plane (`kFlowMeasVyOffset`, vy i16
+  in 1/kFlowVelQ cells/s, + up; the snapshot copy is 72 KiB). The readers ADD
+  it to the tilt, gated by the band like the horizontal, with no horizontal
+  needed: over the gate's 6 x 6 floor hole vy -2.4 cells/s, every ring point
+  round it pulled down (it read sideways, the top ring 1 of 8 down, before).
+  Bodies feel it through the same `y`.
+  KNOWN, NOT FIXED: the horizontal at a drain is the NET flux of an 8-column
+  bin, and a CA drain is not symmetric -- the diagonal falls into and inside
+  the hole drift one way for many ticks, so the hole's node reads a through-
+  flow (7.7 cells/s at the gate's floor hole, 1.5 with diagonal falls' lateral
+  part left out -- which in turn halves a breach's measured gap speed, so it
+  is not done) and the tent spreads it to the ring: early in a drain some
+  arrows on one side point away. The vertical now dominates next to the hole.
+  The same lattice reads a ONE-CELL dam's two sides as one where the dam is
+  in a bin's middle: the CA flood fanning out at the dam's foot is that bin's
+  current too (`flow-measure` W reads at sideDx 7.5 for that reason; the
+  near ring's ends, 6 cells from the dam, aim 33-48 degrees off the gap --
+  ticket 2026-10-18_15-27-30's "a bit off to the side" is plausibly this).
 
 **The blend** (`flowBlend`, CPU twin `flowfield::BlendMeasured`): the measured
 flow counts in full and the solved field fades out under it, gone at
@@ -26778,7 +26818,7 @@ line was "render-only": the arrows turned toward a breach and a swimmer in
 the same water was pushed along the map's solved field. The measured flow is
 now gameplay input, through the one door every gameplay readback uses:
 
-* **The snapshot ring carries GRID** (`World::EncodeReadbacks`): 54 KiB (36
+* **The snapshot ring carries GRID** (`World::EncodeReadbacks`): 72 KiB (54 before the vy plane, 36
   before the vertical plane), a
   tracked copy after the fold, only on ticks the fold or the Fill closing its
   tail rewrote it (`Simulation::FlowMeasureWritten`) or after a reset; any

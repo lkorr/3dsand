@@ -3995,6 +3995,19 @@ Status GateBlastWater(Ctx& c, std::string& detail) {
 //      bottom row UP, and that relaxes after the drain; the vertical plane's
 //      words at four node columns are printed beside it.
 //   Cv. a body over the submerged gap feels the downward pull (snapshot).
+//   X. BLAST (box 3, ticket 2026-10-18_15-21-34 shot 2: "every arrow round an
+//      underwater explosion points one way"): blastAt ticks after a blast in a
+//      still pool, the ring round it runs one way radially (in, as the CA
+//      fills the cavity) and is not one uniform direction.
+//   F. FLOOR HOLE (box 4, the same ticket, shot 1: "pointing directly to the
+//      side instead of down"): a hole through a pool's floor into a room
+//      below -- the ring near the floor runs toward it, the ring near the top
+//      and the column over it are pulled DOWN (the measured vertical flux).
+//   A. AIM (ticket 2026-10-18_15-27-30), off unless flowMeasure.aimMax is set:
+//      the near ring's worst heading error off the gap.
+// MPM water is OFF for the whole gate (flowMeasure.fluidEnabled, default 0:
+// the game as it ships since 2026-10-18). Boxes 3 and 4 go on the first flat,
+// dry spots of a fixed list (PLACES in the detail).
 // Every 15 ticks the trace prints gap / ring mean / box max, so a FAIL says
 // which phase did not happen. Thresholds in baseline.json.
 Status GateFlowMeasure(Ctx& c, std::string& detail) {
@@ -4238,8 +4251,15 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     if (sa <= 0.0f || sb <= 0.0f) return 0.0f;
     return std::acos(std::clamp((a.x * b.x + a.z * b.z) / (sa * sb), -1.0f, 1.0f)) * kDeg;
   };
-  const Vec3 sideN{(float)cx - 3.5f, sy, (float)cz + (float)sideDz};
-  const Vec3 sideS{(float)cx - 3.5f, sy, (float)cz - (float)sideDz};
+  // sideDx cells upstream of the dam's middle. 3.5 put the points inside the
+  // bin the dam splits (a node every 8 cells, the dam at a node: cells -4..+3
+  // of it, the flood beyond the dam included), which reads the two sides of a
+  // one-cell dam as one; with MPM water off the CA's flood fans out right at
+  // the dam's foot, so that bin is the fan's (2026-10-18). 7.5 is the first
+  // node column wholly on the lake side.
+  const float sideDx = (float)BaselineNumber("flowMeasure.sideDx", 3.5);
+  const Vec3 sideN{(float)cx - sideDx, sy, (float)cz + (float)sideDz};
+  const Vec3 sideS{(float)cx - sideDx, sy, (float)cz - (float)sideDz};
   int converged = 0;
   float spread = 0.0f, sideAngN = 180.0f, sideAngS = 180.0f, sideSpdN = 0.0f, sideSpdS = 0.0f;
   std::string ringAngles, farAngles;
