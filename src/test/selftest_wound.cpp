@@ -8768,6 +8768,11 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     // the FLOOR, or inside the basin; the y band they fell in; and how many
     // were wetter after than before.
     uint32_t sWall = 0, sFloor = 0, sIn = 0, sUp = 0, yLo = 1u << 30, yHi = 0;
+    // ...and what touched each one in the mirror that carried the change:
+    // a liquid face-neighbour (soak from the water), else air straight above
+    // (an exposed top: rain, a drip), else neither (wicked through the rock).
+    uint32_t sByLiquid = 0, sByAirAbove = 0, sByNeither = 0;
+    uint32_t sTypes[8] = {};
     std::string lastMoved, drift;   // drift: root x,z and current every 120
   };
   Arm arms[] = {{"human", "human"},
@@ -8818,6 +8823,24 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                   else
                     a.sIn++;
                   if (((n >> 24) & 0xFu) > ((o >> 24) & 0xFu)) a.sUp++;
+                  a.sTypes[(n >> 28) & 7u]++;
+                  auto mirMat = [&](int x, int y, int z) -> uint32_t {
+                    const CachedChunk* q = c.world.Cached({x >> 4, y >> 4, z >> 4});
+                    if (!q || q->voxels.size() != kChunkVol) return 0xFFFFu;
+                    return q->voxels[((uint32_t)(z & 15) * 16u + (uint32_t)(y & 15)) * 16u +
+                                     (uint32_t)(x & 15)] & 0xFFFu;
+                  };
+                  bool wetNb = false;
+                  const int nb[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+                  for (const auto& d : nb) {
+                    const uint32_t mm = mirMat(wx + d[0], wy + d[1], wz + d[2]);
+                    if (mm != 0xFFFFu && mm != 0u && mm < c.mats.size() &&
+                        c.mats[mm].gpu.klass == CLASS_LIQUID)
+                      wetNb = true;
+                  }
+                  if (wetNb) a.sByLiquid++;
+                  else if (mirMat(wx, wy + 1, wz) == 0u) a.sByAirAbove++;
+                  else a.sByNeither++;
                   a.yLo = std::min(a.yLo, (uint32_t)wy);
                   a.yHi = std::max(a.yHi, (uint32_t)wy);
                 }
@@ -9024,13 +9047,17 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
                   "rig %s, corpse %s (%s, last woken how %d), mirror bumps %u "
                   "(cells moved: mat %u, fullness %u, stain %u [wall %u floor %u "
-                  "inside %u, wetter %u, y%u..%u], stamp-only %u; "
+                  "inside %u, wetter %u, y%u..%u; by liquid %u, open top %u, "
+                  "neither %u; types %u/%u/%u/%u/%u/%u/%u/%u], stamp-only %u; "
                   "last %s), drift from centre every 120:%s, y every 60:%s; ",
                   a.rho, a.lowest, a.final, a.pushes,
                   a.rigActive ? "MOVING" : "still",
                   a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.wokeHow,
                   a.bumps, a.cMat, a.cFull, a.cStain, a.sWall, a.sFloor, a.sIn,
-                  a.sUp, a.yLo == (1u << 30) ? 0u : a.yLo, a.yHi, a.cOther,
+                  a.sUp, a.yLo == (1u << 30) ? 0u : a.yLo, a.yHi, a.sByLiquid,
+                  a.sByAirAbove, a.sByNeither, a.sTypes[0], a.sTypes[1],
+                  a.sTypes[2], a.sTypes[3], a.sTypes[4], a.sTypes[5], a.sTypes[6],
+                  a.sTypes[7], a.cOther,
                   a.lastMoved.empty() ? "-" : a.lastMoved.c_str(),
                   a.drift.c_str(), a.trace.c_str())
            + " | limbs" + a.limbs + "; ";
