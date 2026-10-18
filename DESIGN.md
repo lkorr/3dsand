@@ -18266,8 +18266,18 @@ where you hear from either (§12b, "The ears are on the character").
   and clears after, then queues `kFarNChunk + 2` planes on one face and
   asserts the word is exact to `kFarFaceMax` and escalates past it. **Edits reach the far field
   (phase 2):** each tick, `worldgen.wgsl fardown` runs one workgroup per entry
-  of the compacted dirty list — the same `DispatchWorkgroupsIndirect` args the
-  occupancy update uses, so a settled world dispatches nothing — and re-derives
+  of the FAR DOWNSAMPLE CADENCE's list (2026-10-18, `far_select.wgsl`,
+  `World::farDownState`): every slot written this tick (its dirtyOut flag,
+  hash tick or not) goes PENDING, and a pending slot is selected once
+  `FAR_DOWN_EVERY` (8) ticks have passed since its last downsample — the tick
+  of a one-off edit, at most every eighth tick of a chunk running water keeps
+  rewriting, and within seven ticks (~0.25 s) of a chunk's last write once it
+  goes quiet, because the pending bit outlives the dirty flag. It used to be
+  every tick a chunk was written: 4.6 ms of the slope pour's tick and 10.0 ms
+  of the dam breach's (tickets 2026-10-16_11-14-41 / 2026-10-17_21-03-25;
+  `--perf dam` farField at a cadence of 4: 7.8 ms, of 8: 6.6 ms, of 16: 4.5 ms
+  — a wet chunk
+  is rewritten every few ticks, not every tick, so 4 barely bites). A settled world selects nothing and dispatches nothing — and re-derives
   from the LIVE voxel grid every cascade cell whose sample point falls in a
   chunk that changed. It samples the identical center voxel the sieve does, so
   edited and pristine regions agree exactly where they meet, and a chunk edited
@@ -18306,10 +18316,10 @@ where you hear from either (§12b, "The ears are on the character").
   a steady-state plane, whose incoming face is half a level-1 box from the
   player — and that is also the first moment the clear does not race the
   refill (the fill is recorded after `farDown` in the tick's command buffer).
-  Hash ticks compact no dirty list, so `farDownHash` runs the same kernel over
-  the CA's active list there; a chunk first written on a hash tick from OUTSIDE
-  the active set that is quiet the tick after is still missed (pass_table.def
-  says why the fix is not a dirtyOut compaction). A 32-bit collision skips one
+  Hash ticks used to need a backstop (`farDownHash`, over the CA's active
+  list, which missed a chunk first written from OUTSIDE the active set); the
+  cadence reads the per-slot dirtyOut flags on every tick, so that row and its
+  hole are gone. A 32-bit collision skips one
   downsample of render-only data. The per-sample
   procgen (`genColumn`, the column top) is also hoisted to one call per COLUMN
   (a thread per column, cells in an inner loop): 8x fewer at level 1.

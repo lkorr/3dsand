@@ -815,6 +815,9 @@ class Simulation {
     // fardown's follow-up phases (worldgen.wgsl fardownClaim / fardownStalk /
     // fardownFeat; cross-vendor audit #9). Small entries: no procgen.
     rhi::ComputePipeline downClaim, downStalk, downFeat;
+    // The far downsample cadence's selection (far_select.wgsl): published
+    // with `down` so it can never mark a chunk downsampled that nothing ran.
+    rhi::ComputePipeline downSelect;
   };
   // Move the future's result onto the three far pipeline members. Main thread only.
   void PublishFarPipelines();
@@ -1072,6 +1075,7 @@ class Simulation {
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farCoverFill_, farMapFill_, farMapStalk_, farPatchFill_, farDown_;
   rhi::ComputePipeline farDownClaim_, farDownStalk_, farDownFeat_;
+  rhi::ComputePipeline farDownSelect_;
   // The background compile. Valid between BuildPipelines and the publish;
   // `farPublished_` and `deferFarOk_` are main-thread-only, `farReady_` is the
   // one field any other thread may observe.
@@ -1084,6 +1088,7 @@ class Simulation {
   // last loaded it, and the thread count that build used. Held so a Lazy start
   // thousands of ticks later compiles exactly what an Eager one would have.
   rhi::ShaderModule farModule_;
+  rhi::ShaderModule farSelectModule_;   // far_select.wgsl (the cadence)
   unsigned farBuildThreads_ = 1;
   bool farStarted_ = false;
   // The openness grid (sim_openness.wgsl, docs/PLAN_gi.md §2): `dirty` walks

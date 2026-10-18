@@ -505,6 +505,12 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   if (sigClear_) {
     static const std::vector<uint32_t> zeros(kNumSlots, 0u);
     queue.WriteBuffer(world_->farSig, 0, zeros.data(), zeros.size() * 4);
+    // ...and the far downsample cadence's state (world.h farDownState) with
+    // it: every slot "never downsampled", so the first write after a reset or
+    // a refill over the window is downsampled the tick it lands rather than
+    // waiting out a cadence measured from a tick of the old world (a harness
+    // gate restarts its tick numbers at 1 after every worldgen).
+    queue.WriteBuffer(world_->farDownState, 0, zeros.data(), zeros.size() * 4);
     sigClear_ = false;
   }
   // The UBO above is published either way — a caller that is not draining

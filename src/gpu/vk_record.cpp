@@ -899,6 +899,10 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
             args = bind_.buffers[(int)pass::Buf::ElecArgs];
             argsOff = r.y;
             break;
+          case pass::DispatchSel::IndFarDownArgs:
+            // The far downsample cadence's list (far_select.wgsl).
+            args = bind_.buffers[(int)pass::Buf::FarDownArgs];
+            break;
           case pass::DispatchSel::IndCaArgs:
             // The CA's colour rows (sim_step.wgsl calist): iteration k of a
             // 27-iteration row is colour k, whose record is 16 bytes at 16 k.

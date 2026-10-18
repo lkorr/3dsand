@@ -135,6 +135,14 @@ enum class Buf : uint8_t {
   FarPatch,   // cascade edit patches, read by farFill (world.h kFarPatch*)
   FarSig,     // per-slot far-matter signature, fardown's skip (world.h farSig)
   FarMap,     // the far SURFACE MAP (world.h kFarMap*): farmap fills, farpatch/fardown invalidate
+  // THE FAR DOWNSAMPLE CADENCE (world.h farDownState; far_select.wgsl):
+  // per-slot pending/last-tick state, the selected slots `fardown` dispatches
+  // over, and that list's indirect args (staged by the select's atomics, then
+  // copied: the argsStage/dispatchArgs pair).
+  FarDownState,
+  FarDownList,
+  FarDownArgsStage,
+  FarDownArgs,
   // ---- the software page table (docs/PLAN_page_table.md §5.1) ----
   // PageTable is READ by every row whose entry point touches a voxel and
   // written by nothing on the tick path — it is dispatch-invariant
@@ -525,6 +533,9 @@ enum class Pipe : uint8_t {
   // check, the cut-stalk clear and the feature check, each its own entry so
   // no phase reads what another phase of the same dispatch is writing.
   FarDownClaim, FarDownStalk, FarDownFeat,
+  // The cadence's selection (far_select.wgsl): which written chunks downsample
+  // this tick. Published WITH the far set so it never runs without `fardown`.
+  FarDownSelect,
   // The openness grid (sim_openness.wgsl). Two entry points: the dirty walk
   // (indirect on the compacted dirty list, exactly like occupancyDirty) and the
   // rolling refresh. BEFORE ShadowPrepare so the pipeline-copy loop's bound in
@@ -931,6 +942,7 @@ enum class DispatchSel : uint32_t {
   // fragment shader appended last frame, which nothing on the CPU knows.
   IndGiArgs,
   IndCaArgs,         // indirect: caArgs @ 16 x the ITERATION (colour k of a CA row)
+  IndFarDownArgs,    // indirect: world.farDownArgs @ 0 (the far downsample cadence's list)
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

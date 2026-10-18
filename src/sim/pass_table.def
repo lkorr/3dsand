@@ -1229,57 +1229,12 @@ PASS(solHash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_SOL_HASH, K_COMPUTE,
      USES(R(SolTable) A(SolPool) A(Hash)))
 PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
-// ---- THE HASH-TICK farDown BACKSTOP (2026-09-24) --------------------------
-// `farDown` below rides compactNext's dirtyOut list, and a hash tick compacts
-// none — so a chunk whose LAST write landed on a hash tick was never
-// downsampled: the next tick's dirtyOut holds only that tick's writes, and a
-// chunk that went quiet after the hash tick is not in it. openness and glow
-// have a rolling refresh that eventually repairs such a miss; the cascades do
-// not, so the edit simply never reached the horizon.
-//
-// The same pipeline over the list that IS in DirtyList/DispatchArgs on a hash
-// tick: `compact`'s dirtyIn list (the chunks the CA ran this tick), which
-// contains every chunk written this tick by the CA from inside itself and by
-// the mutation/explosion rows (they flag dirtyIn before `compact`). It does
-// NOT cover a chunk first written this tick from OUTSIDE the active set — a
-// grain crossing into a sleeping neighbour, a particle or gas parcel landing,
-// an MPM deposit — that then stays quiet on the next tick. Closing that needs
-// a dirtyOut compaction on hash ticks, and that is not free to add: this
-// tick's DirtyList is also what the PT_FLUIDSEAM excite rows read after
-// PT_TICK, and they WRITE VOXELS, so changing which list a hash tick leaves
-// behind would move the world. Render-only; when the CA is skipped the args
-// still hold the previous tick's list, and fardown's signature makes that a
-// read of unchanged chunks.
-// read-only in practice: `voxels` is read_write for the module because
-// `genChunk` (main/list) writes it; `fardown` only samples the live grid.
-PASS(farDownHash, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig) A(FarVox) A(FarOcc)))
-// fardown's three follow-up phases, same list, same args, back to back
-// (cross-vendor audit #9: worldgen.wgsl's split note). The barrier between
-// each pair is the point -- each phase reads what the one before it finished
-// writing (farVox bytes, VALID bits, feature words) -- and the recorder emits
-// it from these uses: A(FarVox)/A(FarMap) on both sides of every edge.
-// read-only in practice: `voxels` is read_write for the module (genChunk
-// writes it) and `farSig` because `fardown` writes it; this phase reads both.
-// WorldMap: the claim's despeck test (farDespeck, ticket 2026-10-11_22-09-52)
-// loops behind unrollFenceU(), whose fence word is a worldMap load.
-PASS(farDownHashClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          R(PageTable) R(WorldMap) R(FarSig) A(FarMap)))
-// read-only in practice: `farSig` is read_write for the module because `fardown` writes it.
-PASS(farDownHashStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
-     USES(U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs) R(PageTable) R(FarSig)
-          A(FarVox) A(FarMap)))
-// read-only in practice: `voxels` is read_write for the module (genChunk
-// writes it) and `farSig` because `fardown` writes it; this phase reads both.
-PASS(farDownHashFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          R(PageTable) R(WorldMap) R(FarSig) A(FarMap) A(FarVox) A(FarOcc)))
+// ---- (the HASH-TICK farDown BACKSTOP rows that stood here are gone) -------
+// They re-ran the downsample over a hash tick's dirtyIn list because a hash
+// tick compacts no dirtyOut list. The far downsample cadence below selects
+// from the per-slot dirtyOut FLAGS on every tick instead, which a hash tick
+// writes like any other -- so it covers what the backstop covered and the
+// chunks first written from outside the active set that it missed.
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -1300,43 +1255,62 @@ PASS(occupancyDirty, "occupancyDirty+pick", PT_TICK, PIPE_OCCUPANCY_DIRTY, K_IND
           R(PageTable)))
 PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
-// Far-field phase 2: downsample the same compacted dirtyOut list into the
-// cascades, so edits stay visible after the player walks away (render-only
-// derived data — DESIGN.md §9). Rides the SAME indirect args as the occupancy
-// update, so a settled world dispatches nothing. Separate pass: it uses farPL_
-// (slim group 0 + far group 1), not simPL_.
-// NOTE: hash ticks skip this — they take the whole-world occupancy branch and
-// never compact dirtyOut, so there is no work list. The old claim here, "a
-// chunk edited on a hash tick is still dirty the next tick and downsamples
-// then", was wrong: next tick's dirtyOut holds only next tick's writes. The
-// `farDownHash` row above is the backstop, and its note says what it covers.
+// ---- THE FAR DOWNSAMPLE CADENCE (2026-10-18; world.h farDownState) ------
+// Far-field phase 2: downsample the chunks written into the cascades, so edits
+// stay visible after the player walks away (render-only derived data --
+// DESIGN.md §9). Which chunks, this tick, is far_select.wgsl's: every written
+// slot goes PENDING, and a pending slot is downsampled once FAR_DOWN_EVERY
+// ticks have passed since its last downsample -- the tick of a one-off edit,
+// at most every FAR_DOWN_EVERY-th tick of a chunk running water keeps
+// rewriting, and within FAR_DOWN_EVERY - 1 ticks of a chunk's last write when
+// it goes quiet. The old rows rode compactNext's dirtyOut list directly, which
+// re-downsampled every wet chunk on every tick it was written (farField 4.6 ms
+// of the slope pour's tick, 10.0 ms of the dam breach's).
+// Runs on EVERY tick, hash or not, after both occupancy branches: dirtyOut is
+// complete by here either way, and the cadence's pending state must advance
+// on every tick or a chunk due on a hash tick would wait for the next one.
+// A settled world selects nothing: one load per slot, zero fardown groups
+// (rule 2). Separate rows on farPL_ (slim group 0 + far group 1).
+PASS(fill_farDownArgs, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,4,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(FarDownArgsStage)))
+PASS(farDownSelect, "farDown", PT_TICK, PIPE_FAR_DOWN_SELECT, K_COMPUTE, D_CHUNKS64,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_ALWAYS, 1,
+     USES(R(DirtyOut) U(TickUBO) RW(FarDownState) W(FarDownList) A(FarDownArgsStage)))
+PASS(copy_farDownArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(FarDownArgsStage) TW(FarDownArgs)))
 // read-only in practice: `voxels` is read_write for the module because
 // `genChunk` (main/list) writes it. `fardown` only samples the live grid to
 // downsample into the cascades — far-field is derived, render-only data and
 // never writes back (DESIGN.md §9).
-PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_FARDOWNARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(FarDownList) I(FarDownArgs)
           R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig) A(FarVox) A(FarOcc)))
-// The follow-up phases (see farDownHashClaim's note).
+// fardown's three follow-up phases, same list, same args, back to back
+// (cross-vendor audit #9: worldgen.wgsl's split note). The barrier between
+// each pair is the point -- each phase reads what the one before it finished
+// writing (farVox bytes, VALID bits, feature words) -- and the recorder emits
+// it from these uses: A(FarVox)/A(FarMap) on both sides of every edge.
 // read-only in practice: `voxels` is read_write for the module (genChunk
 // writes it) and `farSig` because `fardown` writes it; this phase reads both.
-PASS(farDownClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+// WorldMap: the claim's despeck test (farDespeck, ticket 2026-10-11_22-09-52)
+// loops behind unrollFenceU(), whose fence word is a worldMap load.
+PASS(farDownClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_FARDOWNARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(FarDownList) I(FarDownArgs)
           R(PageTable) R(WorldMap) R(FarSig) A(FarMap)))
 // read-only in practice: `farSig` is read_write for the module because `fardown` writes it.
-PASS(farDownStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
-     USES(U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs) R(PageTable) R(FarSig)
+PASS(farDownStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_FARDOWNARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) U(FarUBO) R(FarDownList) I(FarDownArgs) R(PageTable) R(FarSig)
           A(FarVox) A(FarMap)))
 // read-only in practice: `voxels` is read_write for the module (genChunk
 // writes it) and `farSig` because `fardown` writes it; this phase reads both.
 // FarVox / FarOcc: its tail is the far CONTAINER RULE (worldgen.wgsl
 // fardownFeat), which rewrites level 1-2 cells after `fardown` wrote them.
-PASS(farDownFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+PASS(farDownFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_FARDOWNARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(FarDownList) I(FarDownArgs)
           R(PageTable) R(WorldMap) R(FarSig) A(FarMap) A(FarVox) A(FarOcc)))
 
 // ---- the derived rows' RenderParams (docs/PLAN_async_compute.md) ---------
