@@ -1522,6 +1522,11 @@ const char* const kOrder[] = {
     // basin on the pad, ticks thousands of ticks of running water and
     // regenerates again on exit -- the `lake-settle` exit, so right after it.
     "stream-pool",
+    // Streams held only when natural (tickets 2026-10-17_11-26-13 / 11-37-20):
+    // the `rivers` seam and exit (a synthetic map in a TEMP dir with two lakes,
+    // regenerated, thousands of ticks of a flood and a through-flow, the real
+    // environment back) -- so right after the other running-water gates.
+    "stream-natural",
     // What the infection pass COSTS: eight bitten humans ticked four times
     // over (the whole-lattice sweep against the limb's cell list -- identical
     // outcome, a fraction of the time). LATE on purpose: the crowd bleeds over

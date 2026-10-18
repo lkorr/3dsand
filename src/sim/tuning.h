@@ -3365,6 +3365,14 @@ struct Tuning {
     // cell's mass per pair visit (sim_solute.wgsl THE DRIFT). 24 reads as a
     // slow current; 0 = off (it then only diffuses there).
     int soluteDrift = TPD(sim, soluteDrift);
+    // A player-made stream fed from the map's water is HELD (sim_stream.wgsl)
+    // only once its own surface and every column downstream of it have held
+    // still for this many ticks: a spreading flood or a filling basin stays
+    // live water (tickets 2026-10-17_11-26-13 / 11-37-20). 600 = 20 s.
+    int streamSteadyTicks = TPD(sim, streamSteadyTicks);
+    // 1 = a stream from a FINITE source (a pour, a pool) is held too, through
+    // the conduit's ledger (phase 3). 0 (the default) = only map-fed streams.
+    int streamPoolRoot = TPD(sim, streamPoolRoot);
 
     // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
     //

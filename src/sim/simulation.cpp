@@ -1004,7 +1004,20 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // mouth + 1 (0 = none), the downstream direction sim_solute.wgsl drifts
     // dissolved mass along on a level reach. Its own region, so the four-word
     // records and every reader of them keep their stride.
-    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u + (uint64_t)kWorldN * kWorldN;
+    // ...plus TWO words per window column after the mouth words (2026-10-17,
+    // sim_stream.wgsl STILL_ECHO): a stream column's surface recorded while
+    // it was observed, eight signed-byte samples relative to the target it was
+    // adopted at -- render-only (raymarch replays it), never read by the sim.
+    // ...plus EIGHT words per window column after those (2026-10-17,
+    // sim_stream.wgsl STREAM_OBS): the stream observer's own state -- the
+    // steady test's anchor and sums, the downstream-quiet stamps (scratch +
+    // published), the record's tag, the adoption tick, release / adoption
+    // counts. Read and written by sim_stream.wgsl only (and the gates).
+    // Every clear (the dense Fill, the paged regen's WriteBuffer, the load's
+    // clearStreams) covers them.
+    constexpr uint64_t kStillWaterWords =
+        (uint64_t)kWorldN * kWorldN * 4u + 4u + (uint64_t)kWorldN * kWorldN + 2ull * kWorldN * kWorldN +
+        8ull * kWorldN * kWorldN;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
                                       rhi::BufferUsage::CopySrc,

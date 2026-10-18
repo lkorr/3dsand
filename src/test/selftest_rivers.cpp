@@ -70,6 +70,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -88,8 +89,10 @@
 #include "sim/horizon.h"
 #include "sim/solutes.h"
 #include "sim/treeatlas.h"
+#include "sim/tuning.h"
 #include "sim/weather.h"
 #include "sim/world.h"
+#include "sim/worldgen_run.h"
 #include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -1650,9 +1653,30 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // its hop, POOL or map, its target and the flood count.
         int poolN = 0;
         std::string floodWho;
+        // CYCLING (2026-10-17, sim_stream.wgsl STREAMS ADOPT ONLY WHEN
+        // NATURAL): sim_stream's own per-column counters (STREAM_OBS word 6:
+        // releases, bits 0..7 | adoptions, 8..15; word 7 the release reasons, a byte
+        // each: support | flood | event | drained), the most-released column.
+        int relMaxS = 0, relSumS = 0, adoptSumS = 0;
+        std::string relWhoS;
         auto adoptedCount = [&]() {
           std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
+          const size_t kObsS = size_t(kWorldN) * kWorldN * 7u + 4u;
+          std::vector<uint32_t> obs(size_t(kWorldN) * kWorldN * 8u);
+          rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, kObsS * 4u, obs.data(), obs.size() * 4, "riversStillObs");
+          relMaxS = relSumS = adoptSumS = 0;
+          relWhoS.clear();
+          for (const auto& xz : byCols) {
+            const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+            const int rel = static_cast<int>(obs[ci * 8 + 6] & 0xFFu);
+            relSumS += rel;
+            adoptSumS += static_cast<int>((obs[ci * 8 + 6] >> 8) & 0xFFu);
+            if (rel > relMaxS) {
+              relMaxS = rel;
+              relWhoS = Format(" (%d,%d) reasons 0x%08x", xz.first, xz.second, obs[ci * 8 + 7]);
+            }
+          }
           int k = 0;
           floodMax = 0;
           poolN = 0;
@@ -1726,6 +1750,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
         wet = wetCount();
         adopted = adoptedCount();
         awake = awakeOn();
+        const int relMaxRun = relMaxS;
+        const std::string relRun = Format("; while running %d releases / %d adoptions, at most %d of one column%s", relSumS,
+                                          adoptSumS, relMaxS, relWhoS.c_str());
         std::string runWho = Format("; %d POOL; the most flooded: %s; awake by", poolN, floodWho.c_str());
         for (int b = 0; b < kDirtyReasonBits; b++)
           if ((awakeWhy >> b) & 1u) runWho += Format(" %s", kDirtyReasonName[b]);
@@ -1755,8 +1782,11 @@ Status GateRivers(Ctx& c, std::string& detail) {
         const int awakeMaxS = static_cast<int>(BaselineNumber("rivers.streamAwakeMax", 2));
         const double releaseMax = BaselineNumber("rivers.streamReleaseMax", 0.2);
         const double flapMax = BaselineNumber("rivers.streamFlapMax", 0.1);
+        const int relPerCol = static_cast<int>(BaselineNumber("rivers.streamReleasePerColMax", 1));
         const bool sOk = nBy > 50 && wet >= nBy / 2 && adopted >= static_cast<int>(adoptMin * nBy) && awake <= awakeMaxS &&
-                         lost <= static_cast<int>(flapMax * nBy) && adoptedAfter <= static_cast<int>(releaseMax * nBy);
+                         lost <= static_cast<int>(flapMax * nBy) && adoptedAfter <= static_cast<int>(releaseMax * nBy) &&
+                         relMaxRun <= relPerCol;
+        runWho += relRun;
         std::printf("rivers: S stream held: %s (channel %d columns: after %d ticks %d wet, %d adopted (>= %.2f), %d of its "
                     "%zu chunks awake (<= %d), %d released while running (<= %.2f); plugged, %d ticks on: %d adopted "
                     "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
@@ -1950,9 +1980,849 @@ Status GateRivers(Ctx& c, std::string& detail) {
   return Status::Pass;
 }
 
+// ============================================================================
+// `stream-natural`: a stream is held only when holding it looks natural
+// (sim_stream.wgsl STREAMS ADOPT ONLY WHEN NATURAL; tickets
+// 2026-10-17_11-26-13 and 11-37-20; docs/PLAN_running_water.md phase 2b).
+//
+// THE CLAIM. A breach in map water feeds its stream for ever, so phase 2
+// held such a stream once its surface had stayed within a voxel for 120
+// visits -- which a FLOOD spreading over flat ground, or a basin filling
+// below a stream, also does: their columns were held part way up, at
+// whatever height they stood at that moment, and refilled to it (the
+// owner's "vertical waterfall column things", the rise and the collapse).
+// Now a column is held only when its stream is fed from the map's water, its
+// own MEAN surface has held within an eighth or two for sim.streamSteadyTicks
+// with its water resting on its bed, and nothing DOWNSTREAM of it has changed
+// for as long (no new column wet, no surface moved).
+//
+// THE FIXTURE: a synthetic map (the `rivers` seam: a TEMP asset dir, its own
+// height plane with the terrain noise off) -- flat ground with two map lakes,
+// A high and B low -- and stone-lined cuts written by cell ops:
+//   FLOOD: a 3-wide notch through A's north shore (floor 2 under A's level)
+//     drops 3 voxels onto a walled flat PLAIN (floodX x floodZ) 5 under A's
+//     level, which fills from A until level with it;
+//   CHANNEL: a 3-wide channel out of A's east shore falling 1 in chanRun into
+//     a BASIN basinDepth under its last floor, which overflows over a sill
+//     sillH above its floor into an OUTLET that runs down into lake B: once
+//     the basin is full the whole thing is a through-flow from A to B;
+//   EXTENSION: a dry basin beside the first, behind a wall (phase 2).
+// Then, with MPM excitation and water-body discovery off and a clear dawn
+// pinned (their own systems; the claim is the held stream's):
+//   A. no column of the FLOOD (notch + plain) is held while the plain is still
+//      filling (its water moved by more than fillTolPerCol eighths a column over
+//      the last steady window), and the plain pools and its chunks sleep (<= floodAwakeMax);
+//   B. no PILLAR at any sample: a held column whose target stands more than a
+//      voxel over every wet neighbour (or over open dry ones);
+//   C. no CHANNEL column is held while the basin is still filling, and once it
+//      is a through-flow the channel is held (>= adoptMin) and its chunks
+//      sleep (<= chanAwakeMax);
+//   D. no cycling: at most releaseMax releases per column over phase 1
+//      (sim_stream's own per-column counter, STREAM_OBS word 6), and the held
+//      channel never loses columns between samples while nothing changes;
+//   E. DELIVERY: the extension is opened under the held stream; the water
+//      the basin region gains per tick over rateTicks (from rateDelay after
+//      the opening) is within [rateLo, rateHi] of what it gained per tick
+//      while the LIVE stream first filled the basin;
+//   F. DETERMINISM: detRuns runs of the first detTicks of phase 1 from a fresh
+//      worldgen hash the fixture's voxels and still-table words equal.
+// Every sample prints the volumes, held counts, awake chunks and the largest
+// release count, so a failure names its part (CLAUDE.md verification rule 6).
+// ============================================================================
+Status GateStreamNatural(Ctx& c, std::string& detail) {
+  using sandvox::ReadVoxelsSync;
+  using sandvox::ReloadEnvironment;
+  using sandvox::SubmitWorldgen;
+  const std::string dir = sandvox::AssetDir();
+  std::vector<std::string> problems;
+  auto fail = [&](const std::string& why) {
+    detail = why;
+    std::printf("stream-natural: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  };
+  biomes::BiomeSet set;
+  std::string log;
+  if (!biomes::LoadBiomeSet(dir, c.mats, set, log)) return fail("biome files did not load: " + log);
+  TreeAtlas atlas;
+  if (!LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log)) return fail("tree atlas did not load: " + log);
+  const worldmap::WorldMapData real = worldmap::CurrentWorldMap();
+  if (!real.Loaded()) return fail("no world map loaded");
+  uint32_t mWater = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { mWater = static_cast<uint32_t>(i); break; }
+  if (mWater == 0) return fail("no `water` material");
+  auto num = [](const char* k, double d) { return static_cast<int>(BaselineNumber(k, d)); };
+  const int floodX = num("streamNat.floodX", 12), floodZ = num("streamNat.floodZ", 12);
+  const int notchLen = num("streamNat.notchLen", 6);
+  const int chanLen = num("streamNat.chanLen", 32), chanRun = std::max(1, num("streamNat.chanRun", 4));
+  const int basinX = num("streamNat.basinX", 12), basinZ = num("streamNat.basinZ", 12);
+  const int basinDepth = num("streamNat.basinDepth", 6), sillH = num("streamNat.sillH", 4);
+  const int extZ = num("streamNat.extZ", 12);
+  const int sampleTicks = std::max(10, num("streamNat.sampleTicks", 50));
+  const int minTicks = num("streamNat.minTicks", 2400), maxTicks = num("streamNat.maxTicks", 9000);
+  const int extTicks = num("streamNat.extTicks", 900);
+  const int rateDelay = num("streamNat.rateDelay", 30), rateTicks = num("streamNat.rateTicks", 150);
+  // "Still filling": the region's water moved by more than this many eighths
+  // per column over the steady window -- sim_stream's own news threshold
+  // (STREAM_CHAIN_TOL, half a voxel), so a level wandering inside a few
+  // eighths is not "filling" and a flood rising half a voxel is.
+  const long long fillTolPerCol = num("streamNat.fillTolPerCol", 4);
+  const int floodAwakeMax = num("streamNat.floodAwakeMax", 0), chanAwakeMax = num("streamNat.chanAwakeMax", 1);
+  const double adoptMin = BaselineNumber("streamNat.adoptMin", 0.6);
+  const int releaseMax = num("streamNat.releaseMax", 1);
+  const double rateLo = BaselineNumber("streamNat.rateLo", 0.5), rateHi = BaselineNumber("streamNat.rateHi", 2.0);
+  const int detRuns = num("streamNat.detRuns", 3), detTicks = num("streamNat.detTicks", 600);
+  const int steadyTicks = std::clamp(CurrentTuning().sim.streamSteadyTicks, 32, 4000);
+  const int steadySamples = std::max(1, steadyTicks / sampleTicks);
+
+  // ---- the synthetic map: flat ground, two lakes ----
+  const fs::path tmp = fs::temp_directory_path() /
+                       ("sv_snat_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  const fs::path mdir = tmp / "worldmap" / "snat";
+  const IVec3 org = c.world.WindowOrigin();
+  const int ox = org.x * static_cast<int>(kChunk), oz = org.z * static_cast<int>(kChunk);
+  const int ylo = org.y * static_cast<int>(kChunk);
+  constexpr int L = 6, P = 1 << L, T = worldmap::kTileSide;
+  const int X0 = ((ox - 8192) >> 10) << 10, Z0 = ((oz - 8192) >> 10) << 10;
+  const int G = ylo + 100;
+  // Lake centres ON height posts, so the depression's floor is the post's.
+  auto onPost = [&](int v, int o) { return o + ((v - o + P / 2) / P) * P; };
+  const int xA = onPost(ox + 150, X0), zA = onPost(oz + 300, Z0);
+  // B small, deep and apart from A: the two depressions must not overlap (the
+  // third cut overlapped them, B's lowered A's rim under A's floor and A
+  // held no water at all).
+  const int xB = onPost(ox + 340, X0), zB = zA;
+  const double R0 = 120.0, R0B = 100.0;
+  auto authored = [&](int i, int k) -> int {
+    const double px = X0 + i * P, pz = Z0 + k * P;
+    double h = G;
+    const double dA = std::hypot(px - xA, pz - zA) / R0, dB = std::hypot(px - xB, pz - zB) / R0B;
+    if (dA < 1) h -= 40 * (1 - dA * dA) * (1 - dA * dA);
+    if (dB < 1) h -= 100 * (1 - dB * dB) * (1 - dB * dB);
+    return static_cast<int>(std::lround(h));
+  };
+  std::vector<int> hs(size_t(T) * T), bs(size_t(T) * T, 1);
+  for (int k = 0; k < T; k++)
+    for (int i = 0; i < T; i++) hs[size_t(k) * T + i] = authored(i, k);
+  nlohmann::json te = nlohmann::json::object();
+  {
+    std::ifstream f(dir + "/worldmap/" + real.name + "/map.json");
+    nlohmann::json rj;
+    try { f >> rj; } catch (...) {}
+    if (rj.contains("terrain")) te = rj["terrain"];
+  }
+  // FLAT: the octave ladder off, so the ground is the plane.
+  for (const char* k : {"rangeAmplitude", "hillAmplitude", "detailAmplitude", "grainAmplitude"}) te[k] = 0;
+  nlohmann::json mj = {
+      {"version", 2}, {"name", "snat"},
+      {"extent", {{"min", {X0, Z0}}, {"size", {32768, 32768}}}},
+      {"siteCellLog2", 10},
+      {"planes", {{"height", {{"log2", L}, {"tile", T}, {"default", -300}}},
+                  {"biome", {{"log2", 8}, {"tile", T}, {"default", "ocean"}}}}},
+      // The sea well under every cut (B's pit reaches y0, and a sea over it
+      // flooded B and the outlet: the first stream-natural runs), but not km
+      // below (the `rivers` note: the lapse rate counts from the sea).
+      {"seaLevelY", ylo - 100}, {"edgeFadeVox", 2048}, {"warpAmpVox", 0},
+      {"biomes", {"ocean", "meadow"}},
+      {"terrain", te},
+      {"sites", {{{"id", "pad"}, {"kind", "pad"}, {"min", {ox - 256, oz - 256}}, {"max", {ox + 768, oz + 768}}},
+                 {{"id", "spawn"}, {"kind", "spawn"}, {"at", {ox + 480, oz + 60}}}}},
+      {"rules", nlohmann::json::array()}};
+  bool wrote = WriteTileR(mdir / "planes" / "height" / "0_0.svt", worldmap::kPlaneHeight, 0, 0, hs) &&
+               WriteTileR(mdir / "planes" / "biome" / "0_0.svt", worldmap::kPlaneBiome, 0, 0, bs);
+  {
+    std::ofstream f(mdir / "map.json");
+    f << mj.dump(2);
+    wrote = wrote && static_cast<bool>(f);
+  }
+  if (!wrote) return fail("could not write the synthetic map under " + tmp.string());
+  const std::vector<worldmap::StructurePlacement>* prevOverride = worldmap::StructureOverrideSlot();
+  const std::vector<worldmap::StructurePlacement> prevList = prevOverride ? *prevOverride : std::vector<worldmap::StructurePlacement>{};
+  static const std::vector<worldmap::StructurePlacement> kNone;
+  worldmap::SetStructureOverride(&kNone);
+  const std::string tdir = tmp.string();
+  auto load = [&](const nlohmann::json* j, worldmap::WorldMapData& out, std::string& l) {
+    const std::string text = j ? j->dump() : std::string();
+    return worldmap::LoadWorldMap(tdir, "snat", set, c.mats.size(), kDefaultSeed, out, l, j ? &text : nullptr);
+  };
+  auto cleanup = [&] {
+    worldmap::SetStructureOverride(prevOverride ? &prevList : nullptr);
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+  };
+  // Each lake's level: deep enough over its floor, and two under the lowest
+  // ground on its polygon (so no lake stands over the ground outside it and
+  // spills for ever -- the first cut put A's level 4 over the plain).
+  const int rA = 96, rB = 40;
+  int LA = 0, LB = 0, floorA = 0, floorB = 0, rimA = INT_MAX, rimB = INT_MAX;
+  {
+    worldmap::WorldMapData dry;
+    std::string l;
+    if (!load(nullptr, dry, l)) { cleanup(); return fail("the dry synthetic map was REFUSED: " + l); }
+    worldmap::SetCurrentWorldMap(dry);
+    floorA = worldmap::BareGroundHeight(xA, zA, kDefaultSeed);
+    floorB = worldmap::BareGroundHeight(xB, zB, kDefaultSeed);
+    for (int k = 0; k < 64; k++) {
+      const double a = k * 3.14159265358979 / 32;
+      rimA = std::min(rimA, worldmap::BareGroundHeight(xA + int(std::lround(rA * std::cos(a))), zA + int(std::lround(rA * std::sin(a))), kDefaultSeed));
+      rimB = std::min(rimB, worldmap::BareGroundHeight(xB + int(std::lround(rB * std::cos(a))), zB + int(std::lround(rB * std::sin(a))), kDefaultSeed));
+    }
+    LA = std::min(floorA + 14, rimA - 2);
+    // B sits under A's channel, basin and sill: 16 under A (the outlet's sill
+    // is 11 under A's level).
+    LB = std::min({floorB + 14, rimB - 2, LA - 30});
+  }
+  auto ring = [&](int cx, int cz, double r) {
+    nlohmann::json pts = nlohmann::json::array();
+    for (int k = 0; k < 16; k++) {
+      const double a = k * 3.14159265358979 / 8;
+      pts.push_back({cx + int(std::lround(r * std::cos(a))), cz + int(std::lround(r * std::sin(a)))});
+    }
+    return pts;
+  };
+  nlohmann::json lakes = nlohmann::json::array();
+  lakes.push_back({{"id", "high"}, {"level", LA}, {"smooth", true}, {"bed", "shore_mud"}, {"shore", "sand"}, {"points", ring(xA, zA, rA)}});
+  lakes.push_back({{"id", "low"}, {"level", LB}, {"smooth", true}, {"bed", "shore_mud"}, {"shore", "sand"}, {"points", ring(xB, zB, rB)}});
+  mj["lakes"] = lakes;
+  worldmap::WorldMapData on;
+  {
+    std::string l;
+    if (!load(&mj, on, l)) { cleanup(); worldmap::SetCurrentWorldMap(real); return fail("the lake map was REFUSED: " + l); }
+  }
+  worldmap::SetCurrentWorldMap(on);
+  auto wetAt = [&](int x, int z) { return worldmap::WaterColumnAt(x, z, kDefaultSeed).water >= 0; };
+  // A's north and east shores and B's west shore, along the lakes' axes.
+  int zN = zA, xE = xA, xW = xB;
+  while (zN > zA - 140 && wetAt(xA, zN)) zN--;
+  while (xE < xA + 140 && wetAt(xE, zA)) xE++;
+  while (xW > xB - 140 && wetAt(xW, zB)) xW--;
+
+  // ---- the fixture: kinds per column ----
+  enum Kind { K_NONE = 0, K_WALL, K_NOTCH, K_PLAIN, K_CHAN, K_BASIN, K_OUTLET, K_EXT, K_DOOR, K_COUNT };
+  static const char* kKindName[K_COUNT] = {"none", "wall", "notch", "plain", "channel", "basin", "outlet", "ext", "door"};
+  std::map<std::pair<int, int>, std::pair<int, int>> interior;   // (x,z) -> (kind, floor y = stone top)
+  std::set<std::pair<int, int>> gateCols, doorCols;              // built as wall, opened later
+  // FLOOD: notch rows zN, zN-1, ... (zN is the first dry row north of A).
+  for (int k = 0; k < notchLen; k++)
+    for (int dx = -1; dx <= 1; dx++) {
+      interior[{xA + dx, zN - k}] = {K_NOTCH, LA - 2};
+      if (k == 0) gateCols.insert({xA + dx, zN});
+    }
+  const int zp1 = zN - notchLen, zp0 = zp1 - floodZ + 1;
+  const int xp0 = xA - floodX / 2, xp1 = xp0 + floodX - 1;
+  for (int z = zp0; z <= zp1; z++)
+    for (int x = xp0; x <= xp1; x++) interior[{x, z}] = {K_PLAIN, LA - 5};
+  // CHANNEL out of A's east shore.
+  auto chanFloor = [&](int k) { return LA - 2 - k / chanRun; };
+  for (int k = 0; k < chanLen; k++)
+    for (int dz = -1; dz <= 1; dz++) {
+      interior[{xE + k, zA + dz}] = {K_CHAN, chanFloor(k)};
+      if (k == 0) gateCols.insert({xE, zA + dz});
+    }
+  const int xb0 = xE + chanLen, xb1 = xb0 + basinX - 1;
+  const int zb0 = zA - basinZ / 2, zb1 = zb0 + basinZ - 1;
+  const int yBasin = chanFloor(chanLen - 1) - basinDepth;
+  for (int z = zb0; z <= zb1; z++)
+    for (int x = xb0; x <= xb1; x++) interior[{x, z}] = {K_BASIN, yBasin};
+  // OUTLET: from the sill over the basin floor, a straight ramp down to two
+  // OVER B's level at B's shore, where it falls into B. Never a flat stretch
+  // standing in B's water: a reach-1 CA moves water along a level surface only
+  // by levelling (a ramp of an eighth per two cells is its fixed point), so a
+  // long flat or flooded outlet is a slow pipe the whole through-flow backs up
+  // behind (measured: the first two fixtures' outlets, 79 and 52 columns
+  // ending in B's standing water, were still backing up -- the basin rising
+  // three voxels -- at tick 9000).
+  const int ySill = yBasin + sillH;
+  const int outLen = std::max(1, xW - xb1);
+  int outCols = 0;
+  for (int x = xb1 + 1; x <= xW; x++) {
+    const int k = x - xb1 - 1;
+    const int fy = ySill - (k * (ySill - (LB + 2)) + (outLen - 1) / 2) / std::max(1, outLen - 1);
+    for (int dz = -1; dz <= 1; dz++) interior[{x, zA + dz}] = {K_OUTLET, fy};
+    outCols++;
+  }
+  // EXTENSION south of the basin, behind its wall; the DOOR is that wall.
+  const int ze0 = zb1 + 3, ze1 = ze0 + extZ - 1;
+  for (int z = ze0; z <= ze1; z++)
+    for (int x = xb0; x <= xb1; x++) interior[{x, z}] = {K_EXT, yBasin};
+  for (int z = zb1 + 1; z <= zb1 + 2; z++)
+    for (int x = xb0 + 3; x <= xb1 - 3; x++) {
+      interior[{x, z}] = {K_DOOR, yBasin};
+      doorCols.insert({x, z});
+    }
+  // Interior columns must be dry ground (map water is the lakes'): a cut
+  // through a lake column would hold the lake's own target. A wet one (a
+  // shoreline that bulges into a cut's first row) is the lake's, not cut.
+  int wetInterior = 0;
+  for (auto it = interior.begin(); it != interior.end();) {
+    if (wetAt(it->first.first, it->first.second)) {
+      wetInterior++;
+      gateCols.erase(it->first);
+      it = interior.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  const int wallTop = std::max(G, LA + 4) + 2;
+  const int yBase = std::min({LB - 4, yBasin - 3});
+  const int yTop = G + 40;
+  std::map<std::pair<int, int>, int> kindOf;   // every footprint column, walls included
+  for (const auto& [xz, kf] : interior) kindOf[xz] = kf.first;
+  for (const auto& [xz, kf] : interior)
+    for (int dz = -2; dz <= 2; dz++)
+      for (int dx = -2; dx <= 2; dx++) {
+        const std::pair<int, int> q{xz.first + dx, xz.second + dz};
+        if (!kindOf.count(q) && !wetAt(q.first, q.second)) kindOf[q] = K_WALL;
+      }
+  int bx0 = INT_MAX, bx1 = INT_MIN, bz0 = INT_MAX, bz1 = INT_MIN;
+  for (const auto& [xz, k] : kindOf) {
+    bx0 = std::min(bx0, xz.first); bx1 = std::max(bx1, xz.first);
+    bz0 = std::min(bz0, xz.second); bz1 = std::max(bz1, xz.second);
+  }
+  bx0 -= 2; bx1 += 2; bz0 -= 2; bz1 += 2;
+  const int by0 = yBase, by1 = wallTop + 8;
+  const int wx0 = org.x * static_cast<int>(kChunk), wy0 = ylo, wz0 = org.z * static_cast<int>(kChunk), W = static_cast<int>(kWorldN);
+  std::printf("stream-natural: map: ground y%d, lake A (%d,%d) floor y%d rim y%d level y%d (shores: north z%d, east "
+              "x%d), lake B (%d,%d) floor y%d rim y%d level y%d (west shore x%d); plain %dx%d floor y%d; channel %d long floor y%d -> y%d (1 in %d); basin "
+              "%dx%d floor y%d, sill y%d; outlet %d long; ext %dx%d; %zu footprint columns (%d left to the lakes), box "
+              "x%d..%d y%d..%d z%d..%d\n",
+              G, xA, zA, floorA, rimA, LA, zN, xE, xB, zB, floorB, rimB, LB, xW, floodX, floodZ, LA - 5, chanLen, chanFloor(0), chanFloor(chanLen - 1),
+              chanRun, basinX, basinZ, yBasin, ySill, outCols, basinX, extZ, kindOf.size(), wetInterior, bx0, bx1, by0, by1, bz0, bz1);
+  if (LA - floorA < 4 || LB - floorB < 4 || LA - LB < 14 || ySill - (LB + 2) < outLen / 4 || zN <= zA - 140 || xE >= xA + 140 || xW <= xB - 140 || outCols < 8 || LB >= ySill ||
+      bx0 < wx0 + 8 || bx1 >= wx0 + W - 8 || bz0 < wz0 + 8 || bz1 >= wz0 + W - 8 || by0 < wy0 || yTop >= wy0 + W) {
+    cleanup();
+    worldmap::SetCurrentWorldMap(real);
+    return fail(Format("the fixture does not fit: lake depths %d / %d, A over B %d, shores z%d x%d x%d, outlet %d "
+                       "columns, B level y%d vs sill y%d, box vs window (%d,%d,%d)",
+                       LA - floorA, LB - floorB, LA - LB, zN, xE, xW, outCols, LB, ySill, wx0, wy0, wz0));
+  }
+
+  // ---- build ops (top down), opening ops ----
+  const uint32_t stoneW = kMatStone;
+  std::vector<CellOp> build, openGate, openDoor;
+  for (int y = yTop; y >= yBase; y--)
+    for (const auto& [xz, kd] : kindOf) {
+      int top = wallTop;
+      if (kd != K_WALL) {
+        const int fy = interior[xz].second;
+        top = (gateCols.count(xz) || doorCols.count(xz)) ? wallTop : fy;
+      }
+      build.push_back({World::SlotCellIndex({xz.first, y, xz.second}), y <= top ? stoneW : 0u});
+    }
+  for (const auto& xz : gateCols)
+    for (int y = interior[xz].second + 1; y <= wallTop; y++) openGate.push_back({World::SlotCellIndex({xz.first, y, xz.second}), 0u});
+  for (const auto& xz : doorCols)
+    for (int y = interior[xz].second + 1; y <= wallTop; y++) openDoor.push_back({World::SlotCellIndex({xz.first, y, xz.second}), 0u});
+
+  // ---- chunk sets per kind (the chunks holding each interior's water band) ----
+  std::set<uint32_t> chunksOf[K_COUNT];
+  for (const auto& [xz, kf] : interior)
+    for (int y = kf.second; y <= std::min(kf.second + 8, LA + 1); y++)
+      chunksOf[kf.first].insert(World::SlotChunkIndex({xz.first >> 4, y >> 4, xz.second >> 4}));
+
+  // ---- the readers ----
+  const size_t kSN = size_t(kWorldN) * kWorldN;
+  const size_t kEcho = kSN * 4 + 4 + kSN, kObs = kEcho + 2 * kSN;
+  const int mask = static_cast<int>(kWorldN) - 1;
+  const rhi::Buffer& still = c.sim.StillWaterBuffer();
+  const int nbx = bx1 - bx0 + 1, nbz = bz1 - bz0 + 1, nby = by1 - by0 + 1;
+  // Rows of a per-column region over the box's z span.
+  auto readRows = [&](size_t base, size_t per, std::vector<uint32_t>& out) {
+    out.assign(size_t(nbz) * kWorldN * per, 0u);
+    int z = bz0;
+    while (z <= bz1) {
+      int z2 = z;
+      while (z2 + 1 <= bz1 && ((z2 + 1) & mask) == ((z2 & mask) + 1)) z2++;
+      const size_t first = (size_t(z & mask) * kWorldN) * per;
+      rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, (base + first) * 4u, out.data() + size_t(z - bz0) * kWorldN * per,
+                            size_t(z2 - z + 1) * kWorldN * per * 4u, "streamNatStill");
+      z = z2 + 1;
+    }
+  };
+  struct Snap {
+    std::vector<uint32_t> vox, rec, obs, echo;
+    uint32_t At(int x, int y, int z) const {
+      return vox[(size_t(z - bz0s) * nbys + size_t(y - by0s)) * nbxs + size_t(x - bx0s)];
+    }
+    int bx0s = 0, by0s = 0, bz0s = 0, nbxs = 0, nbys = 0;
+  };
+  auto snapshot = [&](Snap& s) {
+    c.ctx.WaitIdle();
+    s.bx0s = bx0; s.by0s = by0; s.bz0s = bz0; s.nbxs = nbx; s.nbys = nby;
+    s.vox.assign(size_t(nbx) * nby * nbz, 0u);
+    std::vector<uint32_t> run;
+    for (int cz = bz0 >> 4; cz <= (bz1 >> 4); cz++)
+      for (int cy = by0 >> 4; cy <= (by1 >> 4); cy++) {
+        int cx = bx0 >> 4;
+        while (cx <= (bx1 >> 4)) {
+          int cx2 = cx;
+          while (cx2 + 1 <= (bx1 >> 4) && (((cx2 + 1) & (int(kNChunk) - 1)) == ((cx2 & (int(kNChunk) - 1)) + 1))) cx2++;
+          const uint32_t n = static_cast<uint32_t>(cx2 - cx + 1);
+          run.assign(size_t(n) * kChunkVol, 0u);
+          ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({cx, cy, cz}), n, run.data(), "streamNat");
+          for (uint32_t k = 0; k < n; k++)
+            for (uint32_t li = 0; li < kChunkVol; li++) {
+              const int x = (cx + int(k)) * 16 + int(li & 15), y = cy * 16 + int((li >> 4) & 15), z = cz * 16 + int(li >> 8);
+              if (x < bx0 || x > bx1 || y < by0 || y > by1 || z < bz0 || z > bz1) continue;
+              s.vox[(size_t(z - bz0) * nby + size_t(y - by0)) * nbx + size_t(x - bx0)] = run[size_t(k) * kChunkVol + li];
+            }
+          cx = cx2 + 1;
+        }
+      }
+    readRows(0, 4, s.rec);
+    readRows(kObs, 8, s.obs);
+    readRows(kEcho, 2, s.echo);
+  };
+  auto klassOf = [&](uint32_t w) -> int {
+    const uint32_t id = w & 0xFFFu;
+    if (id == 0u || id >= c.mats.size()) return -1;   // air
+    return static_cast<int>(c.mats[id].gpu.klass);
+  };
+  // The RESTING surface (sim_stream.wgsl restingSurface's twin): the top of
+  // the first run of liquid, walking down, that stands on solid or powder;
+  // runs with air or gas under them are in flight. INT_MIN = none.
+  auto restS8 = [&](const Snap& s, int x, int z, bool* flight = nullptr) -> int {
+    // sim_stream.wgsl restingSurface's twin, with its STEP gap (1 open cell).
+    constexpr int kStepGap = 1;
+    int runTop = INT_MIN, gap = -1;
+    bool fl = false;
+    bool inRun = false;
+    int result = INT_MIN;
+    for (int y = by1; y >= by0; y--) {
+      const uint32_t w = s.At(x, y, z);
+      const int k = klassOf(w);
+      if (k == CLASS_LIQUID) {
+        if (gap >= 0) {
+          if (gap <= kStepGap) { result = runTop; break; }
+          fl = true;
+          gap = -1;
+          inRun = false;
+        }
+        if (!inRun) { inRun = true; runTop = 8 * y + static_cast<int>(((w >> 12) & 15u) + 1u); }
+        continue;
+      }
+      const bool open = k == -1 || k == CLASS_GAS;
+      if (inRun) {
+        if (open) { inRun = false; gap = 1; continue; }
+        result = runTop;
+        break;
+      }
+      if (open) { if (gap >= 0) gap++; continue; }
+      if (gap >= 0 && gap <= kStepGap) result = runTop;
+      else if (gap >= 0) fl = true;
+      gap = -2;   // ended on a floor
+      break;
+    }
+    if (result == INT_MIN && inRun) result = runTop;   // liquid to the bottom of the box
+    if (gap >= 0) fl = true;
+    if (flight) *flight = fl;
+    return result;
+  };
+  auto recAt = [&](const Snap& s, int x, int z, int w) { return s.rec[(size_t(z - bz0) * kWorldN + size_t(x & mask)) * 4 + size_t(w)]; };
+  auto obsAt = [&](const Snap& s, int x, int z, int w) { return s.obs[(size_t(z - bz0) * kWorldN + size_t(x & mask)) * 8 + size_t(w)]; };
+  auto echoAt = [&](const Snap& s, int x, int z, int w) { return s.echo[(size_t(z - bz0) * kWorldN + size_t(x & mask)) * 2 + size_t(w)]; };
+
+  struct Census {
+    long long vol[K_COUNT] = {};
+    int held[K_COUNT] = {}, pool = 0, awake[K_COUNT] = {};
+    int pillars = 0, relMax = 0, relTotal = 0, adoptTotal = 0;
+    // CLIFF: a held column over a voxel above ANY open neighbour's water (a
+    // sheer held face); UNDER: a held column whose water stands over a voxel
+    // under its target (being refilled: the RISE).
+    int cliffs = 0, under = 0;
+    // Footprint columns whose observer words belong to them (STREAM_OBS [4]
+    // == the still tag, written by sim_stream's `commit`): 0 after a run means
+    // the stream kernels never ran -- a shader that failed to compile prints
+    // and the run goes on without them.
+    int observed = 0;
+    uint32_t relWhy = 0;   // OR of the reason bytes of every column that released
+    std::string pillarWho, relWho;
+    std::set<std::pair<int, int>> heldCols;
+  };
+  auto census = [&](Snap& s) -> Census {
+    snapshot(s);
+    Census r;
+    for (const auto& [xz, kd] : kindOf) {
+      const int x = xz.first, z = xz.second;
+      for (int y = by0; y <= by1; y++) {
+        const uint32_t w = s.At(x, y, z);
+        if ((w & 0xFFFu) == mWater) r.vol[kd] += ((w >> 12) & 15u) + 1u;
+      }
+      if (recAt(s, x, z, 1) == 0u && recAt(s, x, z, 2) != 0u) {
+        r.held[kd]++;
+        r.heldCols.insert(xz);
+        if (recAt(s, x, z, 3) & (1u << 24)) r.pool++;
+        // PILLAR: the target more than a voxel over every wet neighbour, or
+        // over open dry neighbours only.
+        const int t8 = static_cast<int>(recAt(s, x, z, 2) << 12) >> 12;
+        const int yt = (t8 - 1) >> 3;
+        int best = INT_MIN;
+        bool openDry = false;
+        const int d4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (const auto& d : d4) {
+          const int nx = x + d[0], nz = z + d[1];
+          const int k = klassOf(s.At(nx, yt, nz));
+          if (k != -1 && k != CLASS_GAS && k != CLASS_LIQUID) continue;   // a wall at the target row
+          const int ns = restS8(s, nx, nz);
+          if (ns == INT_MIN) openDry = true;
+          else best = std::max(best, ns);
+        }
+        int lowest = INT_MAX;
+        for (const auto& d : d4) {
+          const int k = klassOf(s.At(x + d[0], yt, z + d[1]));
+          if (k != -1 && k != CLASS_GAS && k != CLASS_LIQUID) continue;
+          const int ns = restS8(s, x + d[0], z + d[1]);
+          lowest = std::min(lowest, ns == INT_MIN ? 8 * by0 : ns);
+        }
+        if (lowest != INT_MAX && t8 > lowest + 8) r.cliffs++;
+        const int own = restS8(s, x, z);
+        if (own == INT_MIN || own < t8 - 8) r.under++;
+        if ((best != INT_MIN && t8 > best + 8) || (best == INT_MIN && openDry)) {
+          if (!r.pillars++)
+            r.pillarWho = Format(" first (%d,%d) %s t8 %d (y%d), highest wet neighbour %d", x, z, kKindName[kd], t8, yt, best);
+        }
+      }
+      {
+        const uint32_t tx = static_cast<uint32_t>(x >> std::countr_zero(kWorldN)) & 0x7FFFu;
+        const uint32_t tz = static_cast<uint32_t>(z >> std::countr_zero(kWorldN)) & 0x7FFFu;
+        if (obsAt(s, x, z, 4) == (1u | (tx << 1u) | (tz << 16u))) r.observed++;
+      }
+      const uint32_t o6 = obsAt(s, x, z, 6);
+      const int rel = static_cast<int>(o6 & 0xFFu);
+      r.relTotal += rel;
+      r.adoptTotal += static_cast<int>((o6 >> 8) & 0xFFu);
+      if (rel > 0) r.relWhy |= obsAt(s, x, z, 7);
+      if (rel > r.relMax) {
+        r.relMax = rel;
+        r.relWho = Format("(%d,%d) %s: %d releases, %u adoptions, reasons 0x%08x", x, z, kKindName[kd], rel, (o6 >> 8) & 0xFFu, obsAt(s, x, z, 7));
+      }
+    }
+    std::vector<uint32_t> fl(kNumSlots, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl.data(), kNumSlots * 4, "streamNatAwake");
+    for (int k = 0; k < K_COUNT; k++)
+      for (uint32_t sl : chunksOf[k])
+        if (sl < kNumSlots && fl[sl] != 0u) r.awake[k]++;
+    return r;
+  };
+
+  // ---- tuning + weather pins (the stream-pool pins) ----
+  const Tuning saved = CurrentTuning();
+  const std::string prevPin = weather::Override();
+  auto restoreTuning = [&] {
+    SetCurrentTuning(saved);
+    weather::SetOverride(prevPin);
+  };
+  {
+    Tuning dawn = saved;
+    dawn.dayNight.freeze = 1;
+    dawn.dayNight.freezePhase = static_cast<int>(kDaySunrise + 1024u);
+    dawn.sim.fluidExciteMode = 0;
+    dawn.sim.waterDiscoverMinEighths = 0;
+    SetCurrentTuning(dawn);
+  }
+  weather::SetOverride("clear");
+  std::vector<uint32_t> words;
+  if (!worldmap::PackWorldMap(set, on, words, log)) {
+    restoreTuning();
+    cleanup();
+    worldmap::SetCurrentWorldMap(real);
+    return fail("the synthetic map did not pack: " + log);
+  }
+  c.ctx.WaitIdle();
+  c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
+  uint32_t t = 98000;
+  const IVec3 fixture{xb0 >> 4, yBasin >> 4, zA >> 4};
+  // Fresh world, the fixture built (gates and door shut), 60 ticks; returns
+  // nothing -- the census after it is the caller's.
+  auto setup = [&]() {
+    c.stream.OnRegen();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    sandvox::support::TickCursor tick{c, t, fixture};
+    const size_t per = 60000;
+    for (size_t i = 0; i < build.size(); i += per) {
+      sandvox::support::TickOps ops;
+      ops.cells.assign(build.begin() + i, build.begin() + std::min(build.size(), i + per));
+      tick(ops);
+    }
+    for (int k = 0; k < 60; k++) tick();
+  };
+  auto line = [&](int tk, const Census& s) {
+    return Format(" [%d: plain %lld notch %lld | chan %lld basin %lld outlet %lld ext %lld | held notch %d plain %d chan %d "
+                  "basin %d outlet %d ext %d (POOL %d; %d cliffs, %d under) | awake flood %d+%d chan %d basin %d outlet %d | "
+                  "pillars %d | releases %d (max %d) adoptions %d]",
+                  tk, s.vol[K_PLAIN], s.vol[K_NOTCH], s.vol[K_CHAN], s.vol[K_BASIN], s.vol[K_OUTLET], s.vol[K_EXT] + s.vol[K_DOOR],
+                  s.held[K_NOTCH], s.held[K_PLAIN], s.held[K_CHAN], s.held[K_BASIN], s.held[K_OUTLET], s.held[K_EXT],
+                  s.pool, s.cliffs, s.under, s.awake[K_NOTCH], s.awake[K_PLAIN], s.awake[K_CHAN], s.awake[K_BASIN], s.awake[K_OUTLET],
+                  s.pillars, s.relTotal, s.relMax, s.adoptTotal);
+  };
+
+  int chanCols = 0, plainCols = 0, basinCols = 0;
+  for (const auto& [xz, kf] : interior) {
+    if (kf.first == K_CHAN) chanCols++;
+    if (kf.first == K_PLAIN) plainCols++;
+    if (kf.first == K_BASIN) basinCols++;
+  }
+  const long long fillTolPlain = fillTolPerCol * plainCols, fillTolBasin = fillTolPerCol * basinCols;
+  // ---- phase 1: open both gates, run until the flood has pooled and slept
+  // and the channel is a held through-flow (or maxTicks) ----
+  setup();
+  Snap snap;
+  std::string curve;
+  struct Hist { int tick; long long plain, basin; int heldFlood, heldChan; };
+  std::vector<Hist> hist;
+  int floodEarly = 0, chanEarly = 0, pillarsMax = 0, lost = 0, done = 0;
+  std::string floodEarlyWho, chanEarlyWho, pillarWho;
+  long long liveRate10 = 0;   // the basin region's gain per 10 ticks while the LIVE stream fills it
+  int liveFrom = -1, liveTo = -1;
+  long long liveVol0 = 0, liveVol1 = 0;
+  int poolAt = -1, chanHeldAt = -1;
+  // WHO made each event (CLAUDE.md verification rule 6): every unheld
+  // footprint column's own fine-event count (STREAM_OBS [6] >> 16), diffed
+  // sample to sample -- the columns that just told everything above them
+  // "something moved here".
+  std::map<std::pair<int, int>, int> evPrev;
+  Census s{};
+  {
+    sandvox::support::TickCursor tick{c, t, fixture};
+    sandvox::support::TickOps o;
+    o.cells = openGate;
+    tick(o);
+    done = 1;
+    int prevHeldChan = 0;
+    const long long basinCap = 8LL * basinX * basinZ * sillH;
+    for (; done < maxTicks;) {
+      for (int k = 0; k < sampleTicks; k++) tick();
+      done += sampleTicks;
+      s = census(snap);
+      curve += "\n " + line(done, s);
+      {
+        std::string evWho;
+        int evCols = 0;
+        for (const auto& [xz, kd] : kindOf) {
+          if (recAt(snap, xz.first, xz.second, 2) != 0u) continue;
+          const int n = static_cast<int>((obsAt(snap, xz.first, xz.second, 6) >> 16) & 0xFFu);
+          int& p = evPrev[xz];
+          if (n > p) {
+            if (evCols++ < 6) evWho += Format(" (%d,%d)%s+%d", xz.first, xz.second, kKindName[kd], n - p);
+          }
+          p = n;
+        }
+        if (evCols > 0) curve += Format(" events from %d columns:%s%s", evCols, evWho.c_str(), evCols > 6 ? " ..." : "");
+      }
+      // THE LANE (every 500 ticks): the channel's, basin's and outlet's centre
+      // row, A's shore to B's, one entry a column: its resting surface in
+      // eighths over B's level ('.' dry), '*' after it when held -- where a
+      // through-flow backs up, and which part of it is held.
+      if (done % 500 == 1) {
+        std::string lane;
+        for (int x = xE; x <= xW; x++) {
+          const int r8 = restS8(snap, x, zA);
+          const bool h = recAt(snap, x, zA, 1) == 0u && recAt(snap, x, zA, 2) != 0u;
+          lane += r8 == INT_MIN ? std::string(" .") : Format(" %d", r8 - (8 * LB + 8));
+          if (h) lane += "*";
+          if (x == xb0 - 1 || x == xb1) lane += " |";
+        }
+        curve += "\n    lane (eighths over B's level, A -> basin | outlet -> B):" + lane;
+        // ...and each lane column's observer (STREAM_OBS): the steady run in
+        // windows, and how long ago the newest event at or below it was, in
+        // 16-tick units ('-' never) -- which of the two holds adoption back.
+        std::string obsLane;
+        const uint32_t now16 = std::max((t >> 4) & 0xFFFFu, 1u);
+        for (int x = xE; x <= xW; x++) {
+          const uint32_t o0 = obsAt(snap, x, zA, 0), o2 = obsAt(snap, x, zA, 2);
+          const uint32_t f = o2 & 0xFFFFu;
+          obsLane += Format(" %u/%s/%u", o0 >> 20, f == 0u ? "-" : std::to_string((now16 - f) & 0xFFFFu).c_str(),
+                            obsAt(snap, x, zA, 6) >> 24);
+          if (x == xb0 - 1 || x == xb1) obsLane += " |";
+        }
+        curve += "\n    observer (run in windows / ticks/16 since the newest event at or below / why not held, "
+                 "sim_stream.wgsl STREAM_OBS [6]):" + obsLane;
+        // WHO makes the events (STREAM_OBS [6] >> 16, unheld columns: their
+        // own fine events so far): the five busiest footprint columns.
+        std::vector<std::pair<int, std::string>> who;
+        for (const auto& [xz, kd] : kindOf) {
+          if (recAt(snap, xz.first, xz.second, 2) != 0u) continue;
+          const int n = static_cast<int>((obsAt(snap, xz.first, xz.second, 6) >> 16) & 0xFFu);
+          if (n > 0) who.push_back({n, Format("(%d,%d) %s %d", xz.first, xz.second, kKindName[kd], n)});
+        }
+        std::sort(who.rbegin(), who.rend());
+        curve += "\n    own events, busiest:";
+        for (size_t i = 0; i < who.size() && i < 6; i++) curve += " " + who[i].second;
+      }
+      const int heldFlood = s.held[K_NOTCH] + s.held[K_PLAIN];
+      const int heldChan = s.held[K_CHAN];
+      hist.push_back({done, s.vol[K_PLAIN] + s.vol[K_NOTCH], s.vol[K_BASIN], heldFlood, heldChan});
+      const size_t n = hist.size();
+      const Hist& back = hist[n > size_t(steadySamples) ? n - 1 - size_t(steadySamples) : 0];
+      // A: a held flood column while the plain is still filling.
+      if (heldFlood > 0 && std::llabs(hist[n - 1].plain - back.plain) > fillTolPlain) {
+        if (!floodEarly++)
+          floodEarlyWho = Format(" first at tick %d: %d held while the plain moved %lld eighths in %d ticks", done, heldFlood,
+                                 hist[n - 1].plain - back.plain, done - back.tick);
+      }
+      // C: a newly held channel column while the basin is still filling.
+      if (heldChan > prevHeldChan && std::llabs(hist[n - 1].basin - back.basin) > fillTolBasin) {
+        if (!chanEarly++)
+          chanEarlyWho = Format(" first at tick %d: %d -> %d held while the basin moved %lld eighths in %d ticks", done,
+                                prevHeldChan, heldChan, hist[n - 1].basin - back.basin, done - back.tick);
+      }
+      if (heldChan < prevHeldChan && poolAt >= 0) lost += prevHeldChan - heldChan;
+      prevHeldChan = heldChan;
+      if (s.pillars > pillarsMax) { pillarsMax = s.pillars; pillarWho = Format(" at tick %d:%s", done, s.pillarWho.c_str()); }
+      // The live fill: from the first water in the basin to half its capacity
+      // under the sill.
+      if (liveFrom < 0 && s.vol[K_BASIN] > 0) { liveFrom = done; liveVol0 = s.vol[K_BASIN] + s.vol[K_CHAN]; }
+      if (liveFrom >= 0 && liveTo < 0 && s.vol[K_BASIN] * 2 >= basinCap) { liveTo = done; liveVol1 = s.vol[K_BASIN] + s.vol[K_CHAN]; }
+      // Pooled: the plain moved under fillTol over the steady window.
+      if (poolAt < 0 && n > size_t(steadySamples) && s.vol[K_PLAIN] > 0 && std::llabs(hist[n - 1].plain - back.plain) <= fillTolPlain)
+        poolAt = done;
+      if (chanHeldAt < 0 && heldChan >= static_cast<int>(adoptMin * chanCols)) chanHeldAt = done;
+      if (done >= minTicks && poolAt >= 0 && done - poolAt >= steadyTicks && s.awake[K_NOTCH] + s.awake[K_PLAIN] <= floodAwakeMax &&
+          chanHeldAt >= 0 && done - chanHeldAt >= 300 && s.awake[K_CHAN] <= chanAwakeMax)
+        break;
+    }
+  }
+  if (liveTo > liveFrom && liveFrom >= 0) liveRate10 = (liveVol1 - liveVol0) * 10 / (liveTo - liveFrom);
+  const Census end1 = s;
+  std::printf("stream-natural: phase 1 (tick: volumes in eighths | held columns | awake chunks | pillars | sim_stream's "
+              "release / adoption counters):%s\n",
+              curve.c_str());
+  // Echo (the render's record, STILL_ECHO): what the held columns kept.
+  {
+    int heldN = 0, moving = 0, dry = 0;
+    for (const auto& xz : end1.heldCols) {
+      heldN++;
+      bool mv = false, dr = false;
+      for (int w = 0; w < 2; w++)
+        for (int b = 0; b < 4; b++) {
+          const int8_t v = static_cast<int8_t>((echoAt(snap, xz.first, xz.second, w) >> (8 * b)) & 0xFFu);
+          if (v == -128) dr = true;
+          else if (v != 0) mv = true;
+        }
+      moving += mv;
+      dry += dr;
+    }
+    std::printf("stream-natural:   echo: of %d held columns %d recorded a moving surface, %d a dry sample\n", heldN, moving, dry);
+  }
+  if (end1.observed == 0) problems.push_back("sim_stream never observed a footprint column (did its kernels compile?)");
+  const int heldFloodEnd = end1.held[K_NOTCH] + end1.held[K_PLAIN];
+  const bool aOk = floodEarly == 0 && poolAt >= 0 && end1.awake[K_NOTCH] + end1.awake[K_PLAIN] <= floodAwakeMax;
+  std::printf("stream-natural: A flood: %s (held while the plain filled: %d samples%s; pooled at tick %d; at the end %d "
+              "flood columns held, %d + %d flood chunks awake (<= %d))\n",
+              aOk ? "PASS" : "FAIL", floodEarly, floodEarlyWho.c_str(), poolAt, heldFloodEnd, end1.awake[K_NOTCH],
+              end1.awake[K_PLAIN], floodAwakeMax);
+  if (!aOk) problems.push_back(Format("A: flood held early %d, pooled at %d, %d awake", floodEarly, poolAt, end1.awake[K_NOTCH] + end1.awake[K_PLAIN]));
+  const bool bOk = pillarsMax == 0;
+  std::printf("stream-natural: B pillars: %s (worst sample %d%s)\n", bOk ? "PASS" : "FAIL", pillarsMax, pillarWho.c_str());
+  if (!bOk) problems.push_back(Format("B: %d pillars%s", pillarsMax, pillarWho.c_str()));
+  const bool cOk = chanEarly == 0 && chanHeldAt >= 0 && end1.awake[K_CHAN] <= chanAwakeMax;
+  std::printf("stream-natural: C channel: %s (held while the basin filled: %d samples%s; >= %.2f of %d held at tick %d; "
+              "at the end %d held, %d channel chunks awake (<= %d))\n",
+              cOk ? "PASS" : "FAIL", chanEarly, chanEarlyWho.c_str(), adoptMin, chanCols, chanHeldAt, end1.held[K_CHAN],
+              end1.awake[K_CHAN], chanAwakeMax);
+  if (!cOk) problems.push_back(Format("C: channel held early %d, held at %d, %d awake", chanEarly, chanHeldAt, end1.awake[K_CHAN]));
+  const bool dOk = end1.relMax <= releaseMax && lost == 0;
+  std::printf("stream-natural: D cycling: %s (most releases of one column %d (<= %d)%s%s; %d releases, %d adoptions in all, "
+              "reasons seen 0x%08x; held channel columns lost between samples after the flood pooled: %d)\n",
+              dOk ? "PASS" : "FAIL", end1.relMax, releaseMax, end1.relWho.empty() ? "" : ": ", end1.relWho.c_str(),
+              end1.relTotal, end1.adoptTotal, end1.relWhy, lost);
+  if (!dOk) problems.push_back(Format("D: %d releases of one column, %d lost", end1.relMax, lost));
+
+  // ---- phase 2: the extension opened under the held stream ----
+  {
+    sandvox::support::TickCursor tick{c, t, fixture};
+    sandvox::support::TickOps o;
+    o.cells = openDoor;
+    tick(o);
+    std::string curve2;
+    long long v0 = -1, v1 = -1;
+    int t0 = -1, t1 = -1;
+    auto region = [&](const Census& q) { return q.vol[K_CHAN] + q.vol[K_BASIN] + q.vol[K_EXT] + q.vol[K_DOOR]; };
+    const int step = std::max(10, std::min(sampleTicks, rateDelay));
+    for (int k = 1; k <= extTicks;) {
+      for (int j = 0; j < step && k <= extTicks; j++, k++) tick();
+      if (k - 1 >= rateDelay && v0 < 0) { s = census(snap); v0 = region(s); t0 = k - 1; curve2 += "\n " + line(k - 1, s); continue; }
+      if (t0 >= 0 && v1 < 0 && k - 1 - t0 >= rateTicks) { s = census(snap); v1 = region(s); t1 = k - 1; curve2 += "\n " + line(k - 1, s); continue; }
+      if ((k - 1) % (step * 5) == 0) { s = census(snap); curve2 += "\n " + line(k - 1, s); }
+    }
+    std::printf("stream-natural: phase 2, the extension opened:%s\n", curve2.c_str());
+    const long long frozen10 = (t1 > t0 && t0 >= 0) ? (v1 - v0) * 10 / (t1 - t0) : 0;
+    const double ratio = liveRate10 > 0 ? double(frozen10) / double(liveRate10) : 0.0;
+    const bool eOk = liveRate10 > 0 && ratio >= rateLo && ratio <= rateHi;
+    std::printf("stream-natural: E delivery: %s (live: the basin region gained %lld eighths / 10 ticks over ticks %d..%d of "
+                "phase 1; held: %lld / 10 ticks over ticks %d..%d after the extension opened (%d channel columns held at "
+                "%d); ratio %.2f in [%.2f, %.2f])\n",
+                eOk ? "PASS" : "FAIL", liveRate10, liveFrom, liveTo, frozen10, t0, t1, end1.held[K_CHAN], done, ratio, rateLo,
+                rateHi);
+    RecordObserved("streamNat.observedLiveRate10", static_cast<double>(liveRate10));
+    RecordObserved("streamNat.observedHeldRate10", static_cast<double>(frozen10));
+    if (!eOk) problems.push_back(Format("E: delivery ratio %.2f (live %lld, held %lld per 10 ticks)", ratio, liveRate10, frozen10));
+  }
+  RecordObserved("streamNat.observedPoolAt", static_cast<double>(poolAt));
+  RecordObserved("streamNat.observedChanHeldAt", static_cast<double>(chanHeldAt));
+
+  // ---- F. determinism: detRuns runs of the first detTicks ----
+  if (detRuns >= 2 && detTicks > 0) {
+    const uint32_t tE = t;
+    std::vector<uint64_t> hashes;
+    for (int r = 0; r < detRuns; r++) {
+      t = tE;
+      setup();
+      sandvox::support::TickCursor tick{c, t, fixture};
+      sandvox::support::TickOps o;
+      o.cells = openGate;
+      tick(o);
+      for (int k = 1; k < detTicks; k++) tick();
+      snapshot(snap);
+      uint64_t h = 1469598103934665603ull;
+      for (uint32_t w : snap.vox) h = (h ^ (w & ~0x00FF0000u)) * 1099511628211ull;
+      for (const auto& [xz, kd] : kindOf) {
+        for (int w = 0; w < 4; w++) h = (h ^ recAt(snap, xz.first, xz.second, w)) * 1099511628211ull;
+        for (int w = 0; w < 8; w++) h = (h ^ obsAt(snap, xz.first, xz.second, w)) * 1099511628211ull;
+        for (int w = 0; w < 2; w++) h = (h ^ echoAt(snap, xz.first, xz.second, w)) * 1099511628211ull;
+      }
+      hashes.push_back(h);
+    }
+    bool same = true;
+    std::string hl;
+    for (size_t r = 0; r < hashes.size(); r++) {
+      hl += Format(" %016llx", static_cast<unsigned long long>(hashes[r]));
+      if (r >= 1 && hashes[r] != hashes[1]) same = false;   // run 0 follows the long phase: 1 vs 2 is the rule-1 pair
+    }
+    if (hashes.size() == 2) same = hashes[0] == hashes[1];
+    std::printf("stream-natural: F determinism: %s (%d runs of %d ticks from a fresh worldgen:%s; runs 2.. must agree)\n",
+                same ? "PASS" : "FAIL", detRuns, detTicks, hl.c_str());
+    if (!same) problems.push_back("F: runs of the same fixture differ --" + hl);
+  }
+
+  // ---- the pristine world back ----
+  restoreTuning();
+  {
+    biomes::EnvironmentStamp stamp;
+    if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, log)) {
+      worldmap::SetCurrentWorldMap(real);
+      problems.push_back("ReloadEnvironment REFUSED afterwards: " + log);
+    }
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    DrainFullRefill(c.ctx, c.world, c.sim, IVec3{108 >> 4, 122 >> 4, 108 >> 4});
+  }
+  cleanup();
+  if (!problems.empty()) {
+    detail = problems[0];
+    for (size_t i = 1; i < problems.size(); i++) detail += "; " + problems[i];
+    std::printf("stream-natural: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  detail = "flood stays live and pools, no pillars, channel held only after the basin filled, no cycling, delivery kept, twice-run identical";
+  std::printf("stream-natural: PASS\n");
+  return Status::Pass;
+}
+
 const std::vector<Gate>& RiverGates() {
   static const std::vector<Gate> g = {
       {"rivers", "sim", {}, false, GateRivers},
+      {"stream-natural", "sim", {}, false, GateStreamNatural},
   };
   return g;
 }

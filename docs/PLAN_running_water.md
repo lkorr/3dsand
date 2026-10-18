@@ -208,7 +208,9 @@ target** once steady, and released when its source is cut.
   where [1] is empty, so the held rule, the reservoir and the renderer need no
   other change. Dense worldgen clears the table (`wg_fill_stillWater`); `cols`
   keeps [2]/[3] while a slot's tag is unchanged.
-* **Adoption** (`scan` then `commit`, after the CA, over the dirty list; only
+* **Adoption** (SUPERSEDED for map-fed streams by phase 2b's natural test,
+  below; the hop chain, one writer per column and release are as here)
+  (`scan` then `commit`, after the CA, over the dirty list; only
   the topmost dirty chunk of each window column acts for it, so one writer per
   column): a column's surface is STEADY within one voxel of where the count
   began for 120 visits, it has OUTFLOW (somewhere lower beside it, or a held
@@ -256,6 +258,97 @@ columns of its own): 153 wet by tick 300, all 153 adopted by tick 1050, its
 chunks 6 -> 0 awake by tick 1350; plugged, 147 released within 150 ticks (the
 6 left stand level with main, which supports them as its own).
 
+## Phase 2b — a stream is held only when holding it looks natural (2026-10-17)
+
+Tickets 2026-10-17_11-26-13 (a bank dug through; the water spilling onto flat
+ground "solidifies into vertical waterfall column things that stay
+solid/sleeping ... the vertical columns rise in an unnatural way for a second
+or so, then collapse into a slightly more normal mound shape before building
+again as water pours in") and 11-37-20 (a stream dug beside the river "looks
+great in how it flows when spawning, but slowly becomes a sheer frozen
+waterfall"). The owner's rule: *a stream we make auto-freezes only after a long
+period in which it is not carrying water to a new area, and only if what feeds
+it is basically infinite (a lake, map water); frozen, it still delivers water
+the same way; it freezes only when that looks natural.*
+
+### What phase 2 did (measured, `stream-natural` on the phase-2 shaders)
+
+MEASURED_BEFORE
+
+### The natural test (`sim_stream.wgsl` STREAMS ADOPT ONLY WHEN NATURAL)
+
+A column a MAP-fed neighbour would feed (the map's water, hop 0, or a map-fed
+held column) is held when ALL of:
+
+* **Fed from the map** — unchanged hop chain; a POOL feeder never counts here.
+* **Its own surface is steady.** The surface observed is the RESTING one
+  (`restingSurface`): the top of the first run of liquid, walking down, that
+  stands on solid or powder. Liquid with air under it is in FLIGHT — over a
+  step, off a ledge — and is not the surface (phase 2's `columnSurface` took
+  it). The column is watched in windows of `STREAM_SUB` (16) visits: the
+  window's MEAN against an ANCHOR (the mean the run began at). A window more
+  than `STREAM_MEAN_TOL` (2) eighths off the anchor re-anchors and restarts the
+  run (a FINE event); a jump of a voxel or more, or the column turning wet or
+  dry by a 3/4 majority of a window, is a COARSE one. The run must last
+  `sim.streamSteadyTicks` (600 = 20 s) of windows in which every visit found a
+  resting surface and none found water in flight. Flicker averages out; a
+  trend — a basin rising an eighth every few seconds — does not.
+* **Nothing downstream moved for as long.** Every column keeps the newest fine
+  and coarse event stamps among its own and its DOWNSTREAM neighbours' (open
+  beside its surface with no water standing higher there), in
+  `STREAM_OBS` [2]; `commit` publishes them ([3]) and the neighbours' next
+  `scan` reads them, so an event anywhere down a stream reaches its top one
+  column a tick later. The map's water is a sink that never changes (never
+  scanned, never read). A flood still spreading, a basin still filling, keep
+  every column above them live CA.
+* **It is held at the shape it has.** The target is the column's current
+  resting surface, taken only at a visit where that stands within
+  `STREAM_AT_TOL` (1) eighth of the anchor: the frozen shape is the mean
+  shape, not a crest, and the reservoir has nothing to fill (no RISE).
+* **It runs.** A held feeder stands HIGHER, or somewhere beside it is LOWER,
+  or its surface moved in the last window. A still pool touching the lake at
+  its own level has none of these and sleeps as plain water; phase 2 held it
+  (fed by the lake at its level, "draining" into the lake at its level).
+
+RELEASE, besides the old rules (support gone, flooded): a map-fed held column
+whose coarse stamp is newer than its adoption (+ `STREAM_EVENT_GRACE`, 32
+ticks) — something dug beside the stream, the basin it ran into drained — or
+whose own water stands more than a voxel under its target (DRAINED) is let go.
+A released column observes from scratch (a whole window again) and its release
+is a FINE event for the columns above it, which then wait a window too: no
+adopt/release cycle runs faster than `sim.streamSteadyTicks`. The reason is
+counted per column (`STREAM_OBS` [6] releases | adoptions, [7] by reason:
+support | flood | event | drained), which is what `stream-natural` D reads.
+
+### Storage (still table, `simulation.cpp` kStillWaterWords)
+
+After the mouth words: **`STILL_ECHO`**, two words a column (render-only:
+eight signed-byte samples of the resting surface, every 4 ticks into slot
+`(tick / 4) % 8`, relative to the target the column is adopted at, -128 = no
+water; written while observed, rebased at adoption, frozen while held, zeroed
+on release / a fresh observation / every clear); then **`STREAM_OBS`**, eight
+words a column (anchor | run, the window's sums, the stamp scratch and the
+published stamps, the tag they belong to, the adoption tick, the counters).
+Words [0]..[3] of the records are unchanged in meaning; an unadopted [3] is 0
+unless `sim.streamPoolRoot` is on (it then holds the conduit's own legacy
+observation, as before). Rule 1: everything a `scan` reads of another column
+(its published stamps, its tag word) is written only by `commit`, after the
+barrier; a `scan` writes only its own column's words.
+
+### Knobs
+
+`sim.streamSteadyTicks` (600, 32..4000) and `sim.streamPoolRoot` (0/1, default
+0), both NO_WGSL. They reach `sim_stream.wgsl` through **TickParams'
+first padding word after `soluteDrift` (`_padSplash0`)**: low 16 bits the
+window, bit 16 the root switch (`support.cpp` SubmitTick). Riding a pad keeps
+world.h, common.wgsl and every shader's SPIR-V cache untouched (a WGSL tuning
+row is a prelude-wide recompile); rename the field the next time either file
+changes anyway.
+
+### Measured (`stream-natural`, 2026-10-17)
+
+MEASURED_AFTER
+
 ## Solute rides the held flow (`sim_solute.wgsl`, landed 2026-10-16)
 
 Ticket 2026-10-16_11-11-51: held water never moves, so nothing dissolved in it
@@ -272,6 +365,14 @@ are unchanged. Termination: SUM mass x rank strictly falls with every carry
 **The reservoir holds an inked surface too** (`sim_step.wgsl` `stillWant`). It used to refuse every branch for a cell carrying solute; with the carry spreading ink down a whole river that was a river surface no longer held -- an inked cell evaporated an eighth, was never refilled, its held neighbours poured into it and the CA ran (and stirred the ink back upstream) for as long as the ink lasted (`rivers` V, first run: 13 chunks awake at tick 4600, MOVE+equalize+bridge). Now only the GIVE that would take such a cell's LAST eighth is refused (the mass needs its solvent); TAKE, GROW and any other GIVE keep the cell and its mass.
 
 ## Phase 3 — a stream from a FINITE source sleeps too (THE CONDUIT)
+
+**OFF BY DEFAULT since 2026-10-17** (`sim.streamPoolRoot` = 0): the owner's
+rule for phase 2b is that only a stream fed by something basically infinite
+(the map's water) freezes, and a conduit is by definition fed by a finite
+source whose stream is still carrying water somewhere new. The code stays;
+with the knob at 0 no column is ever rooted, so no POOL column exists and
+every branch below is inert (the conduit's legacy [3] observation is not even
+kept). `stream-pool` turns it on for its own arms.
 
 Tickets 2026-10-16_11-14-41 (a big pour run down a hill: 60 -> 25 fps) and
 11-16-43 (the owner: *make these chunks fall asleep while still having the

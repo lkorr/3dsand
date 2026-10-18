@@ -729,6 +729,8 @@
     "waterRelevelDepth": 32,
     "stillWaterRelax": 32,
     "soluteDrift": 24,
+    "streamSteadyTicks": 600,
+    "streamPoolRoot": 0,
     "waveMode": 1,
     "waveGravity": 98,
     "waveDepthCap": 10,

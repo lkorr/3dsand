@@ -25375,8 +25375,46 @@ the stream above it is adopted). Derived, not saved; dense worldgen
 clears it, and so does a load (`clearStreams`, PT_LOADRESET: the load's
 streamed refill keeps a stream while its column's tag is unchanged).
 
+**A stream is held only when holding it looks natural** (phase 2b, 2026-10-17;
+tickets 2026-10-17_11-26-13 / 11-37-20; supersedes the steady/fed/runs test
+above for MAP-fed streams). The 120-visit, one-voxel band also passed a flood
+spreading over flat ground and a basin filling below a stream: their columns
+were held part way up, each at whatever height it stood at that visit, refilled
+to it at once (the RISE), drowned by the rising water and released by the flood
+count (the COLLAPSE), and held again 120 visits later (the CYCLE) — the owner's
+"vertical waterfall column things". Now (`sim_stream.wgsl` STREAMS ADOPT ONLY
+WHEN NATURAL) a column a map-fed neighbour would feed is held only when: its
+RESTING surface (the top of the liquid standing on its bed; water with air
+under it is in flight and is not the surface) has a window MEAN (16 visits)
+within 2 eighths of the run's anchor for `sim.streamSteadyTicks` (600 = 20 s),
+every visit resting and none in flight; NOTHING DOWNSTREAM moved for as long —
+each column keeps the newest event stamps among its own and its downstream
+neighbours' (a FINE event: a window off the anchor, a column turning wet or
+dry; a COARSE one: a jump of a voxel or more, or wet/dry), published by
+`commit` and read by the neighbours' next `scan`, so an event reaches the top
+of a stream one column a tick later and the map's water is a sink that never
+moves; its surface stands within an eighth of the anchor at that visit (the
+target IS its surface: the mean shape, not a crest, and nothing to refill); and
+it RUNS (a held feeder stands higher, something beside it lower, or its surface
+moved in the last window — a still pool beside the lake is not held). A held
+map-fed column is also released when a COARSE event newer than its adoption
+reaches it from downstream (something dug next to the stream, the basin it ran
+into drained) or its own water stands more than a voxel under its target
+(DRAINED); a released column observes from scratch and its release is a fine
+event for the columns above, so nothing re-adopts within a window. The still
+table grew two regions after the mouth words: `STILL_ECHO` (two words a
+column, render-only: eight signed-byte samples of the resting surface every 4
+ticks, relative to the adoption target, frozen once held, -128 = no water) and
+`STREAM_OBS` (eight words a column: the observer, the stamps scratch +
+published, the tag, the adoption tick, release / adoption counters by reason).
+Knobs `sim.streamSteadyTicks` and `sim.streamPoolRoot` reach the kernel
+through TickParams' padding word `_padSplash0` (no layout change). Gate
+`stream-natural`; `rivers` S counts releases per column.
+
 **A stream from a FINITE source — THE CONDUIT** (phase 3, 2026-10-16; tickets
-2026-10-16_11-14-41 / 11-16-43). A pour, a pool or a broken tank has no
+2026-10-16_11-14-41 / 11-16-43). **Off by default since 2026-10-17**
+(`sim.streamPoolRoot` = 0: the owner's rule is that only a stream fed by the
+map's water freezes; the code stays, `stream-pool` turns it on). A pour, a pool or a broken tank has no
 infinite reservoir behind it, so its stream is adopted as a POOL stream ([3]
 bit 24; a pending POOL adopt is action 3) and accounted through a LEDGER
 instead. ROOT: a steady, running column with no held feeder may be fed by an

@@ -379,6 +379,8 @@ const TUNING_PARAMS = {
   'sim.waterRelevelDepth':{t:'i',def:32,min:0,max:32,wgsl:'TUNE_WATER_RELEVEL_DEPTH'},
   'sim.stillWaterRelax':{t:'i',def:32,min:0,max:1024},
   'sim.soluteDrift':{t:'i',def:24,min:0,max:255},
+  'sim.streamSteadyTicks':{t:'i',def:600,min:32,max:4000},
+  'sim.streamPoolRoot':{t:'i',def:0,min:0,max:1},
   'sim.waveMode':{t:'i',def:0,min:0,max:1,wgsl:'TUNE_WAVE_MODE'},
   'sim.waveGravity':{t:'f',def:98,min:0,max:4000,wgsl:'TUNE_WAVE_GRAVITY'},
   'sim.waveDepthCap':{t:'i',def:10,min:1,max:64,wgsl:'TUNE_WAVE_DEPTH_CAP'},

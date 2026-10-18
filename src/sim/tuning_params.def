@@ -1169,6 +1169,19 @@ TP_I(sim, stillWaterRelax, NO_WGSL, 32, 0, 1024)
 // held river reach. NO_WGSL: it reaches the kernel as TickParams::soluteDrift
 // (SubmitTick), so it is live; 0 turns the drift off.
 TP_I(sim, soluteDrift, NO_WGSL, 24, 0, 255)
+// STREAMS ADOPT ONLY WHEN NATURAL (sim_stream.wgsl; tickets 2026-10-17_11-26-13
+// and 11-37-20): how long, in ticks, a stream column's own surface AND
+// everything downstream of it must have held still before it is held. Long on
+// purpose: a flood spreading over flat ground or a basin filling below a
+// stream must stay live water until it has stopped going anywhere new.
+// NO_WGSL: it reaches sim_stream.wgsl through the TickParams stream word
+// (SubmitTick), so it is live.
+TP_I(sim, streamSteadyTicks, NO_WGSL, 600, 32, 4000)
+// THE CONDUIT's ROOTING (phase 3): 1 lets a stream fed by a FINITE source (a
+// pour, a pool) be adopted as a POOL stream. 0 = only streams fed from the
+// map's water are ever held (the owner's rule, 2026-10-17). NO_WGSL, the
+// TickParams stream word.
+TP_I(sim, streamPoolRoot, NO_WGSL, 0, 0, 1)
 
 // ---- SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2) ----
 // The relevel relaxes and never overshoots. This is the overshoot: four

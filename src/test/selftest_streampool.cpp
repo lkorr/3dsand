@@ -206,6 +206,10 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     // structure. That is the body system's behaviour, gated by its own gates;
     // this gate's claims are the conduit's.
     dawn.sim.waterDiscoverMinEighths = 0;
+    // THE CONDUIT'S ROOTING is off by default since 2026-10-17 (the owner's
+    // rule: only streams fed from the map's water are held); this gate is the
+    // conduit's, so it turns it on.
+    dawn.sim.streamPoolRoot = 1;
     if (relax >= 0) dawn.sim.stillWaterRelax = relax;
     SetCurrentTuning(dawn);
   };
