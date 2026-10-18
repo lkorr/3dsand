@@ -471,6 +471,14 @@ namespace {
 // Q16.16 fixed point, the FluidSpawnOp unit for both position (world cells)
 // and velocity (cells/tick).
 int32_t Q16(float v) { return (int32_t)std::lround(v * 65536.0f); }
+// A POSITION is world cells MODULO 2^16 (sim_fluid.wgsl fpUnwrapCell; ticket
+// 2026-10-17_00-11-06): the GPU takes the copy nearest the window. Wrapped
+// through 64 bits on purpose -- `long` is 32-bit on MSVC, so lround of a
+// position past 32,767 cells was out of range and came back as garbage. In
+// range this is the same number Q16 gave (x 65536 is exact in float).
+int32_t Q16Pos(float v) {
+  return (int32_t)(uint32_t)(uint64_t)std::llround((double)v * 65536.0);
+}
 }  // namespace
 
 int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
@@ -547,7 +555,7 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     const Vec3 v{v0.x + jit(0x11u) * vl * 0.04f, v0.y + jit(0x22u) * vl * 0.04f,
                  v0.z + jit(0x33u) * vl * 0.04f};
     FluidSpawnOp op{};
-    op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
+    op.px = Q16Pos(p.x); op.py = Q16Pos(p.y); op.pz = Q16Pos(p.z);
     op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
     op.mat = mat;
     out.push_back(op);
@@ -614,7 +622,7 @@ uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
                                   (float)(((h >> 16) & 0xFFu) / 255.0f - 0.5f) * 0.4f};
     const Vec3 v = (aim - p) * (1.0f / (float)life);
     FluidSpawnOp op{};
-    op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
+    op.px = Q16Pos(p.x); op.py = Q16Pos(p.y); op.pz = Q16Pos(p.z);
     op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
     op.flags = flags;
     op.mat = mat;
@@ -643,7 +651,7 @@ uint32_t ContainerApplyStream(Vec3 mouth, Vec3 target, uint32_t mat, int life,
     // The velocity carries the target (see ContainerScoopStream).
     const Vec3 v = (aim - p) * (1.0f / (float)life);
     FluidSpawnOp op{};
-    op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
+    op.px = Q16Pos(p.x); op.py = Q16Pos(p.y); op.pz = Q16Pos(p.z);
     op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
     op.flags = flags;
     op.mat = mat;
@@ -781,7 +789,7 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
       v.y = std::clamp(v.y, -vmax, vmax);
       v.z = std::clamp(v.z, -vmax, vmax);
       FluidSpawnOp op{};
-      op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
+      op.px = Q16Pos(p.x); op.py = Q16Pos(p.y); op.pz = Q16Pos(p.z);
       op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
       op.mat = sp.mat;
       fluid.push_back(op);

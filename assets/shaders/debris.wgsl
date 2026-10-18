@@ -469,7 +469,12 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   }
   var n : vec3f;
   var off = cubeOffset(vi, &n) * TUNE_FLUID_PARTICLE_SIZE;
-  let center = vec3f(f32(p.px), f32(p.py), f32(p.pz)) / 65536.0;
+  // Positions are world cells MODULO 2^16 (sim_fluid.wgsl fpUnwrapCell,
+  // ticket 2026-10-17_00-11-06): take the copy nearest the camera.
+  let camC = vec3<i32>(floor(R.camPos));
+  let pq = vec3<i32>(p.px, p.py, p.pz);
+  let pc = camC + ((((pq >> vec3<u32>(16u)) - camC) << vec3<u32>(16u)) >> vec3<u32>(16u));
+  let center = vec3f(pc) + vec3f(pq & vec3<i32>(0xFFFF)) / 65536.0;
   let v = vec3f(f32(p.vx), f32(p.vy), f32(p.vz)) / 65536.0;  // cells/tick
   let speed = length(v);
   if (speed > 0.05) {

@@ -618,6 +618,23 @@ const SEAM_JFLOOR : i32 = 45875;   // 0.70 in Q16
 // common.wgsl edit re-keys every shader). Keep the two equal.
 const SEAM_MASS_MIN : i32 = 16;
 
+// A particle's CELL. Positions are Q16.16 world cells MODULO 2^16 cells; the
+// cell is the copy nearest the window's centre. sim_fluid.wgsl's fpRefCell /
+// fpUnwrapCell / fpCellOf block says why (ticket 2026-10-17_00-11-06: every
+// particle past |x| or |z| = 32,767 froze out of residency). Copied
+// TEXT-IDENTICAL, not shared: a common.wgsl edit re-keys every shader.
+fn fpRefCell() -> vec3<i32> {
+  return T.origin * i32(CHUNK) + vec3<i32>(i32(WORLD_N) / 2);
+}
+fn fpUnwrapCell(raw : i32, rc : i32) -> i32 {
+  return rc + (((raw - rc) << 16u) >> 16u);
+}
+fn fpCellOf(px : i32, py : i32, pz : i32) -> vec3<i32> {
+  let r = fpRefCell();
+  return vec3<i32>(fpUnwrapCell(px >> 16u, r.x), fpUnwrapCell(py >> 16u, r.y),
+                   fpUnwrapCell(pz >> 16u, r.z));
+}
+
 // Same node addressing as the solver (kept in step by hand — the two modules
 // read the same buffers).
 fn seamNodeBase(bm : u32, nc : vec3<i32>) -> u32 {
@@ -1843,7 +1860,7 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
     return;
   }
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   let csl = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (csl == SLOT_NONE) { return; }
   // HELD WATER ABSORBS ITS OWN PARTICLES (the HELD WATER block at the top):
@@ -1914,7 +1931,7 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   // A GHOST gives the CA nothing to react with and nothing to stain by, and
   // does not hold its chunk out of the calm judgement.
   if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (slot == SLOT_NONE) { return; }
   // seamRestVy: strip the free-surface gravity bias (see the const block).
@@ -2457,7 +2474,7 @@ fn settleBinOne(gi : u32) -> u32 {
   let p = fluidParticles[gi];
   // Ghosts never settle: settleKill spares them by the same test.
   if (!fpAlive(p.attr) || fpGhost(p.attr)) { return 0u; }
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (slot == SLOT_NONE) { return 0u; }
   let mark = atomicLoad(&settleScratch[SP_MARK + slot]);
@@ -3120,7 +3137,7 @@ fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   let p = fluidParticles[gid.x];
   // Ghosts were never binned (settleBin), so they are not killed here either.
   if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (slot == SLOT_NONE) { return; }
   let mark = atomicLoad(&settleScratch[SP_MARK + slot]);

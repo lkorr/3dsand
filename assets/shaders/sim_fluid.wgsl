@@ -459,9 +459,51 @@ struct Axis {
   fx : i32,            // Q16.16 offset of the particle from `base`, in [0.5,1.5]
 };
 
-fn axisOf(p : i32) -> Axis {
+// ---- A PARTICLE POSITION IS WORLD CELLS MODULO 2^16 (ticket 2026-10-17_00-11-06)
+// px/py/pz are Q16.16 world cells in an i32, which holds +-32,768 cells; the
+// default map spans +-100,352. Until 2026-10-18 `p.px >> 16` WAS the cell, so
+// at |x| or |z| past 32,767 (the owner's 2 km mountain at z = -69,497; it read
+// as "altitude", y was 19,832 and fine) every particle's cell came out 65,536
+// cells away, out of residency: alive, counted, frozen, never drawn.
+//
+// A position is therefore stored MODULO 2^32, i.e. modulo 2^16 cells. Every
+// operation on it already tolerates that: adds wrap (WGSL's concrete i32
+// arithmetic is two's complement at run time), and a difference of two
+// positions (the node offsets below, the ghost's target) is exact while the
+// true difference is under 32,768 cells. The one thing that is NOT is turning
+// a position into a CELL, and that goes through fpUnwrapCell: the copy of the
+// cell nearest the residency window's centre. The window is 512 cells wide
+// and a ticket box sits beside it, so every simulated particle is within that
+// range many times over. Integer, a pure function of (position, origin): the
+// world hash cannot see the change anywhere a position already fitted (there
+// raw == the unwrapped cell exactly). C++ twins: container.cpp Q16Pos, and
+// every `(at.x + x) << 16` spawn writer, which C++20 defines to wrap the same.
+fn fpRefCell() -> vec3<i32> {
+  return T.origin * i32(CHUNK) + vec3<i32>(i32(WORLD_N) / 2);
+}
+// `raw` is any `q >> 16` of a position (arithmetic shift, so in
+// [-32768, 32767]); the result is the world cell congruent to it mod 2^16
+// nearest `rc`.
+fn fpUnwrapCell(raw : i32, rc : i32) -> i32 {
+  return rc + (((raw - rc) << 16u) >> 16u);
+}
+fn fpCellOf(px : i32, py : i32, pz : i32) -> vec3<i32> {
+  let r = fpRefCell();
+  return vec3<i32>(fpUnwrapCell(px >> 16u, r.x), fpUnwrapCell(py >> 16u, r.y),
+                   fpUnwrapCell(pz >> 16u, r.z));
+}
+// Q16.16 position -> the particle system's 24.8 world fixed point (which
+// holds +-8M cells, so it is stored unwrapped).
+fn fpTo248(q : i32, rc : i32) -> i32 {
+  return (fpUnwrapCell(q >> 16u, rc) << 8u) | ((q >> 8u) & 0xFF);
+}
+
+fn axisOf(p : i32, rc : i32) -> Axis {
   let xs = p - FLUID_HALF;              // node-index space (node n at coord n)
-  let base = (xs - FLUID_HALF) >> 16u;  // arithmetic shift = floor
+  // arithmetic shift = floor, then the cell nearest the window (see above).
+  // `base << 16` below drops the high bits again, so fx is the same number
+  // whichever copy `base` names.
+  let base = fpUnwrapCell((xs - FLUID_HALF) >> 16u, rc);
   let fx = xs - (base << 16u);          // Q16.16 in [0.5, 1.5]
   var a : Axis;
   a.base = base;
@@ -682,12 +724,13 @@ const MAP_MARK : u32 = 0x80000000u;
 fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   if (!cellResident(cell, T.origin)) { return; }  // frozen out-of-residency
   // The measured flow's record (render-only): once a tick, here, because
   // this is the one per-particle pass that runs once a tick.
   if (fpMat(p.attr) != 0u) { flowMeasParticle(cell, p.vx, p.vz); }
-  let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let fr = fpRefCell();
+  let ax = axisOf(p.px, fr.x); let ay = axisOf(p.py, fr.y); let az = axisOf(p.pz, fr.z);
   let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
   let hi = vec3<i32>(ax.base, ay.base, az.base) +
            vec3<i32>(2 + FLUID_MARK_PAD);
@@ -970,9 +1013,10 @@ fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
 fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   if (!cellResident(cell, T.origin)) { return; }
-  let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let fr = fpRefCell();
+  let ax = axisOf(p.px, fr.x); let ay = axisOf(p.py, fr.y); let az = axisOf(p.pz, fr.z);
   let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
   // The one identity (see fluidMassRatio). mat 0 is a dead slot awaiting
   // compaction: it still scatters volume (it did before), but no composition,
@@ -1072,9 +1116,10 @@ fn densityRatio(m : i32, rest : i32) -> i32 {
 fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   if (!cellResident(cell, T.origin)) { return; }
-  let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let fr = fpRefCell();
+  let ax = axisOf(p.px, fr.x); let ay = axisOf(p.py, fr.y); let az = axisOf(p.pz, fr.z);
   let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
 
   // The (i,j) weight product, hoisted out of BOTH 27-tap loops below — see the
@@ -1481,7 +1526,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>,
 fn g2pParticle(gi : u32) -> u32 {
   if (gi >= liveTotal()) { return 0u; }
   var p = fluidParticles[gi];
-  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  let cell = fpCellOf(p.px, p.py, p.pz);
   if (!cellResident(cell, T.origin)) { return 0u; }
   // ---- the particle woke up inside something ------------------------------
   // Two reasons, two outcomes, and conflating them was a real mass leak (see
@@ -1552,7 +1597,8 @@ fn g2pParticle(gi : u32) -> u32 {
     atomicAdd(&fluidArgs[FA_DEAD], 1u);
     return 0u;
   }
-  let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let fr = fpRefCell();
+  let ax = axisOf(p.px, fr.x); let ay = axisOf(p.py, fr.y); let az = axisOf(p.pz, fr.z);
   let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
 
   var v = vec3<i32>(0, 0, 0);
@@ -1715,18 +1761,18 @@ fn g2pParticle(gi : u32) -> u32 {
   p.px += p.vx / FLUID_SUBSTEPS;
   p.py += p.vy / FLUID_SUBSTEPS;
   p.pz += p.vz / FLUID_SUBSTEPS;
-  if (!ghost && fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+  if (!ghost && fluidSolid(fpCellOf(p.px, p.py, p.pz))) {
     p.px = oldPx; p.py = oldPy; p.pz = oldPz;
     p.px += p.vx / FLUID_SUBSTEPS;
-    if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+    if (fluidSolid(fpCellOf(p.px, p.py, p.pz))) {
       p.px = oldPx; p.vx = 0;
     }
     p.py += p.vy / FLUID_SUBSTEPS;
-    if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+    if (fluidSolid(fpCellOf(p.px, p.py, p.pz))) {
       p.py = oldPy; p.vy = 0;
     }
     p.pz += p.vz / FLUID_SUBSTEPS;
-    if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+    if (fluidSolid(fpCellOf(p.px, p.py, p.pz))) {
       p.pz = oldPz; p.vz = 0;
     }
   }
@@ -1772,7 +1818,8 @@ fn g2pParticle(gi : u32) -> u32 {
       if ((h & 0xFFFFu) < u32(FLUID_SPLASH_CHANCE)) {
         var d : Particle;
         // Q16.16 cells -> the particle system's 24.8 fixed point.
-        d.px = p.px >> 8u; d.py = p.py >> 8u; d.pz = p.pz >> 8u;
+        let dr = fpRefCell();   // unwrapped: 24.8 holds the whole map
+        d.px = fpTo248(p.px, dr.x); d.py = fpTo248(p.py, dr.y); d.pz = fpTo248(p.pz, dr.z);
         // Droplets leave a touch faster than the surface that shed them (the
         // sheet breaks and the film's tension lets go), plus a per-droplet
         // upward kick keyed off the hash so a churning surface fizzes rather
@@ -1952,9 +1999,10 @@ fn g2pParticle(gi : u32) -> u32 {
           let jy = i32((fh >> 12u) & 0x3FFFu) - 8192;
           let jz = i32((fh >> 20u) & 0x3FFFu) - 8192;
           var d : Particle;
-          d.px = (p.px + jx) >> 8u;
-          d.py = (p.py + jy) >> 8u;
-          d.pz = (p.pz + jz) >> 8u;
+          let dr = fpRefCell();   // unwrapped: 24.8 holds the whole map
+          d.px = fpTo248(p.px + jx, dr.x);
+          d.py = fpTo248(p.py + jy, dr.y);
+          d.pz = fpTo248(p.pz + jz, dr.z);
           d.vx = fv.x >> 8u;
           d.vy = fv.y >> 8u;
           d.vz = fv.z >> 8u;

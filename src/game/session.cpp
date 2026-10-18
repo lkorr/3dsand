@@ -1999,6 +1999,62 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             }
       }
 
+      // ---- SANDVOX_AT_POUR: the mpm tool's pour, scripted (harness only) ----
+      // =x,y,z,r,material,ticks[,after[,vx,vz]] -- `ticks` ticks of the tool's
+      // sphere pour (radius r cells, centre x,y,z) of `material` MPM particles,
+      // starting `after` ticks (default 60) into the run, with horizontal
+      // velocity vx,vz cells/tick. Exists so --at can reproduce an owner's MPM
+      // ticket (bug_reports/README.md): 2026-10-17_00-04-26 (acid poured into
+      // water), 00-11-06 (MPM invisible at z = -69,497). Same spawn shape and
+      // budget rule as the tool above, so it is a pour the game could make.
+      // Unset in the game: one cached getenv per process.
+      {
+        static const char* pourEnv = std::getenv("SANDVOX_AT_POUR");
+        static bool parsed = false;
+        static int px = 0, py = 0, pz = 0, pr = 1, pTicks = 0, pAfter = 60;
+        static float pvx = 0.0f, pvz = 0.0f;
+        static uint32_t pMat = 0, pStart = 0, pLast = 0xFFFFFFFFu;
+        if (pourEnv && *pourEnv && !parsed) {
+          parsed = true;
+          char name[64] = "water";
+          std::sscanf(pourEnv, "%d,%d,%d,%d,%63[^,],%d,%d,%f,%f", &px, &py, &pz, &pr,
+                      name, &pTicks, &pAfter, &pvx, &pvz);
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == name) pMat = (uint32_t)i;
+          pr = std::min(std::max(pr, 0), 3);
+          std::printf("SANDVOX_AT_POUR: %d ticks of '%s' (id %u) r%d at (%d,%d,%d) v(%.2f,%.2f)\n",
+                      pTicks, name, pMat, pr, px, py, pz, pvx, pvz);
+          std::fflush(stdout);
+        }
+        if (pMat != 0 && pStart == 0) pStart = tick + (uint32_t)std::max(pAfter, 1);
+        if (pMat != 0 && tick >= pStart && tick < pStart + (uint32_t)pTicks && tick != pLast) {
+          pLast = tick;
+          for (int z = -pr; z <= pr; z++)
+            for (int y = -pr; y <= pr; y++)
+              for (int x = -pr; x <= pr; x++) {
+                if (x * x + y * y + z * z > pr * pr) continue;
+                if (fluidCount + fluidSpawns.size() + 8 > kFluidCap) break;
+                if (fluidSpawns.size() + 8 > kMaxFluidSpawnsPerTick) break;
+                for (int s = 0; s < 8; s++) {
+                  uint32_t h = (tick * 9781u + (uint32_t)fluidSpawns.size() * 6271u) *
+                                   747796405u + 2891336453u;
+                  FluidSpawnOp op{};
+                  op.px = ((px + x) << 16) + ((s & 1) ? 49152 : 16384) +
+                          (int32_t)(h % 8192u) - 4096;
+                  op.py = ((py + y) << 16) + ((s & 2) ? 49152 : 16384) +
+                          (int32_t)((h >> 13) % 8192u) - 4096;
+                  op.pz = ((pz + z) << 16) + ((s & 4) ? 49152 : 16384) +
+                          (int32_t)((h >> 19) % 8192u) - 4096;
+                  op.vx = (int32_t)std::lround(pvx * 65536.0f);
+                  op.vy = -19661;
+                  op.vz = (int32_t)std::lround(pvz * 65536.0f);
+                  op.mat = pMat;
+                  fluidSpawns.push_back(op);
+                }
+              }
+        }
+      }
+
       // ---- VESSELS (game/container.h): the hand's button uses it ------------
       //
       // The hands are up with a flask or a pouch in one of them (the kit's
