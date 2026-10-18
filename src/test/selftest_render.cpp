@@ -1438,9 +1438,20 @@ Status GateFarLayer(Ctx& c, std::string& detail) {
           put(v, x, yo, z, oil, 7u);
     tick(v);
   }
-  // + kFarDownEvery: the last of the oil reaches the cascades within the far
-  // downsample cadence (world.h), not on the tick it was written.
-  for (int i = 0; i < 3 + (int)kFarDownEvery; i++) tick({});
+  for (int i = 0; i < 3; i++) tick({});
+  // THE FAR DOWNSAMPLE CADENCE (world.h kFarDownEvery) lets a chunk that keeps
+  // changing lag the live grid by up to kFarDownEvery - 1 ticks, and this oil
+  // is still spreading when the gate reads it -- so the cascade would be
+  // compared against a live grid a few ticks newer than the one it holds.
+  // This gate tests what the downsample WRITES for a layer, not when, so it
+  // marks every slot pending-and-due (bit 31, last tick 0) and runs one more
+  // tick: every chunk whose far matter changed is downsampled from exactly
+  // the grid the comparison below reads.
+  {
+    const std::vector<uint32_t> due(kNumSlots, 0x80000000u);
+    ctx.queue.WriteBuffer(world.farDownState, 0, due.data(), due.size() * 4);
+    tick({});
+  }
   ctx.WaitIdle();
 
   // ---- the live grid over the tub, one chunk at a time ---------------------
