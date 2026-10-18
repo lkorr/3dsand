@@ -3747,8 +3747,11 @@ struct Tuning {
     // reads the same) and adds it where it is stronger than the node's own
     // 3 x 3 reading, so a breach or a pour bends the current around it for a
     // few metres and fades into the map's solved field instead of ending on
-    // one node. 1 = the 3 x 3 tent alone (before 2026-10-18). Integer, and the
-    // fold is integer: the bodies feel the published grid.
+    // one node. Each neighbour counts as a PULL toward it (where this node is
+    // upstream of it), not as a copy of its vector, so the lake round a breach
+    // converges on the breach (ticket 2026-10-18_11-30-37). 1 = the 3 x 3 tent
+    // alone (before 2026-10-18). Integer, and the fold is integer: the bodies
+    // feel the published grid.
     int currentMeasuredReach = TPD(sim, currentMeasuredReach);
   } sim;
 

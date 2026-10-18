@@ -137,32 +137,42 @@ constexpr int kFlowDry = -32768;
 // CurrentAtCpuSim blends it in. One buffer (`flowMeasure`), three regions, all
 // on the node lattice above (a node every kFlowStep cells, the window grid's
 // kFlowWinNodes per axis):
-//   ACC   per toroidal slot (world node mod kFlowMeasN), four i32: the net
-//         horizontal liquid flux this tick (x, z; eighths x cells, scaled by
-//         kFlowMeasAccQ) and the highest / lowest cell that moved (y + bias,
-//         bias - y; 0 = nothing moved). Atomically ADDED / MAXed by the CA
+//   ACC   per toroidal slot (world node mod kFlowMeasN), kFlowMeasAccStride
+//         i32: the net horizontal liquid flux this tick (x, z; eighths x
+//         cells, scaled by kFlowMeasAccQ), the highest / lowest cell that
+//         moved (y + bias, bias - y; 0 = nothing moved), and (2026-10-18) the
+//         HEIGHT MOMENTS of the moves -- gross flux g, g x y, g x y^2, y the
+//         row about the window's middle -- so the fold knows where in the
+//         column the water ran; one spare. Atomically ADDED / MAXed by the CA
 //         (sim_step.wgsl) and the MPM `mark` pass, zeroed by a Fill after the
 //         fold. Integer adds and maxes commute, so the sum is a function of
 //         the moves and not of the schedule; no GPU sim kernel reads it.
-//   STATE per slot, four words: the smoothed velocity (vx, vz, i32 in
-//         1/16384 cells/s -- the fold is INTEGER because bodies read its
-//         output, flow_measure.wgsl's AUTHORITY note), the world node the slot
-//         holds (a tag: the window moves under it), and the water band (top |
-//         bot, i16 each).
+//   STATE per slot, kFlowMeasStateStride words: the smoothed velocity (vx,
+//         vz, i32 in 1/16384 cells/s -- the fold is INTEGER because bodies
+//         read its output, flow_measure.wgsl's AUTHORITY note), the world node
+//         the slot holds (a tag: the window moves under it), the water band
+//         (top | bot, i16 each), and THE VERTICAL's smoothed target (H, HW, D
+//         in 1/16 cells, ON in Q10; flow_measure.wgsl).
 //   GRID  the render's view, the flowGrid layout exactly: a 4-word header
 //         ([0] origin x [1] origin z [2] nodes per axis, 0 = no field [3] the
 //         tick it was folded) and two words a node, w0 = vx | vz (i16,
 //         1/kFlowVelQ cells/s), w1 = top | bot (i16 world cells; top =
-//         kFlowDry where nothing flows).
+//         kFlowDry where nothing flows); then, from kFlowMeasVertOffset, one
+//         word a node: THE VERTICAL (H i16 | HW << 16 | D/2 << 22 | ON << 28;
+//         common.wgsl flowMeasRise).
 // The fold (flow_measure.wgsl) runs on ticks the CA or the fluid seam ran
 // and for a tail after (Simulation::EncodeTick), so a settled world records
 // nothing; when the tail ends one Fill zeroes STATE + GRID.
 constexpr int kFlowMeasN = kFlowWinNodes;
 constexpr uint32_t kFlowMeasSlots = (uint32_t)(kFlowMeasN * kFlowMeasN);
-constexpr uint32_t kFlowMeasAccWords = kFlowMeasSlots * 4u;
+constexpr uint32_t kFlowMeasAccStride = 8u;
+constexpr uint32_t kFlowMeasStateStride = 8u;
+constexpr uint32_t kFlowMeasAccWords = kFlowMeasSlots * kFlowMeasAccStride;
 constexpr uint32_t kFlowMeasStateBase = kFlowMeasAccWords;
-constexpr uint32_t kFlowMeasGridBase = kFlowMeasStateBase + kFlowMeasSlots * 4u;
-constexpr uint32_t kFlowMeasGridWords = kFlowHeaderWords + kFlowMeasSlots * 2u;
+constexpr uint32_t kFlowMeasGridBase =
+    kFlowMeasStateBase + kFlowMeasSlots * kFlowMeasStateStride;
+constexpr uint32_t kFlowMeasVertOffset = kFlowHeaderWords + kFlowMeasSlots * 2u;
+constexpr uint32_t kFlowMeasGridWords = kFlowMeasVertOffset + kFlowMeasSlots;
 constexpr uint32_t kFlowMeasWords = kFlowMeasGridBase + kFlowMeasGridWords;
 constexpr int kFlowMeasAccQ = 16;
 // The fold's dispatch: 8 x 8 threads a group, one thread per grid node.
@@ -252,16 +262,19 @@ void SetBuffer(const rhi::Buffer* buf);
 // from WriteRenderParams, the one place every drawing path sets its params.
 void Upload(const rhi::Queue& queue);
 
-// THE MEASURED FLOW at a world position, cells/s (horizontal), from a copy of
-// the GRID region (`grid` = kFlowMeasGridWords words: the published snapshot's,
-// or a gate's readback; nullptr = no field). TRANSCRIBED from common.wgsl
+// THE MEASURED FLOW at a world position, cells/s, from a copy of the GRID
+// region (`grid` = kFlowMeasGridWords words: the published snapshot's, or a
+// gate's readback; nullptr = no field). TRANSCRIBED from common.wgsl
 // flowMeasAt -- the same bilinear weights over the same quantised words and
-// the same band gate.
+// the same band gate -- and, for y, flowMeasRise (the pull toward a submerged
+// breach's rows, 2026-10-18).
 Vec3 SampleMeasured(const uint32_t* grid, Vec3 posVox);
 // The same field for a BODY spanning [yLo, yHi] vertically (world cells): the
 // record is a BAND of rows the water moved in (the CA levels a body of water
 // by its top cells), and a body is carried by it when any part of it is in
-// that band, not only its sample point. yLo == yHi == posVox.y is
+// that band, not only its sample point. The vertical is measured from the
+// span too: zero where the span overlaps the pulling water's rows, else
+// toward them from the span's nearer end. yLo == yHi == posVox.y is
 // SampleMeasured exactly.
 Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 posVox, float yLo, float yHi);
 // THE PUBLISHED GRID: the snapshot's copy of GRID as of World::Snap() --

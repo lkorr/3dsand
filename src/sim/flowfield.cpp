@@ -912,7 +912,34 @@ Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 p, float yLo, float yHi) {
   // The band gate, for a span: zero only when the WHOLE of [yLo, yHi] is
   // outside the band (+-1.5 cells). A point (yLo == yHi) is flowMeasAt's gate.
   if (top < -1e8f || yLo > top + 1.5f || yHi < bot - 1.5f) return zero;
-  return Vec3{vx / (float)kFlowVelQ, 0.0f, vz / (float)kFlowVelQ};
+  vx /= (float)kFlowVelQ;
+  vz /= (float)kFlowVelQ;
+  // THE VERTICAL: common.wgsl flowMeasRise, line for line, with the span's
+  // nearer end standing in for the point.
+  float rise = 0.0f;
+  const float vh = std::sqrt(vx * vx + vz * vz);
+  if (vh > 0.0f) {
+    const size_t vbase = kFlowHeaderWords + 2 * (size_t)n * n;
+    float f = 0.0f;
+    for (int c = 0; c < 4; c++) {
+      const int dx = c & 1, dz = c >> 1;
+      const size_t node = (size_t)(iz + dz) * n + (ix + dx);
+      if ((int)(int16_t)(grid[kFlowHeaderWords + 2 * node + 1] & 0xFFFFu) == kFlowDry) continue;
+      const uint32_t vw = grid[vbase + node];
+      const float on = (float)(vw >> 28);
+      if (on == 0.0f) continue;
+      const float h = (float)(int16_t)(vw & 0xFFFFu);
+      const float hw = (float)((vw >> 16) & 63u);
+      const float d = std::max((float)(((vw >> 22) & 63u) * 2u), 4.0f);
+      float dy = 0.0f;
+      if (yHi < h - hw) dy = (h - hw) - yHi;
+      if (yLo > h + hw) dy = (h + hw) - yLo;
+      const float w = (dx ? tx : 1.0f - tx) * (dz ? tz : 1.0f - tz);
+      f += w * (on / 15.0f) * std::clamp(dy / d, -1.5f, 1.5f);
+    }
+    rise = vh * f;
+  }
+  return Vec3{vx, rise, vz};
 }
 
 namespace {
@@ -935,7 +962,8 @@ const uint32_t* PublishedMeasured() {
 Vec3 BlendMeasured(Vec3 solved, Vec3 measured) {
   const float m = std::sqrt(measured.x * measured.x + measured.z * measured.z);
   const float keep = 1.0f - std::clamp(m / kFlowMeasTakeover, 0.0f, 1.0f);
-  return Vec3{solved.x * keep + measured.x, 0.0f, solved.z * keep + measured.z};
+  return Vec3{solved.x * keep + measured.x, solved.y * keep + measured.y,
+              solved.z * keep + measured.z};
 }
 
 void Upload(const rhi::Queue& queue) {

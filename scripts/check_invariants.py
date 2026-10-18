@@ -1022,8 +1022,8 @@ def check_flow_measure():
     want = {
         "FLOWM_N": n,
         "FLOWM_ACC_Q": int(mq.group(1)),
-        "FLOWM_STATE": slots * 4,
-        "FLOWM_GRID": slots * 8,
+        "FLOWM_STATE": slots * 8,
+        "FLOWM_GRID": slots * 16,
     }
     sources = {
         "sim_step.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS"],

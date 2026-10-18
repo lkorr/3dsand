@@ -26627,8 +26627,64 @@ outside it the surroundings', falling to zero at R + 1 nodes, continuous in
 between; the band is gathered over the reach too. With the blend below, the
 solved field then hands over to the measured one smoothly over the reach
 instead of on one node. Integer like the rest of the fold (bounded: per-term
-clamp 2^19, at most 7^4 weight). 1 = the old fold exactly. Cost: (2R+1)^2
-four-word loads per node on the ticks the fold records (81 at 4).
+clamp 2^18, at most 7^4 weight). 1 = the old fold exactly. Cost: (2R+1)^2
+loads per node on the ticks the fold records (81 at 4).
+
+**The reach PULLS, it does not copy** (2026-10-18, ticket 2026-10-18_11-30-37:
+"every vector that is influenced by the dam is pointing in the same direction
+... it should smoothly curve towards that direction when you're approaching
+from the sides"). As first written the reach spread each bin's flux VECTOR
+over its neighbours, so every node a breach reached read the breach's own
+direction: a sheet of parallel arrows normal to the wall. Now a neighbour
+bin `d` nodes away with flux `f` contributes its PULL on the node
+(`flow_measure.wgsl` `flowmPull`): `|f| x clamp(3 cos(theta), 0, 1) x d/|d|`,
+theta between `f` and `d` -- a vector TOWARD the neighbour, as strong as its
+flux, wherever the node is upstream of it (within 70 degrees of the flow's
+axis behind it at full strength, fading to nothing square to it), and nothing
+ahead of it (a flood front does not suck water backwards; that water measures
+its own flow when it arrives). Summed over a breach's bins every node of the
+lake behind it points AT the breach from whatever side it is approached: the
+field of a sink. The node's own bin still counts as its flux, and the
+"where stronger" blend above is unchanged, so inside a flood nothing moves.
+Integer (cos in Q8 over octagonal lengths, `flowmOct`). Measured on the gate's
+far ring (28 cells from the gap, where the reach makes the field): heading
+error to the gap 29/14/3/21/35 degrees -> 0/0/3/8/12, the two outer points'
+currents 25 -> 78 degrees apart (the directions to the gap differ by 90).
+
+**The vertical** (2026-10-18, the same ticket: "if the hole in the wall is
+located a bit below ... that magnitude arrow should influence vectors directly
+next to it to point in its direction from above and below ... so current
+should be able to pull material down into the water"). The grids are columns,
+so a node cannot hold a velocity per height; it holds WHERE in the column the
+water pulling it runs, and the readers turn that into a vertical velocity at
+any height:
+* **The height moments.** Each record also adds its gross flux `g` (eighths x
+  axes moved, <= 16; a particle's speed in eighths x cells), `g x y` and
+  `g x y^2`, `y` the source row about the window's middle (ACC grew 4 -> 8
+  words a slot). Integer adds, so still a function of the moves; a bin past
+  32767 gross is too big to trust and pulls nothing vertically.
+* **The fold** picks the PULLING bin -- the reach's heaviest contribution,
+  the node's own bin included -- and takes its rows' centre `H` (the mean) and
+  half-height `HW` (sqrt(3) x the spread: a uniform band of N rows reads N/2),
+  plus its distance `D` (at least 4 cells). It is ON only where that band is
+  SUBMERGED: ending 2 cells or more inside the band of water moving at the
+  node, above or below -- so a river's moving surface and a full-depth breach,
+  whose bands ARE the moving band, pull nothing up or down. STATE (4 -> 8
+  words) follows H / HW / D and ON in time like the velocity, and GRID gains
+  one word a node after the nodes (`kFlowMeasVertOffset`: H i16 | HW | D/2 |
+  ON 0..15).
+* **The readers** (`common.wgsl` `flowMeasRise`, CPU twin in
+  `flowfield::SampleMeasuredSpan`): at height y, the signed distance `dy` to
+  `[H - HW, H + HW]` (zero inside), as a slope `dy / D` clamped to +-1.5 -- a
+  point sink's geometry, 45 degrees at `dy = D` -- weighted per node like the
+  horizontal and by ON, times the measured horizontal speed there. So it is
+  exactly as strong as the pull it tilts and vanishes with it. `currentAt`
+  adds it as `y` (the F4 arrows tilt; every surface consumer reads `.xz`).
+  A body's span uses its nearer end. Floaters (`CurrentOnFloater`,
+  `CurrentOnFloaterSplit`: debris and corpses) feel the measured vertical
+  through the buoyancy drag's water frame, so a submerged breach drags what
+  floats over it down; their primitives' vertical stays out as before. A
+  swimmer's stroke and an NPC afloat still read the horizontal only.
 
 **The blend** (`flowBlend`, CPU twin `flowfield::BlendMeasured`): the measured
 flow counts in full and the solved field fades out under it, gone at
@@ -26643,7 +26699,8 @@ line was "render-only": the arrows turned toward a breach and a swimmer in
 the same water was pushed along the map's solved field. The measured flow is
 now gameplay input, through the one door every gameplay readback uses:
 
-* **The snapshot ring carries GRID** (`World::EncodeReadbacks`): 36 KiB, a
+* **The snapshot ring carries GRID** (`World::EncodeReadbacks`): 54 KiB (36
+  before the vertical plane), a
   tracked copy after the fold, only on ticks the fold or the Fill closing its
   tail rewrote it (`Simulation::FlowMeasureWritten`) or after a reset; any
   other snapshot SHARES the previous one's table (`WorldSnapshot::flowMeas`,
@@ -26669,8 +26726,10 @@ now gameplay input, through the one door every gameplay readback uses:
 Still no GPU sim kernel reads `flowMeasure`, and nothing reads it on the frame
 path; it is not saved or sent. The world hash moves only where a body the
 water carries moves differently. `CurrentAtCpu` (the render twin) does not
-read it. Not carried: floating debris and particles (`sim_particle.wgsl` reads
-`currentAtQ`, primitives only) and fish (`mob_swim.cpp` reads no current).
+read it. Floating debris and corpses are carried since 2026-10-18
+(`CurrentOnFloaterSplit`, the buoyancy drag's water frame). Not carried:
+particles (`sim_particle.wgsl` reads `currentAtQ`, primitives only) and fish
+(`mob_swim.cpp` reads no current).
 
 Two things this exposed, both fixed with it. **The particle record floored**
 (`vx >> 12`): a particle creeping at -1/65536 cells a tick recorded -1 and its
@@ -26705,8 +26764,17 @@ flood east of it runs east (D); 30 s on, the gap and the ring have relaxed to
 printed beside it -- the CA's last levelling far from the breach is real motion
 and reads as such). C reads what a BODY feels (`CurrentAtCpuSim`, the published
 snapshot only, no blocking readback): still before the breach, east through
-the gap and toward it round the ring after -- the whole chain end to end. Thresholds `flowMeasure.*` in baseline.json; a trace every
-15 ticks prints gap / ring / box max and the fold's tick.
+the gap and toward it round the ring after -- the whole chain end to end.
+Since 2026-10-18: K, on a far ring 28 cells out, the current points AT the gap
+(heading error <= convAngle at convMin of 5 points) and the two outer points'
+currents are >= convSpread apart (a copied field reads ~0); W, two points
+beside the gap along the dam's face run toward it. A SECOND box 96 cells
+south has a SUBMERGED gap (rows 4..6 under 10 of water): S, upstream of it a
+point in the top row is pulled down and one in the bottom row up at >=
+vertMin, and it relaxes after; Cv, a body over it feels the downward pull. The
+vertical plane's words at four node columns are printed beside S. Thresholds
+`flowMeasure.*` in baseline.json; a trace every 15 ticks prints gap / ring /
+box max and the fold's tick.
 
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)
 

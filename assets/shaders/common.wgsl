@@ -4540,11 +4540,17 @@ fn flowGridAt(p : vec3f) -> vec3f {
 //   [0] origin x  [1] origin z  [2] nodes per axis, 0 = none  [3] fold tick
 //   per node: w0 = vx | vz (i16, 1/FLOW_VEL_Q cells/s), w1 = top | bot (i16,
 //   world cells; top == FLOW_DRY where nothing flows).
-// RENDER-ONLY, and that is the whole safety argument: the sim never reads it,
-// the CPU never reads it back on the frame path, and the player's swim stroke
-// (CurrentAtCpuSim) feels the solved field only.
+// After the nodes, one word a node: THE VERTICAL (flowfield.h
+// kFlowMeasVertOffset, flow_measure.wgsl's note of that name) -- where in the
+// column the water pulling the node runs: H (i16 world cells, the rows'
+// centre) | HW (half-height, cells) << 16 | D / 2 (cells) << 22 | ON (0..15)
+// << 28. flowMeasRise reads it.
+// NOT render-only since 2026-10-15: the snapshot ring copies GRID and the
+// bodies the water holds feel it (CurrentAtCpuSim) -- the fold is integer for
+// that reason. No GPU sim kernel reads it, and the CPU never reads it back on
+// the frame path.
 // Must match flowfield.h kFlowMeasGridBase / kFlowMeasTakeover.
-const FLOWM_GRID : u32 = 35912u;
+const FLOWM_GRID : u32 = 71824u;
 const FLOW_MEAS_TAKEOVER : f32 = 4.0;
 
 // World cells/s at `p`, horizontal. TRANSCRIBED from -- and by --
@@ -4581,6 +4587,49 @@ fn flowMeasAt(p : vec3f) -> vec3f {
   return vec3f(v.x, 0.0, v.y) / FLOW_VEL_Q;
 }
 
+// THE VERTICAL at `p`, cells/s (+ up), for a measured horizontal speed `vh`
+// there (ticket 2026-10-18_11-30-37: a breach under the surface pulls the
+// water above it down and the water below it up). TRANSCRIBED from -- and by
+// -- flowfield.cpp SampleMeasuredSpan: per node that is ON, the signed
+// distance dy from p.y to the pulling water's rows [H - HW, H + HW] (zero
+// inside them), as a slope dy / D clamped to +-1.5 (a point sink's 3D
+// geometry: 45 degrees at dy = D), weighted as flowMeasAt weights the node
+// and by ON; times vh, so it is exactly as strong as the pull it tilts and
+// vanishes with it. Zero cost where the measured flow is zero (the caller
+// passes vh = 0 and nothing is read).
+fn flowMeasRise(p : vec3f, vh : f32) -> f32 {
+  if (!FLOW_BOUND || vh <= 0.0) { return 0.0; }
+  let n = i32(flowMeasWord(2u));
+  if (n == 0) { return 0.0; }
+  let fx = (p.x - f32(bitcast<i32>(flowMeasWord(0u)))) / FLOW_STEP;
+  let fz = (p.z - f32(bitcast<i32>(flowMeasWord(1u)))) / FLOW_STEP;
+  let ix = i32(floor(fx));
+  let iz = i32(floor(fz));
+  if (ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1) { return 0.0; }
+  let tx = fx - f32(ix);
+  let tz = fz - f32(iz);
+  let vbase = FLOW_HEADER + 2u * u32(n * n);
+  var f = 0.0;
+  for (var c = 0; c < 4; c++) {
+    let dx = c & 1;
+    let dz = c >> 1u;
+    let node = u32((iz + dz) * n + (ix + dx));
+    if (flowI16Lo(flowMeasWord(FLOW_HEADER + 2u * node + 1u)) == FLOW_DRY) { continue; }
+    let vw = flowMeasWord(vbase + node);
+    let on = f32(vw >> 28u);
+    if (on == 0.0) { continue; }
+    let h = f32(flowI16Lo(vw));
+    let hw = f32((vw >> 16u) & 63u);
+    let d = max(f32(((vw >> 22u) & 63u) * 2u), 4.0);
+    var dy = 0.0;
+    if (p.y < h - hw) { dy = (h - hw) - p.y; }
+    if (p.y > h + hw) { dy = (h + hw) - p.y; }
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    f += w * (on / 15.0) * clamp(dy / d, -1.5, 1.5);
+  }
+  return vh * f;
+}
+
 // The two fields together: the measured flow counts in full, the solved one
 // fades out under it (gone at FLOW_MEAS_TAKEOVER cells/s), so where the water
 // is really running the arrows say where, and everywhere else the map's
@@ -4598,10 +4647,14 @@ fn flowBlend(solved : vec3f, measured : vec3f) -> vec3f {
 // the simulation's water is really doing: a breach, a flood, a pour), and the
 // primitive list (events: a drain's sink and whirlpool), because a river is
 // somewhere and a wind is everywhere.
+// The measured flow is the one part with a VERTICAL from the grids
+// (flowMeasRise: toward a submerged breach), so the F4 arrows tilt where it
+// pulls up or down; every surface consumer reads .xz and is unchanged.
 fn currentAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
   if ((*R).currentRenderOn == 0u) { return vec3f(0.0); }
-  return currentPrimAt(p, R) +
-         flowBlend(flowGridAt(p), flowMeasAt(p) * TUNE_CURRENT_MEASURED);
+  let m = flowMeasAt(p) * TUNE_CURRENT_MEASURED;
+  return currentPrimAt(p, R) + flowBlend(flowGridAt(p), m) +
+         vec3f(0.0, flowMeasRise(p, length(m.xz)), 0.0);
 }
 
 // CONVERGENCE of the field at a point, per second — negative divergence, so

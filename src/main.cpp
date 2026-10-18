@@ -13048,6 +13048,31 @@ int main(int argc, char** argv) {
           std::sscanf(fv, "%f,%f,%f", &atFly[0], &atFly[1], &atFly[2]);
         if (const char* se = std::getenv("SANDVOX_AT_SHOT_EVERY")) atShotEvery = std::atoi(se);
       }
+      // SANDVOX_AT_BLAST=x,y,z[,radius[,frame[,power]]] (world cells): one
+      // blast there on that frame (default radius 4, frame 60, power 120), so
+      // a report taken just after the owner blew something up -- a dam
+      // breach, ticket 2026-10-18_11-30-37 -- is photographed with the
+      // current the breach makes. Through pendingBlasts, the queue's door.
+      static int atBlastFrame = -1;
+      static ExplosionOp atBlast{};
+      if (frameCounter == 1) {
+        if (const char* ab = std::getenv("SANDVOX_AT_BLAST")) {
+          int bx = 0, by = 0, bz = 0, br = 4, bf = 60, bp = 120;
+          if (std::sscanf(ab, "%d,%d,%d,%d,%d,%d", &bx, &by, &bz, &br, &bf, &bp) >= 3) {
+            atBlast.x = bx;
+            atBlast.y = by;
+            atBlast.z = bz;
+            atBlast.radius = br;
+            atBlast.power = bp;
+            atBlastFrame = bf;
+          }
+        }
+      }
+      if (atBlastFrame >= 0 && (int64_t)frameCounter == (int64_t)atBlastFrame) {
+        session.pendingBlasts.push_back(atBlast);
+        std::printf("SANDVOX_AT_BLAST: blast r%d p%d at (%d, %d, %d), frame %d\n", (int)atBlast.radius,
+                    (int)atBlast.power, (int)atBlast.x, (int)atBlast.y, (int)atBlast.z, atBlastFrame);
+      }
       const float flyVox = (float)std::max<int64_t>((int64_t)frameCounter - atFlyAfter, 0) *
                            (1.0f / 60.0f) / kVoxelMeters;
       player.pos = Vec3{g_atEye[0] + atFly[0] * flyVox, g_atEye[1] + atFly[1] * flyVox,

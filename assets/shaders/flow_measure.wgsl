@@ -18,10 +18,13 @@
 //      the CA moves water in 1-cell hops at the free surface, and a node bin
 //      is 8 x 8 columns, so the raw bins are lumpy; the tent spreads a breach
 //      over its neighbours the way the water's pull spreads. Then THE REACH
-//      (2026-10-18): the same flux over a wider tent (sim.currentMeasuredReach
-//      nodes), counted where it is stronger than the node's own reading, so
-//      the current bends round a breach for a few metres and fades into the
-//      solved field instead of stopping one node out.
+//      (2026-10-18): a wider tent (sim.currentMeasuredReach nodes) over which
+//      every bin counts as its PULL on the node -- toward it, where the node is
+//      upstream of it (flowmPull) -- added where it is stronger than the
+//      node's own reading, so the lake converges on a breach for a few metres
+//      and fades into the solved field instead of stopping one node out. The
+//      heaviest pull also names where in the column that water runs: THE
+//      VERTICAL (below), published in its own plane.
 //   2. CONVERT eighths x cells per tick into a velocity: the discharge per
 //      unit width over the bin, divided by a reference depth (FLOWM_DEPTH).
 //      The CA moves the SURFACE of a body, not its depth, so the flux is per
@@ -52,7 +55,7 @@
 // only through the fixed-latency snapshot, never on the frame path.
 //
 // COST. 67 x 67 threads, (2R+1)^2 4-word loads each (R = the reach, 81 at the
-// default 4; nine at 1). Recorded on the ticks the CA
+// default 4; nine at 1), plus the pulling bin's three moment words. Recorded on the ticks the CA
 // or the fluid seam ran, then for kFlowMeasTailTicks after the last one (the
 // decay), then never: a settled world records nothing, and one Fill zeroes the
 // published field when the tail ends (Simulation::EncodeTick, Cond::FlowMeasure
@@ -67,7 +70,12 @@
 const FLOWM_N : i32 = 67;
 const FLOWM_ACC_Q : i32 = 16;
 const FLOWM_Y_BIAS : i32 = 1048576;
-const FLOWM_STATE : u32 = 17956u;
+const FLOWM_STATE : u32 = 35912u;
+// Words a slot in ACC and in STATE (flowfield.h kFlowMeasAccStride /
+// kFlowMeasStateStride), and the VERTICAL plane's place in GRID: after the
+// header and the two-word nodes (flowfield.h kFlowMeasVertOffset).
+const FLOWM_ACC_STRIDE : u32 = 8u;
+const FLOWM_STATE_STRIDE : u32 = 8u;
 // FLOWM_GRID is common.wgsl's (the reader's) constant.
 
 // STATE's fixed point: FLOWM_SUB steps per published unit (1/FLOW_VEL_Q
@@ -178,6 +186,43 @@ fn flowmPull(f : vec2<i32>, d : vec2<i32>) -> vec2<i32> {
   return (mS * d * 16) / vec2<i32>(dQ);
 }
 
+// THE VERTICAL (ticket 2026-10-18_11-30-37: "if the hole in the wall is
+// located a bit below ... that magnitude arrow should influence vectors
+// directly next to it to point in its direction from above and below ... so
+// current should be able to pull material down into the water"). The field
+// is a grid of columns, so a node cannot hold a velocity per height; what it
+// holds is WHERE in the column the water pulling it runs, and the reader
+// (common.wgsl flowMeasRise, flowfield.cpp SampleMeasuredSpan) turns that
+// into a vertical velocity at any height:
+//   H   the centre of that water's rows (the flux-weighted mean of the rows
+//       its moves left, the writers' height moments), world cells;
+//   HW  their half-height, sqrt(3) x the flux-weighted spread (a uniform
+//       band of N rows reads N/2), so a full-depth breach or a river's
+//       moving surface covers its whole band and pulls nothing up or down;
+//   D   how far away it is (the pulling bin's distance, at least 4 cells):
+//       a point dy outside [H - HW, H + HW] is pulled toward it at
+//       |v_h| x clamp(dy / D, -1.5, 1.5) -- a point sink's geometry, 45
+//       degrees at dy = D -- by the reader;
+//   ON  only where that water is SUBMERGED: its rows end FLOWM_VERT_GAP or
+//       more inside the band of water moving here (above or below), so the
+//       pull points somewhere there is water to come from.
+// The pulling bin is the one whose pull (flowmPull, or the node's own flux)
+// weighs most in the reach; ties go to the first in the fixed loop order.
+// STATE follows H / HW / D at the rise rate and ON at the horizontal one,
+// so the published words are as smooth in time as the velocity.
+const FLOWM_VERT_GAP_Q4 : i32 = 32;      // 2 cells, in 1/16 cells
+const FLOWM_VERT_W_MAX : i32 = 32767;    // the writers' trust bound (sim_step.wgsl)
+const FLOWM_ON_Q10 : i32 = 1024;
+// Publish: H i16 world cells | HW (cells, 0..63) << 16 | D / 2 (cells, 1..63)
+// << 22 | ON (0..15) << 28.
+fn flowmVertWord(hQ : i32, hwQ : i32, dQ : i32, on : i32) -> u32 {
+  let h = (hQ + select(-8, 8, hQ >= 0)) / 16;
+  let hw = clamp((hwQ + 8) / 16, 0, 63);
+  let d2 = clamp((dQ + 16) / 32, 1, 63);
+  let o = clamp((on * 15 + 512) / FLOWM_ON_Q10, 0, 15);
+  return flowmI16(h) | (u32(hw) << 16u) | (u32(d2) << 22u) | (u32(o) << 28u);
+}
+
 // STATE -> published units, round half away from zero.
 fn flowmPublish(v : i32) -> i32 {
   let q = (abs(v) + FLOWM_SUB / 2) / FLOWM_SUB;
@@ -220,24 +265,32 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   var wide = vec2<i32>(0);
   var topE = 0;
   var botE = 0;
+  // The pulling bin (THE VERTICAL above): its weight and offset.
+  var bestA = 0;
+  var bestD = vec2<i32>(0);
   for (var dj = -R; dj <= R; dj++) {
     for (var di = -R; di <= R; di++) {
       // A neighbour off the grid would alias the far edge's slot.
       if (i + di < 0 || i + di >= n || j + dj < 0 || j + dj >= n) { continue; }
-      let a = flowmSlot(k + vec2<i32>(di, dj)) * 4u;
+      let a = flowmSlot(k + vec2<i32>(di, dj)) * FLOWM_ACC_STRIDE;
       let acc = vec2<i32>(bitcast<i32>(flowMeasRW[a]), bitcast<i32>(flowMeasRW[a + 1u]));
       if (abs(di) <= 1 && abs(dj) <= 1) {
         let w = (2 - abs(di)) * (2 - abs(dj));
         flux += w * clamp(acc, vec2<i32>(-FLOWM_TERM_MAX), vec2<i32>(FLOWM_TERM_MAX));
       }
-      if (R > 1) {
-        // The node's own bin counts as its flux; every other bin as its PULL
-        // on this node (flowmPull): the reach turns the water toward a breach
-        // instead of copying the breach's direction onto it.
-        let ww = (R + 1 - abs(di)) * (R + 1 - abs(dj));
-        let fw = clamp(acc, vec2<i32>(-FLOWM_WIDE_TERM_MAX), vec2<i32>(FLOWM_WIDE_TERM_MAX));
-        if (di == 0 && dj == 0) { wide += ww * fw; }
-        else { wide += ww * flowmPull(fw, vec2<i32>(di, dj)); }
+      // The node's own bin counts as its flux; every other bin as its PULL
+      // on this node (flowmPull): the reach turns the water toward a breach
+      // instead of copying the breach's direction onto it.
+      let ww = (R + 1 - abs(di)) * (R + 1 - abs(dj));
+      let fw = clamp(acc, vec2<i32>(-FLOWM_WIDE_TERM_MAX), vec2<i32>(FLOWM_WIDE_TERM_MAX));
+      var pw = fw;
+      if (di != 0 || dj != 0) { pw = flowmPull(fw, vec2<i32>(di, dj)); }
+      if (R > 1) { wide += ww * pw; }
+      // ww <= 49, |pw| <= 3.7e5 by octagon: the weight stays under 2^25.
+      let aw = ww * flowmOct(pw);
+      if (aw > bestA) {
+        bestA = aw;
+        bestD = vec2<i32>(di, dj);
       }
       topE = max(topE, bitcast<i32>(flowMeasRW[a + 2u]));
       botE = max(botE, bitcast<i32>(flowMeasRW[a + 3u]));
@@ -271,15 +324,47 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
   }
 
+  // ---- 2c. the vertical's target (THE VERTICAL above) ----
+  // From the pulling bin's height moments: mean and spread of the rows its
+  // water ran in, about the window's middle row (the writers' frame). Every
+  // product is bounded by the trust test: |M1| <= W x 256, M2 <= W x 65536.
+  var tOk = false;
+  var tH = 0;
+  var tHW = 0;
+  var tD = 0;
+  if (bestA > 0) {
+    let b = flowmSlot(k + bestD) * FLOWM_ACC_STRIDE;
+    let W = bitcast<i32>(flowMeasRW[b + 4u]);
+    let M1 = bitcast<i32>(flowMeasRW[b + 5u]);
+    let M2 = bitcast<i32>(flowMeasRW[b + 6u]);
+    if (W > 0 && W <= FLOWM_VERT_W_MAX && M2 >= 0) {
+      let mu16 = (M1 * 16) / W;                       // |.| <= 4096
+      let var256 = max((M2 / W) * 256 - mu16 * mu16, 0);
+      tHW = (curISqrt(var256) * 1774) / 1024;        // sqrt(3) sigma, 1/16 cells
+      // The rows' CENTRE (a row y spans y .. y + 1), world cells x 16.
+      tH = mu16 + 8 + (T.origin.y * i32(CHUNK) + 256) * 16;
+      tD = max(flowmOct(bestD * 16) * 8, 64);
+      tOk = true;
+    }
+  }
+
   // ---- the node's state, reset if the slot held another node ----
-  let s = FLOWM_STATE + flowmSlot(k) * 4u;
+  let s = FLOWM_STATE + flowmSlot(k) * FLOWM_STATE_STRIDE;
   let tag = flowmTag(k);
   var v = vec2<i32>(0);
   var band = (u32(FLOW_DRY) & 0xFFFFu);
+  var vH = 0;
+  var vHW = 0;
+  var vD = 0;
+  var vOn = 0;
   if (flowMeasRW[s + 2u] == tag) {
     v = clamp(vec2<i32>(bitcast<i32>(flowMeasRW[s]), bitcast<i32>(flowMeasRW[s + 1u])),
               vec2<i32>(-FLOWM_STATE_MAX), vec2<i32>(FLOWM_STATE_MAX));
     band = flowMeasRW[s + 3u];
+    vH = bitcast<i32>(flowMeasRW[s + 4u]);
+    vHW = clamp(bitcast<i32>(flowMeasRW[s + 5u]), 0, 1 << 20);
+    vD = clamp(bitcast<i32>(flowMeasRW[s + 6u]), 0, 1 << 20);
+    vOn = clamp(bitcast<i32>(flowMeasRW[s + 7u]), 0, FLOWM_ON_Q10);
   }
 
   // ---- 3. follow: fast up, slow down ----
@@ -290,17 +375,52 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (topE != 0) {
     band = flowmI16(topE - FLOWM_Y_BIAS) | (flowmI16(FLOWM_Y_BIAS - botE) << 16u);
   }
+  // ---- 3b. the vertical follows its target ----
+  // Submerged: the pulling water's rows end FLOWM_VERT_GAP inside the band
+  // moving here, above or below. A tick with no moves in the pulling bin
+  // keeps the last target and lets ON fall.
+  var onT = 0;
+  if (tOk) {
+    let topQ = (flowI16Lo(band) + 1) * 16;
+    let botQ = flowI16Hi(band) * 16;
+    if (flowI16Lo(band) != FLOW_DRY &&
+        (tH + tHW <= topQ - FLOWM_VERT_GAP_Q4 || tH - tHW >= botQ + FLOWM_VERT_GAP_Q4)) {
+      onT = FLOWM_ON_Q10;
+    }
+    if (vOn == 0) {
+      vH = tH;
+      vHW = tHW;
+      vD = tD;
+    } else {
+      // |t - v| < 2^21 (world heights in Q4), x 132 < 2^29.
+      vH += (clamp(tH - vH, -(1 << 20), 1 << 20) * FLOWM_RISE_Q11) / 2048;
+      vHW += ((tHW - vHW) * FLOWM_RISE_Q11) / 2048;
+      vD += ((tD - vD) * FLOWM_RISE_Q11) / 2048;
+    }
+  }
+  let kOn = select(FLOWM_FALL_Q11, FLOWM_RISE_Q11, onT > vOn);
+  vOn += ((onT - vOn) * kOn) / 2048;
+  if (abs(onT - vOn) < 16) { vOn = onT; }   // the truncating follow's last step
   if (flowmStill(v)) {
     v = vec2<i32>(0);
     band = u32(FLOW_DRY) & 0xFFFFu;
+    vOn = 0;
   }
   flowMeasRW[s] = bitcast<u32>(v.x);
   flowMeasRW[s + 1u] = bitcast<u32>(v.y);
   flowMeasRW[s + 2u] = tag;
   flowMeasRW[s + 3u] = band;
+  flowMeasRW[s + 4u] = bitcast<u32>(vH);
+  flowMeasRW[s + 5u] = bitcast<u32>(vHW);
+  flowMeasRW[s + 6u] = bitcast<u32>(vD);
+  flowMeasRW[s + 7u] = bitcast<u32>(vOn);
 
   // ---- 4. publish, flowGrid's layout ----
   let g = FLOWM_GRID + FLOW_HEADER + 2u * u32(j * n + i);
   flowMeasRW[g] = flowmI16(flowmPublish(v.x)) | (flowmI16(flowmPublish(v.y)) << 16u);
   flowMeasRW[g + 1u] = band;
+  // The vertical plane (flowfield.h kFlowMeasVertOffset). Published whether
+  // or not it is ON, so a gate can read where the pulling water is.
+  flowMeasRW[FLOWM_GRID + FLOW_HEADER + 2u * u32(n * n) + u32(j * n + i)] =
+      select(0u, flowmVertWord(vH, vHW, vD, vOn), vH != 0 || vOn != 0);
 }

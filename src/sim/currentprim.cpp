@@ -374,12 +374,16 @@ Vec3 CurrentAtCpuSim(Vec3 posVox, float wetLo, float wetHi) {
                           std::max(wetLo, wetHi));
 }
 
+// The vertical a floater feels is the MEASURED flow's alone (2026-10-18,
+// ticket 11-30-37: a submerged breach pulls what floats above it down): the
+// primitives' own vertical (a vortex's rise) stays out, as it always has.
 Vec3 CurrentOnFloater(Vec3 comVox, float keelY, float topY, float surfY) {
   const float lo = keelY;
   const float hi = std::max(lo, std::min(topY, surfY));
-  const Vec3 c = CurrentAtCpuSim(Vec3{comVox.x, 0.5f * (lo + hi), comVox.z},
-                                 lo, hi);
-  return Vec3{c.x, 0.0f, c.z};
+  Vec3 m{};
+  const Vec3 c = CurrentAtCpuImpl(Vec3{comVox.x, 0.5f * (lo + hi), comVox.z},
+                                  true, lo, hi, &m, true);
+  return Vec3{c.x, m.y, c.z};
 }
 
 FloaterCurrent CurrentOnFloaterSplit(Vec3 comVox, float keelY, float topY,
@@ -392,8 +396,8 @@ FloaterCurrent CurrentOnFloaterSplit(Vec3 comVox, float keelY, float topY,
   const Vec3 s = CurrentAtCpuImpl(p, true, lo, hi, &m, false);
   const Vec3 t = CurrentAtCpuImpl(p, true, lo, hi, nullptr, true);
   f.standing = Vec3{s.x, 0.0f, s.z};
-  f.measured = Vec3{m.x, 0.0f, m.z};
-  f.total = Vec3{t.x, 0.0f, t.z};
+  f.measured = Vec3{m.x, m.y, m.z};
+  f.total = Vec3{t.x, m.y, t.z};
   return f;
 }
 
@@ -423,9 +427,9 @@ static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
     if (carry > 0.0f && grid != nullptr) {
       const Vec3 m = flowfield::SampleMeasuredSpan(grid, posVox, wetLo, wetHi);
       if (measuredOut != nullptr)
-        *measuredOut = Vec3{m.x * carry, 0.0f, m.z * carry};
+        *measuredOut = Vec3{m.x * carry, m.y * carry, m.z * carry};
       if (blend)
-        acc = flowfield::BlendMeasured(acc, Vec3{m.x * carry, 0.0f, m.z * carry});
+        acc = flowfield::BlendMeasured(acc, Vec3{m.x * carry, m.y * carry, m.z * carry});
     }
   }
   const CurrentPrimSystem& cp = CurrentPrims();

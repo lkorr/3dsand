@@ -4171,6 +4171,24 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const Vec3 subHole{subX, (float)fy2 + 0.5f * (float)(kSubLo + kSubHi) + 0.5f, (float)cz2};
   auto speed3 = [](Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
   Vec3 subA{0, 0, 0}, subB{0, 0, 0}, subH{0, 0, 0}, carryA{0, 0, 0};
+  // THE VERTICAL plane's words at a node column (flowfield.h
+  // kFlowMeasVertOffset), decoded, with the node's band: what the reader
+  // turned into vy, so an S failure names the cause (where the fold put the
+  // pulling water, and whether it called it submerged).
+  auto vertNode = [&](float x, float z) {
+    const int n = (int)grid[2];
+    if (n == 0) return std::string("no grid");
+    const int ix = (int)std::lround((x - (float)(int32_t)grid[0]) / (float)kFlowStep);
+    const int iz = (int)std::lround((z - (float)(int32_t)grid[1]) / (float)kFlowStep);
+    if (ix < 0 || iz < 0 || ix >= n || iz >= n) return std::string("off grid");
+    const size_t node = (size_t)iz * n + ix;
+    const uint32_t b = grid[kFlowHeaderWords + 2 * node + 1];
+    const uint32_t w = grid[kFlowMeasVertOffset + node];
+    return Format("x%+d: H %d HW %u D %u on %u band %d..%d", (int)std::lround(x) - cx2,
+                  (int)(int16_t)(w & 0xFFFFu) - fy2, (w >> 16) & 63u, ((w >> 22) & 63u) * 2u, w >> 28,
+                  (int)(int16_t)(b >> 16) - fy2, (int)(int16_t)(b & 0xFFFFu) - fy2);
+  };
+  std::string subNodes;
   float subPeak = 0.0f, subPeakY = 0.0f;
   const int total = kBreachAt + kSettle;
   // The box is ~120k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
@@ -4219,6 +4237,8 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       subB = at(subBelow);
       subH = at(subHole);
       carryA = CurrentAtCpuSim(subAbove, subAbove.y - 0.5f, subAbove.y + 0.5f);
+      for (int dx : {-16, -8, 0, 8})
+        subNodes += (subNodes.empty() ? "" : "; ") + vertNode((float)(cx2 + dx), (float)cz2);
     }
     if (i > kBreachAt && (i - kBreachAt) % 15 == 0) {
       readGrid();
@@ -4305,10 +4325,10 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       "K far ring (%.0f cells) heading error deg@speed %s, %d within %.0f, spread %.0f deg, mean %.2f; near "
       "ring %s deg | W side N %.0f deg %.2f, S %.0f deg %.2f | "
       "S submerged gap rows %d..%d of %d: above (%.2f, %.2f, %.2f) hole (%.2f, %.2f, %.2f) below (%.2f, %.2f, "
-      "%.2f), peak %.2f (vy %.2f) -> %.2f; Cv body vy %.2f | ",
+      "%.2f), peak %.2f (vy %.2f) -> %.2f; Cv body vy %.2f; vertical nodes (H rel. floor) %s | ",
       farR, farAngles.c_str(), converged, convAngle, spread, farMean, ringAngles.c_str(), sideAngN, sideSpdN, sideAngS, sideSpdS, kSubLo, kSubHi,
       kDeep2, subA.x, subA.y, subA.z, subH.x, subH.y, subH.z, subB.x, subB.y, subB.z, subPeak, subPeakY, subEnd,
-      carryA.y) + Format(
+      carryA.y, subNodes.c_str()) + Format(
       "dam breach %dx%dx%d, gap %d: Q quiet %.2f | G gap (%.1f, %.1f) cells/s vs solved %.2f | V %d/%zu ring "
       "points at %.0f cells pulled (mean %.2f) | D downstream (%.1f, %.1f) | R gap/ring peak %.1f -> %.2f "
       "after %d ticks; box max %.1f -> %.2f (%u of %u box chunks awake), grid n %u | C body carry quiet %.2f, "

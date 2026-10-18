@@ -100,6 +100,7 @@
 const FLOWM_N : i32 = 67;
 const FLOWM_ACC_Q : i32 = 16;
 const FLOWM_Y_BIAS : i32 = 1048576;
+const FLOWM_ACC_STRIDE : u32 = 8u;
 // One particle is one eighth of liquid moving `v` cells this tick (Q16.16):
 // eighths x cells x FLOWM_ACC_Q (= 2^4) is v / 4096. A particle at rest, or
 // one moving straight up or down, records nothing. TRUNCATED TOWARD ZERO, not
@@ -115,11 +116,19 @@ fn flowMeasParticle(cell : vec3<i32>, vx : i32, vz : i32) {
   if (fx == 0 && fz == 0) { return; }
   let kx = ((((cell.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let kz = ((((cell.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
-  let s = u32(kz * FLOWM_N + kx) * 4u;
+  let s = u32(kz * FLOWM_N + kx) * FLOWM_ACC_STRIDE;
   if (fx != 0) { atomicAdd(&flowMeasAcc[s], fx); }
   if (fz != 0) { atomicAdd(&flowMeasAcc[s + 1u], fz); }
   atomicMax(&flowMeasAcc[s + 2u], cell.y + FLOWM_Y_BIAS);
   atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - cell.y);
+  // The height moments, sim_step.wgsl flowMeasNote's: the gross flux in
+  // eighths x cells (one particle moving a cell a tick is 1; <= 16 as there).
+  let g = min((abs(fx) + abs(fz) + 8) >> 4u, 16);
+  if (g == 0) { return; }
+  let yc = clamp(cell.y - (T.origin.y * i32(CHUNK) + 256), -256, 255);
+  atomicAdd(&flowMeasAcc[s + 4u], g);
+  atomicAdd(&flowMeasAcc[s + 5u], g * yc);
+  atomicAdd(&flowMeasAcc[s + 6u], g * yc * yc);
 }
 
 @group(1) @binding(0) var<storage, read_write> fluidParticles : array<FluidParticle>;
