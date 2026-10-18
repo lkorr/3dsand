@@ -2843,6 +2843,7 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
   var poolMatStain = 0u; // packed identity of the pooled content
   for (var y = 0; y <= yTop; y++) {
     var blocked = y == yTop;               // the spill ceiling ends the walk
+    var foreign = false;                   // settled liquid of another material
     var w = 0u;
     var idx = PT_NO_WORD;
     if (y < yTop) {
@@ -2865,26 +2866,24 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       // TWO LIQUIDS DO NOT MERGE (ticket 2026-10-17_00-04-26). A cell already
       // holding settled liquid of ANOTHER material than the content arriving
       // in it -- the pool carried up from below, or this cell's own bin -- is
-      // a blocker to that content, exactly as a solid is: the arriving mass
-      // stops under it (pool > 0: the column is refused) or, if it was binned
-      // INSIDE it, pops up and rests on it (the blocker arm below). It used to
-      // be an open cell, and the walk's identity is a running max: acid
-      // (id 13) settling on a river (water, id 5) re-placed the river cell it
-      // landed in AND every water cell above it in the column as ACID, and
-      // the held river's reservoir refilled the water. Measured, `acid-pour`
-      // before this: 9,840 cells of acid poured, 33,856 standing in the world
-      // 600 ticks later. Now a settle writes only the eighths it was given,
-      // as the material they were (the CA's density displacement sinks
-      // denser acid through the water afterwards, a cell at a time). One
-      // liquid on itself -- every water-only scene -- is untouched.
-      if (mat != MAT_AIR && !blocked && y < 16) {
-        let fb = settleBinAt(listIdx, base + vec3<i32>(cx, y, cz));
-        if ((fb.x > 0u && (fb.y >> 16u) != mat) ||
-            (pool > 0u && (poolMatStain >> 16u) != mat)) {
-          blocked = true;
-        }
-      } else if (mat != MAT_AIR && !blocked && pool > 0u && (poolMatStain >> 16u) != mat) {
-        blocked = true;
+      // FOREIGN to that content: the walk leaves it exactly as it is and
+      // carries the content up THROUGH it (the FOREIGN arm below), to the
+      // first cell that can hold it -- the free surface, where buried mass
+      // belongs (the forced walk's rule). It used to be an open cell, and the
+      // walk's identity is a running max: acid (id 13) settling in a river
+      // (water, id 5) re-placed the river cell it landed in AND every water
+      // cell above it in the column as ACID, and the held river's reservoir
+      // refilled the water. Measured, `acid-pour` before this: 9,840 cells of
+      // acid poured, 33,856 standing in the world 600 ticks later, 53,707 bed
+      // cells eaten under the river. Now a settle writes only the eighths it
+      // was given, as the material they were (the CA's density displacement
+      // then sinks denser acid back through the water, a cell at a time).
+      // One liquid on itself -- every water-only scene -- never reaches it.
+      if (mat != MAT_AIR && !blocked) {
+        var fb = vec2<u32>(0u, 0u);
+        if (y < 16) { fb = settleBinAt(listIdx, base + vec3<i32>(cx, y, cz)); }
+        foreign = (fb.x > 0u && (fb.y >> 16u) != mat) ||
+                  (pool > 0u && (poolMatStain >> 16u) != mat);
       }
       // An unmapped word can only mean the coverage guarantee failed (the
       // walk stays inside the settling chunk + its materialized N26 ring);
@@ -2922,6 +2921,35 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       }
       continue;
     }
+    // FOREIGN: another liquid's settled cell (TWO LIQUIDS DO NOT MERGE,
+    // above). Untouched -- not written, not counted, recorded to the
+    // stability test as the unchanged fill it is -- and the content passes
+    // up through it: the cell's own bin joins the pool when it is the pool's
+    // material (or starts it), and the pool goes on to the next cell, which
+    // rests on this one. Refused only where three materials would meet in
+    // one pool, or where the bin is the cell's OWN liquid buried under a
+    // foreign pool -- neither has one right answer, and a refusal leaves
+    // the particles as they are.
+    if (foreign) {
+      if (y < 16) {
+        let fb = settleBinAt(listIdx, base + vec3<i32>(cx, y, cz));
+        if (fb.x > 0u) {
+          let bm = fb.y >> 16u;
+          if (bm == voxMat(w) || (pool > 0u && bm != (poolMatStain >> 16u))) {
+            if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
+            return false;
+          }
+          if (pool == 0u) { poolMatStain = fb.y; } else { poolMatStain = max(poolMatStain, fb.y); }
+          pool += fb.x;
+        }
+      }
+      if (rec && y < SETTLE_LEVELS) {
+        wgFill[col * 3u + u32(y) / 8u] |= (voxState(w) + 1u) << ((u32(y) % 8u) * 4u);
+        wgSame[col] |= 1u << u32(y);
+      }
+      floorOk = true;
+      continue;
+    }
     // Open cell: pool its content, then place bottom-first as we walk. A
     // cell's own binned + existing eighths join the pool at its own height,
     // and the pool drains into the LOWEST open cells — that is the
@@ -2943,8 +2971,8 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     var existing = 0u;
     if (mat != MAT_AIR) { existing = voxState(w) + 1u; }
     // An EMPTIED pool carries no identity up: the content placed from here is
-    // this cell's own (the blocker test above already refused a different
-    // liquid meeting a non-empty pool). Without the reset the running max
+    // this cell's own (a different liquid meeting a non-empty pool took the
+    // FOREIGN arm above). Without the reset the running max
     // relabelled every settled cell above the first higher id it passed --
     // and the UNTOUCHED test below assumes exactly this (nw == w).
     if (pool == 0u) { poolMatStain = 0u; }

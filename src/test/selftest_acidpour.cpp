@@ -241,6 +241,12 @@ Status GateAcidPour(Ctx& c, std::string& detail) {
     uint32_t water = 0;            // water cells in the box
     uint32_t give = 0, take = 0, grow = 0;
     uint32_t live = 0;
+    uint32_t fa[kFluidArgsWords] = {};
+    // WHERE the live acid particles are: the material of the cell each one
+    // is in ([0] air, [1] water, [2] acid, [3] other liquid, [4] solid or
+    // powder, [5] unread) and of the cell under it; and its height over the
+    // river surface (<= -2, -1..1, >= 2).
+    uint64_t pIn[6] = {}, pUnder[6] = {}, pDy[3] = {};
   };
   std::vector<uint32_t> buf(kChunkVol);
   auto census = [&]() {
@@ -263,8 +269,10 @@ Status GateAcidPour(Ctx& c, std::string& detail) {
           box.insert(s);
           slots.insert(s);
         }
+    std::map<uint32_t, std::vector<uint32_t>> read;
     for (uint32_t s : slots) {
       sandvox::ReadVoxelsSync(c.ctx, c.world, s, 1, buf.data(), "apCensus");
+      read[s] = buf;
       const IVec3 wc = c.world.SlotToWorldChunk(s);
       const bool inBox = box.count(s) != 0;
       uint32_t g = 0;
@@ -287,9 +295,27 @@ Status GateAcidPour(Ctx& c, std::string& detail) {
         if (g <= 3) { k.traceChunks++; if (sky) k.skyTrace++; }
       }
     }
-    uint32_t fa[kFluidArgsWords] = {};
+    uint32_t* fa = k.fa;
     sandvox::ReadFluidArgsSync(c.ctx, c.world, fa);
     k.live = fa[7];
+    auto classOf = [&](int x, int y, int z) -> int {
+      const uint32_t s = World::SlotChunkIndex(IVec3{x >> 4, y >> 4, z >> 4});
+      auto it = read.find(s);
+      if (it == read.end()) {
+        if (read.size() > 4096) return 5;
+        std::vector<uint32_t> v(kChunkVol);
+        sandvox::ReadVoxelsSync(c.ctx, c.world, s, 1, v.data(), "apPartCell");
+        it = read.emplace(s, std::move(v)).first;
+      }
+      const uint32_t m = it->second[(uint32_t(z & 15) * kChunk + uint32_t(y & 15)) * kChunk + uint32_t(x & 15)] & 0xFFFu;
+      if (m == 0u) return 0;
+      if (m == mWater) return 1;
+      if (m == mAcid) return 2;
+      if (m >= c.mats.size()) return 5;
+      if (c.mats[m].gpu.klass == CLASS_LIQUID) return 3;
+      if (c.mats[m].gpu.klass == CLASS_SOLID || c.mats[m].gpu.klass == CLASS_POWDER) return 4;
+      return 0;
+    };
     if (k.live != 0) {
       const uint32_t n = std::min<uint32_t>(k.live, kFluidCap);
       std::vector<uint32_t> parts(size_t(n) * kFluidParticleWords);
@@ -299,7 +325,14 @@ Status GateAcidPour(Ctx& c, std::string& detail) {
         const uint32_t a = parts[size_t(i) * kFluidParticleWords + 18];
         const uint32_t m = a & 0xFFFu, f = (a >> 12) & 7u;
         if (m == 0u || f == 0u) continue;
-        if (m == mAcid) k.acidP += f;
+        if (m == mAcid) {
+          k.acidP += f;
+          const int32_t* q = reinterpret_cast<const int32_t*>(&parts[size_t(i) * kFluidParticleWords]);
+          const int x = q[0] >> 16, y = q[1] >> 16, z = q[2] >> 16;
+          k.pIn[classOf(x, y, z)] += f;
+          k.pUnder[classOf(x, y - 1, z)] += f;
+          k.pDy[y - my <= -2 ? 0 : y - my >= 2 ? 2 : 1] += f;
+        }
         else if (m == mWater) k.waterP += f;
       }
     }
@@ -358,11 +391,20 @@ Status GateAcidPour(Ctx& c, std::string& detail) {
     if (k.awake > maxAwake) settledAt = 0;
     curve += Format("\n    [%4d] %4u awake | acid %llu settled + %llu live eighths (water %llu live) | gas %u cells in %u "
                     "awake chunks (%u trace <= 3; sky %u, sky trace %u) | bed %d | box water %u | reservoir take %u grow %u "
-                    "give %u",
+                    "give %u\n           settle (last tick): %u blocks, %u refused (%u unstable), columns ceil %u floor %u, "
+                    "forced %u sealed %u | live acid in air %llu water %llu acid %llu liquid %llu solid %llu ? %llu, over "
+                    "air %llu water %llu acid %llu liquid %llu solid %llu ? %llu, dy<=-2 %llu, -1..1 %llu, >=2 %llu",
                     done, k.awake, (unsigned long long)k.acidE, (unsigned long long)k.acidP,
                     (unsigned long long)k.waterP, k.gas, k.gasChunks, k.traceChunks, k.skyGas, k.skyTrace,
                     static_cast<int>(k.bed) - static_cast<int>(k0.bed), k.water, k.take - prev.take,
-                    k.grow - prev.grow, k.give - prev.give);
+                    k.grow - prev.grow, k.give - prev.give, k.fa[13], k.fa[25], k.fa[26], k.fa[30], k.fa[31], k.fa[32],
+                    k.fa[33], (unsigned long long)k.pIn[0], (unsigned long long)k.pIn[1], (unsigned long long)k.pIn[2],
+                    (unsigned long long)k.pIn[3], (unsigned long long)k.pIn[4], (unsigned long long)k.pIn[5],
+                    (unsigned long long)k.pUnder[0], (unsigned long long)k.pUnder[1], (unsigned long long)k.pUnder[2],
+                    (unsigned long long)k.pUnder[3], (unsigned long long)k.pUnder[4], (unsigned long long)k.pUnder[5],
+                    (unsigned long long)k.pDy[0], (unsigned long long)k.pDy[1], (unsigned long long)k.pDy[2]);
+    std::printf("acid-pour: sample%s\n", curve.substr(curve.rfind("\n    [")).c_str());
+    std::fflush(stdout);
     prev = k;
     last = k;
   }
