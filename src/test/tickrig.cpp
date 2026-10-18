@@ -94,6 +94,7 @@ TickRig::TickRig(const TickEngine& c, uint32_t lastTick, IVec3 fixtureChunk)
                      pending_.cells.end());
     out.spawns.insert(out.spawns.end(), pending_.spawns.begin(),
                       pending_.spawns.end());
+    out.fluid.insert(out.fluid.end(), pending_.fluid.begin(), pending_.fluid.end());
   };
 }
 
@@ -139,7 +140,7 @@ void TickCursor::operator()(const TickOps& ops) {
   r.tick = t;              // the gate may have moved its own clock
   r.SetFixtureChunk(chunk);
   if (ops.ops.empty() && ops.exps.empty() && ops.cells.empty() &&
-      ops.spawns.empty()) {
+      ops.spawns.empty() && ops.fluid.empty()) {
     RunTicks(r, 1);
   } else {
     RunTicks(r, 1, [&ops](uint32_t, TickOps& out) { out = ops; });
