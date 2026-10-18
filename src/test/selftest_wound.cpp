@@ -80,6 +80,8 @@
 #include "game/bodyreg.h"  // heal-restore's optional picture sequence
 #include "gpu/resources.h"  // CreateBuffer, ditto
 #include "sim/currentprim.h"  // float-current: a stream through the basin
+#include "sim/flowfield.h"    // corpse-float: the solved field at the site
+#include "sim/worldmap.h"     // corpse-float: the map's water round the site
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
 #include "phys/floatrho.h"    // corpse-float: the one floating-density rule
@@ -9086,8 +9088,37 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                   a.drift.c_str(), a.trace.c_str())
            + " | limbs" + a.limbs + "; ";
   };
-  detail = Format("site [%s] bed y%d waterline y%d | ", siteWhy.c_str(), bedY,
-                  waterTop) + line(hu) +
+  // THE MAP'S WATER ROUND THE SITE (rule 6): the solved flow field
+  // (WaterFlow, the standing current a floater feels since 2026-10-18) is
+  // composed from worldmap::WaterColumnAt, not from the voxels the site test
+  // read. Where the map says the nearest water is, and what the field says
+  // at the basin's centre on the waterline.
+  std::string mapWater;
+  {
+    int best = INT_MAX, bx = 0, bz = 0, bw = 0, bh = 0;
+    for (int dz = -64; dz <= 64; dz += 8)
+      for (int dx = -64; dx <= 64; dx += 8) {
+        const worldmap::WaterColumn wc =
+            worldmap::WaterColumnAt(site.x + dx, site.z + dz, kDefaultSeed);
+        if (wc.water <= wc.h) continue;
+        const int d2 = dx * dx + dz * dz;
+        if (d2 < best) { best = d2; bx = dx; bz = dz; bw = wc.water; bh = wc.h; }
+      }
+    const Vec3 f = WaterFlow().Sample(Vec3{(float)site.x + 0.5f, (float)waterTop,
+                                           (float)site.z + 0.5f});
+    const std::vector<uint32_t>& fw = WaterFlow().Words();
+    mapWater = best == INT_MAX
+                   ? std::string("map water: none within 64")
+                   : Format("map water nearest (%+d,%+d): surface y%d over ground y%d",
+                            bx, bz, bw, bh);
+    mapWater += Format("; solved field at centre %.2f,%.2f (grid origin %d,%d n %u)",
+                       (double)f.x, (double)f.z,
+                       fw.size() > 2 ? (int)(int32_t)fw[0] : 0,
+                       fw.size() > 2 ? (int)(int32_t)fw[1] : 0,
+                       fw.size() > 2 ? fw[2] : 0u);
+  }
+  detail = Format("site [%s] bed y%d waterline y%d; %s | ", siteWhy.c_str(), bedY,
+                  waterTop, mapWater.c_str()) + line(hu) +
            line(au) + line(an) + line(sy) +
            (limp.ran ? Format("limp human: %s, surface y%.0f, pelvis lowest "
                               "y%.1f final y%.1f, %u pushes, y every 30:%s, drift "
