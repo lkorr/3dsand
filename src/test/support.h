@@ -92,6 +92,20 @@ void SetShortRange(bool on);
 bool ShortRangeNear();
 void SetShortRangeNear(bool on);
 
+// ---- water cost probes (dev panel View page, "water render cost") ----------
+// Bits that switch one liquid-shading effect OFF in the raymarch, so its look
+// and its ms can be compared live (raymarch.wgsl RFLAG_NO_*). WriteRenderParams
+// ORs them into RenderParams.flags bits 8..13. 0 = the shipped look.
+// Render-only: no sim input, cannot reach the world hash.
+constexpr uint32_t kWaterProbeNoMist    = 1u << 8;
+constexpr uint32_t kWaterProbeNoRefl    = 1u << 9;
+constexpr uint32_t kWaterProbeNoCaustic = 1u << 10;
+constexpr uint32_t kWaterProbeNoSheets  = 1u << 11;
+constexpr uint32_t kWaterProbeReflShift = 12;   // 2 bits: steps >> n
+constexpr uint32_t kWaterProbeMask      = 0x3F00u;
+uint32_t WaterFxProbe();
+void SetWaterFxProbe(uint32_t bits);
+
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
 //
@@ -182,6 +196,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t fluidLive = 0,
                 bool vizActive = false,
                 const IVec3* mirrorChunk = nullptr);
+
+// ---- THE MPM MASTER SWITCH's CPU ledger (sim.fluidEnabled 0) -------------
+// Cumulative since process start, never cleared (a gate differences it): the
+// eighths SubmitTick turned from fluid spawn ops into CA cell ops, the eighths
+// it could not place because their cell was not resident, and the ghost ops
+// it dropped. A cell op the GPU refuses (its cell was not air) is not visible
+// here; the gate that cares audits the voxels.
+struct MpmOffStats {
+  uint64_t eighthsPlaced = 0;
+  uint64_t eighthsUnplaced = 0;
+  uint64_t ghostsDropped = 0;
+};
+const MpmOffStats& GetMpmOffStats();
 
 // ---- THE DRAFT BOXES (audit DJ-1, 2026-10-14; DESIGN.md "Drafts") ----------
 // WHERE A PLAYER'S SHELTER BOX GOES: a pure function of the player's chunk on

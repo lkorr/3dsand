@@ -1789,6 +1789,22 @@ void KeyHint(const char* text) {
   ImGui::TextDisabled("%s", text);
 }
 
+// THE MPM MASTER SWITCH (sim.fluidEnabled): one bool, drawn in the tool
+// panel's MPM fluid section and at the top of the MPM Fluid Tuning window.
+// Applies on the next tick through its own latch (fluidEnableDirty, main.cpp)
+// -- no Apply button, no shader recompile.
+void MpmEnabledCheckbox(UIState& s) {
+  bool on = s.fMpmEnabled;
+  if (ImGui::Checkbox("MPM water in world", &on)) {
+    s.fMpmEnabled = on;
+    s.fluidEnableDirty = true;
+  }
+  ImGui::SetItemTooltip(
+      "Off: no particle water appears. Settled water never turns into MPM "
+      "particles (falls, splashes, breaches, explosions), the pour places "
+      "plain CA liquid, and live particles settle back into voxels.");
+}
+
 }  // namespace
 
 // ---- page: Paint -----------------------------------------------------------
@@ -1913,6 +1929,7 @@ void Overlay::DrawDevPaint(UIState& s) {
       ImGui::SetItemTooltip("key %d", k + 1);
       ImGui::PopID();
     }
+    MpmEnabledCheckbox(s);
     ImGui::Text("particles %u / 262144", s.fluidCount);
     ImGui::SameLine();
     if (ImGui::Button("clear (U)")) s.clearFluid = true;
@@ -2773,6 +2790,43 @@ void Overlay::DrawDevView(UIState& s) {
         "every ray - a PERF mode, not a fog filter. Shape it under Rendering:\n"
         "shortRangeDist, shortRangeNearDist, shortRangeFogStart/Density.");
   }
+  if (Section("Water render cost")) {
+    // Live A/B switches for the liquid shade (raymarch.wgsl RFLAG_NO_*). Each
+    // turns ONE effect off at runtime: flip it, watch the world raymarch ms
+    // and the picture. Nothing recompiles and nothing is saved.
+    ImGui::Checkbox("no mist / spray", &s.wfxNoMist);
+    ImGui::SetItemTooltip(
+        "waterfallMist: the vapour slabs and plunge spray over falling water,
+"
+        "and the 24-step sun ray each such pixel casts.");
+    ImGui::Checkbox("no traced reflections", &s.wfxNoRefl);
+    ImGui::SetItemTooltip(
+        "traceReflection returns the sky: no reflected shore, trees or bodies.
+"
+        "Water and ice. The sky, sun glint and Fresnel stay.");
+    const char* kSteps[] = {"full", "1/2", "1/4", "1/8"};
+    ImGui::SetNextItemWidth(120);
+    ImGui::Combo("reflection steps", &s.wfxReflShift, kSteps, IM_ARRAYSIZE(kSteps));
+    ImGui::SetItemTooltip(
+        "The traced reflection's step budget (render.reflectionSteps = %d)
+"
+        "divided down. A ray that runs out returns the sky.",
+        CurrentTuning().render.reflectionSteps);
+    ImGui::Checkbox("no caustics", &s.wfxNoCaustic);
+    ImGui::SetItemTooltip(
+        "The caustic web: on the bed seen through the surface, and on lit
+"
+        "underwater surfaces.");
+    ImGui::Checkbox("no side sheets", &s.wfxNoSheets);
+    ImGui::SetItemTooltip(
+        "waterSideKind: every side face of a liquid is a plain wall - no
+"
+        "white falling sheet, no riser lit as surface.");
+    if (ImGui::Button("all on (shipped look)")) {
+      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = s.wfxNoSheets = false;
+      s.wfxReflShift = 0;
+    }
+  }
   if (Section("Debug draw")) {
     ImGui::Checkbox("corner readout (fps + looking at)", &s.showCornerReadout);
     ImGui::SetItemTooltip("Top-right, stays up with this panel closed.");
@@ -3205,6 +3259,8 @@ void Overlay::Draw(UIState& s) {
     ImGui::SetNextWindowSize(ImVec2(340, 600), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("MPM Fluid Tuning", &s.fluidWindowOpen)) {
       ui::KeepWindowOnScreen(4.0f);  // a saved position may be off this monitor
+      MpmEnabledCheckbox(s);
+      ImGui::Separator();
       if (ImGui::Button("Apply")) s.fluidTuningDirty = true;
       ImGui::SameLine();
       ImGui::TextDisabled("recompiles shaders");

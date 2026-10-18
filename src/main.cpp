@@ -8126,6 +8126,18 @@ int main(int argc, char** argv) {
     ui.fSprayDensity     = fs.fluidSprayDensity;
     ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
     ui.fExciteMode       = fs.fluidExciteMode;
+    ui.fMpmEnabled       = fs.fluidEnabled != 0;
+    // INTERACTIVE PLAY STARTS WITH MPM WATER OFF (owner 2026-10-18). The
+    // "MPM water in world" checkbox is session state from here, like short
+    // range: tuning.json keeps sim.fluidEnabled 1 so every harness (--frames,
+    // the --shot scenes, the lab, the selftest's fluid gates) runs exactly as
+    // before, and the F5 reload below re-asserts the checkbox over the file.
+    if (g_harnessFrames == 0 && labScene < 0) {
+      ui.fMpmEnabled = false;
+      Tuning t = CurrentTuning();
+      t.sim.fluidEnabled = 0;
+      SetCurrentTuning(t);
+    }
     ui.windGasScale      = fs.windGasScale;
     ui.windPartScale     = fs.windPartScale;
     ui.windDragRef       = fs.windDragRef;
@@ -15382,6 +15394,10 @@ int main(int argc, char** argv) {
           tune.sim.fluidExciteMode = 1;
           labTuningMtime = LabFileMtimeNs(labTuningPath);
         }
+        // Interactive play: the MPM checkbox is session state (see its seed
+        // at startup), so a reload keeps it rather than the file's value.
+        if (g_harnessFrames == 0 && labScene < 0)
+          tune.sim.fluidEnabled = ui.fMpmEnabled ? 1 : 0;
         SetCurrentTuning(tune);
         {
           const auto& fs = tune.sim;
@@ -15415,6 +15431,7 @@ int main(int argc, char** argv) {
           ui.fSprayDensity     = fs.fluidSprayDensity;
           ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
           ui.fExciteMode       = fs.fluidExciteMode;
+          ui.fMpmEnabled       = fs.fluidEnabled != 0;
           ui.windGasScale      = fs.windGasScale;
           ui.windPartScale     = fs.windPartScale;
           ui.windDragRef       = fs.windDragRef;
@@ -17750,6 +17767,14 @@ int main(int argc, char** argv) {
       // function and would otherwise each need their own copy of this.
       SetShortRange(ui.shortRange);
       SetShortRangeNear(ui.shortRangeNear);
+      // The View page's water cost probes, same reasoning: one place for every
+      // drawing path (support.h SetWaterFxProbe).
+      SetWaterFxProbe((ui.wfxNoMist ? kWaterProbeNoMist : 0u) |
+                      (ui.wfxNoRefl ? kWaterProbeNoRefl : 0u) |
+                      (ui.wfxNoCaustic ? kWaterProbeNoCaustic : 0u) |
+                      (ui.wfxNoSheets ? kWaterProbeNoSheets : 0u) |
+                      ((uint32_t)std::clamp(ui.wfxReflShift, 0, 3)
+                       << kWaterProbeReflShift));
       // The panel's draw-distance readout, and the evidence that ticking the
       // box did something. Normally the cascade's FILLED radius (the same
       // number the adaptive fog is pinned to just above, so the two cannot
@@ -20757,6 +20782,15 @@ int main(int argc, char** argv) {
       // A slider that recompiled every shader on each frame of a drag would be
       // unusable, which is the whole reason they are on the tick stream and
       // are NO_WGSL rows of tuning_params.def.
+      // The MPM master switch (sim.fluidEnabled): same shape as the wind
+      // latch below, for the same reason -- it rides TickParams._padSplash2,
+      // so the next tick sees it and nothing recompiles.
+      if (ui.fluidEnableDirty) {
+        ui.fluidEnableDirty = false;
+        Tuning t = CurrentTuning();
+        t.sim.fluidEnabled = ui.fMpmEnabled ? 1 : 0;
+        SetCurrentTuning(t);
+      }
       if (ui.windTuningDirty) {
         ui.windTuningDirty = false;
         Tuning t = CurrentTuning();

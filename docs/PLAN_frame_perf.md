@@ -1222,3 +1222,110 @@ not the tick.**
    not done -- sim_fluid_seam.wgsl is the MPM ticket agent's file this round.
 5. far downsample 2.26 (cadence 16 instead of 8 measured -30% in §10: owner
    call on the far-image lag).
+
+## 12. Handoff 2026-10-18 (round 3): the water's RENDER on the breach and the hill (tickets 21-03-25, 11-14-41)
+
+Round 2 left the breach's frame as mostly render (`--render-budget dam`
+21.35 ms against `damground` 3.67). This round is raymarch.wgsl only (no C++,
+no hashed state). Every number below is `--render-budget`, 1080p, RTX 3060 Ti,
+`SANDVOX_RUN_EXCLUSIVE=1`; "in one process" means `debug.perfExp` arms with
+`SANDVOX_BUDGET_ARM_SHOTS=1` pictures, the only valid A/B with live MPM spray.
+
+### LANDED
+
+1. **One water shade a pixel on a calm raft** (`MPM_RAFT_LO`/`HI`,
+   `shadeMpmFluid`'s early return, fs's remapped `lakeW`; DESIGN.md MPM
+   ownership paragraph). OWNER-APPROVED LOOK CHANGE (2026-10-18). A perfExp
+   picture of the raft weight (r = gMpmLakeW, g = calm, b = caFrac) on `dam`:
+   13.2% of the screen is MPM-shaded, 97.5% of those pixels paid BOTH shades
+   (weight > 0.01), and the weights sat at: 3.0% < 0.3, 5.4% at 0.5..0.6
+   (the falls' droplets: CA water falling down the wall face behind them
+   makes caFrac 1), 80% >= 0.995. So the whole MPM shade -- 4-tap normal,
+   traced refraction and reflection, glint, foam -- was computed to supply
+   under 1% of 80% of the pixels. The weight is now
+   smoothstep(0.3, 0.5): above, `shadeWater` alone (`shadeMpmFluid` returns
+   right after caFrac/calm); below, the MPM shade alone; the band pays both.
+   A 0.6..0.95 band was tried first: it turned the droplets into glassy MPM
+   cubes (12.5k px moved by > 32/255); 0.3..0.5 keeps them the white water
+   they mostly were (2.0k px > 32, all on droplet tops that lost the MPM
+   shade's sky highlight). In one process: `dam` 20.28 -> 17.93 (r2,
+   base2 20.21) and 19.99 -> 17.19 (r4, the old path as an arm), `slope`
+   19.34 -> 18.53 (r4; picture: 2 px > 32 vs a base2 floor of 14).
+   Pictures for the owner: `bug_reports/2026-10-17_21-03-25/round3_*`.
+2. **The foam's convergence on shared node fetches** (`waterConvergeNear`,
+   `flowQuadAt`/`flowQuadEval`; `check_invariants.py` "flowconv" pins the
+   copy to common.wgsl). §9 item 4, done: the centre's 2x2 nodes of each flow
+   grid are fetched once and reused by every tap in the same 8-cell node
+   cell; a tap in another cell fetches its own. Same arithmetic in the same
+   order. In one process: `damlake` 14.72 -> 13.79 (base2 drift 0.27), max
+   picture diff 1/255; `dam`/`slope` within noise (their foam is on fewer
+   pixels).
+
+### The round's result, in one process (the final tree, merged with main f4c4c4b3)
+
+`perfExp` arm = items 1 and 2 reverted (old raft mix + old convergence);
+`SANDVOX_BUDGET_REPEAT=2`, exclusive, ms:
+
+| camera | before (arm) | after (baseline) | base2 (drift) | change |
+|---|---|---|---|---|
+| dam | 21.59 / 21.80 | 18.48 / 18.57 | 18.27 / 18.90 | **-3.2 (-15%)** |
+| damlake | 16.44 / 15.62 | 15.04 / 15.33 | 15.23 / 15.72 | -0.3 .. -1.4 |
+| damground | 3.84 / 3.68 | 3.84 / 3.70 | 3.91 / 3.70 | 0 |
+| slope | 20.91 / 21.66 | 20.09 / 20.09 | 21.36 / 20.22 | -0.8 .. -1.6 |
+
+Separate boots (main's assets vs this branch, same exe) are NOT usable for
+this: the same `before` boot read dam 20.14 and 22.2, damlake 14.45 and 16.1
+an hour apart (the MPM pour differs boot to boot, and the machine drifts);
+one cross-boot run was also taken while the owner's game held the GPU at 99%
+and is discarded. `--shader-stats` on the final tree: raymarch fs **128
+registers / 128 B local** (unchanged).
+
+### MEASURED, NOT CHANGED (attribution arms in one process, after item 1)
+
+| arm (ms saved) | dam 18.0 | damlake 14.5 | slope 18.7 |
+|---|---|---|---|
+| waveSlope -> 0 (the wave field) | 2.68 | 2.87 | ~0 |
+| waterFoam -> 0 (incl. convergence) | 1.74 | 2.18 | ~0 |
+| waterCurrentAt -> 0 | 1.14 | 1.98 | ~0 |
+| waterConvergeAt -> 0 (before item 2) | 0.98 | 1.16 | ~0 |
+| `noreflect` | 1.22 | 0.46 | 0.29 |
+| LIQ_VIS_M 10 -> 2 m (the lake march past 2 m) | 0 | 2.40 | ~0 |
+| solPathLook / caustic curvature / glint visibility | 0.37 / 0.31 / 0.19 | ~0 | ~0 |
+| `mpmcoarse` / `mpmthick` | 5.01 / 3.05 | -- | 1.89 / 1.20 |
+| MPM fluidNormalAt flat / MPM traces off (after item 1) | -0.02 / 0.05 | -- | -0.12 / -0.01 |
+
+- **The fall normal (round 2's 2.4 ms) and the falls' refraction/reflection
+  rays (2.0 ms) are gone with item 1**: flattening the normal or dropping
+  both traces now measures inside the noise on `dam` and `slope`. They were
+  the calm raft's discarded MPM shade. No LOD needed.
+- **The rest of `dam`'s water shade is the LAKE's shade on the raft pixels**
+  (the pool at the wall's foot under the measured flow): the wave field
+  2.7, foam 1.7, current 1.1. The wave field is waterNormal / waveSlope,
+  which another agent (water-facets) owned this round.
+- **The lake march (`damlake`, item 3 of the ask).** A perfExp heatmap of
+  trace()'s media cells: mean 18.7 a pixel, p50 11, p90 48, 31-40 in the
+  bottom third of the screen, in CHUNK-ALIGNED rectangles: the chunks near
+  the breaches whose water is moving, where the occupancy word's liquid span
+  is short or absent and the per-cell run loop walks to the bed. An
+  "absorption saturates" early-out buys nothing on clear water: its blue
+  absorption is 0.20/m, so the bed at ~6 m still transmits ~0.3, and
+  liqVisFade already takes the column to 0 at render.subVisibility (10 m);
+  exp(-0.2 d) x fade < 1/255 holds only past ~9.4 m, so the existing 10 m
+  cap IS the saturation point. A bigger exact step in uniform water needs a
+  finer "all one full-liquid key" record than the chunk span: one bit per
+  4^3 block beside the sub-occupancy masks (total / blockers), written where
+  the span is (genChunk, sim_occupancy, the CPU store-hit upload). That is a
+  sim-side data change, not done.
+- **The MPM coarse march on `dam` is ~4.4 ms** and the heatmap shows why:
+  15.3 march iterations a pixel over the WHOLE wall (every ray to the wall
+  crosses the falls' padded blocks), not just over the water. Round 2's XZ
+  column skip was refuted; not retried.
+- **The hill (`slope`).** Running water costs ~1.7-1.9 ms of the frame: the
+  MPM surface (coarse march + refine + a 1.2 ms shade); the CA sheet's
+  shading arms are all inside the noise, and item 1 took 0.8 ms off. The
+  heather is still the frame. NOTE: `slope`'s baseline read 18.5-19.9 ms
+  this round against 14.7 on 10-17 (§9). The in-process arms show it is not
+  this branch (the old raft path is 0.8 ms SLOWER on the same boot); not
+  investigated.
+- Registers: `--shader-stats` raymarch fs 128 registers / 128 B local after
+  item 1 (unchanged from §10).

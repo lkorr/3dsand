@@ -1076,6 +1076,48 @@ def check_flow_measure():
                         f"flowfield.h kFlowHeaderWords = {mh.group(1)}")
 
 
+# ------------------------------------------- the near convergence transcription
+def check_flow_converge_copy():
+    """raymarch.wgsl waterConvergeNear / flowQuadEval against common.wgsl.
+
+    The foam's convergence on window hits is currentConvergeAt's central
+    difference, re-spelt in raymarch.wgsl over node fetches shared between its
+    four taps (2026-10-18). It is only exact while it is the SAME arithmetic:
+    each pair below is a line of flowGridAt / flowMeasAt / currentConvergeAt
+    and its spelling in the copy. Changing one side without the other is the
+    drift this catches.
+    """
+    cm = read("assets/shaders/common.wgsl")
+    rm = read("assets/shaders/raymarch.wgsl")
+    if not cm or not rm:
+        return
+    checked.append("near convergence copy")
+    pairs = [
+        ("p.y > surf + 1.5 || p.y < bed - 0.5", "py > hi + 1.5 || py < lo - 0.5"),
+        ("clamp((p.y - bed) / max(surf - bed, 1.0), 0.0, 1.0)",
+         "clamp((py - lo) / max(hi - lo, 1.0), 0.0, 1.0)"),
+        ("(0.75 + 0.25 * sqrt(hz)) / FLOW_VEL_Q", "(0.75 + 0.25 * sqrt(hz)) / FLOW_VEL_Q"),
+        ("p.y > top + 1.5 || p.y < bot - 1.5", "py > hi + 1.5 || py < lo - 1.5"),
+        ("return vec3f(v.x, 0.0, v.y) / FLOW_VEL_Q;", "return vec3f(v.x, 0.0, v.y) / FLOW_VEL_Q;"),
+        ("let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);",
+         "let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);"),
+        ("v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));",
+         "v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));"),
+        ("return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);",
+         "return -((tv.x - tv.y) + (tv.z - tv.w)) / (2.0 * e);"),
+        ("flowBlend(flowGridAt(p), flowMeasAt(p) * TUNE_CURRENT_MEASURED)",
+         "flowBlend(solved, measured * TUNE_CURRENT_MEASURED)"),
+    ]
+    for c, r in pairs:
+        if c not in cm:
+            problems.append(f"near convergence copy: common.wgsl no longer has `{c}`; "
+                            "update raymarch.wgsl waterConvergeNear/flowQuadEval to match "
+                            "and this check")
+        if r not in rm:
+            problems.append(f"near convergence copy: raymarch.wgsl lost `{r}` "
+                            "(waterConvergeNear/flowQuadEval)")
+
+
 # ------------------------------------------------------ wind primitive layout
 def check_wind_prims():
     """world.h's wind primitive ceilings must match common.wgsl's constants.
@@ -3803,6 +3845,7 @@ ALL = {
     "substeps": check_fluid_substeps,
     "capool": check_ca_pool,
     "flowmeas": check_flow_measure,
+    "flowconv": check_flow_converge_copy,
     "tuning": check_tuning_consts,
     "tuningreach": check_tuning_reach,
     "tuningused": check_tuning_consumers,

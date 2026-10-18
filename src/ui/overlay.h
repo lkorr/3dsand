@@ -84,6 +84,15 @@ struct UIState {
   // draws the two as one off / 50 m / 100 m radio row, but the state stays two
   // bools so the chosen ARM survives toggling the mode off and back on.
   bool shortRangeNear = false;
+  // Water render cost probes (View page): each switches one liquid-shading
+  // effect OFF live so its look and its raymarch ms can be compared. main
+  // packs them into SetWaterFxProbe (support.h) every frame. Session state,
+  // never saved; all false / 0 = the shipped look.
+  bool wfxNoMist = false;      // waterfall mist + spray (and their sun ray)
+  bool wfxNoRefl = false;      // traced reflections -> sky lookup only
+  bool wfxNoCaustic = false;   // caustic web on the bed (looking down + lit bed)
+  bool wfxNoSheets = false;    // side faces never falling sheets / risers
+  int wfxReflShift = 0;        // reflection step budget >> n (0..3)
   // Effective draw distance in METRES, written by main each frame for the
   // panel readout: the cascade's filled radius normally, the short-range
   // ceiling while the mode is on. Read-only in the UI — it is evidence that
@@ -251,6 +260,13 @@ struct UIState {
   // startup.  The overlay draws sliders; main.cpp detects changes (via
   // fluidTuningDirty) and writes them back + reloads shaders.
   bool fluidWindowOpen = false;
+  // THE MASTER SWITCH (sim.fluidEnabled, tuning.h): "MPM water in world".
+  // Its OWN latch, like windTuningDirty: main.cpp writes it into the tuning
+  // with no shader reload (it rides TickParams), so it applies on the next
+  // tick. Drawn in the tool panel's MPM fluid section AND at the top of the
+  // MPM Fluid Tuning window; both edit this one bool.
+  bool fMpmEnabled = true;
+  bool fluidEnableDirty = false;
   // ---- sim tab ----
   float fGravity = 98.1f;
   float fStiffness = 5400.0f;

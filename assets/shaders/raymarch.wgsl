@@ -884,6 +884,24 @@ const RFLAG_GAS : u32 = 8u;
 // recorded, so with this off it is stale and must not be sampled.
 const RFLAG_GASFAR : u32 = 32u;
 
+// ---- WATER COST PROBES (dev panel, View page, 2026-10-18) ------------------
+// R.flags bits 8..13, written by WriteRenderParams from SetWaterFxProbe
+// (support.h). Each bit switches one liquid-shading effect OFF at runtime so
+// the owner can flip it live and compare picture and raymarch ms. A uniform
+// branch keeps its registers, so a probe prices the work, not occupancy --
+// W2-A measured that deleting a quarter of this shader left the count at 168,
+// so the work is the honest number here. All zero = the shipped look.
+const RFLAG_NO_MIST : u32 = 256u;        // waterfallMist: mist + spray + its sun ray
+const RFLAG_NO_REFL : u32 = 512u;        // traceReflection: sky lookup only
+const RFLAG_NO_CAUSTIC : u32 = 1024u;    // waterCausticCurv + bedCaustic
+const RFLAG_NO_SHEETS : u32 = 2048u;     // waterSideKind: every side face a plain wall
+// Bits 12..13: traced-reflection step budget shift (0 = TUNE_REFLECTION_STEPS,
+// 1 = half, 2 = quarter, 3 = eighth).
+const RFLAG_REFL_STEP_SHIFT : u32 = 12u;
+fn reflStepBudget() -> i32 {
+  return TUNE_REFLECTION_STEPS >> ((R.flags >> RFLAG_REFL_STEP_SHIFT) & 3u);
+}
+
 // ---- GAS_RUN: crossing a run of one thin gas in trace()'s tight loop -------
 // IMPLEMENTED, EXACT, MEASURED (2026-10-03, raymarch-smoke); ON since 2026-10-06
 // (owner decision: the smoke camera's -1.0 ms bought for +0.2/+0.15 on the
@@ -10789,6 +10807,8 @@ fn waterRippleFootprint(hitP : vec3f) -> f32 {
 // half CA and half marched isosurface throws ONE caustic web across its bed.
 fn waterCausticCurv(hitP : vec3f, rd : vec3f, pathVox : f32,
                     depthM : f32) -> f32 {
+  // veilCaustic(0) == 1: no web, the bed lit as if the surface were flat.
+  if ((R.flags & RFLAG_NO_CAUSTIC) != 0u) { return 0.0; }
   // where on the surface the sunlight entering this bed point came from
   let bedP = hitP + rd * pathVox;
   let kdc = keyLightDir();
@@ -11106,7 +11126,9 @@ fn waterCurrentAt(p : vec3f) -> vec3f {
 // far pixel whose own current is in the deadband, none (no flow, no foam to
 // gather).
 fn waterConvergeAt(p : vec3f) -> f32 {
-  if (gFlowSlack < 0.0) { return currentConvergeAt(p, &R); }
+  // A window hit: currentConvergeAt's central difference, on shared node
+  // fetches (waterConvergeNear, below).
+  if (gFlowSlack < 0.0) { return waterConvergeNear(p); }
   if (R.currentRenderOn == 0u || !FLOW_BOUND) { return 0.0; }
   let c = waterCurrentAt(p);
   if (c.x == 0.0 && c.z == 0.0) { return 0.0; }
@@ -11116,6 +11138,110 @@ fn waterConvergeAt(p : vec3f) -> f32 {
   let vz1 = waterCurrentAt(p + vec3f(0.0, 0.0, e)).z;
   let vz0 = waterCurrentAt(p - vec3f(0.0, 0.0, e)).z;
   return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);
+}
+
+// ---- THE NEAR CONVERGENCE ON SHARED NODE FETCHES (2026-10-18, ticket
+// 2026-10-17_21-03-25) ----
+// currentConvergeAt (common.wgsl) is four currentAt taps 1.5 cells either side
+// of the point, and each tap fetches its own 2x2 nodes of BOTH grids (the
+// solved field and the measured one): 32 node reads and four inlined copies
+// of two bilinear loops, for one foam term. The grids' nodes are FLOW_STEP
+// (8) cells apart, so a tap 1.5 cells out lies in the centre's node cell on
+// an axis ~63% of the time, and its four nodes are the centre's. This is the
+// SAME arithmetic, term for term and in the same order (flowQuadSolved /
+// flowQuadMeas are flowGridAt / flowMeasAt with the node fetch hoisted), over
+// the centre cell's nodes fetched once per grid; a tap whose node cell
+// differs fetches its own, exactly as before. The answer is currentConvergeAt's
+// up to float contraction. common.wgsl's flowGridAt / flowMeasAt are the
+// truth: change them and these together.
+struct FlowQuad { w0 : vec4<u32>, w1 : vec4<u32>, ok : bool, }
+fn flowQuadAt(meas : bool, n : i32, ix : i32, iz : i32) -> FlowQuad {
+  var q : FlowQuad;
+  q.ok = !(ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1);
+  q.w0 = vec4<u32>(0u);
+  q.w1 = vec4<u32>(0u);
+  if (!q.ok) { return q; }
+  for (var c = 0; c < 4; c++) {
+    let k = FLOW_HEADER + 2u * u32((iz + (c >> 1u)) * n + (ix + (c & 1)));
+    q.w0[c] = select(flowWord(k), flowMeasWord(k), meas);
+    q.w1[c] = select(flowWord(k + 1u), flowMeasWord(k + 1u), meas);
+  }
+  return q;
+}
+// flowGridAt's body past its fetch (meas = false), or flowMeasAt's (true).
+fn flowQuadEval(q : FlowQuad, meas : bool, py : f32, tx : f32, tz : f32) -> vec3f {
+  if (!q.ok) { return vec3f(0.0); }
+  var v = vec2f(0.0);
+  var hi = -1e9;
+  var lo = 1e9;
+  for (var c = 0; c < 4; c++) {
+    let dx = c & 1;
+    let dz = c >> 1u;
+    let w1 = q.w1[c];
+    let s = flowI16Lo(w1);
+    if (s == FLOW_DRY) { continue; }
+    let w0 = q.w0[c];
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));
+    hi = max(hi, f32(s));
+    lo = min(lo, f32(flowI16Hi(w1)));
+  }
+  if (meas) {
+    if (hi < -1e8 || py > hi + 1.5 || py < lo - 1.5) { return vec3f(0.0); }
+    return vec3f(v.x, 0.0, v.y) / FLOW_VEL_Q;
+  }
+  if (hi < -1e8 || py > hi + 1.5 || py < lo - 0.5) { return vec3f(0.0); }
+  let hz = clamp((py - lo) / max(hi - lo, 1.0), 0.0, 1.0);
+  let prof = (0.75 + 0.25 * sqrt(hz)) / FLOW_VEL_Q;
+  return vec3f(v.x * prof, 0.0, v.y * prof);
+}
+fn waterConvergeNear(p : vec3f) -> f32 {
+  if (R.currentRenderOn == 0u) { return 0.0; }
+  let nG = i32(flowWord(2u));
+  let nM = select(0, i32(flowMeasWord(2u)), TUNE_CURRENT_MEASURED > 0.0);
+  if (R.currentPrimCount == 0u &&
+      (!FLOW_BOUND || (flowWord(2u) == 0u && flowMeasWord(2u) == 0u))) { return 0.0; }
+  let e = 1.5;
+  // Each grid's origin and the centre's node cell.
+  let oG = vec2f(f32(bitcast<i32>(flowWord(0u))), f32(bitcast<i32>(flowWord(1u))));
+  let oM = vec2f(f32(bitcast<i32>(flowMeasWord(0u))), f32(bitcast<i32>(flowMeasWord(1u))));
+  let cG = vec2<i32>(floor((p.xz - oG) / FLOW_STEP));
+  let cM = vec2<i32>(floor((p.xz - oM) / FLOW_STEP));
+  var qG : FlowQuad;
+  qG.ok = false;
+  if (FLOW_BOUND && nG > 0) { qG = flowQuadAt(false, nG, cG.x, cG.y); }
+  var qM : FlowQuad;
+  qM.ok = false;
+  if (FLOW_BOUND && nM > 0) { qM = flowQuadAt(true, nM, cM.x, cM.y); }
+  var tv = vec4f(0.0);   // vx(p+e), vx(p-e), vz(p+e), vz(p-e)
+  for (var j = 0; j < 4; j++) {
+    let ax = j < 2;
+    let sg = select(-e, e, (j & 1) == 0);
+    let q = p + select(vec3f(0.0, 0.0, sg), vec3f(sg, 0.0, 0.0), ax);
+    var solved = vec3f(0.0);
+    if (FLOW_BOUND && nG > 0) {
+      let fx = (q.x - oG.x) / FLOW_STEP;
+      let fz = (q.z - oG.y) / FLOW_STEP;
+      let ix = i32(floor(fx));
+      let iz = i32(floor(fz));
+      var qq = qG;
+      if (ix != cG.x || iz != cG.y) { qq = flowQuadAt(false, nG, ix, iz); }
+      solved = flowQuadEval(qq, false, q.y, fx - f32(ix), fz - f32(iz));
+    }
+    var measured = vec3f(0.0);
+    if (FLOW_BOUND && nM > 0) {
+      let fx = (q.x - oM.x) / FLOW_STEP;
+      let fz = (q.z - oM.y) / FLOW_STEP;
+      let ix = i32(floor(fx));
+      let iz = i32(floor(fz));
+      var qq = qM;
+      if (ix != cM.x || iz != cM.y) { qq = flowQuadAt(true, nM, ix, iz); }
+      measured = flowQuadEval(qq, true, q.y, fx - f32(ix), fz - f32(iz));
+    }
+    let v = currentPrimAt(q, &R) + flowBlend(solved, measured * TUNE_CURRENT_MEASURED);
+    tv[j] = select(v.z, v.x, ax);
+  }
+  return -((tv.x - tv.y) + (tv.z - tv.w)) / (2.0 * e);
 }
 
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
@@ -11437,6 +11563,7 @@ const SIDE_WALL : u32 = 0u;
 const SIDE_RISER : u32 = 1u;
 const SIDE_SHEET : u32 = 2u;
 fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
+  if ((R.flags & RFLAG_NO_SHEETS) != 0u) { return SIDE_WALL; }
   if (gHeldKind != 0u) { return heldSideKind(cell, out); }
   let n = cell + out;
   var level = -1.0;   // out of the window: open, and falling
@@ -12146,8 +12273,8 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   // mix() did, so nothing new is live across the reflected march.
   var h : OpaqueHit;
   h.hit = false;
-  if (horizon > 0.0) {
-    h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
+  if (horizon > 0.0 && (R.flags & RFLAG_NO_REFL) == 0u) {
+    h = traceOpaque(p + n * 0.05, rr, reflStepBudget(), 1e30,
                     &occupancy, &materials);
     rsAdd(RS_REFLECT, h.steps);
   }
@@ -12360,7 +12487,7 @@ fn waterTopAbove(p : vec3f) -> f32 {
 // a lit wall, and it makes it stable when the camera moves (it is a property
 // of the surface and the sun, not of the eye).
 fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
-  if (depthM <= 0.0) { return 0.0; }
+  if (depthM <= 0.0 || (R.flags & RFLAG_NO_CAUSTIC) != 0u) { return 0.0; }
   let kd = keyLightDir();
   // Sun below the horizon: no caustics. Guarded before the divide.
   if (kd.y < 0.05) { return 0.0; }
@@ -12802,6 +12929,7 @@ fn mistVeil(ro : vec3f, rd : vec3f, tHit : f32, radius : f32, fieldScale : f32,
 fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
                  cell : vec3<i32>, mat : u32) -> vec3f {
   if (TUNE_MIST_DENSITY <= 0.0 && TUNE_SPRAY_DENSITY <= 0.0) { return base; }
+  if ((R.flags & RFLAG_NO_MIST) != 0u) { return base; }
   let cue = fallCueAt(cell);
   if (cue.fall <= 0.0 && cue.impact <= 0.0) { return base; }
 
@@ -15740,6 +15868,27 @@ const FLUID_SEAM_SHELL : i32 = 2;
 // surface and is shaded by the lake's shade, not by shadeMpmFluid. A half:
 // the surface is the lake's where most of what makes it is the lake.
 const MPM_LAKE_SETTLED : f32 = 0.5;
+// ---- ONE WATER SHADE A PIXEL ON A CALM RAFT (2026-10-18, ticket 2026-10-17_21-03-25) --
+// The calm raft (gMpmLakeW, below; fs's "A CALM RAFT ON THE LAKE IS THE LAKE")
+// used to be a linear mix: shadeMpmFluid in full, then shadeWater in full,
+// blended by the raft weight. On the breached dam (`--render-budget dam`) 97%
+// of the MPM-shaded pixels paid both, and 80% of them had a weight >= 0.99, so
+// the whole MPM shade -- its 4-tap normal, its traced refraction and reflection
+// -- was computed to contribute under 1% of the pixel. The weight is now
+// remapped through smoothstep(MPM_RAFT_LO, MPM_RAFT_HI): at or above HI the
+// pixel is the lake's alone and shadeMpmFluid returns before its surface work;
+// at or below LO it is the MPM shade's alone and shadeWater is never called;
+// only the band between pays both. The owner approved the look change
+// (2026-10-18): calm water over a lake reads as the lake, water still moving
+// (churn above ~0.2 of the foam speed over a deep column) keeps the authored
+// MPM look. Where the weights sat (dam, MPM-shaded pixels): 3% below 0.3,
+// 5.4% at 0.5..0.6 (the fall's droplets in front of the CA sheet down the
+// wall), 80% at >= 0.995. The band 0.3..0.5 keeps those droplets the lake's
+// white water they mostly were (a 0.6..0.95 band made them glassy MPM cubes:
+// 12.5k pixels moved by > 32/255 against 2.0k for this one). `dam` 20.28 ->
+// 17.93 ms in one process (docs/PLAN_frame_perf.md §12).
+const MPM_RAFT_LO : f32 = 0.3;
+const MPM_RAFT_HI : f32 = 0.5;
 // shadeMpmFluid's answer to "how much of this surface is a calm raft of
 // particles floating on the lake" (caFrac * calm, its own two terms), for fs()
 // to hand that share of the pixel to shadeWater. Set on every call.
@@ -16582,7 +16731,7 @@ fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
 // or blood shade with their derived coefficients exactly as a pool of them
 // would.
 fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
-                 caPath : f32, sceneBehind : vec3f) -> vec3f {
+                 caPath : f32, sceneBehind : vec3f, raftOk : bool) -> vec3f {
   gMpmLakeW = 0.0;
   let hitP = ro + rd * fh.t;
   // Colour/velocity sampled half a cell INTO the body so a grazing entry does
@@ -16608,6 +16757,14 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // alone so a thick MPM body standing in a shallow puddle still shades as MPM
   // fluid, and caLen == 0 is still exactly the authored look.
   let caFrac = smoothstep(0.05, 0.55, caLen / max(colVox, 0.5));
+  // The calm raft's share (see `calm` below, where it also gates the ripple),
+  // decided BEFORE any of the surface work: a pixel the raft owns outright is
+  // shaded by fs's shadeWater alone (ONE WATER SHADE A PIXEL ON A CALM RAFT),
+  // so nothing past this point would reach it. `raftOk` = fs will run that
+  // shade on this pixel (no early return where it would not).
+  let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
+  gMpmLakeW = clamp(caFrac * calm, 0.0, 1.0);
+  if (raftOk && !fh.inside && gMpmLakeW >= MPM_RAFT_HI) { return sceneBehind; }
 
   // ---- absorption + body (shared by the submerged and surface paths) ----
   // Beer-Lambert per channel, coefficients derived from the material albedo:
@@ -16731,9 +16888,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // boundary rather than two that merely resemble each other. Up-facing only,
   // exactly as waterNormal restricts it: the wave field describes a top
   // surface, and tilting a wall with it pushes the normal into the terrain.
-  let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
   let rippleW = clamp(max(s.settled, caFrac * calm), 0.0, 1.0);
-  gMpmLakeW = clamp(caFrac * calm, 0.0, 1.0);
   // The rough-mirror lobe of that same ripple field (waterReflBlur), for the
   // reflection below -- the MPM half of a lake must lose its stars exactly
   // where the CA half does.
@@ -20750,7 +20905,8 @@ fn fs(in : VSOut) -> FSOut {
         caPath = max(far.t - mf.t, 0.0) + fb.path;
       }
       let behindMpm = color;
-      color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color);
+      let raftOk = !mf.inside && h.liqT > 0.05 && caMat == caMatRaw;
+      color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color, raftOk);
       if (SEAM_DBG >= 5u) { gDbgW0.x = 2.0; }
       // ---- A CALM RAFT ON THE LAKE IS THE LAKE (ticket 2026-10-10 10:50) ----
       // mfLake handed the settled surface to the lake's shade; this is the
@@ -20765,8 +20921,12 @@ fn fs(in : VSOut) -> FSOut {
       // column under it: the same law the lake around it is drawn with, so
       // the boundary is only where the water genuinely moves. The veil terms
       // blend by the same weight.
-      let lakeW = gMpmLakeW;
-      if (lakeW > 0.01 && !mf.inside && h.liqT > 0.05 && caMat == caMatRaw) {
+      var lakeW = gMpmLakeW;
+      // Remapped (ONE WATER SHADE A PIXEL ON A CALM RAFT): 1 above the band,
+      // where shadeMpmFluid already returned before its surface work, and 0
+      // below it, where this shade is not run at all.
+      lakeW = smoothstep(MPM_RAFT_LO, MPM_RAFT_HI, lakeW);
+      if (lakeW > 0.01 && raftOk) {
         let mK = gVK; let mS = gVScatter; let mA = gVAbsorb; let mD = gVDelta;
         let mC = gVCurv;
         let wHit = R.camPos + rd * mf.t;

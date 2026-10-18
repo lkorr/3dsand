@@ -709,6 +709,7 @@
     "fluidExciteStep": 2,
     "fluidSpoutGain": 0.3,
     "fluidSpoutChance": 0.6,
+    "fluidEnabled": 1,
     "fluidSettledMass": 1,
     "fluidSubmergedSolid": 1,
     "fluidSettleEps": 6,

@@ -4241,6 +4241,30 @@ EMPTY lateral neighbour whose own below-cell is also empty, i.e. the water is
 perched on a ledge and could fall diagonally. **Default OFF since WP5**
 (`sim.fluidExcitePerch`), on the EXCITE side only — see below.
 
+**THE MASTER SWITCH: `sim.fluidEnabled`** (2026-10-18; the owner's "MPM
+water in world" checkbox in the F1 tool panel's MPM fluid section and the MPM
+Fluid Tuning window). 1 = everything above, unchanged. 0 = no MLS-MPM particle
+is born anywhere, and the ones alive go back to the CA. It is NOT
+`fluidExciteMode` (which gates triggers (a)-(d) only and needs a shader
+reload): it rides `TickParams._padSplash2` bit 0 (SET = off, so a TickParams
+built elsewhere reads as on), packed per tick by `SubmitTick`, so it is live,
+on the tick input stream and in the op record. Off, in full: `SubmitTick` also
+zeroes `fluidExciteEnable` and the water bodies' discharge block
+(`waterDrainBodies`, so the ledger refuses every discharge); `exciteDetect`
+looks at no cell (so the drain shell and progressive wake, which sit outside
+the excite gate, are off too); a CPU spawn op becomes plain CA liquid
+(`FluidSpawnsAsCells`: one eighth per op summed per cell, a full or
+other-liquid cell passes the rest up its column, fill-air-only cell ops, so a
+pour aimed into standing water is refused there like a prefab paint) and a
+ghost op is dropped; and `settleScan` DRAINS the pool through the force-settle
+path with its gates opened — a slot is forced after 2 ticks holding particles
+(not `fluidStuckTicks`), up to 16 forced blocks a tick (not
+`fluidForceBlocks`), and the forced walk's floor test is lifted, so water in
+flight is written where it stands as CA liquid and the CA drops it (excite
+cannot take it back; there is nothing to oscillate with). The walk is still
+the all-or-nothing one, so the drain conserves mass exactly. Gate:
+`fluid-off`.
+
 **WP5: THE FLIP, AND WHAT IT COSTS** (2026-08-25; world hash 7b01cfd8 →
 58b27f33). `sim.fluidExciteMode` ships at 1, so world water responds to being
 dug under. The plan's other half — deleting the CA's liquid movement — was
@@ -4873,7 +4897,14 @@ the surfaces its particles make — the pour, the splash, a raft standing proud
 of the lake — and for those the CA column now includes `liqExtra` (the far
 bed past the handoff) and, when the near trace crossed no liquid at all, the
 cascade's own water under them, so a raft past 20 m blends to the lake instead
-of the authored blue. Instruments: `SEAM_DBG 9` (owner per water pixel, caFrac,
+of the authored blue. A raft that has STOPPED moving on a deep column is the
+lake's too, by weight (`gMpmLakeW` = caFrac x calm), and since 2026-10-18 that
+weight is a near-switch, not a mix (`MPM_RAFT_LO`/`HI`, 0.3..0.5): above the
+band the pixel is `shadeWater` alone and `shadeMpmFluid` returns before its
+normal and traces, below it `shadeWater` is not run, and only the band pays
+both shades (ticket 2026-10-17_21-03-25: on the breached dam 97% of the MPM
+pixels paid two full shades for a weight >= 0.99; owner-approved look change,
+`docs/PLAN_frame_perf.md` §12). Instruments: `SEAM_DBG 9` (owner per water pixel, caFrac,
 foam) and `10` (settled share, churn, column). Repro without a C++ hook:
 `--shot-fluid-pond` on a map with an authored lake at the pond site
 (`SANDVOX_MAP`), since the harness map has no pond there.
@@ -5048,9 +5079,34 @@ excited particles born each tick: how many carry a throw, where, how fast):
   a cell resting on something with a lateral neighbour that is air over air
   (the perch configuration) and, on the OPPOSITE side, this liquid with its
   head ≥ 3 rows over the cell — the head is what tells a spout from a film on a
-  ramp, the case `sim.fluidExcitePerch` is off for. Still inside
-  `settleCheck`'s veto (it tests the full perch predicate), so settle can never
-  rebuild what it takes. It needs `fluidExciteMode` on and both knobs non-zero.
+  ramp, the case `sim.fluidExcitePerch` is off for. Its "air over air" is the
+  raw VOXEL, not the perch predicate's mass-aware `seamNeighbourState`: while
+  a spout pours, its own stream's particles fill the drop, and the mass-aware
+  test cut `fluid-spout`'s throws to 55 particles (+0.24 cells, need +0.50).
+  So it is NOT a strict subset of `settleCheck`'s veto, which reads excited
+  mass: settle may rebuild a mouth cell beside a particle-filled drop and the
+  mouth takes it again. What bounds that is the head: every take moves water
+  out of the reservoir, and below 3 rows standing over the lip it stops. It
+  needs `fluidExciteMode` on and both knobs non-zero.
+- **A REAL HEAD for the fall cells too** (2026-10-18). A FALL cell is thrown
+  only if the water it came out of stands >= 3 rows (`SPOUT_MOUTH_HEAD`) over
+  its row, the mouth's own bound. Trigger (a) asks for an air VOXEL below, and
+  over a flood that voxel is air with particles in it: a settled cell lying on
+  moving water, its "source" the flood's own surface beside it, 1 or 2 rows
+  over it. Seeded at rest that re-wake is dissipative; thrown, every re-wake
+  handed the body a fresh Torricelli kick and settle/excite pumped energy
+  (measured, `flow-measure` R, a breach that must relax: 1.97 cells/s left
+  after 900 ticks, vs 0.37 with the throw off, and 2.10 with the throw kept
+  but refused over a drop holding excited mass, since sparse spray reads as
+  empty). The head alone still threw at the seam's edge (a settled column 3+
+  rows beside a cell lying on the particle body: `flow-measure`'s SPOUT THROWS
+  attribution, 380 thrown births in the +600..900 tail, 20 of 24 box chunks
+  awake), so the fall cell also needs A REAL DROP: no node mass >=
+  `SEAM_MASS_MIN` in the cell under it. Head + drop measured 2026-10-18: R
+  0.71, tail throws 40, 10 of 24 chunks awake (the chance-0 figure), but
+  `fluid-spout` +0.49 cells against its 0.50 floor (head alone: +0.58) --
+  UNFINISHED: the package was stopped here, before that was tuned. Such cells
+  still excite, at rest.
 - **THE NOZZLE.** A thrown cell is born one cell from SETTLED water, whose
   nodes `clearGrid` seeds with zero-velocity mass; the particle's quadratic
   support still gathers ~28% from that node, so each substep kept ~72% of the
@@ -25924,6 +25980,23 @@ one inside the other, and three changes:
   and in `exciteScratch[7]`. The reservoir takes it back as it takes a GIVE;
   a breach's rush is then a pour, not a jet. (Absorbing particles in the
   surface band on their way down as well was measured and is not needed.)
+* **...and dilutes another liquid's particles buried in it** (2026-10-18,
+  ticket 2026-10-17_00-04-26). A particle of a DIFFERENT liquid inside a
+  settled cell of a map column's held water, at or under its top cell (at
+  most `SEAM_DILUTE_DEPTH`, 48, under it), is absorbed the same way: the
+  refill buried it in a body the window holds a few metres of. Nothing else
+  can take it (a submerged cell is solid to the solver, water to the CA, and
+  the settle walk must not merge it, below). Acid that SETTLES on the river
+  stays acid, sinks and eats the bed.
+* **Two liquids do not merge in a settle walk** (`settleColumn`, same
+  ticket). A settled cell of another liquid than the arriving content (the
+  pool from below, or the cell's own bin) is FOREIGN: left untouched, and the
+  content is carried up through it to the first cell that can hold it; an
+  emptied pool carries no identity up. Before, the walk's identity was a
+  running max, so acid (id 13) settling in a river re-placed the water column
+  above it as acid and the reservoir refilled it: `acid-pour` measured 9,840
+  cells poured, 33,856 standing 600 ticks later and 53,707 bed cells eaten;
+  with the walk fix, 1,037-5,866 eaten and the awake peak 770 -> 241-422.
 * **The top cell over its target is at rest** (`sim_step.wgsl` `heldRest`,
   map columns only). With the seam out of it, C still ran forever with NO
   particle involved: TAKE 12.5k / GROW 5.8k / GIVE 1.9k eighths in the first

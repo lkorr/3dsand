@@ -57,6 +57,10 @@ struct TickOps {
   std::vector<ExplosionOp> exps;
   std::vector<CellOp> cells;
   std::vector<ParticleSpawn> spawns;
+  // MPM fluid particles (the fluid tool's pour, FluidSpawnOp). Pushed first
+  // like the rest, so the tick's own spawns are charged against kFluidCap
+  // after them (`acid-pour`).
+  std::vector<FluidSpawnOp> fluid;
   // The command the harness body plays this tick. Empty by default: the body
   // is a camera nobody is playing. A gate that asserts an INPUT path (a
   // button's press edge reaching the tick) sets the bits it means.

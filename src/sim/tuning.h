@@ -3150,6 +3150,14 @@ struct Tuning {
     // SubmitTick packs both into TickParams._padSplash1.
     float fluidSpoutGain = TPD(sim, fluidSpoutGain);
     float fluidSpoutChance = TPD(sim, fluidSpoutChance);
+    // ---- THE MASTER SWITCH: MPM water in the world at all ----------------
+    // 1 = MLS-MPM water behaves as it always has. 0 = no particle is ever
+    // born (no excite trigger fires, no water-body discharge, CPU spawn ops
+    // land as plain CA liquid, ghost ops are dropped) and live particles are
+    // force-settled back into voxels, mass conserved. Live: SubmitTick packs
+    // it into TickParams._padSplash2 every tick, no shader recompile. The
+    // F1 tool panel's "MPM water in world" checkbox drives it.
+    int fluidEnabled = TPD(sim, fluidEnabled);
     // ---- settled liquid as MPM boundary mass ------------------------------
     // WP4 shipped the two representations passing straight THROUGH each other:
     // sim_fluid.wgsl's fluidSolid() blocks solids and powders only, and a
