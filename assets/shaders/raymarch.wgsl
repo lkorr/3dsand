@@ -15743,32 +15743,6 @@ fn fluidChunkExit(ro : vec3f, inv : vec3f, c : vec3<i32>, t : f32) -> f32 {
   return max(min(min(tf.x, tf.y), tf.z), t + 0.05);
 }
 
-// THE XZ-COLUMN SKIP (2026-10-18, water perf round 2). Must the march's coarse
-// loop take fluidFieldAt's taps at p (cell c), in a class-1 chunk whose
-// occupancy word is `ym`? Bits 16..31 of that word are the XZ half
-// (sim_fluid.wgsl fbmXZBits; THE SAME CONVENTION LIVES THERE AND IN
-// sim_fluid_seam.wgsl): one bit per 4x4 group of columns, lit for every node
-// with >= FLUID_MASS_MIN and every settled liquid cell of the block, dilated
-// +-2 cells. A sample's taps are x,z in [floor(p - 0.5), +1] (within 1 of c)
-// and y in [c.y - 1, c.y + 1]; when all of them lie in THIS chunk and c's
-// group is clear, every tap reads a node of mass < 16 (fill < 0.002 at the
-// default rest density) and no liquid voxel, so the field is below
-// iso * 0.25 -- and the coarse loop only ever COMPARES the field to iso and
-// iso * 0.25. Reading it as 0 there takes the same branch at every step: the
-// same t sequence, the same crossing, the same pixels, without the 8-12 grid
-// and voxel loads of the sample. A tap box that reaches into a neighbour chunk
-// is always sampled (the neighbour's mass is not in this word).
-fn fluidColumnSampled(p : vec3f, c : vec3<i32>, ym : u32) -> bool {
-  let lc = c & vec3<i32>(CHUNK_MASK);
-  let bx = i32(floor(p.x - 0.5)) - (c.x - lc.x);
-  let bz = i32(floor(p.z - 0.5)) - (c.z - lc.z);
-  if (bx < 0 || bx > i32(CHUNK) - 2 || bz < 0 || bz > i32(CHUNK) - 2 ||
-      lc.y < 1 || lc.y > i32(CHUNK) - 2) {
-    return true;
-  }
-  return ((ym >> (16u + u32(lc.x >> 2) + 4u * u32(lc.z >> 2))) & 1u) != 0u;
-}
-
 struct FluidHit {
   hit    : bool,
   t      : f32,    // entry distance along the ray (0 when the camera is inside)
@@ -16059,10 +16033,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
                 t + 0.5);
         continue;
       }
-      var d = 0.0;
-      if (TUNE_PERF_EXP != 1 || heldClass != 1u || fluidColumnSampled(p, c, heldYMask)) {
-        d = fluidFieldAt(p);
-      }
+      let d = fluidFieldAt(p);
       if (d >= iso) { found = true; break; }
       tPrev = t;
       // Adaptive stride: far below the iso the field cannot reach it within

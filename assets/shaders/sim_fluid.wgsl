@@ -891,7 +891,7 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
 // brick (k decays of an un-added-to value ARE k decays: g2p adds foam only at
 // dirty substeps, after that substep's gridUpdate has caught the brick up),
 // and FA_CLAMPED for the static substeps. Everything read after the tick -- the
-// renderer, the seam's settle and wake, the CA's fluidOccMat, the Y/XZ mask --
+// renderer, the seam's settle and wake, the CA's fluidOccMat, the Y mask --
 // is word for word what the dense passes left (rule 1).
 // The first substep of a tick clears every brick (alloc raises BRICK_FULL):
 // block indices are reassigned each tick, so last tick's ledger is meaningless.
@@ -1316,27 +1316,6 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
 // OR and the SUM are folded in workgroup memory and published once. OR and
 // integer add are associative and commutative, so the words end up bit-for-bit
 // what the per-node atomics produced (rule 1).
-// ---- THE XZ-COLUMN HALF OF THE OCCUPANCY WORD (2026-10-18) ---------------
-// The Y-mask word (common.wgsl fbmYMaskIndex) uses bits 0..15. Bits 16..31 are
-// its sibling: one bit per 4x4 group of the chunk's 16x16 columns, bit
-// 16 + gx + 4*gz, lit for every node/cell the Y half lights, dilated +-2 cells
-// in x and z exactly as the Y half is in y. A clear bit therefore proves no
-// node of the block within 2 columns of that group carries >= FLUID_MASS_MIN
-// and no settled liquid voxel stands there: the raymarch's MPM march
-// (raymarch.wgsl fluidMarch) reads a sample whose whole tap box lies in such a
-// group as empty without its taps. Set ONLY together with Y bits, so every
-// `word != 0` test of the mask is unchanged. Render-only, retired with the Y
-// half by alloc's phase A. THE SAME DECLARATION LIVES IN sim_fluid.wgsl,
-// sim_fluid_seam.wgsl AND raymarch.wgsl (kept out of common.wgsl on purpose).
-fn fbmXZBits(lx : i32, lz : i32) -> u32 {
-  let x0 = u32(clamp(lx - 2, 0, 15)) >> 2u;
-  let x1 = u32(clamp(lx + 2, 0, 15)) >> 2u;
-  let z0 = u32(clamp(lz - 2, 0, 15)) >> 2u;
-  let z1 = u32(clamp(lz + 2, 0, 15)) >> 2u;
-  let xm = ((2u << x1) - 1u) & ~((1u << x0) - 1u);
-  return ((xm << (4u * z0)) | (xm << (4u * z1))) << 16u;
-}
-
 var<workgroup> guYMask : atomic<u32>;
 var<workgroup> guClamped : atomic<u32>;
 
@@ -1392,11 +1371,11 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
 //     exactly FLUID_SUBSTEPS decays applied, as the dense pass did);
 //   * a CLEAN brick (not processed by the last substep's gridUpdate) holds the
 //     clear+seed state, so the dense pass's last-substep result for it is
-//     gridUpdateNode on what is there -- velocity, Y/XZ bits -- and its
+//     gridUpdateNode on what is there -- velocity, Y bits -- and its
 //     FA_CLAMPED share is that node's clamp once per substep it was static;
 //   * a RECLEAR brick holds the last substep's real result already; its
 //     static substeps (if any) still owe FA_CLAMPED, from the seed alone.
-// Its Y/XZ bits need nothing more: a node static for some substeps had the
+// Its Y bits need nothing more: a node static for some substeps had the
 // seed mass then and seed + particles (>= seed) at its dirty ones, which lit
 // the same bits when gridUpdate processed it.
 @compute @workgroup_size(256)
@@ -1467,7 +1446,7 @@ fn foamDecay(ni : u32, k : u32) {
 // One node of gridUpdate (block, chunk-local node index). `decays` foam
 // decays first (the owed ones plus this substep's); `clampMul` is how many
 // substeps this result stands for in FA_CLAMPED (1 from gridUpdate, the
-// static substep count from gridFinish). Returns (this node's Y/XZ-mask bits,
+// static substep count from gridFinish). Returns (this node's Y-mask bits,
 // clamp count) for the workgroup fold; every other effect is its own.
 fn gridUpdateNode(block : u32, localIdx : u32, decays : u32, clampMul : u32) -> vec2<u32> {
   let ni = (block * CHUNK_VOL + localIdx) * FLUID_GW;
@@ -1485,8 +1464,7 @@ fn gridUpdateNode(block : u32, localIdx : u32, decays : u32, clampMul : u32) -> 
   // This node carries mass: light its y level in the chunk's Y-occupancy mask
   // (common.wgsl). Render-only derived data, folded per workgroup by the entry
   // point above; the word is retired once per tick by `alloc`'s phase A.
-  let ybits = fbmYBits(i32((localIdx >> 4u) & 15u)) |
-              fbmXZBits(i32(localIdx & 15u), i32(localIdx >> 8u));
+  let ybits = fbmYBits(i32((localIdx >> 4u) & 15u));
   var v : vec3<i32>;
   // Momentum is MASS-weighted (p2g1), so divide by the node's mass, not its
   // volume: the same pressure force moves a lava node a 2.8th as far as a

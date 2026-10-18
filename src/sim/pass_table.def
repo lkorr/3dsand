@@ -2345,7 +2345,7 @@ PASS(copy_fluidPArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 16,0,12, GRP_NON
 // fluidOccMat next tick, the renderer -- must see the state the dense node
 // passes left: the static velocity of every brick the last substep skipped,
 // every brick's owed foam decays, the static substeps' FA_CLAMPED, and the
-// Y/XZ occupancy bits of the clean bricks. Same uses as fluidGridUp (it runs
+// Y occupancy bits of the clean bricks. Same uses as fluidGridUp (it runs
 // the same node update), dispatched off the same node args.
 // read-only in practice: `fluidBlockList` is read_write for the module because
 // alloc writes it; gridFinish only reads its block's chunk slot.

@@ -3089,6 +3089,11 @@ struct RenderArm {
   // pair only means something under precipitation — pin it for the run with
   // SANDVOX_WEATHER=rain (or storm, for the steep lean).
   bool noRainMap = false;
+  // OR'd into RenderParams.fluidCount (raymarch.wgsl fluidStage): the MPM
+  // surface's own attribution stages, the lab's (lab.cpp FluidArm) on a budget
+  // camera. 1 = coarse march only, 3 = + thickness walk, 4 = the step heatmap
+  // (a picture, not a cost: read it with SANDVOX_BUDGET_ARM_SHOTS=1).
+  uint32_t fluidBits = 0;
 };
 
 const RenderArm kRenderArms[] = {
@@ -3409,6 +3414,17 @@ const RenderArm kExtraArms[] = {
      [](Tuning& t) { t.debug.perfExp = 15; }, true, 1,
      "whatever experiment 15 in the shaders is — see TUNE_PERF_EXP",
      false, false, /*anyCamera=*/true},
+    // The MPM surface's stages (fluidBits above): full minus mpmcoarse is
+    // refine + thickness + shade, mpmthick minus mpmcoarse the thickness walk.
+    {"mpmcoarse", "MPM surface: coarse march only (a hit reads as a miss)", nullptr,
+     true, 1, "everything the MPM surface costs past its coarse march", false, false,
+     /*anyCamera=*/true, false, 1u << 28},
+    {"mpmthick", "MPM surface: march + thickness walk, no shade", nullptr, true, 1,
+     "the MPM shade (and lake-ownership test) past the march + thickness", false,
+     false, /*anyCamera=*/true, false, 3u << 28},
+    {"mpmheat", "MPM surface: the step heatmap (picture only)", nullptr, true, 1,
+     "nothing: r = march iterations, g = field samples, b = empty strides, /96",
+     false, false, /*anyCamera=*/true, false, 4u << 28},
     // The baseline AGAIN, last: arms share one world and one set of render
     // caches (shadow cache, GI cache, openness), so an arm that changes what
     // those caches hold hands the NEXT arm a different warm state. `base2`
@@ -4701,7 +4717,7 @@ class RenderBudgetRunner {
       // actually played in.
       WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
                         arm.shadows, kBudgetAnimTime, kFarFogDensity, (float)H,
-                        skyTick_, s.fluidLive);
+                        skyTick_, s.fluidLive | (s.fluidLive ? arm.fluidBits : 0u));
       rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
       uint32_t pb = 0, pe = 0, rb = 0, re = 0;
       const bool timedPre = timer_.AllocPassPair("pre", pb, pe);
@@ -4781,11 +4797,12 @@ class RenderBudgetRunner {
   // exists for exactly one reason: `build/render_budget.bmp` is the path
   // everything downstream already knows, and the noon camera has to keep
   // writing it even though it now also writes render_budget_noon.bmp.
-  void Shot(const Scene& s, const char* path, const char* alsoPath = nullptr) {
+  void Shot(const Scene& s, const char* path, const char* alsoPath = nullptr,
+            uint32_t fluidBits = 0) {
     const uint32_t W = opt_.width, H = opt_.height;
     WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
                       /*shadows=*/true, kBudgetAnimTime, kFarFogDensity,
-                      (float)H, skyTick_, s.fluidLive);
+                      (float)H, skyTick_, s.fluidLive | (s.fluidLive ? fluidBits : 0u));
     rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
     {
       rhi::RenderPass rp = sim_.BeginRenderPass(
@@ -5294,7 +5311,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       // differ boot to boot). build/render_budget_<cam>_<arm>.bmp.
       if (r.ok && std::getenv("SANDVOX_BUDGET_ARM_SHOTS")) {
         const std::string p = std::string("build/render_budget_") + id + "_" + arm->id + ".bmp";
-        runner.Shot(scene, p.c_str());
+        runner.Shot(scene, p.c_str(), nullptr, arm->fluidBits);
       }
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
