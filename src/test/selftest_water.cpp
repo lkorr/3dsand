@@ -4000,26 +4000,47 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const int kDeep = (int)BaselineNumber("flowMeasure.deep", 8);
   const int kGap = (int)BaselineNumber("flowMeasure.gap", 6);
   const int x0 = cx - kHalfX, x1 = cx + kHalfX, z0 = cz - kHalfZ, z1 = cz + kHalfZ;
-  const int fy = FixtureYOver(x0 - 1, z0 - 1, x1 + 1, z1 + 1, kDefaultSeed, 1);
-  const int wallTop = fy + kDeep + 3;
   std::vector<CellOp> build, fill, breach;
+  // One dam box: an open stone box round (bx, bz), split by a stone dam at
+  // x = bx, the west half `deep` full cells of water, and a gap kGap wide
+  // round z = bz cut through the dam's rows fy + rowLo .. fy + rowHi at the
+  // breach. Returns fy (the floor's top).
   // The floor is a SLAB down into the ground, not one layer at fy: fy is one
   // over the footprint's highest terrain, so a one-layer floor touches
   // nothing, and the first support-loss scan after the breach (the dam's cut
   // cells) turned the whole box into a debris body and poured the reservoir
   // out (the first run: "island of 4711 voxels -> 1 body shard").
-  for (int z = z0 - 1; z <= z1 + 1; z++)
-    for (int x = x0 - 1; x <= x1 + 1; x++)
-      for (int y = fy - 12; y <= wallTop + 6; y++) {
-        const bool wall = x < x0 || x > x1 || z < z0 || z > z1 || x == cx;
-        const bool solid = (y <= wallTop && wall) || y <= fy;
-        build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
-        if (x >= x0 && x < cx && z >= z0 && z <= z1 && y >= fy + 1 && y <= fy + kDeep)
-          fill.push_back({World::SlotCellIndex({x, y, z}), PackVoxNew(kMatWater, 7u)});
-      }
-  const int gz0 = cz - kGap / 2, gz1 = gz0 + kGap - 1;
-  for (int z = gz0; z <= gz1; z++)
-    for (int y = fy + 1; y <= wallTop; y++) breach.push_back({World::SlotCellIndex({cx, y, z}), 0u});
+  auto addBox = [&](int bx, int bz, int deep, int rowLo, int rowHi) {
+    const int ax0 = bx - kHalfX, ax1 = bx + kHalfX, az0 = bz - kHalfZ, az1 = bz + kHalfZ;
+    const int bfy = FixtureYOver(ax0 - 1, az0 - 1, ax1 + 1, az1 + 1, kDefaultSeed, 1);
+    const int top = bfy + deep + 3;
+    for (int z = az0 - 1; z <= az1 + 1; z++)
+      for (int x = ax0 - 1; x <= ax1 + 1; x++)
+        for (int y = bfy - 12; y <= top + 6; y++) {
+          const bool wall = x < ax0 || x > ax1 || z < az0 || z > az1 || x == bx;
+          const bool solid = (y <= top && wall) || y <= bfy;
+          build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
+          if (x >= ax0 && x < bx && z >= az0 && z <= az1 && y >= bfy + 1 && y <= bfy + deep)
+            fill.push_back({World::SlotCellIndex({x, y, z}), PackVoxNew(kMatWater, 7u)});
+        }
+    const int gz0 = bz - kGap / 2, gz1 = gz0 + kGap - 1;
+    for (int z = gz0; z <= gz1; z++)
+      for (int y = bfy + rowLo; y <= std::min(bfy + rowHi, top); y++)
+        breach.push_back({World::SlotCellIndex({bx, y, z}), 0u});
+    return bfy;
+  };
+  // Box 1: the full-height breach (claims Q G V K W D R C).
+  const int fy = addBox(cx, cz, kDeep, 1, kDeep + 3);
+  const int wallTop = fy + kDeep + 3;
+  // Box 2 (ticket 2026-10-18_11-30-37): a SUBMERGED breach -- the gap cut
+  // through rows fy2 + subLo .. fy2 + subHi only, under kDeep2 of water, so
+  // there is water above AND below the hole (claims S, Cv). Far enough south
+  // (sub.dz cells) that neither box reaches the other's nodes.
+  const int kDeep2 = (int)BaselineNumber("flowMeasure.subDeep", 10);
+  const int kSubLo = (int)BaselineNumber("flowMeasure.subLo", 4);
+  const int kSubHi = (int)BaselineNumber("flowMeasure.subHi", 6);
+  const int cx2 = cx, cz2 = cz + (int)BaselineNumber("flowMeasure.subDz", 96);
+  const int fy2 = addBox(cx2, cz2, kDeep2, kSubLo, kSubHi);
 
   const int kBreachAt = (int)BaselineNumber("flowMeasure.breachAt", 90);
   const int kAt = (int)BaselineNumber("flowMeasure.at", 45);
@@ -4094,6 +4115,53 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     }
     return n;
   };
+  // K / W (ticket 2026-10-18_11-30-37: "every vector influenced by the dam
+  // is pointing in the same direction ... they should all be pointing
+  // towards the hole itself ... smoothly curve towards that direction when
+  // you're approaching from the sides"). Per ring point, the angle between
+  // the published current and the direction to the gap, degrees; the SPREAD
+  // is the angle between the two outermost ring points' currents (a field
+  // copied from the gap reads ~0 there, a converging one ~the arc's span).
+  // W: two points beside the gap along the dam's lake face, sideDz cells
+  // north and south of it, must run along the face toward it.
+  const double convAngle = BaselineNumber("flowMeasure.convAngle", 35.0);
+  const int convMin = (int)BaselineNumber("flowMeasure.convMin", 6);
+  const double convSpread = BaselineNumber("flowMeasure.convSpread", 45.0);
+  const double sideDz = BaselineNumber("flowMeasure.sideDz", 12.0);
+  const double sideAngle = BaselineNumber("flowMeasure.sideAngle", 60.0);
+  const float kDeg = 57.2957795f;
+  auto angleTo = [&](Vec3 v, Vec3 p) {   // degrees between v and p -> gap, horizontal
+    const float s = speed(v);
+    const float dx = gapP.x - p.x, dz = gapP.z - p.z, dl = std::sqrt(dx * dx + dz * dz);
+    if (s <= 0.0f || dl <= 0.0f) return 180.0f;
+    return std::acos(std::clamp((v.x * dx + v.z * dz) / (s * dl), -1.0f, 1.0f)) * kDeg;
+  };
+  auto angleBetween = [&](Vec3 a, Vec3 b) {
+    const float sa = speed(a), sb = speed(b);
+    if (sa <= 0.0f || sb <= 0.0f) return 0.0f;
+    return std::acos(std::clamp((a.x * b.x + a.z * b.z) / (sa * sb), -1.0f, 1.0f)) * kDeg;
+  };
+  const Vec3 sideN{(float)cx - 3.5f, sy, (float)cz + (float)sideDz};
+  const Vec3 sideS{(float)cx - 3.5f, sy, (float)cz - (float)sideDz};
+  int converged = 0;
+  float spread = 0.0f, sideAngN = 180.0f, sideAngS = 180.0f, sideSpdN = 0.0f, sideSpdS = 0.0f;
+  std::string ringAngles;
+  // S (the same ticket: "if the hole in the wall is located a bit below ...
+  // current should be able to pull material down into the water"): box 2's
+  // submerged gap. Upstream of it, sub.x cells back from the dam: a point in
+  // the top water row must be pulled DOWN toward the hole, a point in the
+  // bottom row UP toward it, at >= vertMin cells/s; the point at the hole's
+  // own height is printed. Then it RELAXES: once the reservoir has drained to
+  // the hole's sill the 3D current at those points falls to <= relaxMax of
+  // its peak. Cv: a body there feels the downward pull too (the snapshot).
+  const double vertMin = BaselineNumber("flowMeasure.vertMin", 0.3);
+  const float subX = (float)cx2 - (float)BaselineNumber("flowMeasure.subX", 6.0) + 0.5f;
+  const Vec3 subAbove{subX, (float)(fy2 + kDeep2) - 0.5f, (float)cz2};
+  const Vec3 subBelow{subX, (float)fy2 + 1.5f, (float)cz2};
+  const Vec3 subHole{subX, (float)fy2 + 0.5f * (float)(kSubLo + kSubHi) + 0.5f, (float)cz2};
+  auto speed3 = [](Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+  Vec3 subA{0, 0, 0}, subB{0, 0, 0}, subH{0, 0, 0}, carryA{0, 0, 0};
+  float subPeak = 0.0f, subPeakY = 0.0f;
   const int total = kBreachAt + kSettle;
   // The box is ~120k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
   // the rest are REFUSED, not queued (the first run built half a box and its
@@ -4122,6 +4190,22 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       ringPull(pulled, ringMean);
       carryGap = carry(gapP);
       carryPulled = carryRing();
+      for (size_t k = 0; k < ring.size(); k++) {
+        const Vec3 v = at(ring[k]);
+        const float a = angleTo(v, ring[k]);
+        if (speed(v) >= pullSpeed && a <= convAngle) converged++;
+        ringAngles += Format("%s%.0f", k ? "/" : "", a);
+      }
+      spread = angleBetween(at(ring.front()), at(ring.back()));
+      const Vec3 vn = at(sideN), vs = at(sideS);
+      sideAngN = angleTo(vn, sideN);
+      sideAngS = angleTo(vs, sideS);
+      sideSpdN = speed(vn);
+      sideSpdS = speed(vs);
+      subA = at(subAbove);
+      subB = at(subBelow);
+      subH = at(subHole);
+      carryA = CurrentAtCpuSim(subAbove, subAbove.y - 0.5f, subAbove.y + 0.5f);
     }
     if (i > kBreachAt && (i - kBreachAt) % 15 == 0) {
       readGrid();
@@ -4131,6 +4215,8 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       const float bm = boxMax();
       peak = std::max(peak, bm);
       nearPeak = std::max(nearPeak, std::max(speed(at(gapP)), ringMax));
+      subPeak = std::max(subPeak, std::max(speed3(at(subAbove)), speed3(at(subBelow))));
+      subPeakY = std::max(subPeakY, std::max(std::abs(at(subAbove).y), std::abs(at(subBelow).y)));
       if ((i - kBreachAt) % 60 == 0 || i - kBreachAt <= 90)
         trace += Format("%s+%d: gap %.1f ring %.2f (%d pulled) box %.1f [fold@%d]",
                         trace.empty() ? "" : "; ", i - kBreachAt, speed(at(gapP)), m, p, bm,
@@ -4143,6 +4229,7 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   float endRingMean = 0.0f;
   ringPull(endPulled, endRingMean);
   const float endNear = std::max(speed(at(gapP)), ringMax);
+  const float subEnd = std::max(speed3(at(subAbove)), speed3(at(subBelow)));
   // The box's awake chunks, for the residual box max beside R.
   uint32_t boxAwake = 0, boxChunks = 0;
   {
@@ -4163,6 +4250,10 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   RecordObserved("flowMeasure.endObserved", endNear);
   RecordObserved("flowMeasure.carryObserved", carryGap.x);
   RecordObserved("flowMeasure.carryPulledObserved", carryPulled);
+  RecordObserved("flowMeasure.convergedObserved", converged);
+  RecordObserved("flowMeasure.spreadObserved", spread);
+  RecordObserved("flowMeasure.subAboveYObserved", subA.y);
+  RecordObserved("flowMeasure.subBelowYObserved", subB.y);
   std::vector<std::string> fails;
   if (quietGap < 0.0f || quietGap > 0.05f)
     fails.push_back(Format("Q: the still reservoir already published %.2f cells/s at the gap", quietGap));
@@ -4181,7 +4272,29 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
                            "(need east >= %.1f), %d of %zu ring points carried toward the gap (need %d)",
                            carryQuiet, carryGap.x, carryGap.z, kAt, carryMin, carryPulled, ring.size(),
                            pullMin));
+  if (converged < convMin || spread < convSpread)
+    fails.push_back(Format("K: %d of %zu ring points within %.0f deg of the gap (need %d), spread %.0f deg "
+                           "(need %.0f)", converged, ring.size(), convAngle, convMin, spread, convSpread));
+  if (sideAngN > sideAngle || sideAngS > sideAngle || sideSpdN < pullSpeed || sideSpdS < pullSpeed)
+    fails.push_back(Format("W: beside the gap along the dam the current is %.0f / %.0f deg off the gap at "
+                           "%.2f / %.2f cells/s (need <= %.0f deg, >= %.1f)", sideAngN, sideAngS, sideSpdN,
+                           sideSpdS, sideAngle, pullSpeed));
+  if (subA.y > -vertMin || subB.y < vertMin)
+    fails.push_back(Format("S: by the submerged gap the current above it is vy %.2f, below it vy %.2f "
+                           "(need <= -%.1f and >= %.1f)", subA.y, subB.y, vertMin, vertMin));
+  if (subPeak <= 0.0f || subEnd > relaxMax * subPeak)
+    fails.push_back(Format("S-R: the submerged breach's current still %.2f cells/s after %d ticks, peak %.2f "
+                           "(allow %.0f%%)", subEnd, kSettle, subPeak, relaxMax * 100.0));
+  if (carryA.y > -0.5 * vertMin)
+    fails.push_back(Format("Cv: a body above the submerged gap feels vy %.2f (need <= -%.2f)", carryA.y,
+                           0.5 * vertMin));
   detail = Format(
+      "K ring heading error %s deg, %d within %.0f, spread %.0f deg | W side N %.0f deg %.2f, S %.0f deg %.2f | "
+      "S submerged gap rows %d..%d of %d: above (%.2f, %.2f, %.2f) hole (%.2f, %.2f, %.2f) below (%.2f, %.2f, "
+      "%.2f), peak %.2f (vy %.2f) -> %.2f; Cv body vy %.2f | ",
+      ringAngles.c_str(), converged, convAngle, spread, sideAngN, sideSpdN, sideAngS, sideSpdS, kSubLo, kSubHi,
+      kDeep2, subA.x, subA.y, subA.z, subH.x, subH.y, subH.z, subB.x, subB.y, subB.z, subPeak, subPeakY, subEnd,
+      carryA.y) + Format(
       "dam breach %dx%dx%d, gap %d: Q quiet %.2f | G gap (%.1f, %.1f) cells/s vs solved %.2f | V %d/%zu ring "
       "points at %.0f cells pulled (mean %.2f) | D downstream (%.1f, %.1f) | R gap/ring peak %.1f -> %.2f "
       "after %d ticks; box max %.1f -> %.2f (%u of %u box chunks awake), grid n %u | C body carry quiet %.2f, "
