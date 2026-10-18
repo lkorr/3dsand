@@ -4873,7 +4873,14 @@ the surfaces its particles make — the pour, the splash, a raft standing proud
 of the lake — and for those the CA column now includes `liqExtra` (the far
 bed past the handoff) and, when the near trace crossed no liquid at all, the
 cascade's own water under them, so a raft past 20 m blends to the lake instead
-of the authored blue. Instruments: `SEAM_DBG 9` (owner per water pixel, caFrac,
+of the authored blue. A raft that has STOPPED moving on a deep column is the
+lake's too, by weight (`gMpmLakeW` = caFrac x calm), and since 2026-10-18 that
+weight is a near-switch, not a mix (`MPM_RAFT_LO`/`HI`, 0.3..0.5): above the
+band the pixel is `shadeWater` alone and `shadeMpmFluid` returns before its
+normal and traces, below it `shadeWater` is not run, and only the band pays
+both shades (ticket 2026-10-17_21-03-25: on the breached dam 97% of the MPM
+pixels paid two full shades for a weight >= 0.99; owner-approved look change,
+`docs/PLAN_frame_perf.md` §12). Instruments: `SEAM_DBG 9` (owner per water pixel, caFrac,
 foam) and `10` (settled share, churn, column). Repro without a C++ hook:
 `--shot-fluid-pond` on a map with an authored lake at the pond site
 (`SANDVOX_MAP`), since the harness map has no pond there.

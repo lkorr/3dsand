@@ -15649,6 +15649,27 @@ const FLUID_SEAM_SHELL : i32 = 2;
 // surface and is shaded by the lake's shade, not by shadeMpmFluid. A half:
 // the surface is the lake's where most of what makes it is the lake.
 const MPM_LAKE_SETTLED : f32 = 0.5;
+// ---- ONE WATER SHADE A PIXEL ON A CALM RAFT (2026-10-18, ticket 2026-10-17_21-03-25) --
+// The calm raft (gMpmLakeW, below; fs's "A CALM RAFT ON THE LAKE IS THE LAKE")
+// used to be a linear mix: shadeMpmFluid in full, then shadeWater in full,
+// blended by the raft weight. On the breached dam (`--render-budget dam`) 97%
+// of the MPM-shaded pixels paid both, and 80% of them had a weight >= 0.99, so
+// the whole MPM shade -- its 4-tap normal, its traced refraction and reflection
+// -- was computed to contribute under 1% of the pixel. The weight is now
+// remapped through smoothstep(MPM_RAFT_LO, MPM_RAFT_HI): at or above HI the
+// pixel is the lake's alone and shadeMpmFluid returns before its surface work;
+// at or below LO it is the MPM shade's alone and shadeWater is never called;
+// only the band between pays both. The owner approved the look change
+// (2026-10-18): calm water over a lake reads as the lake, water still moving
+// (churn above ~0.2 of the foam speed over a deep column) keeps the authored
+// MPM look. Where the weights sat (dam, MPM-shaded pixels): 3% below 0.3,
+// 5.4% at 0.5..0.6 (the fall's droplets in front of the CA sheet down the
+// wall), 80% at >= 0.995. The band 0.3..0.5 keeps those droplets the lake's
+// white water they mostly were (a 0.6..0.95 band made them glassy MPM cubes:
+// 12.5k pixels moved by > 32/255 against 2.0k for this one). `dam` 20.28 ->
+// 17.93 ms in one process (docs/PLAN_frame_perf.md §12).
+const MPM_RAFT_LO : f32 = 0.3;
+const MPM_RAFT_HI : f32 = 0.5;
 // shadeMpmFluid's answer to "how much of this surface is a calm raft of
 // particles floating on the lake" (caFrac * calm, its own two terms), for fs()
 // to hand that share of the pixel to shadeWater. Set on every call.
@@ -16491,7 +16512,7 @@ fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
 // or blood shade with their derived coefficients exactly as a pool of them
 // would.
 fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
-                 caPath : f32, sceneBehind : vec3f) -> vec3f {
+                 caPath : f32, sceneBehind : vec3f, raftOk : bool) -> vec3f {
   gMpmLakeW = 0.0;
   let hitP = ro + rd * fh.t;
   // Colour/velocity sampled half a cell INTO the body so a grazing entry does
@@ -16517,6 +16538,14 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // alone so a thick MPM body standing in a shallow puddle still shades as MPM
   // fluid, and caLen == 0 is still exactly the authored look.
   let caFrac = smoothstep(0.05, 0.55, caLen / max(colVox, 0.5));
+  // The calm raft's share (see `calm` below, where it also gates the ripple),
+  // decided BEFORE any of the surface work: a pixel the raft owns outright is
+  // shaded by fs's shadeWater alone (ONE WATER SHADE A PIXEL ON A CALM RAFT),
+  // so nothing past this point would reach it. `raftOk` = fs will run that
+  // shade on this pixel (no early return where it would not).
+  let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
+  gMpmLakeW = clamp(caFrac * calm, 0.0, 1.0);
+  if (raftOk && !fh.inside && gMpmLakeW >= MPM_RAFT_HI) { return sceneBehind; }
 
   // ---- absorption + body (shared by the submerged and surface paths) ----
   // Beer-Lambert per channel, coefficients derived from the material albedo:
@@ -16640,9 +16669,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // boundary rather than two that merely resemble each other. Up-facing only,
   // exactly as waterNormal restricts it: the wave field describes a top
   // surface, and tilting a wall with it pushes the normal into the terrain.
-  let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
   let rippleW = clamp(max(s.settled, caFrac * calm), 0.0, 1.0);
-  gMpmLakeW = clamp(caFrac * calm, 0.0, 1.0);
   // The rough-mirror lobe of that same ripple field (waterReflBlur), for the
   // reflection below -- the MPM half of a lake must lose its stars exactly
   // where the CA half does.
@@ -20658,7 +20685,8 @@ fn fs(in : VSOut) -> FSOut {
         caPath = max(far.t - mf.t, 0.0) + fb.path;
       }
       let behindMpm = color;
-      color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color);
+      let raftOk = !mf.inside && h.liqT > 0.05 && caMat == caMatRaw;
+      color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color, raftOk);
       if (SEAM_DBG >= 5u) { gDbgW0.x = 2.0; }
       // ---- A CALM RAFT ON THE LAKE IS THE LAKE (ticket 2026-10-10 10:50) ----
       // mfLake handed the settled surface to the lake's shade; this is the
@@ -20673,8 +20701,12 @@ fn fs(in : VSOut) -> FSOut {
       // column under it: the same law the lake around it is drawn with, so
       // the boundary is only where the water genuinely moves. The veil terms
       // blend by the same weight.
-      let lakeW = gMpmLakeW;
-      if (lakeW > 0.01 && !mf.inside && h.liqT > 0.05 && caMat == caMatRaw) {
+      var lakeW = gMpmLakeW;
+      // Remapped (ONE WATER SHADE A PIXEL ON A CALM RAFT): 1 above the band,
+      // where shadeMpmFluid already returned before its surface work, and 0
+      // below it, where this shade is not run at all.
+      lakeW = smoothstep(MPM_RAFT_LO, MPM_RAFT_HI, lakeW);
+      if (lakeW > 0.01 && raftOk) {
         let mK = gVK; let mS = gVScatter; let mA = gVAbsorb; let mD = gVDelta;
         let mC = gVCurv;
         let wHit = R.camPos + rd * mf.t;
