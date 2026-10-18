@@ -4189,7 +4189,18 @@ conditions read live from the voxel buffer through `voxWordAt`, 6 substeps per
 tick. The chunk→block MAP is built ONCE per tick (`PT_FLUIDMAP`), not once per
 substep: displacement is CFL-capped at 2.7 cells/tick and `mark` pads its
 support by 3, so the padded set is a superset of every substep's exact set.
-The node ACCUMULATORS are still cleared per substep. Every fluid dispatch is
+The node ACCUMULATORS are still cleared per substep, but only where a particle
+reached (THE BRICK LEDGER, 2026-10-18, `sim_fluid.wgsl`): a block is 64 bricks
+of 4^3 nodes, p2g1 marks the bricks its support touches (the 8 corner taps name
+them all), and clear / gridUpdate run only those -- the first substep of a tick
+clears everything (block indices are reassigned each tick). A brick nobody
+touched holds exactly clear+seed, the state each skipped substep would have
+rebuilt, and nothing reads it until the tick ends, so `gridFinish` (first row
+of PT_FLUIDSETTLE) writes the end state once: the static velocity of every
+untouched brick, the foam decays each brick was owed, the static substeps'
+FA_CLAMPED. Bit-exact (`--perf dam` hash and end-of-run grid census unchanged);
+on the breached dam (75 blocks, 2.7% of nodes in any support) the node passes
+went 1.52 -> 0.51 ms a tick. Every fluid dispatch is
 indirect off a GPU-owned count, so a world that has poured water and settled it
 records the tables (the CPU count is monotone by design — recording must never
 depend on readback timing) and costs ~0 ms.
@@ -4467,7 +4478,10 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
   The same synthesis makes an excited cell a SELF: an air cell whose intent
   names a fluid material runs that material's bucket through the unchanged
   `doReactions` (`sim_step` `excitedReact`, substep 0, gated on the chunk's
-  block-map word so a fluid-free chunk pays one broadcast load). A self
+  block-map word so a fluid-free chunk pays one broadcast load; since
+  2026-10-18 the colour gather takes an MPM chunk's air only in the y rows
+  its Y-occupancy mask lights -- a clear bit proves no node of that level
+  carried mass last tick, so excitedReact would have returned at once). A self
   product is written into the air cell and the cell's bin is flagged for
   `consumeApply` (`reactWriteSelf`) — the neighbour side's contract, from
   the other side. So splashing acid corrodes stone and eats organics, and

@@ -706,6 +706,9 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
         if (cs != SLOT_NONE &&
             (atomicLoad(&fluidBlockMap[cs]) & MAP_MARK) == 0u) {
           atomicOr(&fluidBlockMap[cs], MAP_MARK);
+          // ...and its bit of THE MARK BITMAP, so alloc walks the marks
+          // rather than every slot (fbmMarkWord). Idempotent like the OR above.
+          atomicOr(&fluidBlockMap[fbmMarkWord(cs >> 5u)], 1u << (cs & 31u));
         }
       }
     }
@@ -807,11 +810,20 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   // storage read is non-uniform to the compiler, and a barrier in non-uniform
   // control flow is a WGSL validation error. Skipping the WORK is enough.)
   let asleep = min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP) == 0u;
-  let span = NUM_SLOTS / 256u;    // 128 slots per thread
+  let span = NUM_SLOTS / 256u;    // 136 slots per thread
+  // THE MARK BITMAP (fbmMarkWord, 2026-10-18): after phase A a slot's index
+  // word is non-zero iff `mark` marked it this tick, and `mark` sets the slot's
+  // bit beside MAP_MARK, so the walk reads ceil(136 / 32) + 1 bitmap words a
+  // thread instead of 136 map words -- the same slots, in the same order. It
+  // was a single-workgroup walk of all NUM_SLOTS whenever anything was live,
+  // a world-sized cost (rule 2). The bits are cleared below as they are
+  // consumed, so the bitmap is all zero outside mark -> alloc.
+  let s0 = li * span;
+  let s1 = s0 + span;
   var n = 0u;
   if (!asleep) {
-    for (var s = li * span; s < (li + 1u) * span; s++) {
-      if (atomicLoad(&fluidBlockMap[s]) != 0u) { n += 1u; }
+    for (var wi = s0 >> 5u; wi <= (s1 - 1u) >> 5u; wi++) {
+      n += countOneBits(atomicLoad(&fluidBlockMap[fbmMarkWord(wi)]) & markSpanMask(wi, s0, s1));
     }
   }
   allocPartial[li] = n;
@@ -836,28 +848,48 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   workgroupBarrier();
   if (asleep) { return; }
   var idx = allocPartial[li];
-  for (var s = li * span; s < (li + 1u) * span; s++) {
-    if (atomicLoad(&fluidBlockMap[s]) == 0u) { continue; }
-    if (idx < FLUID_BLOCKS) {
-      atomicStore(&fluidBlockMap[s], idx + 1u);
-      fluidBlockList[idx] = s;
-      // min/max commute: the box is the same whatever the thread order.
-      let bw = vec3<u32>(slotWorldChunk(s, T.origin) + vec3<i32>(FBM_BOX_BIAS));
-      for (var k = 0u; k < 3u; k++) {
-        atomicMin(&fluidBlockMap[fbmBoxIndex() + k], bw[k]);
-        atomicMax(&fluidBlockMap[fbmBoxIndex() + 3u + k], bw[k]);
-      }
-      for (var k = 0u; k < 7u; k++) {
-        let ns = fbmNearSlot(s, k);
-        if (ns != SLOT_NONE) {
-          atomicOr(&fluidBlockMap[fbmNearWord(ns)], 1u << (ns & 31u));
+  for (var wi = s0 >> 5u; wi <= (s1 - 1u) >> 5u; wi++) {
+    let mk = markSpanMask(wi, s0, s1);
+    var bits = atomicLoad(&fluidBlockMap[fbmMarkWord(wi)]) & mk;
+    if (bits == 0u) { continue; }
+    // This thread's bits of the word only: a word straddling two spans is
+    // shared with the neighbouring thread, which clears its own.
+    atomicAnd(&fluidBlockMap[fbmMarkWord(wi)], ~mk);
+    while (bits != 0u) {
+      let s = wi * 32u + firstTrailingBit(bits);
+      bits &= bits - 1u;
+      if (idx < FLUID_BLOCKS) {
+        atomicStore(&fluidBlockMap[s], idx + 1u);
+        fluidBlockList[idx] = s;
+        // min/max commute: the box is the same whatever the thread order.
+        let bw = vec3<u32>(slotWorldChunk(s, T.origin) + vec3<i32>(FBM_BOX_BIAS));
+        for (var k = 0u; k < 3u; k++) {
+          atomicMin(&fluidBlockMap[fbmBoxIndex() + k], bw[k]);
+          atomicMax(&fluidBlockMap[fbmBoxIndex() + 3u + k], bw[k]);
         }
+        for (var k = 0u; k < 7u; k++) {
+          let ns = fbmNearSlot(s, k);
+          if (ns != SLOT_NONE) {
+            atomicOr(&fluidBlockMap[fbmNearWord(ns)], 1u << (ns & 31u));
+          }
+        }
+      } else {
+        atomicStore(&fluidBlockMap[s], 0u);  // over budget: freeze this chunk
       }
-    } else {
-      atomicStore(&fluidBlockMap[s], 0u);  // over budget: freeze this chunk
+      idx += 1u;
     }
-    idx += 1u;
   }
+}
+
+// THE MARK BITMAP: one bit per slot, after the brick ledger (world.cpp sizes
+// it). Set by `mark` with MAP_MARK, consumed and cleared by `alloc`.
+fn fbmMarkWord(wi : u32) -> u32 { return fbmBrickWord(FLUID_BLOCKS, 0u) + wi; }
+// The bits of bitmap word wi that fall in slot span [s0, s1).
+fn markSpanMask(wi : u32, s0 : u32, s1 : u32) -> u32 {
+  let lo = max(s0, wi * 32u) - wi * 32u;            // 0..31
+  let hi = min(s1, wi * 32u + 32u) - wi * 32u;      // 1..32
+  let upto = select((1u << hi) - 1u, 0xFFFFFFFFu, hi >= 32u);
+  return upto & ~((1u << lo) - 1u);
 }
 
 // ---- THE BRICK LEDGER: node passes over the bricks particles touch ---------
