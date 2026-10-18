@@ -121,14 +121,10 @@ fn flowMeasParticle(cell : vec3<i32>, vx : i32, vz : i32) {
   if (fz != 0) { atomicAdd(&flowMeasAcc[s + 1u], fz); }
   atomicMax(&flowMeasAcc[s + 2u], cell.y + FLOWM_Y_BIAS);
   atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - cell.y);
-  // The height moments, sim_step.wgsl flowMeasNote's: the gross flux in
-  // eighths x cells (one particle moving a cell a tick is 1; <= 16 as there).
-  let g = min((abs(fx) + abs(fz) + 8) >> 4u, 16);
-  if (g == 0) { return; }
-  let yc = clamp(cell.y - (T.origin.y * i32(CHUNK) + 256), -256, 255);
-  atomicAdd(&flowMeasAcc[s + 4u], g);
-  atomicAdd(&flowMeasAcc[s + 5u], g * yc);
-  atomicAdd(&flowMeasAcc[s + 6u], g * yc * yc);
+  // NO height moments (sim_step.wgsl flowMeasNote's): particles are the jet
+  // AFTER it has left a breach, falling and spraying, so their rows would
+  // spread the place the water is drawn FROM over the fall. The vertical is
+  // the CA's: where it moves water sideways under the surface.
 }
 
 @group(1) @binding(0) var<storage, read_write> fluidParticles : array<FluidParticle>;

@@ -26658,11 +26658,17 @@ should be able to pull material down into the water"). The grids are columns,
 so a node cannot hold a velocity per height; it holds WHERE in the column the
 water pulling it runs, and the readers turn that into a vertical velocity at
 any height:
-* **The height moments.** Each record also adds its gross flux `g` (eighths x
-  axes moved, <= 16; a particle's speed in eighths x cells), `g x y` and
-  `g x y^2`, `y` the source row about the window's middle (ACC grew 4 -> 8
-  words a slot). Integer adds, so still a function of the moves; a bin past
-  32767 gross is too big to trust and pulls nothing vertically.
+* **The height moments.** Each CA record also adds a weight `w = eighths^2`,
+  `w x y` and `w x y^2`, `y` the source row about the window's middle (ACC
+  grew 4 -> 8 words a slot). Squared, because a whole cell driven sideways by
+  the head behind it (the jet, the water drawn toward it under the surface)
+  must outweigh the drawn-down surface's levelling, which moves an eighth or
+  two at a time: weighted by the eighths alone the gate's 3-row hole read as
+  rows 1..9 (HW 4) and pulled nothing up from below it; squared, rows 3..9
+  around a centre of 6. MPM particles add none (they are the jet after it left
+  the breach, falling: their rows would smear where the water is drawn FROM).
+  Integer adds, so still a function of the moves; a bin past 32767 total
+  weight is too big to trust and pulls nothing vertically.
 * **The fold** picks the PULLING bin -- the reach's heaviest contribution,
   the node's own bin included -- and takes its rows' centre `H` (the mean) and
   half-height `HW` (sqrt(3) x the spread: a uniform band of N rows reads N/2),
@@ -26680,7 +26686,7 @@ any height:
   horizontal and by ON, times the measured horizontal speed there. So it is
   exactly as strong as the pull it tilts and vanishes with it. `currentAt`
   adds it as `y` (the F4 arrows tilt; every surface consumer reads `.xz`).
-  A body's span uses its nearer end. Floaters (`CurrentOnFloater`,
+  A body takes it at its span's centre (dragged as a whole). Floaters (`CurrentOnFloater`,
   `CurrentOnFloaterSplit`: debris and corpses) feel the measured vertical
   through the buoyancy drag's water frame, so a submerged breach drags what
   floats over it down; their primitives' vertical stays out as before. A

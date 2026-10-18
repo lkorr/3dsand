@@ -272,10 +272,9 @@ Vec3 SampleMeasured(const uint32_t* grid, Vec3 posVox);
 // The same field for a BODY spanning [yLo, yHi] vertically (world cells): the
 // record is a BAND of rows the water moved in (the CA levels a body of water
 // by its top cells), and a body is carried by it when any part of it is in
-// that band, not only its sample point. The vertical is measured from the
-// span too: zero where the span overlaps the pulling water's rows, else
-// toward them from the span's nearer end. yLo == yHi == posVox.y is
-// SampleMeasured exactly.
+// that band, not only its sample point. The vertical is taken at posVox.y
+// (the span's centre, for a body: it is dragged as a whole). yLo == yHi ==
+// posVox.y is SampleMeasured exactly.
 Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 posVox, float yLo, float yHi);
 // THE PUBLISHED GRID: the snapshot's copy of GRID as of World::Snap() --
 // exactly World::kSnapshotLatency ticks behind the tick being assembled, the

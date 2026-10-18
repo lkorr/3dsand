@@ -3984,6 +3984,16 @@ Status GateBlastWater(Ctx& c, std::string& detail) {
 //      the whole chain (fold, tracked copy, parse, publish, blend) end to end.
 //      The bodies span the top few rows (sy - 3 .. sy + 1), as a floater's
 //      submerged span does.
+//   K. CONVERGE (2026-10-18, ticket 11-30-37): on a far ring (28 cells, where
+//      the fold's reach makes the field) the current points AT the gap, and
+//      the ring's two outer points' currents are well apart -- a field that
+//      copied the gap's vector reads ~0 there.
+//   W. SIDES: beside the gap along the dam's lake face it runs toward it.
+//   S. SUBMERGED (box 2, 96 cells south, its gap only through rows 4..6
+//      under 10 of water): upstream of it the top row is pulled DOWN and the
+//      bottom row UP, and that relaxes after the drain; the vertical plane's
+//      words at four node columns are printed beside it.
+//   Cv. a body over the submerged gap feels the downward pull (snapshot).
 // Every 15 ticks the trace prints gap / ring mean / box max, so a FAIL says
 // which phase did not happen. Thresholds in baseline.json.
 Status GateFlowMeasure(Ctx& c, std::string& detail) {

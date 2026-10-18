@@ -107,13 +107,17 @@ const FLOWM_ACC_STRIDE : u32 = 8u;
 // sim.currentMeasuredCarry both 0) the whole body const-folds away.
 // THE HEIGHT MOMENTS (2026-10-18, ticket 11-30-37: a breach under the
 // surface must pull the water above it down and the water below it up): each
-// move also adds its gross flux g = eighths x (|dx| + |dz|) <= 16, and g x y,
-// g x y^2 with y the source row about the window's middle (-256..255), so the
-// fold knows WHERE in the column a bin's water ran (mean) and how spread
-// (variance) -- a jet through a hole is a thin band, a full-depth breach or a
-// surface flow is not. Bounded: while the gross sum stays <= 32767 (the
-// fold's trust test) g y^2 <= 16 x 65536 sums inside i32; past it the bin
-// overflows harmlessly and the fold ignores its moments.
+// move also adds a weight w, w x y and w x y^2, y the source row about the
+// window's middle (-256..255), so the fold knows WHERE in the column a bin's
+// water ran (mean) and how spread (variance) -- a jet through a hole is a
+// thin band, a full-depth breach is not. w = eighths^2 (1..64): a whole cell
+// driven sideways by the head behind it (the jet, the water drawn toward it
+// under the surface) outweighs the surface's levelling, which moves an eighth
+// or two at a time, 16 to 64 times over -- measured, weighting by the eighths
+// alone let the drawn-down surface spread a 3-row hole over 8 rows. Bounded:
+// while the summed weight stays <= 32767 (the fold's trust test) w y^2 <=
+// 64 x 65536 sums inside i32; past it the bin overflows harmlessly and the
+// fold ignores its moments.
 fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
   if (TUNE_CURRENT_MEASURED <= 0.0 && TUNE_CURRENT_MEASURED_CARRY <= 0.0) { return; }
   let d = dst - src;
@@ -126,7 +130,7 @@ fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
   if (d.z != 0) { atomicAdd(&flowMeasAcc[s + 1u], d.z * q); }
   atomicMax(&flowMeasAcc[s + 2u], src.y + FLOWM_Y_BIAS);
   atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - src.y);
-  let g = i32(eighths) * (min(abs(d.x), 1) + min(abs(d.z), 1));
+  let g = i32(eighths) * i32(eighths);
   let yc = clamp(src.y - (T.origin.y * i32(CHUNK) + 256), -256, 255);
   atomicAdd(&flowMeasAcc[s + 4u], g);
   atomicAdd(&flowMeasAcc[s + 5u], g * yc);
