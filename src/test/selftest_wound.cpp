@@ -82,6 +82,7 @@
 #include "sim/currentprim.h"  // float-current: a stream through the basin
 #include "sim/flowfield.h"    // corpse-float: the solved field at the site
 #include "sim/worldmap.h"     // corpse-float: the map's water round the site
+#include "sim/waterbody.h"    // corpse-float: the registry's hole hints
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
 #include "phys/floatrho.h"    // corpse-float: the one floating-density rule
@@ -8744,6 +8745,43 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   const IVec3 pchunk{site.x >> 4, waterTop >> 4, site.z >> 4};
   support::TickRig rig(c, 71000u, pchunk);
 
+  // THE WATER-BODY REGISTRY'S VIEW OF THE BASIN (rule 6). Every op the gate
+  // stamps into a chunk the registry has labelled reads to it as a possible
+  // dig (WaterBodySystem::Tick's hole hint), and a hint seeds a whirlpool +
+  // sink (CurrentPrimSystem::SeedDrains) that bodies afloat have felt since
+  // 2026-10-18. Bodies, their levels, and every live hint with its cell
+  // relative to the basin centre.
+  auto bodyView = [&]() {
+    std::string v;
+    for (const WaterBodyDesc& b : WaterBodies().Bodies()) {
+      const WaterBodyHole h = WaterBodies().HoleHint(b.basinId);
+      v += Format(" [basin %u level %d state %u%s", b.basinId, b.level,
+                  (unsigned)b.state, h.valid ? "" : "]");
+      if (h.valid)
+        v += Format(" HOLE (%+d,%d,%+d) at t%u]", h.x - site.x, h.y, h.z - site.z,
+                    h.tick);
+    }
+    v += Format(" prims %u", CurrentPrims().Count());
+    return v.empty() ? std::string(" none") : v;
+  };
+  // A FRESH BASIN, and the registry's memory of the last one goes with it.
+  // Re-stamping the basin the previous arm floated in is a mutation in a
+  // labelled lake, which the registry cannot tell from a dig: it seeded a
+  // 30 s whirlpool at the first op, and the limp human was dragged into the
+  // basin's corner by it (measured 2026-10-18: a standing current of 5-7
+  // cells/s in a sealed tub, with no hole anywhere). The first arm stamps
+  // into a world with no discovered body, and every arm now starts as it did:
+  // the discovered probe withdrawn (ClearDiscovered, then the ticks the CPU
+  // and the GPU ledger take to let go of it) and the current list empty.
+  auto freshBasin = [&]() {
+    WaterBodies().ClearDiscovered();
+    CurrentPrims().Clear();
+    support::RunTicks(rig, 4);
+    CurrentPrims().Clear();
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+  };
+  std::string hintWhy;
+
   const int kTicks = (int)BaselineNumber("corpseFloatTicks", 600);
   struct Arm {
     const char* label;
@@ -8791,7 +8829,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     c.debris.Reset();
     // A FRESH BASIN PER ARM: each arm is measured against the stamp, not
     // against whatever the arm before it left in the water.
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    freshBasin();
     support::RunTicks(rig, 20);  // the water settles; the mirror fetches it
     const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
     Mob* m = id ? mobs.FindMobById(id) : nullptr;
@@ -8914,6 +8952,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       a.wokeHow = m->DeadWokeHow();
     }
     a.matterSame = mobs.DeadMatterSameTotal() - matterSame0;
+    hintWhy += Format(" %s:", a.label) + bodyView() + ";";
   }
   // THE LIVE LIMP ARM. Same basin, same drop; StartRagdoll instead of Die,
   // with a minimum longer than the watch so the get-up never starts and what
@@ -8923,7 +8962,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   if (const int d = mobs.FindDef(limp.def); d >= 0) {
     mobs.Reset();
     c.debris.Reset();
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    freshBasin();
     support::RunTicks(rig, 20);
     const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
     Mob* m = id ? mobs.FindMobById(id) : nullptr;
@@ -8965,6 +9004,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
         limp.surf = m->FloatSurfaceY();
         limpHeld = m->Alive() && m->Ragdoll() == Mob::RagdollPhase::Limp;
       }
+      hintWhy += " limp:" + bodyView() + ";";
     }
   }
   // THE SEVERED ARM. Owner, 2026-10-14: "corpses will float but their limbs
@@ -8993,7 +9033,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   if (const int d = mobs.FindDef("human"); d >= 0) {
     mobs.Reset();
     c.debris.Reset();
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    freshBasin();
     support::RunTicks(rig, 20);
     const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
     Mob* m = id ? mobs.FindMobById(id) : nullptr;
@@ -9026,6 +9066,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
         }
       }
       for (Piece& p : pieces) p.debrisRho = c.debris.FloatingDensityOf(p.h);
+      hintWhy += " severed:" + bodyView() + ";";
     }
   }
   bool severOk = severRan;
@@ -9117,8 +9158,9 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                        fw.size() > 2 ? (int)(int32_t)fw[1] : 0,
                        fw.size() > 2 ? fw[2] : 0u);
   }
-  detail = Format("site [%s] bed y%d waterline y%d; %s | ", siteWhy.c_str(), bedY,
-                  waterTop, mapWater.c_str()) + line(hu) +
+  detail = Format("site [%s] bed y%d waterline y%d; %s; water bodies at each arm's "
+                  "end:%s | ", siteWhy.c_str(), bedY, waterTop, mapWater.c_str(),
+                  hintWhy.c_str()) + line(hu) +
            line(au) + line(an) + line(sy) +
            (limp.ran ? Format("limp human: %s, surface y%.0f, pelvis lowest "
                               "y%.1f final y%.1f, %u pushes, y every 30:%s, drift "
