@@ -9079,6 +9079,23 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                      : std::string("limp human: (no def)")) +
            (severRan ? " | severed:" + severWhy
                      : std::string(" | severed: (no human)"));
+  // WHICH CLAIM (rule 6): the detail carries every number, but a red line
+  // used to leave the reader to re-derive eight comparisons from it.
+  if (!ok) {
+    std::string bad;
+    auto add = [&bad](bool failed, const char* what) {
+      if (failed) bad += bad.empty() ? what : (std::string(", ") + what);
+    };
+    add(!humanOk, "human-floats-asleep");
+    add(!sank(au), "automaton-sinks");
+    add(au.ran && au.asleepAt < 0, "automaton-asleep");
+    add(!sank(an), "android-sinks");
+    add(!sylvanOk, "sylvan-rides-high");
+    add(!limpOk, "limp-floats");
+    add(!severOk, "severed-pieces");
+    detail += Format(" | FAILED: %s (human final %.3f, limp final %.3f)",
+                     bad.c_str(), (double)hu.final, (double)limp.final);
+  }
   std::printf("corpse-float: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
