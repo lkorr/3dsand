@@ -15427,9 +15427,13 @@ struct FluidSample {
   vel  : vec3f,
   col  : vec3f,
   // The material holding the most of the sampled volume (particles or the
-  // settled liquid behind them): whose liquidOptics the shade uses. MAT_AIR
-  // only when nothing was sampled.
+  // settled liquid behind them). MAT_AIR only when nothing was sampled.
   mat  : u32,
+  // The runner-up and its share of the two (0..1; mat2 == mat, mix2 == 0 for
+  // a pure sample). The shade blends the two liquids' optics by it -- see
+  // TWO LIQUIDS ARE A MIXTURE in fluidSampleAt.
+  mat2 : u32,
+  mix2 : f32,
   foam : f32,
   // Share of the sampled density that is SETTLED voxel water rather than live
   // MPM particles: 0 = all particles, 1 = the march is drawing a surface over
@@ -15439,6 +15443,15 @@ struct FluidSample {
   // region reading as a chunk-shaped patch of a different liquid.
   settled : f32,
 };
+
+// One weighted contribution to fluidSampleAt's two-material tally.
+fn fluidMixAdd(mat : u32, w : f32, matA : ptr<function, u32>, wA : ptr<function, f32>,
+               matB : ptr<function, u32>, wB : ptr<function, f32>) {
+  if (w <= 0.0) { return; }
+  if (mat == *matA || *matA == MAT_AIR) { *matA = mat; *wA += w; return; }
+  if (mat == *matB || *matB == MAT_AIR) { *matB = mat; *wB += w; return; }
+  if (w > *wB) { *matB = mat; *wB = w; }
+}
 
 fn fluidSampleAt(p : vec3f) -> FluidSample {
   let g = p - vec3f(0.5);
@@ -15450,8 +15463,23 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   var vel = vec3f(0.0);
   var colAcc = vec3f(0.0);   // sum of albedo * weighted volume
   var colW = 0.0;
-  var domMat = MAT_AIR;
-  var domW = 0.0;
+  // TWO LIQUIDS ARE A MIXTURE (ticket 2026-10-17_00-04-26, "after pouring a
+  // lil bit of acid in water (mpm fluid) the shaders start tweakin out").
+  // The shade took ALL its optics -- absorption, in-scatter, the clear-water
+  // weight, the interface reflectance -- from ONE material: the one with the
+  // single biggest node contribution among these 8 taps. The colour (colAcc)
+  // was already a weighted blend, but in a stirred acid + water body that
+  // winner flips node by node and tick by tick, and acid (opacity 170: the
+  // derived murky body, Fresnel 0.55) and water (the authored clear look) are
+  // nothing alike, so the surface broke into hard-edged patches of two
+  // different liquids that jumped every frame. Now the two materials with
+  // the most volume are ACCUMULATED (slot A, slot B; a third evicts B only
+  // when its contribution beats B's total -- rare, bounded, and still
+  // continuous) and the shade mixes the two optics by their shares.
+  var matA = MAT_AIR;
+  var wA = 0.0;
+  var matB = MAT_AIR;
+  var wB = 0.0;
   var foam = 0.0;
   for (var i = 0; i < 8; i++) {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
@@ -15492,9 +15520,9 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
           fh = clamp(f32(sh) / (f32(i32(hi) - i32(lo)) * max(f32(mi), 1.0)),
                      0.0, 1.0);
           a = mix(liquidAlbedo(materials[lo]), a, fh);
-          if (w * m * (1.0 - fh) > domW) { domW = w * m * (1.0 - fh); domMat = lo; }
+          fluidMixAdd(lo, w * m * (1.0 - fh), &matA, &wA, &matB, &wB);
         }
-        if (w * m * fh > domW) { domW = w * m * fh; domMat = hi; }
+        fluidMixAdd(hi, w * m * fh, &matA, &wA, &matB, &wB);
         colAcc += a * (w * m);
         colW += w * m;
       }
@@ -15521,7 +15549,7 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
       vmass += w * extra;
       colAcc += liquidAlbedo(materials[vmat]) * (w * extra);
       colW += w * extra;
-      if (w * extra > domW) { domW = w * extra; domMat = vmat; }
+      fluidMixAdd(vmat, w * extra, &matA, &wA, &matB, &wB);
     }
   }
   var out : FluidSample;
@@ -15531,7 +15559,12 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   out.vel = vec3f(0.0);
   if (mass > 1e-4) { out.vel = vel * (30.0 / mass); }   // cells/tick -> vox/s
   out.col = colAcc / max(colW, 1e-4);
-  out.mat = domMat;
+  // The dominant one names the sample; the other is mixed in by its share.
+  let bWins = wB > wA;
+  out.mat = select(matA, matB, bWins);
+  out.mat2 = select(matB, matA, bWins);
+  out.mix2 = min(wA, wB) / max(wA + wB, 1e-6);
+  if (out.mat2 == MAT_AIR) { out.mat2 = out.mat; out.mix2 = 0.0; }
   out.foam = clamp(foam, 0.0, 1.0);
   out.settled = vmass / max(mass + vmass, 1e-4);
   return out;
@@ -16468,7 +16501,18 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // The particles' own liquid through the one optics model: the authored MPM
   // look above is its clear-water end, so water is untouched and a murky
   // liquid shades with the same derived coefficients its pool would have.
-  let po = liquidClearBlend(liquidOptics(materials[s.mat]), absorb, body);
+  // TWO LIQUIDS ARE A MIXTURE (fluidSampleAt): the runner-up's optics are
+  // mixed in by its share, every term, so a stirred acid + water body grades
+  // between the two instead of flipping node by node.
+  var lo = liquidOptics(materials[s.mat]);
+  if (s.mix2 > 0.0) {
+    let lo2 = liquidOptics(materials[s.mat2]);
+    lo.absorbK = mix(lo.absorbK, lo2.absorbK, s.mix2);
+    lo.scatter = mix(lo.scatter, lo2.scatter, s.mix2);
+    lo.clear = mix(lo.clear, lo2.clear, s.mix2);
+    lo.fresnel = mix(lo.fresnel, lo2.fresnel, s.mix2);
+  }
+  let po = liquidClearBlend(lo, absorb, body);
   absorb = po.absorbK;
   body = po.scatter;
   if (caFrac > 0.001) {

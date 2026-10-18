@@ -2001,7 +2001,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
 
       // ---- SANDVOX_AT_POUR: the mpm tool's pour, scripted (harness only) ----
       // =x,y,z,r,material,ticks[,after[,vx,vz]] -- `ticks` ticks of the tool's
-      // sphere pour (radius r cells, centre x,y,z) of `material` MPM particles,
+      // sphere pour (radius r cells, centre x,y,z) of `material` MPM particles
+      // (`a/b`: two liquids, alternate particles -- a stirred mixture),
       // starting `after` ticks (default 60) into the run, with horizontal
       // velocity vx,vz cells/tick. Exists so --at can reproduce an owner's MPM
       // ticket (bug_reports/README.md): 2026-10-17_00-04-26 (acid poured into
@@ -2013,14 +2014,20 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         static bool parsed = false;
         static int px = 0, py = 0, pz = 0, pr = 1, pTicks = 0, pAfter = 60;
         static float pvx = 0.0f, pvz = 0.0f;
-        static uint32_t pMat = 0, pStart = 0, pLast = 0xFFFFFFFFu;
+        static uint32_t pMat = 0, pMat2 = 0, pStart = 0, pLast = 0xFFFFFFFFu;
         if (pourEnv && *pourEnv && !parsed) {
           parsed = true;
           char name[64] = "water";
           std::sscanf(pourEnv, "%d,%d,%d,%d,%63[^,],%d,%d,%f,%f", &px, &py, &pz, &pr,
                       name, &pTicks, &pAfter, &pvx, &pvz);
-          for (size_t i = 0; i < mats.size(); i++)
-            if (mats[i].name == name) pMat = (uint32_t)i;
+          std::string n1 = name, n2;
+          const size_t slash = n1.find('/');
+          if (slash != std::string::npos) { n2 = n1.substr(slash + 1); n1.resize(slash); }
+          for (size_t i = 0; i < mats.size(); i++) {
+            if (mats[i].name == n1) pMat = (uint32_t)i;
+            if (!n2.empty() && mats[i].name == n2) pMat2 = (uint32_t)i;
+          }
+          if (pMat2 == 0) pMat2 = pMat;
           pr = std::min(std::max(pr, 0), 3);
           std::printf("SANDVOX_AT_POUR: %d ticks of '%s' (id %u) r%d at (%d,%d,%d) v(%.2f,%.2f)\n",
                       pTicks, name, pMat, pr, px, py, pz, pvx, pvz);
@@ -2049,7 +2056,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                   op.vx = (int32_t)std::lround(pvx * 65536.0f);
                   op.vy = -19661;
                   op.vz = (int32_t)std::lround(pvz * 65536.0f);
-                  op.mat = pMat;
+                  op.mat = (s & 1) ? pMat2 : pMat;
                   fluidSpawns.push_back(op);
                 }
               }
