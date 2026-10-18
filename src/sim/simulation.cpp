@@ -603,6 +603,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(15, T::Storage),         // solPool
         entry(16, T::Storage),         // solMeta
         entry(17, T::ReadOnlyStorage), // solSpec
+        // The still-water table (worldgen.wgsl binding 58, read-only here):
+        // held water at rest is not excited, and absorbs its own particles
+        // (sim_fluid_seam.wgsl HELD WATER; bug 2026-10-17_11-21-36).
+        entry(18, T::ReadOnlyStorage), // stillWater
+        entry(19, T::Storage),         // stillLedger (= stillWater, atomics:
+                                       // exciteDetect's diagnostic census)
     };
     fluidSeamBGL_ = device.CreateBindGroupLayout(sfentries, std::size(sfentries));
   }
@@ -1030,10 +1036,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // adoption counters. Read and written by sim_stream.wgsl only (and the
     // gates). Every clear (the dense Fill, the paged regen's WriteBuffer, the
     // load's clearStreams) covers them.
+    // ...plus SIXTEEN diagnostic words after those (2026-10-17, sim_step.wgsl
+    // STILL_DIAG): the reservoir's cumulative GIVE / TAKE / GROW eighths and
+    // the MPM seam's excite census (sim_fluid_seam.wgsl). Never read by the
+    // sim; `held-splash` and `rivers` S read them. (They first sat right after
+    // the mouth words, where STILL_ECHO landed the same day: the two branches
+    // met in a merge and the diagnostics moved past STREAM_OBS.)
     constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u + 4u +
                                           (uint64_t)kWorldN * kWorldN +
                                           2u * (uint64_t)kWorldN * kWorldN +
-                                          8u * (uint64_t)kWorldN * kWorldN;
+                                          8u * (uint64_t)kWorldN * kWorldN + 16u;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
                                       rhi::BufferUsage::CopySrc,
@@ -1455,6 +1467,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(15, world_->solPool),
         b(16, world_->solMeta),
         b(17, solSpecBuf_),
+        b(18, stillWaterBuf_),
+        b(19, stillWaterBuf_),
     };
     fluidSeamBG_[page] = device.CreateBindGroup(fluidSeamBGL_, sentries,
                                                 std::size(sentries), "fluidSeamBG");

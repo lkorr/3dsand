@@ -44,6 +44,7 @@ const std::vector<Gate>& RiverGates();
 // The lake reservoir (sim_step.wgsl stage 5): a synthetic map lake, disturbed
 // and ticked flat. The `rivers` seam and exit.
 const std::vector<Gate>& LakeSettleGates();
+const std::vector<Gate>& HeldSplashGates();
 // A stream from a finite source sleeps while it runs (docs/PLAN_running_water.md
 // phase 3, THE CONDUIT): a stone reservoir + channel + basin on the pad.
 const std::vector<Gate>& StreamPoolGates();
@@ -1539,6 +1540,10 @@ const char* const kOrder[] = {
     // (a synthetic map, regenerated, TICKED -- blasts included -- the real
     // environment back), so it runs right after `rivers` for the same reason.
     "lake-settle",
+    // Held water disturbed comes back once and rests (bug 2026-10-17_11-21-36):
+    // the `rivers` seam and exit again (a synthetic map, regenerated per arm,
+    // TICKED -- splashes and a blast -- the real environment back).
+    "held-splash",
     // A stream from a finite source (docs/PLAN_running_water.md phase 3): it
     // regenerates the window on entry, builds a stone reservoir + channel +
     // basin on the pad, ticks thousands of ticks of running water and
@@ -1588,7 +1593,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &StreamPoolGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &HeldSplashGates(), &StreamPoolGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

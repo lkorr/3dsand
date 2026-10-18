@@ -3304,24 +3304,30 @@ def _wgsl_item(text, kind, name):
 
 def check_still_level():
     step = read("assets/shaders/sim_step.wgsl")
-    sol = read("assets/shaders/sim_solute.wgsl")
-    if not step or not sol:
+    if not step:
         return
-    if "stillLevel8" not in sol:
-        return
-    checked.append("stilllevel")
-    for kind, name in _STILL_ITEMS:
-        a, b = _wgsl_item(step, kind, name), _wgsl_item(sol, kind, name)
-        if a is None or b is None:
-            problems.append(f"stilllevel: `{kind} {name}` missing from "
-                            f"{'sim_step.wgsl' if a is None else 'sim_solute.wgsl'}")
-        elif a != b:
-            problems.append(
-                f"stilllevel: sim_solute.wgsl's `{name}` differs from "
-                "sim_step.wgsl's -- the solute carry and the held rule read "
-                "the still table differently; copy sim_step's.\n"
-                f"      sim_step  : {a[:160]}\n"
-                f"      sim_solute: {b[:160]}")
+    # sim_solute.wgsl (the carry) and sim_fluid_seam.wgsl (held water is not
+    # excited and absorbs its own particles, bug 2026-10-17_11-21-36) both
+    # read the still table.
+    readers = [("sim_solute.wgsl", _STILL_ITEMS), ("sim_fluid_seam.wgsl", _STILL_ITEMS)]
+    for fname, items in readers:
+        other = read("assets/shaders/" + fname)
+        if not other or "stillLevel8" not in other:
+            continue
+        if "stilllevel" not in checked:
+            checked.append("stilllevel")
+        for kind, name in items:
+            a, b = _wgsl_item(step, kind, name), _wgsl_item(other, kind, name)
+            if a is None or b is None:
+                problems.append(f"stilllevel: `{kind} {name}` missing from "
+                                f"{'sim_step.wgsl' if a is None else fname}")
+            elif a != b:
+                problems.append(
+                    f"stilllevel: {fname}'s `{name}` differs from "
+                    "sim_step.wgsl's -- it and the held rule read the still "
+                    "table differently; copy sim_step's.\n"
+                    f"      sim_step  : {a[:160]}\n"
+                    f"      {fname}: {b[:160]}")
 
 
 def check_react_fx():

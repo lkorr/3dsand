@@ -142,6 +142,135 @@ const PT_KERNEL : u32 = PT_K_FLUIDSEAM;
 @group(1) @binding(16) var<storage, read_write> solMeta : array<atomic<u32>>;
 @group(1) @binding(17) var<storage, read> solSpec : array<u32>;
 
+// ---- HELD WATER (sim_step.wgsl HELD WATER / THE RESERVOIR; DESIGN.md 5b.13) --
+// Bug report 2026-10-17_11-21-36: "running water sometimes constantly turns
+// into MPM fluid and explodes a bit, then turns back into running water and
+// resets in a loop". A river, a map lake and the sea are HELD: their columns
+// carry the map's target surface in the still table, the CA never
+// moves their water at rest, and the reservoir refills a held column under its
+// target AT ONCE and takes back what stands over it. The seam knew none of
+// that, and the two fed each other. MEASURED, `held-splash` (a 5x5x4 block of
+// water dropped on a held river, and a blast at its surface), before:
+//   * excite took held water like any water (the surface step and the wake
+//     triggers fire all over a river's ramp once a splash wakes it);
+//   * the reservoir refilled every excited cell at once, UNDER and INSIDE the
+//     particles that had just left it -- settled mass is seeded into the node
+//     grid (DESIGN.md WP5b), so that cell held twice the rest density and the
+//     EOS threw the particles up as a jet (the ticket's "explodes"); they came
+//     back down fast, woke the river round them, and those cells were
+//     excited and refilled in turn;
+//   * particles that landed on the river stood OVER its target, never calm on
+//     a ramp, and ran down it, waking held water as they went.
+// Every arm pinned the excited population at the 8,000 ceiling for good,
+// ~5-12k eighths excited and settled per 100 ticks, 54 chunks awake.
+// So, with the still table bound here (read-only, the CA's derived data):
+//   * HELD WATER AT REST IS NOT EXCITED (exciteDetect): a map column's cell
+//     at or under its target (8 y + f <= T8) takes no trigger -- fall, perch,
+//     surface step, shell or wake. The CA holds it still, so no "this would
+//     fall" is true of it, and every excitation of it was refilled under its
+//     own particles; a splash's wake took the river round it the same way.
+//     Water over the target (a mound, a splash that settled on the river, a
+//     block falling onto it, the top cell's excess) is ordinary water and
+//     excites as before, and so is a held cell at a BREACH (seamBreachEdge:
+//     the breach's rush). sim_step.wgsl's heldRest holds that top cell over
+//     its target still too (THE TOP CELL OVER ITS TARGET IS AT REST TOO),
+//     which is what ended the second loop, the CA's conveyor.
+//   * HELD WATER ABSORBS ITS OWN PARTICLES (consumeApply): a particle of the
+//     column's liquid INSIDE a settled cell of its held water (an overlap: a
+//     refill landed on it -- at a breach, or under an over-target cell that
+//     was excited) is taken by the reservoir, as settled water over a target
+//     is (the GIVE). The jet needs the overlap; without it a breach's rush is
+//     a pour.
+// MEASURED after, `held-splash`: A excites 939 eighths, B 800, C 552, all in
+// the first 100 ticks, nearly all of it absorbed back; nothing after; 0
+// particles live; 0 / 0 / 1 chunks awake. And in `rivers` S (a channel dug from a map lake down to a river),
+// counted with the refusal switched off (HELD_EXCLUDE): 662k eighths of the
+// lake's and the river's water AT REST marked by the step trigger and 2.19M
+// by the wake while the stream ran -- the ticket's loop, at a breach, inside
+// that fixture -- and S's stream adoption turns out to depend on it (with the
+// refusal on, 12-20 of 153 columns adopted and the adopted ones flooded:
+// floodMax 3221 vs 863). That is sim_stream.wgsl's to retune; see DESIGN.md.
+// The MAP's water only (the still record's word [1]), not a stream that
+// sim_stream.wgsl adopted (its columns are that kernel's to judge) and not a
+// POOL stream's (its ledger is exact). Not another liquid's particles either
+// (acid splashed into a river stays acid). RULE 1: pure reads of the still
+// table, the voxels and the particle's own state; a particle kills only
+// itself. RULE 2: both only remove work.
+// STILL_WORDS / stillIndex / stillTag / STILL_UNHELD / stillLevel8 are
+// sim_step.wgsl's, copied TEXT-IDENTICAL (check_invariants.py `stilllevel`
+// fails if they drift).
+@group(1) @binding(18) var<storage, read> stillWater : array<u32>;
+const STILL_WORDS : u32 = 4u;
+fn stillIndex(x : i32, z : i32) -> u32 {
+  return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
+}
+fn stillTag(x : i32, z : i32) -> u32 {
+  let tx = bitcast<u32>(x >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  let tz = bitcast<u32>(z >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  return 1u | (tx << 1u) | (tz << 16u);
+}
+const STILL_UNHELD : i32 = -1073741824;
+fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
+  if (T.stillWaterRelax == 0u) { return STILL_UNHELD; }
+  let si = stillIndex(x, z);
+  if (stillWater[si] != stillTag(x, z)) { return STILL_UNHELD; }
+  let v = stillWater[si + 1u];
+  if (v != 0u) {
+    if ((v >> 20u) != mat) { return STILL_UNHELD; }
+    return bitcast<i32>(v << 12u) >> 12u;
+  }
+  let d = stillWater[si + 2u];
+  if (d == 0u || (stillWater[si + 3u] & 0xFFFu) != mat) { return STILL_UNHELD; }
+  return bitcast<i32>(d << 12u) >> 12u;
+}
+// The map's held target (T8, eighths) of column (x, z) for liquid `mat`, or
+// STILL_UNHELD (no record, a stream's record, another liquid, relax 0).
+fn seamHeldT8(x : i32, z : i32, mat : u32) -> i32 {
+  if (stillWater[stillIndex(x, z) + 1u] == 0u) { return STILL_UNHELD; }
+  return stillLevel8(x, z, mat);
+}
+// ...EXCEPT AT A BREACH: a held cell with a lateral neighbour that is open
+// (not a blocker) in a column the map does not hold -- a bank somebody dug
+// through, a channel cut out of a lake -- or with air under it (its bed dug
+// out). The CA spills it there (HELD WATER: a breach runs for as long as the
+// river does), and its excitation is the breach's RUSH, kept: the particles
+// fall into the hole, and the refill behind them, if it lands on them, is
+// absorbed (consumeApply), so the rush is a pour and not a jet.
+fn seamBreachEdge(c : vec3<i32>, mat : u32) -> bool {
+  // ...or a hole under it: the bed dug out from below.
+  let b = c - vec3<i32>(0, 1, 0);
+  if (cellResident(b, T.origin) && voxMat(voxWordAt(b)) == MAT_AIR) { return true; }
+  for (var d = 0u; d < 4u; d++) {
+    let n = c + seamLateral(d);
+    if (seamHeldT8(n.x, n.z, mat) == STILL_UNHELD && seamNeighbourState(n).x == 0u) { return true; }
+  }
+  return false;
+}
+// How deep under a held surface's top cell the absorb reaches, in cells: a
+// splash crater's depth. Deeper is not the river's surface any more (a cave
+// pool under its bed carries the column's record too), and is left to the
+// solver as anywhere else.
+const SEAM_ABSORB_DEPTH : i32 = 8;
+// exciteScratch [7]: DIAGNOSTIC, never read by the sim -- CUMULATIVE eighths
+// held water absorbed (consumeApply). `held-splash` reads it.
+const EX_ABSORBED : u32 = 7u;
+// THE SAME BUFFER as binding 18, as atomics (sim_step.wgsl's binding 62
+// alias): the excite candidates' DIAGNOSTIC census, cumulative eighths in
+// sim_step.wgsl's STILL_DIAG words [3..7] -- never read by the sim, read by
+// `held-splash` -- so a river that keeps turning into MPM names WHICH water
+// keeps being taken: [3] a held column, over its target's top cell; [4] a
+// column that is not held beside one that is (a bank, a breach); [5] a column
+// that is not held, elsewhere; [6] an adopted stream's column; [7] a held
+// cell at or under its top cell: at a breach (seamBreachEdge), or woken.
+@group(1) @binding(19) var<storage, read_write> stillLedger : array<atomic<u32>>;
+const STILL_DIAG : u32 = WORLD_N * WORLD_N * STILL_WORDS + 4u + 11u * WORLD_N * WORLD_N;
+// [8..12] the eighths of held water AT REST a trigger fired on and the rule
+// refused (fall / perch / step / shell / wake), [13] 0x7FFFFFFF minus the
+// lowest target among them, [14] the highest: which body it was. `rivers` S
+// prints them. HELD_EXCLUDE false keeps the census and excites them anyway
+// (the DIAGNOSTIC arm that measured them; never ship it false).
+const HELD_EXCLUDE : bool = true;
+
 // MIRROR-BEGIN solute
 // ---- THE SOLUTE LAYER'S SHARED ACCESSORS (docs/PLAN_solutes.md) -------------
 // ONE block, pasted verbatim into every shader that touches dissolved mass
@@ -329,6 +458,16 @@ const EX_COMPACT_LIVE : u32 = 2u; // survivors after compaction (spawn base)
 const EX_EXCITED_LIVE : u32 = 3u; // of those, EXCITE-origin (FP_EXCITED) — the
                                   // population the ceiling actually bounds
 const EX_ARGS : u32 = 4u;         // [4..6] emit dispatch args (listCount,1,1)
+// [11..15] DIAGNOSTIC, never read by the sim: CUMULATIVE eighths exciteDetect
+// marked, by the trigger that took the cell (the first that fired, in
+// detect's order): fall (a), perch, surface step (d), drain shell (e), wake.
+// Never cleared (a gate reads them before and after a window), so "the river
+// keeps turning into MPM" names its trigger in one run (CLAUDE.md rule 6).
+const EX_BY_FALL : u32 = 11u;
+const EX_BY_PERCH : u32 = 12u;
+const EX_BY_STEP : u32 = 13u;
+const EX_BY_SHELL : u32 = 14u;
+const EX_BY_WAKE : u32 = 15u;
 const EX_COUNTS : u32 = 16u;                       // + slot
 const EX_BASES : u32 = 16u + NUM_SLOTS;            // + slot
 const EX_LIST : u32 = 16u + 2u * NUM_SLOTS;        // + list index
@@ -980,6 +1119,12 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
   var seen = 0u;
   var cand = 0u;
   var parts = 0u;
+  // EX_BY_* (diagnostic): this thread's eighths per trigger, added once below.
+  var byK = array<u32, 5>(0u, 0u, 0u, 0u, 0u);
+  var byC = array<u32, 5>(0u, 0u, 0u, 0u, 0u);   // the candidate census
+  var supK = array<u32, 5>(0u, 0u, 0u, 0u, 0u);   // ...and the refusals
+  var supLo = 0xFFFFFFFFu;
+  var supHi = 0u;
   // Sentinel chunk: nothing to excite in a chunk with no page -- a uniform
   // interior has no exposed face by construction. Decided ONCE for the
   // workgroup (every cell of the chunk shares this entry) instead of by a
@@ -1003,6 +1148,14 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     let mat = voxMat(w);
     if (!seamLiquid(mat)) { continue; }
     seen += 1u;   // FA_EXSEEN, the reach probe (common.wgsl); folded below
+    // HELD WATER AT REST IS NOT EXCITED (the HELD WATER block at the top): a
+    // map column's cell at or under its target takes no trigger, except at a
+    // breach. The triggers are still evaluated for it, so the refusals are
+    // counted where they happen (STILL_DIAG [8..14]) -- the refusal itself is
+    // below, once `kind` is known.
+    let heldT8 = seamHeldT8(c.x, c.z, mat);
+    let heldStill = heldT8 != STILL_UNHELD && 8 * c.y + i32(voxState(w) + 1u) <= heldT8 &&
+                    !seamBreachEdge(c, mat);
 
     // ---- SUBMERGED WATER IS FULL WATER, AND IT IS ALSO UNEXCITABLE --------
     //
@@ -1045,11 +1198,13 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // while the CA still owns liquid movement it stays off by default.
     var excite = false;
     var byFall = false;
+    var kind = 4u;   // EX_BY_* index of the trigger that took it: wake unless set
     if (T.fluidExciteEnable != 0u && atSurface) {
       let below = c + vec3<i32>(0, -1, 0);
       if (cellResident(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
         excite = true;
         byFall = true;
+        kind = 0u;
       }
       // Triggers (b) diagonal fall and (c) lateral pressure gradient (WP3
       // item 1), the same predicate settleCheck refuses to settle INTO. These
@@ -1082,6 +1237,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
           if (seamLateralExcite(seamNeighbourState(n),
                                 seamNeighbourState(n + vec3<i32>(0, -1, 0)))) {
             excite = true;
+            kind = 1u;
             break;
           }
         }
@@ -1096,7 +1252,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       // (`atSurface` is hoisted above and shared with triggers (a)/(b)/(c) —
       // this test is where it started, and it now gates all four.)
       if (!excite && SEAM_EX_STEP > 0) {
-        if (seamSurfaceStep(c)) { excite = true; }
+        if (seamSurfaceStep(c)) { excite = true; kind = 2u; }
       }
     }
     // Trigger (e), THE DRAIN SHELL (component 7). Deliberately OUTSIDE the
@@ -1109,6 +1265,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     if (!excite && seamDrainShellHit(c, mat)) {
       excite = true;
       byShell = true;
+      kind = 3u;
       // The measurement plan §9 item 2 calls for. Cumulative per body while it
       // stays adopted, so one read at the end of a gate window sees the whole
       // shell rather than whatever the last tick happened to do.
@@ -1160,6 +1317,14 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
     if (!excite) { continue; }
+    if (heldStill) {
+      // The census of what this rule REFUSES (STILL_DIAG [8..14]): by trigger,
+      // and the range of the columns' targets (which body it was).
+      supK[kind] += voxState(w) + 1u;
+      supLo = min(supLo, u32(heldT8));
+      supHi = max(supHi, u32(heldT8));
+      if (HELD_EXCLUDE) { continue; }
+    }
     // THE SOLUTE REFUSAL (docs/PLAN_solutes.md §7.2): a cell carrying
     // dissolved mass stays with the CA, which carries mass through every
     // move; the MPM particle has no payload for it yet. Counted, per cell.
@@ -1197,6 +1362,29 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     voxels[idx] = (w & ~EXCITE_SCRATCH_BITS) | EXCITE_PEND_BIT |
                   (depth << EXCITE_DEPTH_SHIFT);
     parts += voxState(w) + 1u;   // this chunk's EX_COUNTS slot; folded below
+    byK[kind] += voxState(w) + 1u;
+    // The candidate census (STILL_DIAG [3..7], diagnostic).
+    var cls = 5u;
+    if (heldT8 != STILL_UNHELD) {
+      cls = select(3u, 7u, c.y <= ((heldT8 - 1) >> 3u));
+    } else if (stillLevel8(c.x, c.z, mat) != STILL_UNHELD) {
+      cls = 6u;
+    } else {
+      for (var d = 0u; d < 4u; d++) {
+        let n = c + seamLateral(d);
+        if (seamHeldT8(n.x, n.z, mat) != STILL_UNHELD) { cls = 4u; break; }
+      }
+    }
+    byC[cls - 3u] += voxState(w) + 1u;
+  }
+  for (var k = 0u; k < 5u; k++) {
+    if (byK[k] != 0u) { atomicAdd(&exciteScratch[EX_BY_FALL + k], byK[k]); }
+    if (byC[k] != 0u) { atomicAdd(&stillLedger[STILL_DIAG + 3u + k], byC[k]); }
+    if (supK[k] != 0u) { atomicAdd(&stillLedger[STILL_DIAG + 8u + k], supK[k]); }
+  }
+  if (supHi != 0u) {
+    atomicMax(&stillLedger[STILL_DIAG + 13u], 0x7FFFFFFFu - supLo);
+    atomicMax(&stillLedger[STILL_DIAG + 14u], supHi);
   }
   if (seen != 0u) { atomicAdd(&exdSeen, seen); }
   if (cand != 0u) { atomicAdd(&exdCand, cand); }
@@ -1607,6 +1795,23 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   let csl = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (csl == SLOT_NONE) { return; }
+  // HELD WATER ABSORBS ITS OWN PARTICLES (the HELD WATER block at the top):
+  // back inside a settled cell of its column's held water (an overlap: a
+  // refill under them). Its own slot only, decided on read-only
+  // state (rule 1); counted with the reactions' consumption, so every
+  // `standing + live + consumed` book still balances, and in EX_ABSORBED.
+  let mat = fpMat(p.attr);
+  let t8 = seamHeldT8(cell.x, cell.z, mat);
+  if (t8 != STILL_UNHELD) {
+    let yt = (t8 - 1) >> 3u;
+    if (cell.y <= yt && cell.y >= yt - SEAM_ABSORB_DEPTH && voxMat(voxWordAt(cell)) == mat) {
+      atomicAdd(&fluidArgs[FA_CONSUMED], fpFullness(p.attr));
+      atomicAdd(&fluidArgs[FA_DEAD], 1u);
+      atomicAdd(&exciteScratch[EX_ABSORBED], fpFullness(p.attr));
+      fluidParticles[gid.x].attr = 0u;
+      return;
+    }
+  }
   let bm = atomicLoad(&fluidBlockMapR[csl]);
   if (bm == 0u) { return; }
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));

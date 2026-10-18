@@ -25623,6 +25623,83 @@ claiming channel of the same water within twice the nearest's d2 (+64) is
 averaged with weights that reach 0 at that cutoff (continuous; integer; the CPU
 twin matches, `rivers` D). At the ticket's spot the largest step between
 neighbouring water columns went from 6-7 voxels to 2.6 (mean 0.14).
+
+**Held water and the MPM seam** (2026-10-17, ticket 11-21-36: "running water
+sometimes constantly turns into MPM fluid and explodes a bit, then turns back
+into running water and resets in a loop"). Gate `held-splash`
+(`selftest_heldsplash.cpp`: the `rivers` valley; A one 5x5x4 block of water
+dropped on `main`, B one over `falls`' first crest, C a radius-5 blast at
+`main`'s surface; each on a fresh worldgen, 1,500 ticks, every 100 the excited
+eighths by trigger, the reservoir's TAKE / GROW / GIVE, what the seam refused
+and absorbed, and the awake chunks). Before: every arm pinned the excited
+population at the 8,000 ceiling for good, ~5-12k eighths excited and as many
+settled per 100 ticks, 54 / 11 / 56 chunks awake at tick 1,500. Two loops,
+one inside the other, and three changes:
+
+* **The seam excited held water and the reservoir refilled it under its own
+  particles.** A cell of the MAP's held water (a river, a map lake, the sea:
+  the still record's word [1]) at or under its target (`8 y + f <= T8`) takes
+  no excite trigger -- fall, perch, step, shell or wake -- except at a BREACH
+  (an open lateral neighbour in a column the map does not hold, or air under
+  it: the breach's rush is kept). The seam binds the still table at group 1
+  binding 18 (read-only; `stillLevel8` text-identical to sim_step's,
+  `check_invariants.py stilllevel`) and 19 (the same buffer as atomics, for
+  the diagnostic census). Excited, such a cell was refilled at once (stage 0)
+  INSIDE its particles -- an intermediate build that counted them saw ~70
+  refills a tick land on a cell holding its own particles -- and settled mass
+  is seeded into the node grid (WP5b), so that cell held twice the rest
+  density: the EOS threw the particles up as the ticket's jet, and the wake
+  trigger took the river round where they landed.
+* **Held water absorbs its own particles.** `consumeApply` kills a particle
+  of the column's liquid INSIDE a settled cell of its held water (an overlap:
+  a refill landed on it), at most `SEAM_ABSORB_DEPTH` (8) cells under the
+  target's top cell, counted with the reactions' consumption (`FA_CONSUMED`)
+  and in `exciteScratch[7]`. The reservoir takes it back as it takes a GIVE;
+  a breach's rush is then a pour, not a jet. (Absorbing particles in the
+  surface band on their way down as well was measured and is not needed.)
+* **The top cell over its target is at rest** (`sim_step.wgsl` `heldRest`,
+  map columns only). With the seam out of it, C still ran forever with NO
+  particle involved: TAKE 12.5k / GROW 5.8k / GIVE 1.9k eighths in the first
+  100 ticks, then ~5k / 3.5k / 6k every 100, 49 chunks awake. A held column's
+  top cell over its target was not at rest, so a split took HALF the cell
+  (excess AND held eighths), the cell fell under its target, stage 0 refilled
+  it, and the water moved stood over the next column's target: a conveyor the
+  reservoir fed at every step, and on a ramp there is always a lower
+  neighbour, so stage 5's GIVE was rarely reached. At rest, the top cell pours
+  into no held column at or over that column's target (still into a crater or
+  an unheld column) and its excess leaves by the rolled GIVE (THE CONDUIT's
+  CAPPED head is the same rule). An unrolled stage-0 trim of the excess was
+  measured first and also ends it.
+
+After: A excites 939 eighths (939 absorbed back), B 800 (800), C 552 (528),
+all in the first 100 ticks; nothing in the last 500; 0 particles live; 0 / 0
+/ 1 chunks awake. The world hash is unchanged (4993b9b0: the determinism
+fixture holds no held water the seam touches). Diagnostics: `exciteScratch[11..15]` (cumulative eighths
+marked by fall / perch / step / shell / wake) and sim_step's `STILL_DIAG`
+(16 words after the STILL_MOUTH region: [0..2] the reservoir's GIVE / TAKE /
+GROW eighths; [3..7] the excite candidates by water -- a held column over its
+target, a bank beside one, other unheld water, an adopted stream's column, a
+held cell at a breach; [8..12] held water at rest a trigger fired on and the
+seam refused, by trigger; [13..14] the range of their targets).
+`HELD_EXCLUDE` (sim_fluid_seam.wgsl) false keeps that census and excites them
+anyway -- the diagnostic arm.
+
+**What it exposed, and is NOT fixed here.** `rivers` V's carry finished early
+partly because the conveyor stirred the fixture's water (74 chunks MOVING with
+no solute in its CONTROL); without it the carry still terminates, slower
+(pending carry pairs 147 / 73 / 40 at ticks 3600 / 4100 / 4600), and
+`rivers.soluteSettleTicks` went 4000 -> 7000. `rivers` S (a channel dug from a
+map lake down to `main`) FAILS: 12-20 of its 153 columns adopted, the adopted
+ones flooded (floodMax 3221 vs 863). Measured with `HELD_EXCLUDE` false, while
+S's stream ran the seam marked 662k eighths of the lake's and the river's
+water AT REST by the step trigger and 2.19M by the wake (targets T8 824..1248)
+-- the ticket's loop, at a breach, inside that fixture -- and with it S passes
+(153 of 153). So S's stream adoption depends on the lake churning at its
+breach; fed by the CA alone the channel carries more water than the adopted
+columns' flood count tolerates. Split-half controls: the seam half alone fails
+S, the sim_step half alone passes it. That is sim_stream.wgsl's to retune
+(it is being reworked: "reservoir refill limits for stream columns").
+
 **THE DRIFT** (2026-10-17, ticket 00-01-44): a level reach gives the held
 flow no direction, so worldgen `cols` writes each river column's network
 distance to its mouth (worldwater.cpp `River::mouth`, packed over the pieces'
