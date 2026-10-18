@@ -147,6 +147,13 @@ void SetShortRangeNear(bool on) {
   g_shortRangeNear = on;
 }
 
+// The dev panel's water cost probes (support.h). Set every frame by the game.
+namespace {
+uint32_t g_waterFxProbe = 0;
+}
+uint32_t WaterFxProbe() { return g_waterFxProbe; }
+void SetWaterFxProbe(uint32_t bits) { g_waterFxProbe = bits & kWaterProbeMask; }
+
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
 float g_shotTimeOfDay = 0.34f;
@@ -878,7 +885,9 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u) |
              (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u) |
              (GasFarRenderActive() ? 32u : 0u) |
-             (CurrentTuning().render.horizon ? 128u : 0u);
+             (CurrentTuning().render.horizon ? 128u : 0u) |
+             // Bits 8..13: the dev panel's water cost probes (support.h).
+             WaterFxProbe();
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.

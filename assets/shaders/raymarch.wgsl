@@ -884,6 +884,24 @@ const RFLAG_GAS : u32 = 8u;
 // recorded, so with this off it is stale and must not be sampled.
 const RFLAG_GASFAR : u32 = 32u;
 
+// ---- WATER COST PROBES (dev panel, View page, 2026-10-18) ------------------
+// R.flags bits 8..13, written by WriteRenderParams from SetWaterFxProbe
+// (support.h). Each bit switches one liquid-shading effect OFF at runtime so
+// the owner can flip it live and compare picture and raymarch ms. A uniform
+// branch keeps its registers, so a probe prices the work, not occupancy --
+// W2-A measured that deleting a quarter of this shader left the count at 168,
+// so the work is the honest number here. All zero = the shipped look.
+const RFLAG_NO_MIST : u32 = 256u;        // waterfallMist: mist + spray + its sun ray
+const RFLAG_NO_REFL : u32 = 512u;        // traceReflection: sky lookup only
+const RFLAG_NO_CAUSTIC : u32 = 1024u;    // waterCausticCurv + bedCaustic
+const RFLAG_NO_SHEETS : u32 = 2048u;     // waterSideKind: every side face a plain wall
+// Bits 12..13: traced-reflection step budget shift (0 = TUNE_REFLECTION_STEPS,
+// 1 = half, 2 = quarter, 3 = eighth).
+const RFLAG_REFL_STEP_SHIFT : u32 = 12u;
+fn reflStepBudget() -> i32 {
+  return TUNE_REFLECTION_STEPS >> ((R.flags >> RFLAG_REFL_STEP_SHIFT) & 3u);
+}
+
 // ---- GAS_RUN: crossing a run of one thin gas in trace()'s tight loop -------
 // IMPLEMENTED, EXACT, MEASURED (2026-10-03, raymarch-smoke); ON since 2026-10-06
 // (owner decision: the smoke camera's -1.0 ms bought for +0.2/+0.15 on the
@@ -10789,6 +10807,8 @@ fn waterRippleFootprint(hitP : vec3f) -> f32 {
 // half CA and half marched isosurface throws ONE caustic web across its bed.
 fn waterCausticCurv(hitP : vec3f, rd : vec3f, pathVox : f32,
                     depthM : f32) -> f32 {
+  // veilCaustic(0) == 1: no web, the bed lit as if the surface were flat.
+  if ((R.flags & RFLAG_NO_CAUSTIC) != 0u) { return 0.0; }
   // where on the surface the sunlight entering this bed point came from
   let bedP = hitP + rd * pathVox;
   let kdc = keyLightDir();
@@ -11543,6 +11563,7 @@ const SIDE_WALL : u32 = 0u;
 const SIDE_RISER : u32 = 1u;
 const SIDE_SHEET : u32 = 2u;
 fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
+  if ((R.flags & RFLAG_NO_SHEETS) != 0u) { return SIDE_WALL; }
   if (gHeldKind != 0u) { return heldSideKind(cell, out); }
   let n = cell + out;
   var level = -1.0;   // out of the window: open, and falling
@@ -12252,8 +12273,8 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   // mix() did, so nothing new is live across the reflected march.
   var h : OpaqueHit;
   h.hit = false;
-  if (horizon > 0.0) {
-    h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
+  if (horizon > 0.0 && (R.flags & RFLAG_NO_REFL) == 0u) {
+    h = traceOpaque(p + n * 0.05, rr, reflStepBudget(), 1e30,
                     &occupancy, &materials);
     rsAdd(RS_REFLECT, h.steps);
   }
@@ -12466,7 +12487,7 @@ fn waterTopAbove(p : vec3f) -> f32 {
 // a lit wall, and it makes it stable when the camera moves (it is a property
 // of the surface and the sun, not of the eye).
 fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
-  if (depthM <= 0.0) { return 0.0; }
+  if (depthM <= 0.0 || (R.flags & RFLAG_NO_CAUSTIC) != 0u) { return 0.0; }
   let kd = keyLightDir();
   // Sun below the horizon: no caustics. Guarded before the divide.
   if (kd.y < 0.05) { return 0.0; }
@@ -12908,6 +12929,7 @@ fn mistVeil(ro : vec3f, rd : vec3f, tHit : f32, radius : f32, fieldScale : f32,
 fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
                  cell : vec3<i32>, mat : u32) -> vec3f {
   if (TUNE_MIST_DENSITY <= 0.0 && TUNE_SPRAY_DENSITY <= 0.0) { return base; }
+  if ((R.flags & RFLAG_NO_MIST) != 0u) { return base; }
   let cue = fallCueAt(cell);
   if (cue.fall <= 0.0 && cue.impact <= 0.0) { return base; }
 

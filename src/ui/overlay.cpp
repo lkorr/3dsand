@@ -2790,6 +2790,43 @@ void Overlay::DrawDevView(UIState& s) {
         "every ray - a PERF mode, not a fog filter. Shape it under Rendering:\n"
         "shortRangeDist, shortRangeNearDist, shortRangeFogStart/Density.");
   }
+  if (Section("Water render cost")) {
+    // Live A/B switches for the liquid shade (raymarch.wgsl RFLAG_NO_*). Each
+    // turns ONE effect off at runtime: flip it, watch the world raymarch ms
+    // and the picture. Nothing recompiles and nothing is saved.
+    ImGui::Checkbox("no mist / spray", &s.wfxNoMist);
+    ImGui::SetItemTooltip(
+        "waterfallMist: the vapour slabs and plunge spray over falling water,
+"
+        "and the 24-step sun ray each such pixel casts.");
+    ImGui::Checkbox("no traced reflections", &s.wfxNoRefl);
+    ImGui::SetItemTooltip(
+        "traceReflection returns the sky: no reflected shore, trees or bodies.
+"
+        "Water and ice. The sky, sun glint and Fresnel stay.");
+    const char* kSteps[] = {"full", "1/2", "1/4", "1/8"};
+    ImGui::SetNextItemWidth(120);
+    ImGui::Combo("reflection steps", &s.wfxReflShift, kSteps, IM_ARRAYSIZE(kSteps));
+    ImGui::SetItemTooltip(
+        "The traced reflection's step budget (render.reflectionSteps = %d)
+"
+        "divided down. A ray that runs out returns the sky.",
+        CurrentTuning().render.reflectionSteps);
+    ImGui::Checkbox("no caustics", &s.wfxNoCaustic);
+    ImGui::SetItemTooltip(
+        "The caustic web: on the bed seen through the surface, and on lit
+"
+        "underwater surfaces.");
+    ImGui::Checkbox("no side sheets", &s.wfxNoSheets);
+    ImGui::SetItemTooltip(
+        "waterSideKind: every side face of a liquid is a plain wall - no
+"
+        "white falling sheet, no riser lit as surface.");
+    if (ImGui::Button("all on (shipped look)")) {
+      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = s.wfxNoSheets = false;
+      s.wfxReflShift = 0;
+    }
+  }
   if (Section("Debug draw")) {
     ImGui::Checkbox("corner readout (fps + looking at)", &s.showCornerReadout);
     ImGui::SetItemTooltip("Top-right, stays up with this panel closed.");

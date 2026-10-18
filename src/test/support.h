@@ -92,6 +92,20 @@ void SetShortRange(bool on);
 bool ShortRangeNear();
 void SetShortRangeNear(bool on);
 
+// ---- water cost probes (dev panel View page, "water render cost") ----------
+// Bits that switch one liquid-shading effect OFF in the raymarch, so its look
+// and its ms can be compared live (raymarch.wgsl RFLAG_NO_*). WriteRenderParams
+// ORs them into RenderParams.flags bits 8..13. 0 = the shipped look.
+// Render-only: no sim input, cannot reach the world hash.
+constexpr uint32_t kWaterProbeNoMist    = 1u << 8;
+constexpr uint32_t kWaterProbeNoRefl    = 1u << 9;
+constexpr uint32_t kWaterProbeNoCaustic = 1u << 10;
+constexpr uint32_t kWaterProbeNoSheets  = 1u << 11;
+constexpr uint32_t kWaterProbeReflShift = 12;   // 2 bits: steps >> n
+constexpr uint32_t kWaterProbeMask      = 0x3F00u;
+uint32_t WaterFxProbe();
+void SetWaterFxProbe(uint32_t bits);
+
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
 //

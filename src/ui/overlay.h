@@ -84,6 +84,15 @@ struct UIState {
   // draws the two as one off / 50 m / 100 m radio row, but the state stays two
   // bools so the chosen ARM survives toggling the mode off and back on.
   bool shortRangeNear = false;
+  // Water render cost probes (View page): each switches one liquid-shading
+  // effect OFF live so its look and its raymarch ms can be compared. main
+  // packs them into SetWaterFxProbe (support.h) every frame. Session state,
+  // never saved; all false / 0 = the shipped look.
+  bool wfxNoMist = false;      // waterfall mist + spray (and their sun ray)
+  bool wfxNoRefl = false;      // traced reflections -> sky lookup only
+  bool wfxNoCaustic = false;   // caustic web on the bed (looking down + lit bed)
+  bool wfxNoSheets = false;    // side faces never falling sheets / risers
+  int wfxReflShift = 0;        // reflection step budget >> n (0..3)
   // Effective draw distance in METRES, written by main each frame for the
   // panel readout: the cascade's filled radius normally, the short-range
   // ceiling while the mode is on. Read-only in the UI — it is evidence that
