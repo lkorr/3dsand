@@ -2212,6 +2212,18 @@ species shows its FULL look at -- `c` and `f` are taken against it -- so a
 potent species (blood: 48) still reads once dilute. Render-only; packed in
 bits 16..23 of the tintStrength word.
 
+*The walk is a cell DDA* (2026-10-18, ticket 2026-10-17_11-50-39, "blood in
+water ... weird lines at voxel edges"). The slab walk took ONE sample per cell
+slab of the ray's dominant axis, at its mid-plane, and so skipped the corner a
+minor axis clips. Freshly mixed blood is exactly that corner: it sits in a
+river's top layer, often a part-full top cell, and a grazing ray leaves that
+layer within half a cell, so only the pixels whose entry lay just before a
+mid-plane sampled it -- a red stripe per voxel across a pink surface (measured
+with a per-pixel probe of the walk's largest blood share). `solPathLook` now
+visits every cell the ray crosses (Amanatides-Woo: integer steps, face
+crossings as `(face - ro) / rd`, exact far from the origin), each for its exact
+length; the chunk skip is unchanged; the budget is 192 crossings.
+
 **The CPU's one view of the layer** (2026-10-11): `World::RequestSoluteAgg` /
 `SoluteAgg` -- solCompact's per-chunk aggregate word `(species << 24) | mass`,
 copied 4 bytes a chunk for the chunks asked about (`kSolAggPerTick`), landed
@@ -4992,7 +5004,7 @@ position already fitted, the unwrapped cell IS `p >> 16`, so nothing near the
 origin moves. CPU writers: `(x << 16)` spawn writers wrap by C++20; the
 container pours go through `container.cpp Q16Pos` (64-bit, because MSVC's
 `lround` returns a 32-bit `long` and came back garbage past 32,767 cells).
-Repro harness: `SANDVOX_AT_POUR=x,y,z,r,material,ticks[,after[,vx,vz]]` with
+Repro harness: `SANDVOX_AT_POUR=x,y,z,r,material[/material2],ticks[,after[,vx,vz]]` with
 `--at` (session.cpp, the mpm tool's own pour).
 
 **THE SPOUT JET** (2026-10-18; owner-approved ticket 2026-10-17_11-44-48, "falling
@@ -5010,15 +5022,52 @@ is always 0 (trigger (a) requires the free surface), so bit 23 marks a jet and
 bits 20..22 carry direction + strength (h ≥ 4); a shell cell's depth is capped
 at 7 to leave the bit free, which changes no J at the shipped tuning (it floors
 at depth 3). `exciteEmit` turns it into the particles' horizontal velocity
-(two strengths, ±1/8 per-particle spread, clamped to `FLUID_VMAX`). Only
-velocity: no cell is excited that was not already being excited, so held water
-at rest (refused above it) is never thrown and `held-splash` / `rivers` /
-`stream-natural` cannot see it; the energy is the head the water falls from.
-Both knobs are `NO_WGSL`, packed by `SubmitTick` into `TickParams._padSplash1`
-(no layout or prelude change; F1-live). Gate `fluid-spout`: a reservoir behind
-a dam pours through a 3×1 hole into a 13-deep pit; the shipped arm's falling
-water must sit `fluidSpout.minGain` cells farther from the dam than the
-gain-0 control's, and run twice to the same hash.
+(two strengths, ±1/8 per-particle spread, clamped to `FLUID_VMAX`).
+
+Two more pieces were needed, both measured by the gate's own attribution (the
+excited particles born each tick: how many carry a throw, where, how fast):
+- **THE MOUTH.** Fall cells alone moved the stream 0.07 cells: the CA takes a
+  spout's water out of its mouth DIAGONALLY, to the cell under the lip, and on
+  down the face as a sheet whose cells have water over them, so trigger (a)
+  sees only its top and its tip — 12% of the poured water carried a throw. So
+  the mouth is a trigger of its own (`spoutMouthCode`, census `EX_BY_PERCH`):
+  a cell resting on something with a lateral neighbour that is air over air
+  (the perch configuration) and, on the OPPOSITE side, this liquid with its
+  head ≥ 3 rows over the cell — the head is what tells a spout from a film on a
+  ramp, the case `sim.fluidExcitePerch` is off for. Still inside
+  `settleCheck`'s veto (it tests the full perch predicate), so settle can never
+  rebuild what it takes. It needs `fluidExciteMode` on and both knobs non-zero.
+- **THE NOZZLE.** A thrown cell is born one cell from SETTLED water, whose
+  nodes `clearGrid` seeds with zero-velocity mass; the particle's quadratic
+  support still gathers ~28% from that node, so each substep kept ~72% of the
+  throw and the birth tick ended at 0.02 cells/tick from a 1.0 seed. The throw
+  rides the particle in `_r4/_r5` (written by `exciteEmit` only) and `g2p`
+  holds its horizontal velocity at least to it for `SPOUT_NOZZLE_TICKS` (2)
+  from birth — the head still pushing until it clears the mouth.
+
+Held water at rest is refused before any of this (never thrown), and the
+energy is the head the water falls from. Both knobs are `NO_WGSL`, packed by
+`SubmitTick` into `TickParams._padSplash1` (no layout or prelude change;
+F1-live). Gate `fluid-spout`: a reservoir behind a dam pours through a 3×1 hole
+into a 13-deep pit; the shipped arm's still-falling particles low in the fall
+must sit `fluidSpout.minGain` (0.5) cells farther from the dam than the gain-0
+control's (measured 1.21 vs 0.45 at gain 0.3 / chance 0.6), and run twice to
+the same hash.
+
+**Two liquids in one MPM body are a mixture** (2026-10-18; ticket
+2026-10-17_00-04-26, "after pouring a lil bit of acid in water (mpm fluid) the
+shaders start tweakin out"). `shadeMpmFluid` took all its optics — absorption,
+in-scatter, the clear-water weight, the interface reflectance — from ONE
+material, the one with the single biggest node contribution among
+`fluidSampleAt`'s eight taps, while the colour was already a weighted blend.
+In a stirred acid + water body that winner flips node by node and tick by tick,
+and acid (opacity 170: the derived murky body, Fresnel 0.55) and water (the
+authored clear look) are nothing alike, so the surface broke into hard patches
+of two liquids that jumped every frame. `fluidSampleAt` now ACCUMULATES the two
+materials with the most volume (`fluidMixAdd`; a third evicts the runner-up
+only when its contribution beats the runner-up's total) and returns
+`mat2`/`mix2`; the shade mixes the two `liquidOptics` term by term by the
+runner-up's share. Render-only.
 
 **The fluid lab (2026-08-24; `src/lab/`, docs/PLAN_fluid_overhaul.md §4).**
 The dedicated place fluid is looked at, tuned and benchmarked. `--lab
