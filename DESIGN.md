@@ -7320,7 +7320,14 @@ neighbors, so this needs an explicit connectivity pass:
   it is deterministic and replayable). Odd-angle bodies stay bodies — snapping
   them would resample to mush. One body per tick, whole body or nothing (no
   partial settles losing matter). This closes the grid → body → grid loop and
-  applies to blast debris and severed mob limbs alike.
+  applies to blast debris and severed mob limbs alike. The snap is
+  `floor(pos + 0.75)` per axis, not `lround(pos)`: the terrain collider is
+  marching cubes through cell SAMPLES, so a solid cell n's top face is at
+  n + 0.5 and a body at rest lies half a cell below the lattice it was born
+  on (pos n − 0.5, against a wall on either side too). `lround` split exactly
+  between the two, so contact slop could round a body lying flat into the
+  ground; since a target cell that is not air holds the settle (audit SB-2,
+  2026-10-14) such a body never settled (gate `floaters`, fixed 2026-10-18).
 - **Body burn (2026-08-19, implemented):** bodies are outside the CA, so
   without this a burning plank froze mid-flame the moment it detached.
   `DebrisSystem::BurnBodies` runs a CPU mirror of the reaction table (same
@@ -14093,8 +14100,13 @@ debris for the network). All of that is gone.
   in Jolt, no burn front or `alight`, no active coat (washer, corrosive, hot)
   and nothing dirty, no bleed budget or gush, twins clean. Asleep it skips
   `PostStep`, the burn/stain scans and all but a strided terrain anchor; it
-  wakes on Jolt activity, any damage entry point or a change in the chunk
-  versions around it (`DeadWakeKey`). A PASSIVE coat (one that only dries --
+  wakes on Jolt activity, any damage entry point or a change in the CELLS
+  round it: a moved chunk version (`DeadWakeKey`, the per-tick test) is
+  confirmed against a digest of the mirror words in the body's own box
+  (`DeadMatterKey`, bits 16-23 masked) before it wakes anything, so a chunk
+  that changed somewhere the body is not -- water stain creeping into a
+  basin wall a dozen cells off, measured 2026-10-18 waking a floating
+  corpse 768 times in 1,500 ticks -- leaves it asleep. A PASSIVE coat (one that only dries --
   blood, ichor, oil: `MobSystem::CoatDriesAsleep`) does not hold it awake: it
   gets one visit per tick its next drying level is due (`Mob::NextDryTick`,
   `DeadDryVisit` = the awake `StainTick` of that tick), so the coat ends

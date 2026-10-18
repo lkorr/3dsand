@@ -3018,8 +3018,26 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
         }
         mem.src = &mem.down;
       }
-      mem.base = IVec3{(int)std::lround(m.xf.pos.x), (int)std::lround(m.xf.pos.y),
-                       (int)std::lround(m.xf.pos.z)};
+      // THE SNAP: floor(pos + 0.75), not lround(pos). A body's lattice
+      // corner sits on one of two lattices, half a cell apart, and lround
+      // splits exactly between them. Born from the grid (an island, a
+      // severed limb, a fixture) it is at the cell itself, pos = n. At REST
+      // it is at n - 0.5: the terrain collider is marching cubes through the
+      // cell SAMPLES (phys/marching_cubes.h, edge midpoints), so a solid
+      // cell n has its top face at n + 0.5, not n + 1, and every body lying
+      // flat on the ground sleeps half a cell lower than the cells it came
+      // from (and half a cell off any wall it leans on, the same way, on
+      // either side). lround(n + 0.5 - contact slop) then picked the cell
+      // INSIDE the ground about as often as the one above it, and since the
+      // target-must-be-air rule below (audit SB-2, 2026-10-14) a body that
+      // picked the low one was held for ever -- `floaters`'s control block,
+      // lying square on a stone pad at pos y 185.50, was refused 10 times
+      // in 300 ticks as target-blocked and never settled. floor(pos + 0.75)
+      // maps both lattices to n with a quarter cell of margin each way, on
+      // every axis and for every snapped orientation (a rotated lattice's
+      // corner is on its far side, and it rests a half-cell off there too).
+      mem.base = IVec3{ifloor(m.xf.pos.x + 0.75f), ifloor(m.xf.pos.y + 0.75f),
+                       ifloor(m.xf.pos.z + 0.75f)};
       totalOps += mem.src->size();
       members.push_back(std::move(mem));
     }

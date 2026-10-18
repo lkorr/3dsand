@@ -492,20 +492,85 @@ Status GateFloaters(Ctx& c, std::string& detail) {
   // same code path; the only variable is what is underneath it.
   debris.Reset();
   const uint32_t settledBeforeB = debris.SettledBack();
+  const uint32_t refusedBeforeB = debris.Floaters().settleWithoutSupport;
+  const uint32_t blockedBeforeB = debris.Floaters().settleTargetBlocked;
+  const uint32_t terrainWakesBeforeB = debris.Settle().terrainWakes;
+  const uint32_t blastWakesBeforeB = debris.Settle().blastWakes;
+  uint64_t groundHandle = 0;
   {
     std::vector<DebrisVoxel> vox = StoneBlock();
     const int restY = padY + 1;  // directly on the pad
     uint64_t bh = phys.CreateDebrisBody(vox, {fx, restY, fz}, dens);
+    groundHandle = bh;
     BodyTransform bxf{};
     bxf.pos = Vec3{(float)fx, (float)restY, (float)fz};
     bxf.quat[3] = 1;
     debris.AdoptBody(bh, vox, bxf);
   }
-  for (int i = 0; i < 360 && debris.BodyCount() > 0; i++)
+  int quietRun = 0, maxQuiet = 0, wakesB = 0;
+  for (int i = 0; i < 360 && debris.BodyCount() > 0; i++) {
     RunTick(c, t, fixtureChunk);
+    if (debris.BodyCount() == 0) break;
+    if (phys.IsActive(groundHandle)) {
+      if (quietRun > 0) wakesB++;
+      quietRun = 0;
+    } else {
+      maxQuiet = std::max(maxQuiet, ++quietRun);
+    }
+  }
   const uint32_t settledB = debris.SettledBack() - settledBeforeB;
+  const uint32_t refusedB =
+      debris.Floaters().settleWithoutSupport - refusedBeforeB;
   const bool passB =
       note(settledB >= 1 && debris.BodyCount() == 0, "supported-still-settles");
+  // WHERE THE CONTROL BLOCK ENDED AND WHAT WAS UNDER IT (rule 6). A red
+  // control used to say only "ground-block settled 0", which is every cause at
+  // once: the block never slept, it slept off the pad, or it slept ON the pad
+  // while the CPU mirror the support test reads did not hold the pad. So when
+  // it is still a body: its centre, Jolt activity, and for the cell under its
+  // footprint centre, the mirror's material + chunk version against the
+  // GPU's own word for the same cell.
+  std::string whyB;
+  if (!passB && groundHandle != 0) {
+    Vec3 com{};
+    if (phys.BodyCenterOfMass(groundHandle, com)) {
+      const IVec3 below{ifloor(com.x), ifloor(com.y - 1.5f) - 1, ifloor(com.z)};
+      const IVec3 wc{below.x >> 4, below.y >> 4, below.z >> 4};
+      const uint32_t li = ((uint32_t)(below.z & 15) * kChunk +
+                           (uint32_t)(below.y & 15)) * kChunk +
+                          (uint32_t)(below.x & 15);
+      const CachedChunk* cc = world.Cached(wc);
+      uint32_t mirrorWord = 0xFFFFFFFFu, gpuWord = 0xFFFFFFFFu;
+      if (cc && cc->voxels.size() == kChunkVol) mirrorWord = cc->voxels[li];
+      if (world.ChunkInWindow(wc)) {
+        std::vector<uint32_t> ch(kChunkVol, 0);
+        ReadVoxelsSync(c.ctx, world, World::SlotChunkIndex(wc), 1, ch.data(),
+                       "floatersWhyB");
+        gpuWord = ch[li];
+      }
+      BodyTransform gx{};
+      phys.GetTransform(groundHandle, gx);
+      const DebrisSystem::SettleProbe& sp = debris.Settle();
+      whyB = Format(
+          "; ground-block: refused %u, target-blocked %u, com (%.2f,%.2f,%.2f) "
+          "pos (%.2f,%.2f,%.2f) quat (%.3f,%.3f,%.3f,%.3f) %s, longest asleep "
+          "%d ticks, woken %d times (terrain %u blast %u, last t%u chunk "
+          "%d,%d,%d), pad y%d, "
+          "below (%d,%d,%d) mirror %s0x%08x (v%u, tick %u) gpu 0x%08x",
+          refusedB, debris.Floaters().settleTargetBlocked - blockedBeforeB,
+          (double)com.x, (double)com.y, (double)com.z, (double)gx.pos.x,
+          (double)gx.pos.y, (double)gx.pos.z, (double)gx.quat[0],
+          (double)gx.quat[1], (double)gx.quat[2], (double)gx.quat[3],
+          phys.IsActive(groundHandle) ? "ACTIVE" : "asleep", maxQuiet, wakesB,
+          sp.terrainWakes - terrainWakesBeforeB, sp.blastWakes - blastWakesBeforeB,
+          sp.lastWakeTick, sp.lastWakeChunk.x,
+          sp.lastWakeChunk.y, sp.lastWakeChunk.z, padY, below.x,
+          below.y, below.z, cc ? "" : "UNCACHED ", mirrorWord,
+          cc ? cc->version : 0u, t, gpuWord);
+    } else {
+      whyB = Format("; ground-block: refused %u, body gone", refusedB);
+    }
+  }
 
   // ---- PASS C: sweep the world those two left behind ---------------------
   //
@@ -546,7 +611,7 @@ Status GateFloaters(Ctx& c, std::string& detail) {
       "defer-gaveup %u, queue-dropped %u; deferrals: cellop %u, spawn-ring %u, "
       "drain-backpressure %u, "
       "oversize %u, spilled %u, settle-unsupported %u; anchors: boundary %u, "
-      "unknown %u, oversize-flood %u%s%s",
+      "unknown %u, oversize-flood %u%s%s%s",
       fx, fz, org.x, org.z, siteInWindow ? 1 : 0, sw.components,
       sw.componentsTotal, sw.voxels, sw.cellsScanned, sw.chunksMissing,
       worst.empty() ? "" : " [", worst.c_str(), worst.empty() ? "" : "]",
@@ -556,8 +621,8 @@ Status GateFloaters(Ctx& c, std::string& detail) {
       fp.drainBackpressure,
       fp.deferredOversize, fp.eventQueueFullSpilled, fp.settleWithoutSupport,
       fp.anchoredByRegionBoundary, fp.anchoredByUnknownChunk,
-      fp.anchoredByOversizeFlood, failed.empty() ? "" : "; FAILED: ",
-      failed.c_str());
+      fp.anchoredByOversizeFlood, whyB.c_str(),
+      failed.empty() ? "" : "; FAILED: ", failed.c_str());
   std::printf("floaters: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   // Leave the world as this gate found it. Every late world-touching gate in
