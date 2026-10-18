@@ -4548,7 +4548,8 @@ fn ledgerNote(dep : u32, wd : u32) {
 // them; a dense worldgen Fill clears them with the table): [0] GIVE, [1]
 // TAKE, [2] GROW, the eighths the reservoir wrote (non-POOL and POOL alike);
 // [3..14] the MPM seam's excite census (sim_fluid_seam.wgsl writes them
-// through its own alias of this buffer); [15] spare. `held-splash` and
+// through its own alias of this buffer); [15] one excited held cell at or
+// under its top row, packed (sim_fluid_seam.wgsl WHERE). `held-splash` and
 // `rivers` S read them.
 const STILL_DIAG : u32 = WORLD_N * WORLD_N * STILL_WORDS + 4u + 11u * WORLD_N * WORLD_N;
 fn stillNote(want : u32, eighths : u32) {
@@ -4787,8 +4788,23 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   // was an instant pipe to the map: measured, `stream-natural`, a held basin
   // filled a dug extension at 3.6 times the live stream's rate. Not a POOL
   // column (THE CONDUIT withdraws from its ledger) and not the map's own.
+  // ...EXCEPT THE HEAD (hop 1, 2026-10-18): the column the map's own water
+  // feeds is the reservoir's edge, refilled as the map's water beside it is.
+  // The map feeds it only through the CA otherwise, and a head whose target
+  // stands under the map's surface row cannot take that: the map's cell at
+  // the head's top row is submerged (no sideways levelling, THE HYDROSTATIC
+  // INVARIANT) and the one over it would pour over the head's target (held,
+  // refused) -- the live head was fed by exactly that spill from the map's
+  // top layer. MEASURED, `rivers` S (a channel dug into a lake, its head a
+  // few cells under the lake's surface): the head held, then stood more than
+  // a voxel under its target, was released DRAINED, and the 75 columns held
+  // below it let go for want of support; refilled, the head stood at its
+  // target to the eighth for the 1,500 ticks the gate's head trace followed
+  // it. What it delivers on is still the held stream's own CA, column to
+  // column (`stream-natural` E: held and live deliver at the same rate).
   let si = stillIndex(c.x, c.z);
-  if (stillWater[si + 1u] == 0u && (stillWater[si + 3u] & STILL_POOL_BIT) == 0u) { return STILL_NONE; }
+  if (stillWater[si + 1u] == 0u && (stillWater[si + 3u] & STILL_POOL_BIT) == 0u &&
+      (stillWater[si + 2u] >> 20u) != 1u) { return STILL_NONE; }
   if (f < select(8u, ft, dy == 0)) { return STILL_TAKE; }
   if (dy < 0 && voxWordIndex(a) != PT_NO_WORD) { return STILL_GROW; }
   return STILL_NONE;

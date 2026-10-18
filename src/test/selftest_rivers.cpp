@@ -1599,7 +1599,28 @@ Status GateRivers(Ctx& c, std::string& detail) {
       // rivers: a stream that never sleeps on its own. It must (a) run,
       // (b) be ADOPTED column by column and fall asleep, and (c) once its
       // mouth is plugged with stone, be RELEASED and drain.
+      // MPM EXCITATION is rivers.streamExciteMode (default 0, OFF), as in
+      // `stream-natural` and `stream-pool`: the claim is the held stream's.
+      // With it on (1, the game's default) the seam turns this channel into a
+      // perpetual MPM torrent -- measured 2026-10-18: ~40k eighths of the
+      // stream's own water woken into particles every 150 ticks (the wake
+      // trigger; fall ~1k and step ~0.8k seed it, at the lake's drop into the
+      // channel and over its risers), its volume 1,400 to 3,600 eighths between
+      // samples, waves up to five cells over the lake's surface at its head --
+      // which the natural rules (a surface steady for sim.streamSteadyTicks)
+      // rightly do not freeze. That is the seam's behaviour, gated by its own
+      // gates; set the knob to 1 to measure it here.
+      struct ExciteMode {
+        Tuning saved = CurrentTuning();
+        explicit ExciteMode(int mode) {
+          Tuning t = saved;
+          t.sim.fluidExciteMode = mode;
+          SetCurrentTuning(t);
+        }
+        ~ExciteMode() { SetCurrentTuning(saved); }
+      };
       {
+        const ExciteMode streamExcite(static_cast<int>(BaselineNumber("rivers.streamExciteMode", 0)));
         const auto& Lm = rMain->line;
         size_t im = 0;
         for (size_t i = 0; i < Lm.size(); i++)
@@ -1661,7 +1682,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // releases, bits 0..7 | adoptions, 8..15; word 7 the release reasons, a byte
         // each: support | flood | event | drained), the most-released column.
         int relMaxS = 0, relSumS = 0, adoptSumS = 0;
-        std::string relWhoS;
+        std::string relWhoS, whyS, relWhyS;
+        std::map<std::pair<int, int>, int> evPrevS;
         auto adoptedCount = [&]() {
           std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
@@ -1670,6 +1692,76 @@ Status GateRivers(Ctx& c, std::string& detail) {
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, kObsS * 4u, obs.data(), obs.size() * 4, "riversStillObs");
           relMaxS = relSumS = adoptSumS = 0;
           relWhoS.clear();
+          // WHY NOT (sim_stream.wgsl STREAM_OBS [6] bits 24..31, the first test
+          // the column's last visit failed): a histogram over the channel's
+          // unheld columns, the longest steady run (windows) and the newest
+          // event at or below any of them (ticks ago).
+          int whyN[16] = {};
+          uint32_t runMax = 0, ageMin = 0xFFFFFFFFu;
+          const uint32_t now16 = std::max((tick.t >> 4) & 0xFFFFu, 1u);
+          for (const auto& xz : byCols) {
+            const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+            if (tab[ci * 4 + 2] == 0u) {
+              whyN[(obs[ci * 8 + 6] >> 24) & 15u]++;
+              runMax = std::max(runMax, obs[ci * 8] >> 20);
+              const uint32_t f = obs[ci * 8 + 2] & 0xFFFFu;
+              if (f != 0u) ageMin = std::min(ageMin, ((now16 - f) & 0xFFFFu) * 16u);
+            }
+          }
+          whyS.clear();
+          for (int w = 0; w < 16; w++)
+            if (whyN[w]) whyS += Format(" %d:%d", w, whyN[w]);
+          // ...and WHO made the events since the last sample (each column's own
+          // fine-event count, STREAM_OBS [6] bits 16..23, diffed): along the
+          // channel from the lake (0) to main (n-1), its distance from the lake.
+          {
+            std::string who;
+            int nWho = 0;
+            for (size_t i = 0; i < byCols.size(); i++) {
+              const auto& xz = byCols[i];
+              const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+              const int n = static_cast<int>((obs[ci * 8 + 6] >> 16) & 0xFFu);
+              int& p = evPrevS[xz];
+              if (n > p && nWho++ < 4) who += Format(" (%d,%d)+%d", xz.first, xz.second, n - p);
+              p = n;
+            }
+            if (nWho) whyS += Format(" events from %d:%s", nWho, who.c_str());
+          }
+          whyS += Format(" run<=%u newest-event %s", runMax, ageMin == 0xFFFFFFFFu ? "none" : std::to_string(ageMin).c_str());
+          // ...and every release by reason (STREAM_OBS [7]: support | flood |
+          // (the observer's run drift) | drained, a byte each), and the
+          // lake-most released column's word.
+          relWhyS.clear();
+          {
+            int byReason[4] = {};
+            int firstRelZ = 0;
+            uint32_t firstRel = 0;
+            for (const auto& xz : byCols) {
+              const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+              const uint32_t o7 = obs[ci * 8 + 7];
+              for (int b = 0; b < 4; b++) byReason[b] += static_cast<int>((o7 >> (8 * b)) & 0xFFu);
+              const int dz = std::abs(xz.second - zA);
+              if ((obs[ci * 8 + 6] & 0xFFu) != 0u && (firstRel == 0u || dz < firstRelZ)) {
+                firstRelZ = dz;
+                firstRel = o7;
+                relWhyS = Format(" lake-most (%d,%d) 0x%08x;", xz.first, xz.second, o7);
+              }
+            }
+            relWhyS += Format(" by reason support %d flood %d drained %d", byReason[0], byReason[1], byReason[3]);
+            // WHERE the unheld columns are: (x, distance from the lake end)
+            // why/run, lake-side first, at most 24.
+            std::vector<std::pair<int, std::string>> un;
+            for (const auto& xz : byCols) {
+              const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+              if (tab[ci * 4 + 2] != 0u) continue;
+              un.push_back({std::abs(xz.second - zA) * 4 + (xz.first - lakeX + 1),
+                            Format(" (%d,+%d)%u/%u", xz.first, std::abs(xz.second - zA), (obs[ci * 8 + 6] >> 24) & 15u,
+                                   obs[ci * 8] >> 20)});
+            }
+            std::sort(un.begin(), un.end());
+            relWhyS += Format("; %zu unheld (x,+dz)why/run:", un.size());
+            for (size_t i = 0; i < un.size() && i < 24; i++) relWhyS += un[i].second;
+          }
           for (const auto& xz : byCols) {
             const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
             const int rel = static_cast<int>(obs[ci * 8 + 6] & 0xFFu);
@@ -1735,8 +1827,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
         first.cells = dig;
         tick(first);
         std::printf("rivers:   S channel: lake (%d,%d) y%d -> main (%d,%d) y%d, %zu columns (%zu its own), %zu wall ops, "
-                    "%zu dig ops\n",
-                    lakeX, zA, yA, lakeX, zB, yB, floorOf.size(), byCols.size(), byWalls.size(), dig.size());
+                    "%zu dig ops; MPM excitation %s (rivers.streamExciteMode)\n",
+                    lakeX, zA, yA, lakeX, zB, yB, floorOf.size(), byCols.size(), byWalls.size(), dig.size(),
+                    CurrentTuning().sim.fluidExciteMode != 0 ? "on" : "off");
         const int streamTicks = static_cast<int>(BaselineNumber("rivers.streamTicks", 1800));
         std::string curve;
         int wet = 0, adopted = 0, awake = 0;
@@ -1746,16 +1839,107 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // down the whole stream) -- measured monotone (0 lost) when it works;
         // a first cut of the flood release took it to 22, 45, 27, 15, 69, 12 ...
         int lost = 0;
+        // IS THE STREAM STEADY (CLAUDE.md rule 6)? Per sample: the eighths
+        // standing in the channel's own columns (floor .. floor + 6), and the
+        // MPM seam's excite census since the last sample (STILL_DIAG [3..7]:
+        // held over its top / bank / unheld / stream / held at or under its
+        // top -- at a breach, or its top cell over the target) with the
+        // reservoir's GIVE / TAKE / GROW ([0..2]).
+        const uint64_t diag0Off = (uint64_t(kWorldN) * kWorldN * 4u + 4u + 11u * uint64_t(kWorldN) * kWorldN) * 4u;
+        uint32_t dPrev[8] = {};
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), diag0Off, dPrev, sizeof dPrev, "riversDiag0");
+        // ...and the excitation by trigger (exciteScratch [11..15], EX_BY_*: fall
+        // / perch / step / shell / wake), cumulative, diffed per sample.
+        uint32_t byPrev[5] = {};
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.fluidExciteScratch, 11u * 4u, byPrev, sizeof byPrev, "riversBy0");
+        auto chanVol = [&]() {
+          long long v = 0;
+          for (const auto& xz : byCols)
+            for (int y = floorOf[xz]; y <= floorOf[xz] + 6; y++) {
+              const uint32_t w = voxRaw(xz.first, y, xz.second);
+              if ((w & 0xFFFu) == mWater) v += ((w >> 12) & 15u) + 1u;
+            }
+          return v;
+        };
+        // THE HEAD'S TRACE (CLAUDE.md rule 6): the lake's last row and the
+        // channel's first four own rows, three columns each, every 10 ticks
+        // while any of those twelve columns is held (and the sample after the
+        // last one is let go): per column its held target / hop (or `-`) and
+        // its water's top, 8 y + f, walking down from over the lake's surface
+        // (`.` dry to the floor). What a held head does to its water -- and
+        // why it is let go -- is a trajectory, not a count.
+        int kOwn = 0;
+        while (kOwn < static_cast<int>(path.size()) &&
+               worldmap::WaterColumnAt(path[kOwn].x, path[kOwn].z, kDefaultSeed).water >= 0)
+          kOwn++;
+        bool traceWas = false;
+        int traceLines = 0;
+        std::string headTrace;
+        auto traceHead = [&](int k) {
+          if (kOwn < 1 || kOwn + 3 >= static_cast<int>(path.size())) return;
+          std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
+          rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversHeadStill");
+          bool any = false;
+          std::string ln = Format("\n      %4d:", k);
+          rows.clear();
+          // ...the head's five rows, then (after `>>`) the channel's last
+          // four own rows and main's first row.
+          int kEnd = kOwn;
+          while (kEnd + 1 < static_cast<int>(path.size()) &&
+                 worldmap::WaterColumnAt(path[kEnd + 1].x, path[kEnd + 1].z, kDefaultSeed).water < 0)
+            kEnd++;
+          const int rowsK[10] = {kOwn - 1, kOwn, kOwn + 1, kOwn + 2, kOwn + 3, kEnd - 3, kEnd - 2, kEnd - 1, kEnd, kEnd + 1};
+          for (int ri = 0; ri < 10; ri++) {
+            if (rowsK[ri] < 0 || rowsK[ri] >= static_cast<int>(path.size())) continue;
+            const PP& p = path[rowsK[ri]];
+            ln += ri == 5 ? " >>" : (ri == 1 ? " ||" : " |");
+            for (int dx = -1; dx <= 1; dx++) {
+              const int x = p.x + dx, z = p.z;
+              const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
+              const uint32_t d = tab[ci * 4 + 2];
+              if (ri >= 1 && ri <= 4 && d != 0u) any = true;
+              int s8 = -1;
+              for (int y = std::max(lakeLevel + 2, p.y + 12); y >= p.y - 2; y--) {
+                const uint32_t w = voxRaw(x, y, z);
+                if ((w & 0xFFFu) == mWater) { s8 = 8 * y + static_cast<int>((w >> 12) & 15u) + 1; break; }
+                if ((w & 0xFFFu) != 0u && y < p.y + 6) break;
+              }
+              const std::string sv = s8 < 0 ? std::string(".") : std::to_string(s8);
+              if (d == 0u) ln += Format(" -:%s", sv.c_str());
+              else ln += Format(" %d/%u:%s", static_cast<int>(d << 12) >> 12, d >> 20, sv.c_str());
+            }
+          }
+          if ((any || traceWas) && traceLines < 160) {
+            headTrace += ln;
+            traceLines++;
+          }
+          traceWas = any;
+        };
         for (int k = 1; k < streamTicks; k++) {
           tick();
+          if (k % 10 == 0) {
+            c.ctx.WaitIdle();
+            traceHead(k);
+          }
           if (k % 150 == 0) {
             c.ctx.WaitIdle();
             wet = wetCount();
+            const long long vol = chanVol();
             const int prevAdopted = adopted;
             adopted = adoptedCount();
             lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            curve += Format(" %d:%d/%d(%dP)/%d/%u", k, wet, adopted, poolN, awake, floodMax);
+            uint32_t dNow[8] = {}, byNow[5] = {};
+            rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), diag0Off, dNow, sizeof dNow, "riversDiag1");
+            rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.fluidExciteScratch, 11u * 4u, byNow, sizeof byNow, "riversBy1");
+            curve += Format(" %d:%d/%d(%dP)/%d/%u vol %lld [give %u take %u grow %u | excited over %u bank %u unheld %u "
+                            "stream %u held %u; by fall %u perch %u step %u shell %u wake %u] [why%s]",
+                            k, wet, adopted, poolN, awake, floodMax, vol, dNow[0] - dPrev[0], dNow[1] - dPrev[1],
+                            dNow[2] - dPrev[2], dNow[3] - dPrev[3], dNow[4] - dPrev[4], dNow[5] - dPrev[5], dNow[6] - dPrev[6],
+                            dNow[7] - dPrev[7], byNow[0] - byPrev[0], byNow[1] - byPrev[1], byNow[2] - byPrev[2],
+                            byNow[3] - byPrev[3], byNow[4] - byPrev[4], whyS.c_str());
+            std::copy(dNow, dNow + 8, dPrev);
+            std::copy(byNow, byNow + 5, byPrev);
           }
         }
         c.ctx.WaitIdle();
@@ -1763,8 +1947,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
         adopted = adoptedCount();
         awake = awakeOn();
         const int relMaxRun = relMaxS;
-        const std::string relRun = Format("; while running %d releases / %d adoptions, at most %d of one column%s", relSumS,
-                                          adoptSumS, relMaxS, relWhoS.c_str());
+        const std::string relRun = Format("; while running %d releases / %d adoptions, at most %d of one column%s;%s", relSumS,
+                                          adoptSumS, relMaxS, relWhoS.c_str(), relWhyS.c_str());
         std::string runWho = Format("; %d POOL; the most flooded: %s; awake by", poolN, floodWho.c_str());
         for (int b = 0; b < kDirtyReasonBits; b++)
           if ((awakeWhy >> b) & 1u) runWho += Format(" %s", kDirtyReasonName[b]);
@@ -1873,6 +2057,13 @@ Status GateRivers(Ctx& c, std::string& detail) {
                     "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
                     flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
+        // (Printed only when S fails: a held stream fills it with 160 lines.)
+        if (!sOk) {
+          std::printf("rivers:   S head trace (tick: | the lake's last row || the channel's first own row | the next three >> its "
+                      "last four own rows | main's first row; "
+                      "each column target/hop:water top, 8 y + f, or -:top when not held):%s\n",
+                      headTrace.empty() ? " nothing held" : headTrace.c_str());
+        }
         c.ctx.WaitIdle();
         rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), seamDiagOff, seamDiag1,
                               sizeof seamDiag1, "riversSeamDiag");
@@ -2154,9 +2345,8 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   const int extTicks = num("streamNat.extTicks", 900);
   const int rateDelay = num("streamNat.rateDelay", 30), rateTicks = num("streamNat.rateTicks", 150);
   // "Still filling": the region's water moved by more than this many eighths
-  // per column over the steady window -- sim_stream's own news threshold
-  // (STREAM_CHAIN_TOL, half a voxel), so a level wandering inside a few
-  // eighths is not "filling" and a flood rising half a voxel is.
+  // per column over the steady window: half a voxel, so a level wandering
+  // inside a few eighths is not "filling" and a flood rising half a voxel is.
   const long long fillTolPerCol = num("streamNat.fillTolPerCol", 4);
   const int floodAwakeMax = num("streamNat.floodAwakeMax", 0), chanAwakeMax = num("streamNat.chanAwakeMax", 1);
   const double adoptMin = BaselineNumber("streamNat.adoptMin", 0.6);
@@ -2835,22 +3025,42 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   std::printf("stream-natural: phase 1 (tick: volumes in eighths | held columns | awake chunks | pillars | sim_stream's "
               "release / adoption counters):%s\n",
               curve.c_str());
-  // Echo (the render's record, STILL_ECHO): what the held columns kept.
+  // G. ECHO (the render's record, STILL_ECHO, sim_stream.wgsl echoSample):
+  // what the held columns kept for raymarch.wgsl to play back. A held column
+  // with both words 0 plays the procedural flicker instead (not wrong, but
+  // then the recorder did nothing); a sample further than echoRangeMax
+  // eighths from the target (other than -128, "no water") is not the surface
+  // the column was held at -- a recording taken against the wrong anchor, or
+  // not rebased at adoption. Asserted: at least echoRecordedMin of the held
+  // columns carry a recording, and no sample is out of range.
   {
-    int heldN = 0, moving = 0, dry = 0;
+    const double echoRecMin = BaselineNumber("streamNat.echoRecordedMin", 0.5);
+    const int echoRange = num("streamNat.echoRangeMax", 24);
+    int heldN = 0, recorded = 0, moving = 0, dry = 0, outOfRange = 0, vMin = 127, vMax = -127;
+    std::string oorWho;
     for (const auto& xz : end1.heldCols) {
       heldN++;
       bool mv = false, dr = false;
+      if ((echoAt(snap, xz.first, xz.second, 0) | echoAt(snap, xz.first, xz.second, 1)) != 0u) recorded++;
       for (int w = 0; w < 2; w++)
         for (int b = 0; b < 4; b++) {
           const int8_t v = static_cast<int8_t>((echoAt(snap, xz.first, xz.second, w) >> (8 * b)) & 0xFFu);
-          if (v == -128) dr = true;
-          else if (v != 0) mv = true;
+          if (v == -128) { dr = true; continue; }
+          if (v != 0) mv = true;
+          vMin = std::min(vMin, int(v));
+          vMax = std::max(vMax, int(v));
+          if (std::abs(int(v)) > echoRange && outOfRange++ < 4)
+            oorWho += Format(" (%d,%d) slot %d: %d", xz.first, xz.second, w * 4 + b, int(v));
         }
       moving += mv;
       dry += dr;
     }
-    std::printf("stream-natural:   echo: of %d held columns %d recorded a moving surface, %d a dry sample\n", heldN, moving, dry);
+    const bool gOk = heldN > 0 && recorded >= echoRecMin * heldN && outOfRange == 0;
+    std::printf("stream-natural: G echo: %s (of %d held columns %d carry a recording (>= %.2f), %d of them a moving "
+                "surface, %d a dry sample; samples %d..%d eighths, %d past +-%d%s)\n",
+                gOk ? "PASS" : "FAIL", heldN, recorded, echoRecMin, moving, dry, vMin, vMax, outOfRange, echoRange,
+                oorWho.c_str());
+    if (!gOk) problems.push_back(Format("G: %d / %d held columns recorded, %d samples out of range", recorded, heldN, outOfRange));
   }
   if (end1.observed == 0) problems.push_back("sim_stream never observed a footprint column (did its kernels compile?)");
   const int heldFloodEnd = end1.held[K_NOTCH] + end1.held[K_PLAIN];

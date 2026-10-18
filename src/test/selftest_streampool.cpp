@@ -34,6 +34,9 @@
 //   E. DETERMINISM: the same build + open twice from a fresh worldgen at the
 //      same tick numbers, detTicks ticks on, hashed (fixture voxels, the
 //      fixture's still-table words, the ledger): equal.
+//   F. ROOT OFF, THE SHIPPED DEFAULT: the same pour with sim.streamPoolRoot 0
+//      (and MPM on) for rootOffTicks: no column of the box is ever adopted --
+//      a finite pour runs as water (ticket 2026-10-17_11-48-39).
 // Every sample prints tick : reservoir / channel / basin eighths, MPM, the
 // ledger (live, snapshot), adopted (POOL / map) channel columns, awake
 // head / middle / mouth chunks and the largest flood count, so a failure says
@@ -193,6 +196,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     SetCurrentTuning(saved);
     weather::SetOverride(prevPin);
   };
+  int rootFlag = 1;   // sim.streamPoolRoot for the next setup (F turns it off)
   auto pinTuning = [&](int exciteMode, int relax) {
     Tuning dawn = saved;
     dawn.dayNight.freeze = 1;
@@ -209,7 +213,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     // THE CONDUIT'S ROOTING is off by default since 2026-10-17 (the owner's
     // rule: only streams fed from the map's water are held); this gate is the
     // conduit's, so it turns it on.
-    dawn.sim.streamPoolRoot = 1;
+    dawn.sim.streamPoolRoot = rootFlag;
     if (relax >= 0) dawn.sim.stillWaterRelax = relax;
     SetCurrentTuning(dawn);
   };
@@ -409,6 +413,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
   // full-height gate on a deep reservoir excited ~9,400 eighths into
   // particles that never settled back (first run), and the claim here is the
   // CA conduit, not the splash.
+  int firstPoolAt = -1;   // the main arm's first sample with a POOL column (F compares against it)
   const Census before = setup(0);
   const long long poured = before.Total();
   const long long pourOps = static_cast<long long>(fill.size()) * 8;
@@ -431,6 +436,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     std::string curve;
     long long massErrMax = 0;
     int bestPool = 0, sleepRun = 0, sleepBest = 0, sleepAt = -1, emptyAt = -1, done = 1;
+    firstPoolAt = -1;
     long long prevRes = before.res;
     std::vector<long long> resHist;
     Census s;
@@ -441,6 +447,7 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
       curve += "\n " + line(done, s) + " materials vs the pour:" + matDelta(before, s) + "\n    lane |" + s.lane + "|";
       massErrMax = std::max(massErrMax, std::llabs(s.Total() - poured));
       bestPool = std::max(bestPool, s.adoptPool);
+      if (firstPoolAt < 0 && s.adoptPool > 0) firstPoolAt = done;
       const bool draining = s.res < prevRes;
       prevRes = s.res;
       if (draining && s.middle <= middleAwakeMax && s.adoptPool > 0) {
@@ -553,6 +560,44 @@ Status GateStreamPool(Ctx& c, std::string& detail) {
     if (!eOk)
       problems.push_back(Format("E: two runs of the same pour differ from tick %d (%s) and the control does not -- RULE 1",
                                 d23, w23.c_str()));
+  }
+
+  // ---- F. THE SHIPPED DEFAULT: a finite pour never freezes ----
+  // The owner's rule (2026-10-17; ticket 2026-10-17_11-48-39, "when water
+  // pours in a small stream it hardens at the bottom"): only a stream fed by
+  // the map's water is held. With sim.streamPoolRoot at its default 0 no POOL
+  // column can be rooted, and nothing else in this fixture is map water, so
+  // the same pour run for rootOffTicks must leave no column of the box
+  // adopted -- while the main arm (root on) had its first POOL column at
+  // firstPoolAt. MPM excitation on (the game's default): the ticket's pour
+  // splashed.
+  {
+    const int rootOffTicks = num("streamPool.rootOffTicks", 1500);
+    rootFlag = 0;
+    setup(-1);
+    rootFlag = 1;
+    sandvox::support::TickCursor tick{c, t, fixture};
+    sandvox::support::TickOps o;
+    o.cells = open;
+    tick(o);
+    int heldMax = 0, heldAt = -1;
+    long long chanMax = 0;
+    for (int done = 1; done < rootOffTicks;) {
+      const int n = std::min(sampleTicks, rootOffTicks - done);
+      for (int k = 0; k < n; k++) tick();
+      done += n;
+      const Census s = census(false);
+      const int held = s.adoptPool + s.adoptMap + s.resAdopt;
+      chanMax = std::max(chanMax, s.chan);
+      if (held > heldMax) { heldMax = held; heldAt = done; }
+    }
+    const bool fOk = heldMax == 0 && chanMax > 0 && (firstPoolAt < 0 || firstPoolAt <= rootOffTicks);
+    std::printf("stream-pool: F root off (the default): %s (the same pour with sim.streamPoolRoot 0 and MPM on, %d ticks: "
+                "at most %d columns adopted (0 wanted)%s; the channel carried up to %lld eighths; root on, the first POOL "
+                "column was adopted at tick %d)\n",
+                fOk ? "PASS" : "FAIL", rootOffTicks, heldMax, heldAt >= 0 ? Format(" at tick %d", heldAt).c_str() : "",
+                chanMax, firstPoolAt);
+    if (!fOk) problems.push_back(Format("F: a finite pour adopted %d columns with streamPoolRoot 0", heldMax));
   }
 
   // ---- a fresh world back ----

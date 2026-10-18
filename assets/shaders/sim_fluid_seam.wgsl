@@ -229,22 +229,45 @@ fn seamHeldT8(x : i32, z : i32, mat : u32) -> i32 {
   if (stillWater[stillIndex(x, z) + 1u] == 0u) { return STILL_UNHELD; }
   return stillLevel8(x, z, mat);
 }
-// ...EXCEPT AT A BREACH: a held cell with a lateral neighbour that is open
-// (not a blocker) in a column the map does not hold -- a bank somebody dug
-// through, a channel cut out of a lake -- or with air under it (its bed dug
-// out). The CA spills it there (HELD WATER: a breach runs for as long as the
-// river does), and its excitation is the breach's RUSH, kept: the particles
-// fall into the hole, and the refill behind them, if it lands on them, is
-// absorbed (consumeApply), so the rush is a pour and not a jet.
+// sim_step.wgsl STILL_POOL_BIT / sim_stream.wgsl STREAM_POOL_BIT: must agree.
+const SEAM_POOL_BIT : u32 = 1u << 24u;
+// The held target the seam treats as AT REST (2026-10-18): the map's water
+// AND a map-fed stream sim_stream.wgsl adopted -- every column sim_step.wgsl's
+// heldRest holds still, minus THE CONDUIT's POOL columns (their excess is
+// the ledger's, deposited at stage 0) -- or STILL_UNHELD. The CA and the seam
+// must agree on what is at rest: a held stream's water the seam still took
+// (a riser's spill, the wake of a splash) was a deficit the held neighbours
+// refilled at once, under the particle, and excited again -- the same loop as
+// the map's, on a stream the CA had put to sleep.
+fn seamRestT8(x : i32, z : i32, mat : u32) -> i32 {
+  let si = stillIndex(x, z);
+  if (stillWater[si + 1u] == 0u && (stillWater[si + 3u] & SEAM_POOL_BIT) != 0u) { return STILL_UNHELD; }
+  return stillLevel8(x, z, mat);
+}
+// ...EXCEPT OVER A HOLE: a map column's held cell with air under it (its bed
+// dug out from below). The CA drops it there, the reservoir does not refill a
+// cell with air under it (sim_step.wgsl stillWant), so nothing lands on the
+// particles: they fall into the hole, a pour -- the breach's RUSH.
+// NOT a held cell beside an open column the map does not hold (a bank dug
+// through, a channel cut out of a lake), which this also used to be (until
+// 2026-10-18). There the reservoir DOES refill the cell under its particle
+// (TAKE / GROW: it rests on the river), consumeApply absorbs the particle, and
+// the CA's own spill into the hole never happens: a loop that delivers
+// nothing. MEASURED, `rivers` S (a channel dug from a map lake to a river):
+// 11-13k eighths of the lake's and the river's held water excited every 150
+// ticks at the channel's two ends for as long as the stream ran, all of it
+// absorbed back; 0 after. The CA spills such a cell into the hole like any
+// water and the reservoir refills it; the spilled water is the seam's like
+// any unheld water. (Which is why S's stream still churns through the seam
+// with this gone -- ~40k eighths of its own water every 150 ticks, by the
+// wake trigger, seeded by its falls -- see `rivers` S, which measures the
+// held stream with excitation off.)
+// A STREAM's column over a hole is its own riser's spill (sim_stream.wgsl
+// restingSurface's step), at rest: no exception.
 fn seamBreachEdge(c : vec3<i32>, mat : u32) -> bool {
-  // ...or a hole under it: the bed dug out from below.
+  if (seamHeldT8(c.x, c.z, mat) == STILL_UNHELD) { return false; }
   let b = c - vec3<i32>(0, 1, 0);
-  if (cellResident(b, T.origin) && voxMat(voxWordAt(b)) == MAT_AIR) { return true; }
-  for (var d = 0u; d < 4u; d++) {
-    let n = c + seamLateral(d);
-    if (seamHeldT8(n.x, n.z, mat) == STILL_UNHELD && seamNeighbourState(n).x == 0u) { return true; }
-  }
-  return false;
+  return cellResident(b, T.origin) && voxMat(voxWordAt(b)) == MAT_AIR;
 }
 // How deep under a held surface's top cell the absorb reaches, in cells: a
 // splash crater's depth. Deeper is not the river's surface any more (a cave
@@ -1153,8 +1176,20 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // breach. The triggers are still evaluated for it, so the refusals are
     // counted where they happen (STILL_DIAG [8..14]) -- the refusal itself is
     // below, once `kind` is known.
+    // AT REST is sim_step.wgsl heldRest's test: at or under the target, OR
+    // the target's TOP cell holding more than it (THE TOP CELL OVER ITS
+    // TARGET IS AT REST TOO). Not the top cell's excess, here, until
+    // 2026-10-18: excited, it went WHOLE -- its held eighths with the excess
+    // -- the reservoir refilled it under its particle, and the held neighbour
+    // upstream, pouring into it while it stood under, overshot its target
+    // again. MEASURED, `held-splash` C (a blast on main where its ramp drops
+    // ten eighths between two columns): 4 eighths a tick excited by the step
+    // trigger at that lip and absorbed back, for good, 5 chunks awake. Held,
+    // the excess leaves by the reservoir's GIVE, as the CA's own conveyor's did.
     let heldT8 = seamHeldT8(c.x, c.z, mat);
-    let heldStill = heldT8 != STILL_UNHELD && 8 * c.y + i32(voxState(w) + 1u) <= heldT8 &&
+    let restT8 = seamRestT8(c.x, c.z, mat);
+    let restF = 8 * c.y + i32(voxState(w) + 1u);
+    let heldStill = restT8 != STILL_UNHELD && (restF <= restT8 || c.y == ((restT8 - 1) >> 3u)) &&
                     !seamBreachEdge(c, mat);
 
     // ---- SUBMERGED WATER IS FULL WATER, AND IT IS ALSO UNEXCITABLE --------
@@ -1321,8 +1356,8 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       // The census of what this rule REFUSES (STILL_DIAG [8..14]): by trigger,
       // and the range of the columns' targets (which body it was).
       supK[kind] += voxState(w) + 1u;
-      supLo = min(supLo, u32(heldT8));
-      supHi = max(supHi, u32(heldT8));
+      supLo = min(supLo, u32(restT8));
+      supHi = max(supHi, u32(restT8));
       if (HELD_EXCLUDE) { continue; }
     }
     // THE SOLUTE REFUSAL (docs/PLAN_solutes.md §7.2): a cell carrying
@@ -1367,6 +1402,22 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     var cls = 5u;
     if (heldT8 != STILL_UNHELD) {
       cls = select(3u, 7u, c.y <= ((heldT8 - 1) >> 3u));
+      // WHERE (STILL_DIAG [15], diagnostic): one class-7 cell, packed
+      // x & 1023 | z & 1023 << 10 | y & 255 << 20 | why << 28 (0 its top cell
+      // over the target, 1 air under it -- a map column over a hole, the one
+      // breach the seam still excites at rest -- 2 retired) | the
+      // trigger << 30 (0 fall, 1 perch, 2 step, 3 shell/wake); atomicMax, so
+      // which one is a function of the set, not of the order.
+      if (cls == 7u) {
+        var why = 0u;
+        if (8 * c.y + i32(voxState(w) + 1u) <= heldT8) {
+          let bb = c - vec3<i32>(0, 1, 0);
+          why = select(2u, 1u, cellResident(bb, T.origin) && voxMat(voxWordAt(bb)) == MAT_AIR);
+        }
+        let pk = (bitcast<u32>(c.x) & 1023u) | ((bitcast<u32>(c.z) & 1023u) << 10u) |
+                 ((bitcast<u32>(c.y) & 255u) << 20u) | (why << 28u) | (min(kind, 3u) << 30u);
+        atomicMax(&stillLedger[STILL_DIAG + 15u], pk);
+      }
     } else if (stillLevel8(c.x, c.z, mat) != STILL_UNHELD) {
       cls = 6u;
     } else {

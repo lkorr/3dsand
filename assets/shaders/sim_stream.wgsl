@@ -281,7 +281,9 @@ fn ledgerSnap() -> i32 { return bitcast<i32>(stillWater[STREAM_LEDGER + 1u]); }
 //     every 50-200 ticks, and nothing above it was ever still.)
 //   * the run must last sim.streamSteadyTicks of windows in which most
 //     visits found a resting surface (3 of 4) and few found water in flight
-//     (a quarter at most);
+//     (a quarter at most), and in which the anchor has not DRIFTED more than
+//     STREAM_RUN_DRIFT (half a voxel) from where the run began (THE RUN IS A
+//     LEVEL, NOT A WINDOW, at the run's update);
 //   * NOTHING DOWNSTREAM moved for as long: every column keeps the newest
 //     fine and coarse event stamp among its own and its DOWNSTREAM
 //     neighbours' (open beside its surface, no water standing over it there:
@@ -301,7 +303,8 @@ fn ledgerSnap() -> i32 { return bitcast<i32>(stillWater[STREAM_LEDGER + 1u]); }
 // gone (DRAINED) -- something below took more than the stream brings, or the
 // stream above stopped feeding it. NOT on news from below: a held map-fed
 // stream is not refilled from the reservoir (sim_step.wgsl stillWant, A
-// MAP-FED STREAM IS NOT REFILLED), so it delivers into a dig or a draining
+// MAP-FED STREAM IS NOT REFILLED -- except its HEAD, hop 1, the column the
+// map's own water feeds), so it delivers into a dig or a draining
 // basin as the live stream would, its water running down through it, and it
 // rests again when nothing below takes water. (Released on the first new
 // wet column below, as the first cut was, it let go whenever an established
@@ -332,7 +335,7 @@ const STREAM_SUB : u32 = 64u;
 // How far a window's mean may sit off the anchor and still be steady, eighths.
 const STREAM_MEAN_TOL : i32 = 2;
 // How far a column's block level must move to be news to the columns above
-// (a FINE event), eighths.
+// (a FINE event), eighths: half a voxel.
 const STREAM_CHAIN_TOL : i32 = 4;
 // Windows per BLOCK: the level a column reports upstream is its mean over
 // this many windows (8 x 64 = 512 visits), compared block to block.
@@ -375,9 +378,18 @@ const STILL_ECHO : u32 = STREAM_MOUTH_END;
 //       something below moved, 6 no outflow, 7 not running, 8 no held map-fed
 //       feeder, 9 a POOL feeder, 10 not at its anchor, 15 adopted) --
 //       diagnostic, saturating
-//   [7] releases by reason, a byte each: support | flood | event | drained
+//   [7] releases by reason, a byte each: support | flood | THE RUN'S DRIFT |
+//       drained. Byte 2 (the retired event release's count) is the observer's
+//       own while the column is not held: how far, signed eighths, its anchor
+//       has moved since its steady run began (THE RUN IS A LEVEL, NOT A WINDOW
+//       at the run's update).
 // A stamp is (tick >> 4) & 0xFFFF, never 0 (0 = never).
 const STREAM_OBS : u32 = STILL_ECHO + 2u * WORLD_N * WORLD_N;
+// THE RUN IS A LEVEL, NOT A WINDOW: how far, eighths, a column's anchor may
+// move from where its steady run began before the run starts over. Half a
+// voxel: `stream-natural`'s own measure of "still filling" (a region rising
+// more than half a voxel a column over the steady window).
+const STREAM_RUN_DRIFT : i32 = 4;
 const STREAM_REL_SUPPORT : u32 = 1u;
 const STREAM_REL_FLOOD : u32 = 2u;
 const STREAM_REL_EVENT : u32 = 3u;
@@ -504,8 +516,13 @@ fn echoShift(ei : u32, d : i32) {
     if (o != v) { stillWater[ei + w] = o; }
   }
 }
-// One echo sample into slot (tick / 4) % 8.
+// One echo sample into slot (tick / 4) % 8, taken on the slot's FIRST tick
+// only (a visit on the other three would only overwrite it: the recording is
+// one sample every 4 ticks, 7.5 a second, as raymarch.wgsl plays it back).
+// A column whose chunk slept through a slot's first tick keeps the sample
+// that slot held 32 ticks earlier.
 fn echoSample(ei : u32, v : i32) {
+  if ((T.tick & 3u) != 0u) { return; }
   let slot = (T.tick >> 2u) & 7u;
   let wi = ei + (slot >> 2u);
   let sh = 8u * (slot & 3u);
@@ -792,6 +809,32 @@ fn isRoot(nx : i32, ys : i32, nz : i32, sN : i32, mat : u32) -> bool {
 fn streamSupport(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32) -> vec2<u32> {
   return streamSupportTo(x, z, t8, mat, hopBelow, STREAM_HOP_MAX);
 }
+// FED BY A HELD STREAM: some lateral neighbour is an adopted map-rooted
+// stream column (hop >= 1, not POOL) whose target stands at or over `t8`,
+// with an open way into this column at that row -- whatever else feeds it.
+// THE FRONT's test (scan): the best hop alone (streamSupportTo) is 0 beside
+// the map's water, and a column between a held stream and the river it runs
+// into then had to pass the HEAD's tests -- a whole quiet window of its own --
+// which the water running through it into the river never gave it (measured,
+// `rivers` S: the held channel stopped 20 columns short of main, those
+// columns' runs never past 5 windows, the 6 chunks awake for good).
+fn fedByHeldStream(x : i32, z : i32, t8 : i32, mat : u32) -> bool {
+  for (var i = 0u; i < 4u; i++) {
+    var d = vec2<i32>(1, 0);
+    if (i == 1u) { d = vec2<i32>(-1, 0); }
+    else if (i == 2u) { d = vec2<i32>(0, 1); }
+    else if (i == 3u) { d = vec2<i32>(0, -1); }
+    let t = neighbourTarget(x + d.x, z + d.y, mat);
+    if (t.x == STREAM_NONE || t.x < t8 || t.y < 1 || u32(t.y) >= STREAM_HOP_MAX || t.z != 0) { continue; }
+    let mc = vec3<i32>(x, (t.x - 1) >> 3u, z);
+    if (!inBounds(mc)) { continue; }
+    let mm = voxMat(voxWordAt(mc));
+    if (mm != MAT_AIR && mm != mat && materials[mm].klass != CLASS_GAS) { continue; }
+    return true;
+  }
+  return false;
+}
+
 // streamSupport with `poolStepMax`: a POOL feeder counts only if its target
 // stands at most this many eighths over t8. A FALL ENDS A CONDUIT: the basin
 // under a waterfall at a POOL stream's mouth is "fed" by a target ten voxels
@@ -972,6 +1015,10 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
       // side lane got wet for the first time after thousands of ticks --
       // measured, `stream-natural`: 238 columns held, all released 100
       // ticks later, by two outlet columns of an established chute.)
+      // (Per visit, not debounced over a window: a held basin a dug
+      // extension drains must let go at once, so the extension fills at the
+      // live stream's rate -- debounced, `stream-natural` E delivered 0.47 of
+      // the live rate, measured 2026-10-18.)
       let drained = (r.ok && r.mat == mat && r.s8 < t8 - 8) || (r.known && !r.ok && r.hasFloor && r.floor8 < t8 - 8);
       if (drained && yt <= top) {
         held = false;
@@ -1062,6 +1109,11 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
     var fl = (o5 >> 23u) & 127u;
     var fallLast = (o5 >> 30u) & 1u;
     var wetLast = o5 >> 31u;
+    // THE RUN'S DRIFT (STREAM_OBS [7] byte 2; THE RUN IS A LEVEL, NOT A
+    // WINDOW, below). A slot that took another world column starts from 0
+    // (`commit` clears [7] after this scan).
+    let old7 = select(stillWater[oi + 7u], 0u, fresh);
+    var drift = bitcast<i32>(((old7 >> 16u) & 0xFFu) << 24u) >> 24;
     // A column that is wet, or was: a visit whose walk ran out in open air
     // says nothing about it.
     if (r.known && (r.ok || anch != 0u || wet != 0u)) {
@@ -1073,6 +1125,7 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
         bSum = 0;
         bN = 0u;
         bPrev = -128;
+        drift = 0;
         if (stillWater[ei] != 0u) { stillWater[ei] = 0u; }
         if (stillWater[ei + 1u] != 0u) { stillWater[ei + 1u] = 0u; }
       }
@@ -1122,10 +1175,13 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
         var wMean = 0;
         if (nowWet == 1u && wn > 0) { wMean = acc / wn; }
         if (nowWet == 1u && wn > 0 && abs(acc) > STREAM_MEAN_TOL * wn) {
-          // Re-anchored: the column's own run restarts; the block's numbers
-          // are re-expressed against the new anchor.
+          // Re-anchored: the anchor follows the mean (it is what the column
+          // is held at, and what the echo and the block are relative to); the
+          // block's numbers are re-expressed against the new anchor, and the
+          // run's drift counts the move (THE RUN IS A LEVEL, below).
           moveOwn = true;
           anchor += wMean;
+          drift = clamp(drift + wMean, -127, 127);
           echoShift(ei, -wMean);
           bSum -= wMean * i32(bN);
           if (bPrev != -128) { bPrev = clamp(bPrev - wMean, -127, 127); }
@@ -1160,18 +1216,38 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
           stillWater[oi + 6u] = (o6e & 0xFF00FFFFu) | (min(((o6e >> 16u) & 0xFFu) + 1u, 255u) << 16u);
         }
         if (cev) { coarse = stamp16(T.tick); }
-        run = select(0u, min(run + 1u, 4095u), steady && !ev && !moveOwn);
+        // THE RUN IS A LEVEL, NOT A WINDOW (2026-10-18). The run went on while
+        // no window's mean stood more than STREAM_MEAN_TOL off the anchor:
+        // every re-anchor restarted it. A stream the MPM seam churns -- the
+        // game's default, sim.fluidExciteMode 1: water spilling over every
+        // riser excited, its particles waking the water round them -- has
+        // window means a few eighths either side of where it stands, up and
+        // down, for as long as it runs. MEASURED, `rivers` S (a channel dug
+        // from a map lake to a river, MPM on): 30-38k eighths of the stream's
+        // own water through the seam every 150 ticks, its volume 1,500 to
+        // 2,700 eighths between samples, nothing downstream of its head moving
+        // for 1,400 ticks at a time -- and the head's run 0 to 4 windows for
+        // 3,000 ticks, never the 10 the window needs; 0 of 153 columns held.
+        // Now a re-anchor ends the run only once the anchor has DRIFTED more
+        // than STREAM_RUN_DRIFT from where the run began: a level wandering
+        // either side of its place keeps its run, one that goes somewhere --
+        // a basin rising half a voxel a column, `stream-natural`'s own measure
+        // of still filling -- restarts it as before. (STREAM_MEAN_TOL still
+        // moves the anchor: it is the target the column is held at.)
+        let drifted = abs(drift) > STREAM_RUN_DRIFT;
+        run = select(0u, min(run + 1u, 4095u), steady && !ev && !drifted);
+        if (run == 0u) { drift = 0; }
         if (nowWet == 0u) { anch = 0u; }
         wet = nowWet;
+        // WET THROUGH: an eighth of the window's visits dry at most
+        // (diagnostic: the gate prints it). Before the window's counts reset.
+        wetLast = select(0u, 1u, dry * 8u <= STREAM_SUB);
         k = 0u;
         acc = 0;
         dry = 0u;
         // A FALL: more than a quarter of the window's visits found water in
         // flight (a cascade, a chute). The front does not go into one.
         fallLast = select(0u, 1u, fl * 4u > STREAM_SUB);
-        // WET THROUGH: an eighth of the window's visits dry at most
-        // (diagnostic: the gate prints it).
-        wetLast = select(0u, 1u, dry * 8u <= STREAM_SUB);
         fl = 0u;
         movedLast = moved;
         moved = 0u;
@@ -1184,6 +1260,9 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
            (movedLast << 31u);
       o5 = (bitcast<u32>(bSum) & 0x7FFu) | (bN << 11u) | ((bitcast<u32>(bPrev) & 0xFFu) << 14u) | (ever << 22u) |
            (fl << 23u) | (fallLast << 30u) | (wetLast << 31u);
+      // ...and the run's drift, [7] byte 2 (only a changed word is stored).
+      let n7 = (old7 & 0xFF00FFFFu) | ((bitcast<u32>(drift) & 0xFFu) << 16u);
+      if (n7 != old7) { stillWater[oi + 7u] = n7; }
       // HELD when natural: steady for the window, resting, nothing below it
       // moved for as long, standing at its anchor now, running, and fed by
       // the map's water (hop 0) or a map-fed held column. RUNNING, not just
@@ -1268,7 +1347,16 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
         // Waiting on it, the front stopped at a basin's sill for good and the
         // held channel and basin above ran as a conveyor into the live chute
         // below for ever (measured, `stream-natural`: 5 channel chunks awake).
-        let front = sup.x >= 1u && sup.x < STREAM_HOP_MAX && sup.y == 0u && fallLast == 0u && !floodedBefore;
+        // FED BY A HELD STREAM COLUMN, whatever else feeds it (2026-10-18;
+        // fedByHeldStream): the smallest feeding hop is 0 for a column beside
+        // the map's water as well, and as `sup.x >= 1` the front stopped there
+        // -- the mouth of a stream at the river it runs into had to pass the
+        // head's tests, a whole quiet window of its own that the water
+        // running through it into the river never gave it (measured, `rivers`
+        // S: the held channel stopped 20 columns short of main, those
+        // columns' runs never past 5 windows, its chunks awake for good).
+        let front = fedByHeldStream(x, z, tgt, r.mat) && sup.x < STREAM_HOP_MAX && sup.y == 0u && fallLast == 0u &&
+                    !floodedBefore;
         if (front && abs(r.s8 - anchor) > STREAM_AT_TOL) { why = 10u; }
         else if (!front && !quiet) { why = 5u; }
         else if (front) {

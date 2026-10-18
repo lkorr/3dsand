@@ -19427,26 +19427,52 @@ where you hear from either (§12b, "The ears are on the character").
     the far bed is the level's centre-sampled staircase, not the near
     voxels; no traced reflection of the far shore; the waterline is a cell
     top (or the refine's exact column top at levels 1-2).
-  - **A shallow river's bed sinks a cell at level 4 (found 2026-10-16, ticket
-    `2026-10-16_11-05-33`, NOT fixed: the cause is in the sieve).** Seen from
-    93 m up, the river's bed shows through its water out to the level-3 box
-    face and the water turns uniform past it. Measured along the river
-    (SEAM_DBG 7, the bed march instrumented): the ray's path to the bed is
+  - **A shallow river's bed sank a cell at level 4 (found 2026-10-16, ticket
+    `2026-10-16_11-05-33`; FIXED 2026-10-18 by the map's WET BED).** Seen from
+    93 m up, the river's bed showed through its water out to the level-3 box
+    face and the water turned uniform past it. Measured along the river
+    (SEAM_DBG 7, the bed march instrumented): the ray's path to the bed was
     2.5-4.6 m at level 3 and 15-24 m at level 4, every bed found (not a
     missed bed, not the cap). Cause: `farSurfaceMat`'s `wetTop`
     (worldgen.wgsl) paints the BED's topmost cell with the fluid wherever the
     water is too shallow for any cell centre to fall inside it -- right for
     the colour from above (the sea shelf it was made for), but `farWaterBed`
-    then treats that bed cell as a full cell of water: the bed drops to the
-    cell's floor, on average a whole cell under the true bed (h is in the
+    then treated that bed cell as a full cell of water: the bed dropped to
+    the cell's floor, on average a whole cell under the true bed (h is in the
     cell's upper half by construction). At 1.6 m cells on a ~1 m river that
     doubles the depth, and at the grazing angles level 4 is seen at (path ~
-    9x depth) Beer-Lambert takes the bed. The cascade alone cannot tell a
-    wetTop cell from a real one-cell column (both put the refined surface in
-    the same range), so the fix needs the sieve or the map to say so: e.g.
-    the surface map's sub-skin bits of a FLUID-topped sub-column (always the
-    fluid itself, so free there) carrying the column's true depth, which
-    farWaterBed would take as the bed under every refined far water hit.
+    9x depth) Beer-Lambert took the bed. The cascade alone cannot tell a
+    wetTop cell from a real one-cell column, so the MAP says it: a FLUID
+    top's strata word (which had nothing to carry -- a fluid top has no
+    riser strata) is its BED, `FAR_STRATA_WET` (bit 30, PRESENT clear): the
+    fluid's depth over the bed in fine voxels (top - h, bits 0..15) and the
+    bed's skin slot (16..22), written by `farmap` from one more probe of its
+    rolled genCellIn loop (y = h, wet sub-columns only; no new call site, so
+    the kernel's size is flat). `farWaterBed` reads it (`farWetBedAt`, the
+    entry + strata vec4s of the hit's level cell):
+    - the vertical DEPTH under the hit (the wave law's shoaling and shore
+      fade) is the map's, exact, and the cascade column walk runs only where
+      the map has no bed (not VALID, a dry top, outside the level);
+    - THE WET BED OVERRULES A BED THE CASCADE PUT TOO LOW: where the march
+      ended (the bed cell it entered, the cap, or air) under the map's bed of
+      its LAST WATER SAMPLE's sub-column, the bed is the plane at that
+      column's bed, met from above -- a tread, wearing the bed's skin (a
+      slot naming a fluid is ignored). A bed the march met over the map's (a
+      bank's riser above the bed, a shelf deepening away from the eye)
+      stands, so the sea shelf's ray-following path of 2026-10-13 is kept.
+    Measured at the ticket camera (`SEAM_DBG 20`: the cascade's path and the
+    returned one in the same frame, per level): level 4 rows of the river
+    14.2-19.0 m -> 5.5-9.7 m (the overrule fired on 0.89-0.94 of them),
+    level 3 4.4-5.5 -> 4.2-4.6, levels 1-2 trimmed by ~8 % (the centre-
+    sampled staircase's half cell). The path now grows smoothly with
+    distance across the 3/4 seam instead of tripling at it. Gate:
+    `far-surface` arm (h) -- every fluid-topped entry over the fixture lake,
+    at levels 1 and 4, carries WET with depth == top - TerrainHeight, and at
+    level 1 the bed slot is the live voxel's at h (its first run caught the
+    probe reading the water: the bed slot was water's). Not covered: a bed
+    EDITED under standing water keeps the map's pristine depth until a
+    pristine refill (`fardown` checks only that the band is far-solid, and
+    water is), so a dug river bed reads at its old depth past the window.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -20297,7 +20323,8 @@ where you hear from either (§12b, "The ears are on the character").
     per column the slope is gentle and a riser is a real single step, read
     at its depth. Level 1 never wraps: there the side IS the near field's.
     Entries with no strata (a fluid top, a cactus stalk -- its side is its
-    body) keep the sub-skin rule. Edits need nothing: the plane is trusted
+    body) keep the sub-skin rule; a fluid top's word carries its BED instead
+    (`FAR_STRATA_WET`, see "A shallow river's bed" under the far water). Edits need nothing: the plane is trusted
     only under a VALID entry.
     **Measured** (ticket camera `--at 78285.77,1214.63,-11857.50,120.4,20.7`,
     minute 660, clear, 2400 frames; red share by r-b unmix): level 1
@@ -25469,41 +25496,68 @@ the stream above it is adopted). Derived, not saved; dense worldgen
 clears it, and so does a load (`clearStreams`, PT_LOADRESET: the load's
 streamed refill keeps a stream while its column's tag is unchanged).
 
-**A stream is held only when holding it looks natural** (phase 2b, 2026-10-17;
-tickets 2026-10-17_11-26-13 / 11-37-20; supersedes the steady/fed/runs test
-above for MAP-fed streams). The 120-visit, one-voxel band also passed a flood
-spreading over flat ground and a basin filling below a stream: their columns
-were held part way up, each at whatever height it stood at that visit, refilled
-to it at once (the RISE), drowned by the rising water and released by the flood
-count (the COLLAPSE), and held again 120 visits later (the CYCLE) — the owner's
-"vertical waterfall column things". Now (`sim_stream.wgsl` STREAMS ADOPT ONLY
-WHEN NATURAL) a column a map-fed neighbour would feed is held only when: its
-RESTING surface (the top of the liquid standing on its bed; water with air
-under it is in flight and is not the surface) has a window MEAN (16 visits)
-within 2 eighths of the run's anchor for `sim.streamSteadyTicks` (600 = 20 s),
-every visit resting and none in flight; NOTHING DOWNSTREAM moved for as long —
-each column keeps the newest event stamps among its own and its downstream
-neighbours' (a FINE event: a window off the anchor, a column turning wet or
-dry; a COARSE one: a jump of a voxel or more, or wet/dry), published by
-`commit` and read by the neighbours' next `scan`, so an event reaches the top
-of a stream one column a tick later and the map's water is a sink that never
-moves; its surface stands within an eighth of the anchor at that visit (the
-target IS its surface: the mean shape, not a crest, and nothing to refill); and
-it RUNS (a held feeder stands higher, something beside it lower, or its surface
-moved in the last window — a still pool beside the lake is not held). A held
-map-fed column is also released when a COARSE event newer than its adoption
-reaches it from downstream (something dug next to the stream, the basin it ran
-into drained) or its own water stands more than a voxel under its target
-(DRAINED); a released column observes from scratch and its release is a fine
-event for the columns above, so nothing re-adopts within a window. The still
-table grew two regions after the mouth words: `STILL_ECHO` (two words a
-column, render-only: eight signed-byte samples of the resting surface every 4
-ticks, relative to the adoption target, frozen once held, -128 = no water) and
-`STREAM_OBS` (eight words a column: the observer, the stamps scratch +
-published, the tag, the adoption tick, release / adoption counters by reason).
-Knobs `sim.streamSteadyTicks` and `sim.streamPoolRoot` reach the kernel
-through TickParams' padding word `_padSplash0` (no layout change). Gate
-`stream-natural`; `rivers` S counts releases per column.
+**A stream is held only when holding it looks natural** (phase 2b, 2026-10-17,
+finished 2026-10-18; tickets 2026-10-17_11-26-13 / 11-37-20; supersedes the
+steady/fed/runs test above for MAP-fed streams). The 120-visit, one-voxel band
+also passed a flood spreading over flat ground and a basin filling below a
+stream: their columns were held part way up, each at whatever height it stood
+at that visit, refilled to it at once (the RISE), drowned by the rising water
+and released by the flood count (the COLLAPSE), and held again 120 visits later
+(the CYCLE) — the owner's "vertical waterfall column things". Now
+(`sim_stream.wgsl` STREAMS ADOPT ONLY WHEN NATURAL) a column a map-fed
+neighbour would feed is held only when: its RESTING surface (the top of the
+liquid standing on its bed; water with air under it is in flight and is not the
+surface) is observed in windows of 64 visits, and its RUN — windows wet, three
+in four visits resting, a quarter at most in flight — has lasted
+`sim.streamSteadyTicks` (600 = 20 s) with the window mean's ANCHOR never more
+than half a voxel from where the run began (THE RUN IS A LEVEL: a level
+wandering either side of its place keeps its run, one that goes somewhere
+restarts it; until 2026-10-18 every re-anchor of more than 2 eighths restarted
+it, and a stream with any churn never got one); NOTHING DOWNSTREAM moved for as
+long — each column keeps the newest event stamps among its own and its
+downstream neighbours', published by `commit` and read by the neighbours' next
+`scan`, so news reaches the top of a stream one column a tick later; an event
+is a column's FIRST wet window (a new area) or its level over a BLOCK of 8
+windows moving half a voxel against the block before (a basin filling, a flood
+spreading); the map's water is a sink that never moves; it stands within half a
+voxel of the anchor at that visit (the target IS its surface: the mean shape,
+not a crest); and it RUNS (a held feeder stands higher, something beside it
+lower, or its surface moved in the last window — a still pool beside the lake
+is not held). That is the HEAD; THE FRONT after it is taken at once at its
+anchor: any column a held map-fed stream column feeds (also one the map's water
+feeds as well — the mouth of a stream at the river it runs into), not into a
+fall, never one let go before. A held map-fed column is released when its
+support goes, when the flood count runs out, or when its own water stands more
+than a voxel under its target (DRAINED, per visit: a held basin a dug extension
+drains must let go at once, or the extension fills at half the live rate) —
+not on news from below. A held map-fed stream is not refilled from the
+reservoir (it delivers through its own CA, column to column, at the live rate:
+`stream-natural` E) EXCEPT ITS HEAD (hop 1), the column the map's own water
+feeds: the map feeds it otherwise only through the CA, and a head under the
+map's surface row cannot take that (the map's cell at its top row is submerged;
+the one over it would pour over the head's target) — `rivers` S's head was
+held, drained and let go with the 75 columns under it. A released column
+observes from scratch and its release is a fine event for the columns above,
+so nothing re-adopts within a window. The still table grew two regions after
+the mouth words: `STILL_ECHO` (two words a column, render-only: eight
+signed-byte samples of the resting surface minus the anchor, one every 4 ticks
+on the slot's first tick into slot `(tick / 4) % 8`, -128 = no water; rebased
+onto the target at adoption, frozen while held, zeroed on release, on a fresh
+observation and by every clear; NOT in the world hash — `sim_occupancy` hashes
+the voxels only — and not saved; `stream-natural` G asserts the held columns
+carry recordings within ±`streamNat.echoRangeMax` eighths) and `STREAM_OBS`
+(eight words a column: the observer, the stamps scratch + published, the tag,
+the adoption tick, release / adoption counters, release reasons; [7] byte 2 is
+the run's drift while observed). Knobs `sim.streamSteadyTicks` and
+`sim.streamPoolRoot` reach the kernel through TickParams' padding word
+`_padSplash0` (no layout change). Gate `stream-natural`; `rivers` S counts
+releases per column. WITH MPM EXCITATION ON (the game's default) a channel like
+`rivers` S's is a perpetual MPM torrent — the wake trigger takes ~40k eighths
+of its water every 150 ticks, seeded by its falls (~2k), waves up to five cells
+over its head — which the rules above rightly never call steady, so it is not
+held; S measures the held stream with excitation off
+(`rivers.streamExciteMode` 0, as `stream-natural` and `stream-pool` do). Making
+a dug stream calm enough to freeze in the game is the seam's question (OPEN).
 
 **A stream from a FINITE source — THE CONDUIT** (phase 3, 2026-10-16; tickets
 2026-10-16_11-14-41 / 11-16-43). **Off by default since 2026-10-17**
@@ -25651,7 +25705,8 @@ one inside the other, and three changes:
   the still record's word [1]) at or under its target (`8 y + f <= T8`) takes
   no excite trigger -- fall, perch, step, shell or wake -- except at a BREACH
   (an open lateral neighbour in a column the map does not hold, or air under
-  it: the breach's rush is kept). The seam binds the still table at group 1
+  it: the breach's rush is kept). (Amended 2026-10-18, below: AT REST is now
+  sim_step's `heldRest` exactly, and the breach is only a hole.) The seam binds the still table at group 1
   binding 18 (read-only; `stillLevel8` text-identical to sim_step's,
   `check_invariants.py stilllevel`) and 19 (the same buffer as atomics, for
   the diagnostic census). Excited, such a cell was refilled at once (stage 0)
@@ -25709,6 +25764,31 @@ breach; fed by the CA alone the channel carries more water than the adopted
 columns' flood count tolerates. Split-half controls: the seam half alone fails
 S, the sim_step half alone passes it. That is sim_stream.wgsl's to retune
 (it is being reworked: "reservoir refill limits for stream columns").
+
+**RESOLVED 2026-10-18** (`held-splash` C and `rivers` S pass again). C's
+reopening touched no stream (none was observed within 12 columns of the blast;
+the stream rules change nothing in a map column): `main`'s ramp drops ten
+eighths between two columns at the blast (the river blend, 2026-10-17, landed
+after the MPM fix was measured; that it made this lip is likely, not
+verified), a held top cell there stood two cells over the next column, and a
+top cell over its target was still excitable. The seam took it WHOLE (its held eighths with the excess), the
+reservoir grew it back under the particle (absorbed), the held column upstream
+poured into it while it stood under its target and overshot again: 4 eighths a
+tick by the step trigger, for good, 5 chunks awake (`held-splash` names the
+cell now: STILL_DIAG [15], the late window's excited held cell, with the
+voxels round it). The seam's AT REST is now `heldRest`'s exactly
+(`seamRestT8`): at or under the target OR the target's top cell, for the map's
+water AND a map-fed adopted stream (not a POOL column), so the CA and the seam
+agree on what is still. The BREACH exception is now only a map column's held
+cell with AIR UNDER it (the reservoir does not refill it, so its particles
+fall: a pour). A held cell beside an open unheld column was a loop that
+delivered nothing — the reservoir refilled it under its particle and absorbed
+it — 11-13k eighths of the lake's and `main`'s water every 150 ticks at S's
+two ends; the CA spills such a cell into the hole like any water. C after:
+411 eighths excited, all in the first 100 ticks, 0 live, 1 awake. S: see the
+held-stream paragraph (the run is a level, the front, the head's refill); with
+MPM excitation on its own channel stays a wake-driven torrent, so S runs with
+it off.
 
 **THE DRIFT** (2026-10-17, ticket 00-01-44): a level reach gives the held
 flow no direction, so worldgen `cols` writes each river column's network

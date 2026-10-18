@@ -302,9 +302,16 @@ period in which it is not carrying water to a new area, and only if what feeds
 it is basically infinite (a lake, map water); frozen, it still delivers water
 the same way; it freezes only when that looks natural.*
 
-### What phase 2 did (measured, `stream-natural` on the phase-2 shaders)
+### What phase 2 did
 
-MEASURED_BEFORE
+(No run of `stream-natural` on the phase-2 shaders was recorded.) What its
+fixtures were built to catch, from the tickets and the first natural cuts: a
+flood spreading over flat ground and a basin filling below a stream rose more
+slowly than "within a voxel for 120 visits", so their columns were held part
+way up at whatever height they stood at that visit (a crest or a trough),
+refilled to it at once (the RISE), drowned by the rising water and let go by
+the flood count (the COLLAPSE), and held again 120 visits later (the CYCLE);
+and water in flight over a step was taken as the surface.
 
 ### The natural test (`sim_stream.wgsl` STREAMS ADOPT ONLY WHEN NATURAL)
 
@@ -318,20 +325,28 @@ held column) is held when ALL of:
   step, off a ledge — and is not the surface (phase 2's `columnSurface` took
   it). The column is watched in windows of `STREAM_SUB` (16) visits: the
   window's MEAN against an ANCHOR (the mean the run began at). A window more
-  than `STREAM_MEAN_TOL` (2) eighths off the anchor re-anchors and restarts the
-  run (a FINE event); a jump of a voxel or more, or the column turning wet or
-  dry by a 3/4 majority of a window, is a COARSE one. The run must last
-  `sim.streamSteadyTicks` (600 = 20 s) of windows in which every visit found a
-  resting surface and none found water in flight. Flicker averages out; a
-  trend — a basin rising an eighth every few seconds — does not.
+  than `STREAM_MEAN_TOL` (2) eighths off the anchor re-anchors (the anchor follows
+  the mean: it is what the column is held at). The run must last
+  `sim.streamSteadyTicks` (600 = 20 s) of windows (64 visits each, `STREAM_SUB`)
+  in which three visits in four found a resting surface and at most a quarter
+  water in flight, and in which the anchor has not DRIFTED more than
+  `STREAM_RUN_DRIFT` (4 eighths, half a voxel) from where the run began —
+  THE RUN IS A LEVEL, NOT A WINDOW (2026-10-18: every re-anchor used to
+  restart the run, and a stream with any churn — `rivers` S, MPM on — never
+  had one longer than four windows; its head's anchor wandering either side
+  of its place now keeps the run, one rising half a voxel restarts it, which
+  is `stream-natural`'s own measure of "still filling").
 * **Nothing downstream moved for as long.** Every column keeps the newest fine
   and coarse event stamps among its own and its DOWNSTREAM neighbours' (open
   beside its surface with no water standing higher there), in
   `STREAM_OBS` [2]; `commit` publishes them ([3]) and the neighbours' next
   `scan` reads them, so an event anywhere down a stream reaches its top one
-  column a tick later. The map's water is a sink that never changes (never
-  scanned, never read). A flood still spreading, a basin still filling, keep
-  every column above them live CA.
+  column a tick later. An event is a column's FIRST wet window (a new area:
+  fine and coarse) or its level over a BLOCK of 8 windows moving
+  `STREAM_CHAIN_TOL` (4 eighths) against the block before (fine). The map's
+  water is a sink that never changes (never scanned, never read). A flood
+  still spreading, a basin still filling, keep every column above them live
+  CA.
 * **It is held at the shape it has.** The target is the column's current
   resting surface, taken only at a visit where that stands within
   `STREAM_AT_TOL` (1) eighth of the anchor: the frozen shape is the mean
@@ -340,11 +355,28 @@ held column) is held when ALL of:
   or its surface moved in the last window. A still pool touching the lake at
   its own level has none of these and sleeps as plain water; phase 2 held it
   (fed by the lake at its level, "draining" into the lake at its level).
+* That is the HEAD. **The front does not wait**: a column a held map-fed
+  stream column feeds (`fedByHeldStream`; also one the map's water feeds as
+  well — the mouth of a stream at the river it runs into, which as "smallest
+  feeding hop >= 1" stopped the front 20 columns short of `main` in `rivers`
+  S) is taken at once at its anchor, not into a fall, never one let go
+  before.
+* **The head is the reservoir's edge** (2026-10-18, `sim_step.wgsl`
+  stillWant): a held map-fed stream is not refilled from the reservoir —
+  except its hop-1 columns, the ones the map's own water feeds. A head under
+  the map's surface row cannot take the map's water through the CA (the
+  map's cell at its top row is submerged; the one over it would pour over the
+  head's target, held, refused); `rivers` S's head was held, stood more than
+  a voxel under its target, was released DRAINED and the 75 columns under it
+  went for want of support. Refilled, it stands at its target.
 
 RELEASE, besides the old rules (support gone, flooded): a map-fed held column
-whose coarse stamp is newer than its adoption (+ `STREAM_EVENT_GRACE`, 32
-ticks) — something dug beside the stream, the basin it ran into drained — or
-whose own water stands more than a voxel under its target (DRAINED) is let go.
+whose own water stands more than a voxel under its target (DRAINED, per visit:
+debounced over a window, a held basin a dug extension drains let go late and
+the extension filled at 0.47 of the live rate, `stream-natural` E, measured
+2026-10-18) is let go. NOT on news from below (the first cut released on a
+coarse stamp newer than the adoption, and let go whenever a cascade's side
+lane got wet for the first time).
 A released column observes from scratch (a whole window again) and its release
 is a FINE event for the columns above it, which then wait a window too: no
 adopt/release cycle runs faster than `sim.streamSteadyTicks`. The reason is
@@ -360,6 +392,17 @@ water; written while observed, rebased at adoption, frozen while held, zeroed
 on release / a fresh observation / every clear); then **`STREAM_OBS`**, eight
 words a column (anchor | run, the window's sums, the stamp scratch and the
 published stamps, the tag they belong to, the adoption tick, the counters).
+The ECHO WRITER (`echoSample`, `echoShift`) samples on the slot's FIRST tick
+only, so the recording is one sample every 4 ticks, 7.5 a second, as the
+renderer plays it back; a re-anchor shifts the recorded bytes with the anchor,
+the adoption rebases them onto the target. Render-only: no sim kernel reads
+the echo, `sim_occupancy` (the world hash) binds no still table, and saves do
+not carry it (`worldio`). `stream-natural` G asserts that at least
+`streamNat.echoRecordedMin` of the held columns carry a recording and no
+sample stands past `streamNat.echoRangeMax` eighths (measured: 354 of 454
+held columns recorded, samples -5..+6). `STREAM_OBS` [7] byte 2 (the retired
+event release's count) is the observer's run drift while the column is
+observed.
 Words [0]..[3] of the records are unchanged in meaning; an unadopted [3] is 0
 unless `sim.streamPoolRoot` is on (it then holds the conduit's own legacy
 observation, as before). Rule 1: everything a `scan` reads of another column
@@ -376,9 +419,34 @@ world.h, common.wgsl and every shader's SPIR-V cache untouched (a WGSL tuning
 row is a prelude-wide recompile); rename the field the next time either file
 changes anyway.
 
-### Measured (`stream-natural`, 2026-10-17)
+### Measured (2026-10-18, `--verify rivers,held-splash,stream-natural,stream-pool,lake-settle,sleep,determinism`)
 
-MEASURED_AFTER
+* `stream-natural`: A the flood pooled at tick 1,601, no flood column ever
+  held; B no pillar; C 95 of 95 channel columns held by tick 5,751, 1 chunk
+  awake at the end (a rolled GIVE, react-idle); D 0 releases, 455 adoptions;
+  E after the extension opens the held stream delivers 36 eighths per 10
+  ticks, the live one 36 (1.00); F three runs identical; G 367 of 455 held
+  columns carry an echo recording, samples -6..+6 eighths.
+* `rivers` S (MPM excitation off): the channel wet by tick 150 and still
+  filling (its volume 2,100 -> 4,966 eighths, block-level news to tick 2,250);
+  all 153 columns held between ticks 2,850 and 3,000, 0 released while it
+  ran, its 6 chunks asleep by tick 3,300; plugged, 0 held 150 ticks later.
+* `held-splash` A / B / C: 789 / 800 / 411 eighths excited, all in the first
+  100 ticks, none in the last 500, 0 particles live, 0 / 0 / 1 chunks awake.
+* `stream-pool` A-F, `lake-settle`, `sleep` pass; `determinism` 4993b9b0, the
+  pinned value (no held water in its fixture).
+
+`rivers` S with MPM excitation ON (the game's default; `rivers.streamExciteMode`
+1): the seam turns the channel into a perpetual torrent — every 150 ticks
+~40k eighths of its water taken by the wake trigger, seeded by ~1k fall and
+~0.8k step excitations at the lake's drop into the channel and over its
+risers; its volume swings 1,400 to 3,600 eighths between samples and waves
+stand five cells over its head. The natural rules hold its head now and then
+and let it go again (drained, flooded by the settling particles); 0 of 153
+columns held at the end. That is a dug stream the rules rightly do not call
+steady; making one calm enough to freeze in the game is the seam's question
+(OPEN). S measures the held stream with excitation off, as `stream-natural`
+and `stream-pool` do.
 
 ## Solute rides the held flow (`sim_solute.wgsl`, landed 2026-10-16)
 
@@ -403,7 +471,11 @@ rule for phase 2b is that only a stream fed by something basically infinite
 source whose stream is still carrying water somewhere new. The code stays;
 with the knob at 0 no column is ever rooted, so no POOL column exists and
 every branch below is inert (the conduit's legacy [3] observation is not even
-kept). `stream-pool` turns it on for its own arms.
+kept). `stream-pool` turns it on for its own arms, and its arm F (2026-10-18,
+ticket 2026-10-17_11-48-39, "when water pours in a small stream it hardens at
+the bottom") runs the same pour with the knob at its default 0 and MPM on:
+no column of the fixture is adopted in 1,500 ticks (root on, the first POOL
+column is adopted at tick 301).
 
 Tickets 2026-10-16_11-14-41 (a big pour run down a hill: 60 -> 25 fps) and
 11-16-43 (the owner: *make these chunks fall asleep while still having the

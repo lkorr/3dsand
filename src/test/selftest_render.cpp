@@ -730,6 +730,9 @@ Status GateFarPersist(Ctx& c, std::string& detail) {
 //       with the live grid's census of its footprint (in aggregate), beats
 //       the retired one-sample-column rule per cell, and no level-3+ cell
 //       keeps a cover stalk its centre sample caught (at the desert site).
+//   (h) THE WET BED. A fluid top's strata word carries the fluid's depth
+//       over the bed and the bed's skin slot (FAR_STRATA_WET), at levels 1
+//       and 4 over the fixture lake (below, inside (f)'s block).
 namespace {
 uint32_t FarMapEntry(GpuContext& ctx, World& world, uint32_t level, int mx, int mz) {
   rhi::Buffer staging =
@@ -851,6 +854,8 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   // as the one that took the slot -- "a slot round-trips" for the ground.
   int stCols = 0, stLayered = 0, stChecked = 0, stWrong = 0, palBad = 0;
   std::string stWhy;
+  int wetCols[2] = {0, 0}, wetWrong = 0;   // (h): level 1, level 4
+  std::string wetWhy;
   {
     std::unordered_map<uint32_t, std::vector<uint32_t>> chunkWords;
     auto liveAt = [&](int x, int y, int z) -> uint32_t {
@@ -897,6 +902,57 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
         }
       }
     }
+    // ---- (h) THE WET BED (FAR_STRATA_WET, 2026-10-18) ----------------------
+    // A fluid top's strata word carries its bed: depth == top - h at the
+    // entry's sample column, and (level 1, where the sub-column IS the fine
+    // column) the bed skin's far slot == the live voxel's at h. Over the
+    // harness map's fixture lake at (420, 420), at level 1 and at level 4 --
+    // the level whose 1.6 m cells put a shallow river's bed a cell low
+    // before the word existed (ticket 2026-10-16_11-05-33). A dry top's word
+    // must not carry the flag.
+    for (uint32_t level : {1u, 4u}) {
+      const int wsh = (int)(level + kFarShiftBase) - 1;   // fine voxels per sub-column
+      const int stepM = level == 1 ? 12 : 2;                // sub-columns between samples
+      const int m0x = (360 >> wsh), m1x = (480 >> wsh);
+      for (int mz = m0x; mz <= m1x; mz += stepM) {
+        for (int mx = m0x; mx <= m1x; mx += stepM) {
+          const uint32_t e = FarMapEntry(ctx, world, level, mx, mz);
+          if (!(e & kFarMapValid)) continue;
+          const int fx = (mx << wsh) + ((1 << wsh) >> 1);
+          const int fz = (mz << wsh) + ((1 << wsh) >> 1);
+          const int top = FarMapTopOf(e);
+          const int h = World::TerrainHeight(fx, fz, seed);
+          const uint32_t st = FarMapWords(ctx, world, FarStrataWord(level, mx, mz), 1)[0];
+          const bool flagged = (st & (kFarStrataPresent | kFarStrataWet)) == kFarStrataWet;
+          if (top <= h) {
+            if (st & kFarStrataWet) {
+              wetWrong++;
+              if (wetWhy.size() < 300)
+                wetWhy += Format(" [L%u (%d,%d) dry top %d: word 0x%08x]", level, fx, fz,
+                                 top, st);
+            }
+            continue;
+          }
+          wetCols[level == 1 ? 0 : 1]++;
+          const int depth = (int)(st & 0xFFFFu);
+          bool bad = !flagged || depth != top - h;
+          uint32_t want = 0;
+          if (!bad && level == 1) {
+            const uint32_t m = liveAt(fx, h, fz);
+            if (m != 0xFFFFu && m < c.mats.size()) {
+              want = c.mats[m].farPalSlot <= 0x7Fu ? c.mats[m].farPalSlot : 0u;
+              if (FarStrataWetBed(st) != want) bad = true;
+            }
+          }
+          if (bad) {
+            wetWrong++;
+            if (wetWhy.size() < 300)
+              wetWhy += Format(" [L%u (%d,%d) top %d h %d: word 0x%08x depth %d bed %u want %u]",
+                               level, fx, fz, top, h, st, depth, FarStrataWetBed(st), want);
+          }
+        }
+      }
+    }
     slotsMet.insert(c.mats[kMatStone].farPalSlot);
     for (uint32_t s : slotsMet) {
       int owner = -1, taker = -1;
@@ -918,6 +974,7 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
     }
   }
   const bool fOk = stCols >= 24 && stChecked > 0 && stWrong == 0 && palBad == 0;
+  const bool hOk = wetCols[0] >= 8 && wetCols[1] >= 8 && wetWrong == 0;
 
   // ---- (b) live edits invalidate -------------------------------------------
   auto validAt = [&](int x, int z) {
@@ -1311,18 +1368,19 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
              nSolid, nMicro, nL2, agree, checked, cutSolid ? "stalk" : "card", cutCleared,
              cutMapValid, !noGhost, ctlKept);
 
-  const bool ok = aOk && bOk && cOk && dOk && eOk && fOk && gOk;
+  const bool ok = aOk && bOk && cOk && dOk && eOk && fOk && gOk && hOk;
   detail = Format("L1 %d/%d valid, %d exact + %d fluid, %d cell/skin agree, %d wrong; "
                   "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d; %s; "
                   "strata %d cols (%d layered), %d/%d depths agree, %d palette bad%s; "
                   "flush re-skin (pre %d): live %d/4 cells %d/4 maps off, indexed %d/4 "
-                  "cells %d/4 maps off%s; %s",
+                  "cells %d/4 maps off%s; %s; wet bed L1 %d L4 %d cols, %d wrong%s",
                   valid, sampled, exact, fluid, cellAgree, wrong, coarseExact, coarse,
                   preCrater, preBuild, preControl, postCrater, postBuild,
                   postControl, postCrater2, healed, keptCrater, keptBuild,
                   dDetail.c_str(), stCols, stLayered, stChecked - stWrong, stChecked,
                   palBad, stWhy.c_str(), preYard, yardCellsLive, yardMapsLive, yardCellsIdx,
-                  yardMapsIdx, yardWhy.c_str(), gDetail.c_str());
+                  yardMapsIdx, yardWhy.c_str(), gDetail.c_str(), wetCols[0], wetCols[1],
+                  wetWrong, wetWhy.c_str());
   std::printf("far surface: %s (%s%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
               detail.c_str(), firstWrong.c_str(), firstBad.c_str(), noted);
   // Leave the cascades as the next gate expects to find them: pristine + the
