@@ -2395,7 +2395,7 @@ PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, 
 // A(FluidExciteScratch): the scan writes settleBin/settleKill's dispatch args
 // into that buffer's spare header triple (EX_SETTLE_ARGS), staged just below.
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(A(FluidCalm) A(FluidSettleScratch) A(FluidArgsStage)
+     USES(U(TickUBO) A(FluidCalm) A(FluidSettleScratch) A(FluidArgsStage)
           A(FluidExciteScratch)))
 // settleBin and settleKill do nothing to a particle outside a PICKED block, so
 // on the (common) tick nothing was picked they were two full passes over the

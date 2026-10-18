@@ -1105,7 +1105,11 @@ def check_flow_converge_copy():
          "v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));"),
         ("return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);",
          "return -((tv.x - tv.y) + (tv.z - tv.w)) / (2.0 * e);"),
-        ("flowBlend(flowGridAt(p), flowMeasAt(p) * TUNE_CURRENT_MEASURED)",
+        # currentAt names the scaled measured flow `m` (2026-10-18, the
+        # breach's vertical rise reads its length); the x/z blend is unchanged.
+        ("let m = flowMeasAt(p) * TUNE_CURRENT_MEASURED;",
+         "flowBlend(solved, measured * TUNE_CURRENT_MEASURED)"),
+        ("flowBlend(flowGridAt(p), m)",
          "flowBlend(solved, measured * TUNE_CURRENT_MEASURED)"),
     ]
     for c, r in pairs:
