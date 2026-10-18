@@ -3717,6 +3717,17 @@ struct Tuning {
     // 0 = bodies feel the solved field only (what they did before 2026-10-15);
     // the record stops only when this and render.currentMeasured are both 0.
     float currentMeasuredCarry = TPD(sim, currentMeasuredCarry);
+    // THE MEASURED FLOW's REACH, in flow nodes (0.8 m each; ticket
+    // 2026-10-17_20-56-48: "the arrows discretely change from the natural
+    // current of the lake to this manmade flow ... all arrows should be
+    // influencing other arrows"). flow_measure.wgsl's fold spreads each node's
+    // measured flux over a tent of this radius (normalised, so a broad flood
+    // reads the same) and adds it where it is stronger than the node's own
+    // 3 x 3 reading, so a breach or a pour bends the current around it for a
+    // few metres and fades into the map's solved field instead of ending on
+    // one node. 1 = the 3 x 3 tent alone (before 2026-10-18). Integer, and the
+    // fold is integer: the bodies feel the published grid.
+    int currentMeasuredReach = TPD(sim, currentMeasuredReach);
   } sim;
 
   // ---- day/night cycle ----

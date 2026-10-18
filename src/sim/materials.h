@@ -386,7 +386,15 @@ inline uint32_t PackRepose(int32_t deg) {
 //                 skitters, a log barely moves. Also what keeps debris from
 //                 piling into a tower: a floater that cannot settle where it is
 //                 drifts until it finds free waterline.
-//   bits 12..31 : free. The next rule goes here.
+//   bit  12     : SEALED -- a liquid STANDS on this surface: nothing soaks
+//                 into it and a DRYING rule (reactions.json `"drying": true`,
+//                 kCondDrying) does not fire on a cell resting on it. Authored
+//                 on the SUBSTRATE beside its absorb capacity, as
+//                 `"absorb": {"sealed": true}` (ice, glass, metal: the
+//                 surfaces blood does not soak into, so it pools on them
+//                 instead of drying away -- ticket 2026-10-17_00-19-10). Read
+//                 by sim_step.wgsl's decay branch (FLUIDPACK_SEALED).
+//   bits 13..31 : free. The next rule goes here.
 //
 // Authored in materials.json as `"fluid": {"lift": n, "drag": n, "wander": n}`;
 // any absent key takes the Derive* default below. Never hardcoded per material
@@ -394,6 +402,7 @@ inline uint32_t PackRepose(int32_t deg) {
 constexpr uint32_t kFluidPackLiftShift = 0, kFluidPackLiftMask = 0xF;
 constexpr uint32_t kFluidPackDragShift = 4, kFluidPackDragMask = 0xF;
 constexpr uint32_t kFluidPackWanderShift = 8, kFluidPackWanderMask = 0xF;
+constexpr uint32_t kFluidPackSealedBit = 1u << 12;
 constexpr uint32_t kFluidMax = 15;
 
 // Solids and powders feel the liquid; liquids and gases do not.
@@ -765,8 +774,10 @@ struct RuleFx {
   // This rule is the world's abstraction of matter SOAKING INTO THE GROUND
   // or DRYING IN THE OPEN (blood's `blood -> air`), not chemistry. The world
   // runs it as authored; the alchemy bench never fires it on matter inside a
-  // vessel (there is no ground in a flask). CPU-side only: it takes no fx id
-  // and nothing of it reaches the GPU, so the world hash cannot see it.
+  // vessel (there is no ground in a flask). This flag is the bench's half and
+  // takes no fx id; the world's half is the cond bit kCondDrying (below),
+  // which the parser sets beside it: the CA does not dry a cell resting on a
+  // sealed surface (2026-10-18).
   bool drying = false;
 };
 // Does rule k of `m` (its bucket, reactOffset + k) carry a solute condition?
@@ -783,6 +794,15 @@ bool RuleNeedsSolute(const MaterialDef& m, uint32_t k);
 // ramps and rolls exactly as it would without one.
 constexpr uint32_t kCondFxShift = 24, kCondFxMask = 0x1Fu;
 constexpr uint32_t kMaxReactFx = 31;
+// ---- a DRYING rule on the GPU (ReactionGpu.cond bit 29) --------------------
+// reactions.json `"drying": true` (RuleFx::drying, the bench's half) also sets
+// this bit, and the CA reads it: a drying rule -- matter soaking into the
+// ground or drying in the open -- does not fire, and does not hold its chunk
+// awake, on a cell RESTING ON a sealed surface (kFluidPackSealedBit: ice,
+// glass, metal). Blood there has nothing to soak into, so it pools and stays
+// instead of vanishing without a mark (ticket 2026-10-17_00-19-10). Must
+// match sim_step.wgsl RCOND_DRYING.
+constexpr uint32_t kCondDrying = 1u << 29;
 // The effect kinds some consumer registers (the world: explode; the alchemy
 // bench, package C: explode, flash, eject, shock, burst). A kind outside this
 // list still loads -- consumers ignore kinds they do not know -- but the
@@ -832,6 +852,10 @@ struct MaterialDef {
   // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
   // gpu.stainPack; kept unpacked here for the tuner and the wiki.
   uint32_t absorbCapacity = 0;
+  // "absorb": {"sealed": true} -- a liquid stands on this surface and a
+  // drying rule does not fire on a cell resting on it (kFluidPackSealedBit,
+  // which is the truth; this mirrors it for the tuner and the wiki).
+  bool sealed = false;
   // How fast this material's stain DRIES off the ground on its own, per mille
   // per tick per level (materials.json "stain": {"dries": n}); 0 = it stays
   // until something replaces it. Water's wet dries; blood and oil do not.

@@ -2128,6 +2128,80 @@ Status GateRivers(Ctx& c, std::string& detail) {
                     wOk ? "PASS" : "FAIL", pileCells, gTicks, onPile, onPileMax);
         if (!wOk) problems.push_back(Format("W: %d water cells on the gravel pile (%d gravel over the surface)", onPile, pileCells));
       }
+      // ---- W2. gravel sunk into the deep lake conserves the water ----
+      // Ticket 2026-10-17_11-45-30 (a 60-cell map lake on `default`): "pouring
+      // gravel into water seems to delete all the water on top and make the
+      // water run in an alternate direction". W's rule sent EVERY cell of held
+      // water a sinking grain displaced back to the reservoir, at any depth, so
+      // a grain falling through the lake left a column of air holes under the
+      // surface. In a box of lake columns round the pour, y <= the lake's top
+      // cell, `water eighths + 8 x gravel cells` is what a grain sinking can
+      // never change: a swap under the surface keeps both, a grain entering
+      // the top cell trades one cell of water (to the reservoir) for one of
+      // gravel. Its largest drop while the pile sinks is the water deleted;
+      // `holes` is the air standing under the target at that sample.
+      {
+        const uint32_t mGravel = matIdOf("gravel");
+        const int lx = lakeX, lz = lakeZ, half = 8;
+        const int yLo = lakeLevel - 16, yHi = lakeLevel;
+        auto census = [&](int64_t& inv, int& holes, int& gravel) {
+          rows.clear();
+          inv = 0;
+          holes = 0;
+          gravel = 0;
+          for (int dz = -half; dz <= half; dz++)
+            for (int dx = -half; dx <= half; dx++)
+              for (int y = yLo; y <= yHi; y++) {
+                const uint32_t w = voxRaw(lx + dx, y, lz + dz);
+                const uint32_t m = w & 0xFFFu;
+                if (m == mWater) inv += int64_t(((w >> 12) & 15u) + 1u);
+                else if (m == mGravel) { inv += 8; gravel++; }
+                else if (m == 0u && y < yHi) holes++;
+              }
+        };
+        c.ctx.WaitIdle();
+        int64_t inv0 = 0;
+        int holes0 = 0, gravel0 = 0;
+        census(inv0, holes0, gravel0);
+        std::vector<CellOp> pour;
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dx = -1; dx <= 1; dx++)
+            for (int y = lakeLevel + 2; y <= lakeLevel + 13; y++)
+              pour.push_back(CellOp{World::SlotCellIndex(IVec3{lx + dx, y, lz + dz}), mGravel | 0x80000000u});
+        sandvox::support::TickOps lops;
+        lops.cells = pour;
+        tick(lops);
+        const int lTicks = static_cast<int>(BaselineNumber("rivers.gravelLakeTicks", 300));
+        int64_t worst = 0;
+        int worstHoles = 0, worstAt = 0, gravelEnd = 0, holesEnd = 0;
+        int64_t invEnd = inv0;
+        std::string curve;
+        for (int k = 1; k <= lTicks; k++) {
+          tick();
+          if (k % 10 != 0) continue;
+          c.ctx.WaitIdle();
+          int64_t inv = 0;
+          int holes = 0, gravel = 0;
+          census(inv, holes, gravel);
+          if (inv0 - inv > worst) { worst = inv0 - inv; worstAt = k; }
+          worstHoles = std::max(worstHoles, holes - holes0);
+          if (k % 50 == 0) curve += Format(" %d:%lld/%d/%d", k, (long long)(inv0 - inv), holes - holes0, gravel - gravel0);
+          invEnd = inv;
+          holesEnd = holes;
+          gravelEnd = gravel;
+        }
+        const int64_t deficitMax = static_cast<int64_t>(BaselineNumber("rivers.gravelLakeDeficitMax", 16));
+        const bool w2Ok = gravelEnd - gravel0 >= 60 && worst <= deficitMax && worstHoles <= 2;
+        std::printf("rivers: W2 gravel into the lake: %s (108 grains at (%d,%d) over a lake at y%d; %d sank into the box; "
+                    "water+gravel lost at worst %lld eighths at tick %d (<= %lld), %lld at the end; air under the target "
+                    "at worst %d, %d at the end (<= 2); tick:lost/holes/gravel%s)\n",
+                    w2Ok ? "PASS" : "FAIL", lx, lz, lakeLevel, gravelEnd - gravel0, (long long)worst, worstAt,
+                    (long long)deficitMax, (long long)(inv0 - invEnd), worstHoles, holesEnd - holes0, curve.c_str());
+        RecordObserved("rivers.observedGravelLakeLost", std::to_string(worst));
+        if (!w2Ok)
+          problems.push_back(Format("W2: gravel into the lake lost %lld eighths of water (holes %d, %d sank)", (long long)worst,
+                                    worstHoles, gravelEnd - gravel0));
+      }
       weather::SetOverride(prevPin);
       if (!gOk) problems.push_back(Format("G: %u chunks awake after %d ticks (%d at the water)", active, ticks, nearWater));
     }

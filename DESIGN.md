@@ -5278,6 +5278,18 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     function, `common.wgsl`'s `stainStep`, which both `doStaining` and the MPM
     seam's `stainApply` call (rule-unification W1-B1); the kernels keep only
     the roll, the write and the spend in their own currency.
+  - **A SEALED surface (2026-10-18, ticket 2026-10-17_00-19-10).**
+    `"absorb": {"sealed": true}` (ice, glacier ice, rime, glass, crystal,
+    gems, the metals; `materials.h` `kFluidPackSealedBit`, the fluid pack's
+    bit 12) is the opposite of absorbent: `stainStep` gives it NO stain (a
+    washer may still rinse an old one off), and a DRYING rule
+    (`reactions.json` `"drying": true`, now also the GPU cond bit
+    `kCondDrying`) does not fire -- nor hold its chunk awake -- on a cell
+    resting on one (`sim_step.wgsl` `restsOnSealed`, the cell straight
+    below). So blood on ice POOLS and stays, where on dirt it soaks in and on
+    stone it dries off leaving its stain: before, it vanished from ice without
+    a mark. Only the layer touching the surface is held (a read at distance
+    1): a deep pool's upper cells still dry down to a film. Gate `blood-pool`.
   - **Absorbing SPENDS the liquid**: one eighth of the source cell's fullness
     per successful contact, in the same units `stepLiquid` speaks, and the cell
     dies when it gives its last. Without that debit the puddle would stain the
@@ -25787,7 +25799,7 @@ depth words) into the still table's own STILL_MOUTH region, and sim_solute's
 rank orders a level pair by it: `sim.soluteDrift`/256 (TickParams, live; 0 =
 off) of the upstream cell's dissolved mass moves downstream a visit. `rivers`
 X checks ink drifts downstream; V runs with it off.
-**Gate `rivers`** grew: **W** pours a 5x5 column of gravel half into main (ticket 2026-10-17_00-02-59: a grain sinking into AT-REST held water used to swap that water up onto the pile while the reservoir refilled the river, so water climbed every pile poured into a river; `tryMove` now returns displaced held water to the reservoir -- the source becomes air) and counts water standing on the pile (<= `rivers.gravelWaterMax`). **L** walks every waterfall of the SHIPPED map
+**Gate `rivers`** grew: **W** pours a 5x5 column of gravel half into main (ticket 2026-10-17_00-02-59: a grain sinking into AT-REST held water used to swap that water up onto the pile while the reservoir refilled the river, so water climbed every pile poured into a river; `tryMove` now returns displaced held water to the reservoir -- the source becomes air) and counts water standing on the pile (<= `rivers.gravelWaterMax`). **Only the part over the target goes back** (2026-10-18, ticket 2026-10-17_11-45-30: "pouring gravel into water seems to delete all the water on top"): the first version returned EVERY displaced cell, at any depth, so a grain sinking through a 60-cell map lake deleted the water it passed and left a column of air holes under the surface. The displaced eighths now keep what fits under the target of the column they land in (the held column's own when that column is not held) and only the excess returns -- a plain swap under the surface, air at it. **W2** drops 108 grains into the fixture lake's middle and asserts `water eighths + 8 x gravel` in the box under the top cell falls by at most `rivers.gravelLakeDeficitMax` while they sink, with at most 2 air cells under the target. **L** walks every waterfall of the SHIPPED map
 (`default`, CPU twin, a 41-column box round each) and counts leaking faces —
 water over a dry neighbour whose ground is under it, the sea excepted
 (`rivers.fallLeakMax` = 0); E holds only the fixture's one fall and passed both
@@ -26401,6 +26413,22 @@ every node still in view and starts the ones that scroll in from zero; a
 format bit in the tag restarts slots the old f32 fold wrote) and its band;
 GRID publishes it in flowGrid's own layout, except that the second word is the
 band (top | bot) the reader gates on (+-1.5 cells).
+
+**The reach** (2026-10-18, ticket 2026-10-17_20-56-48: "the flow/current
+vector field arrows discretely change from the natural current of the lake to
+this manmade flow ... all arrows should be influencing other arrows"). With the
+3 x 3 tent alone a breach's pull ended 1.6 m out, and the next arrow pointed
+wherever the solved field did -- often at right angles. The fold now also takes
+the flux over a tent of radius `sim.currentMeasuredReach` nodes (default 4,
+3.2 m; weights `(R+1-|di|)(R+1-|dj|)`, normalised to the small tent's sum so a
+broad flood reads the same) and publishes `local + wide x (1 - min(|local|^2 /
+|wide|^2, 1))`: inside a flood or at a jet's core exactly the old reading,
+outside it the surroundings', falling to zero at R + 1 nodes, continuous in
+between; the band is gathered over the reach too. With the blend below, the
+solved field then hands over to the measured one smoothly over the reach
+instead of on one node. Integer like the rest of the fold (bounded: per-term
+clamp 2^19, at most 7^4 weight). 1 = the old fold exactly. Cost: (2R+1)^2
+four-word loads per node on the ticks the fold records (81 at 4).
 
 **The blend** (`flowBlend`, CPU twin `flowfield::BlendMeasured`): the measured
 flow counts in full and the solved field fades out under it, gone at

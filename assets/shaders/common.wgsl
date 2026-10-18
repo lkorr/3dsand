@@ -301,6 +301,13 @@ fn stainStep(sType : u32, sAmt : u32, washes : bool, nw : u32,
     return vec2<u32>(nw, 0u);
   }
   let cur = voxStainAmt(nw);
+  // ...and never into a SEALED one (ice, glass, metal: matFluidSealed). Blood
+  // left a one-level mark on ice and could pit it like stone; now it stands
+  // on it as a pool instead (ticket 2026-10-17_00-19-10). A washer may still
+  // rinse off a stain the surface already carries (an old save's).
+  if (matFluidSealed(nm) && !(washes && cur != 0u)) {
+    return vec2<u32>(nw, 0u);
+  }
   let curType = voxStainType(nw);
   let capacity = matAbsorbCapacity(nm);
   // No corrosive stain reaches the ground (a corrosive coat is `bodyOnly`),
@@ -347,6 +354,11 @@ fn stainConsumes(sm : Material, roll : u32) -> bool {
 fn matFluidLift(m : Material)   -> u32 { return m.fluidPack & 0xFu; }
 fn matFluidDrag(m : Material)   -> u32 { return (m.fluidPack >> 4u) & 0xFu; }
 fn matFluidWander(m : Material) -> u32 { return (m.fluidPack >> 8u) & 0xFu; }
+// SEALED (materials.h kFluidPackSealedBit, authored `absorb: {sealed: true}`):
+// a liquid STANDS on this surface -- no stain soaks into it (stainStep) and a
+// drying rule does not fire on a cell resting on it (sim_step.wgsl
+// restsOnSealed). Ice, glass, metal (ticket 2026-10-17_00-19-10).
+fn matFluidSealed(m : Material) -> bool { return (m.fluidPack & 0x1000u) != 0u; }
 
 // ---- wind coupling, authored per material (invariant 7) --------------------
 // Both are 0..15 and both are AUTHORED in materials.json ("wind": {"response":
