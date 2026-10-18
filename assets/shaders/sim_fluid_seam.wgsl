@@ -1096,9 +1096,14 @@ fn spoutHead(u0 : vec3<i32>, back : vec3<i32>, cy : i32, mat : u32) -> i32 {
 // head is what makes it a spout and not a film on a ramp: `ca-slope-hybrid`'s
 // sealed ramp, the reason the perch trigger is off, has no water standing
 // over its treads. Then it is excited with a throw toward the drop, rolled
-// like the fall cells. It is still a subset of what settleCheck's stability
-// veto refuses (that tests the FULL perch predicate), so the hysteresis
-// guarantee holds: settle can never build what this takes. 0 = not a mouth.
+// like the fall cells. NOT a strict subset of settleCheck's stability veto:
+// the veto's perch predicate counts excited mass in the drop as water, this
+// asks for air VOXELS, because a pouring spout's drop is full of its own
+// stream (the mass-aware test measured 55 thrown particles on `fluid-spout`,
+// +0.24 cells for a +0.50 floor). So settle can rebuild a mouth cell beside a
+// particle-filled drop and this takes it again; what bounds that is the head
+// -- each take drains the reservoir, and under SPOUT_MOUTH_HEAD it stops.
+// 0 = not a mouth.
 const SPOUT_MOUTH_HEAD : i32 = 3;
 fn spoutMouthCode(c : vec3<i32>, mat : u32) -> u32 {
   if (spoutChanceQ() == 0u || spoutGainQ() == 0) { return 0u; }

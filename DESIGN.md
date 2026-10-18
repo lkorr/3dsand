@@ -5048,19 +5048,28 @@ excited particles born each tick: how many carry a throw, where, how fast):
   a cell resting on something with a lateral neighbour that is air over air
   (the perch configuration) and, on the OPPOSITE side, this liquid with its
   head ≥ 3 rows over the cell — the head is what tells a spout from a film on a
-  ramp, the case `sim.fluidExcitePerch` is off for. "Air over air" is the
-  perch predicate itself (`seamLateralExcite` over `seamNeighbourState`, which
-  counts excited MPM mass as water), so the mouth is a strict subset of
-  `settleCheck`'s veto and settle can never rebuild what it takes. It needs
-  `fluidExciteMode` on and both knobs non-zero.
-- **A REAL DROP.** A FALL cell is thrown only if the cell under it holds no
-  excited mass either. Trigger (a) asks for an air VOXEL below, and over a
-  flood that voxel is air with particles in it — a settled cell lying on moving
-  water. Seeded at rest that re-wake is dissipative; thrown, every re-wake
-  handed the body a fresh Torricelli kick and the settle/excite pair pumped
-  energy (measured, `flow-measure` R: a breach that must relax kept 1.97
-  cells/s after 900 ticks, vs 0.37 with the throw off). Such cells still
-  excite, at rest.
+  ramp, the case `sim.fluidExcitePerch` is off for. Its "air over air" is the
+  raw VOXEL, not the perch predicate's mass-aware `seamNeighbourState`: while
+  a spout pours, its own stream's particles fill the drop, and the mass-aware
+  test cut `fluid-spout`'s throws to 55 particles (+0.24 cells, need +0.50).
+  So it is NOT a strict subset of `settleCheck`'s veto, which reads excited
+  mass: settle may rebuild a mouth cell beside a particle-filled drop and the
+  mouth takes it again. What bounds that is the head: every take moves water
+  out of the reservoir, and below 3 rows standing over the lip it stops. It
+  needs `fluidExciteMode` on and both knobs non-zero.
+- **A REAL HEAD for the fall cells too** (2026-10-18). A FALL cell is thrown
+  only if the water it came out of stands >= 3 rows (`SPOUT_MOUTH_HEAD`) over
+  its row, the mouth's own bound. Trigger (a) asks for an air VOXEL below, and
+  over a flood that voxel is air with particles in it: a settled cell lying on
+  moving water, its "source" the flood's own surface beside it, 1 or 2 rows
+  over it. Seeded at rest that re-wake is dissipative; thrown, every re-wake
+  handed the body a fresh Torricelli kick and settle/excite pumped energy
+  (measured, `flow-measure` R, a breach that must relax: 1.97 cells/s left
+  after 900 ticks, vs 0.37 with the throw off, and 2.10 with the throw kept
+  but refused over a drop holding excited mass, since sparse spray reads as
+  empty). With the head bound R relaxes and the throw stops once the breach
+  equalises (the gate prints throws per settle phase); such cells still excite,
+  at rest.
 - **THE NOZZLE.** A thrown cell is born one cell from SETTLED water, whose
   nodes `clearGrid` seeds with zero-velocity mass; the particle's quadratic
   support still gathers ~28% from that node, so each substep kept ~72% of the
