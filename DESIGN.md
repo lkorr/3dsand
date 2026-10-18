@@ -18257,12 +18257,14 @@ where you hear from either (§12b, "The ears are on the character").
   of the FAR DOWNSAMPLE CADENCE's list (2026-10-18, `far_select.wgsl`,
   `World::farDownState`): every slot written this tick (its dirtyOut flag,
   hash tick or not) goes PENDING, and a pending slot is selected once
-  `FAR_DOWN_EVERY` (4) ticks have passed since its last downsample — the tick
-  of a one-off edit, every fourth tick of a chunk running water rewrites every
-  tick (it was every tick: 2.2 ms of the slope pour's 9.6 ms tick, tickets
-  2026-10-16_11-14-41 / 2026-10-17_21-03-25), and within three ticks of a
-  chunk's last write once it goes quiet, because the pending bit outlives the
-  dirty flag. A settled world selects nothing and dispatches nothing — and re-derives
+  `FAR_DOWN_EVERY` (8) ticks have passed since its last downsample — the tick
+  of a one-off edit, at most every eighth tick of a chunk running water keeps
+  rewriting, and within seven ticks (~0.25 s) of a chunk's last write once it
+  goes quiet, because the pending bit outlives the dirty flag. It used to be
+  every tick a chunk was written: 4.6 ms of the slope pour's tick and 10.0 ms
+  of the dam breach's (tickets 2026-10-16_11-14-41 / 2026-10-17_21-03-25;
+  `--perf dam` farField at a cadence of 4: 7.8 ms, of 16: 4.5 ms — a wet chunk
+  is rewritten every few ticks, not every tick, so 4 barely bites). A settled world selects nothing and dispatches nothing — and re-derives
   from the LIVE voxel grid every cascade cell whose sample point falls in a
   chunk that changed. It samples the identical center voxel the sieve does, so
   edited and pristine regions agree exactly where they meet, and a chunk edited

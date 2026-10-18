@@ -1260,11 +1260,12 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 // stay visible after the player walks away (render-only derived data --
 // DESIGN.md §9). Which chunks, this tick, is far_select.wgsl's: every written
 // slot goes PENDING, and a pending slot is downsampled once FAR_DOWN_EVERY
-// ticks have passed since its last downsample -- the tick of a one-off edit, a
-// quarter of the ticks of a chunk that running water rewrites every tick, and
-// within FAR_DOWN_EVERY - 1 ticks of a chunk's last write when it goes quiet.
-// The old rows rode compactNext's dirtyOut list directly, which re-downsampled
-// every wet chunk of a pour on every tick (2.2 ms of the slope pour's tick).
+// ticks have passed since its last downsample -- the tick of a one-off edit,
+// at most every FAR_DOWN_EVERY-th tick of a chunk running water keeps
+// rewriting, and within FAR_DOWN_EVERY - 1 ticks of a chunk's last write when
+// it goes quiet. The old rows rode compactNext's dirtyOut list directly, which
+// re-downsampled every wet chunk on every tick it was written (farField 4.6 ms
+// of the slope pour's tick, 10.0 ms of the dam breach's).
 // Runs on EVERY tick, hash or not, after both occupancy branches: dirtyOut is
 // complete by here either way, and the cadence's pending state must advance
 // on every tick or a chunk due on a hash tick would wait for the next one.

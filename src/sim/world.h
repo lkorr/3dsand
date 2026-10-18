@@ -6040,9 +6040,10 @@ class World {
   rhi::Buffer farSig;
   // THE FAR DOWNSAMPLE CADENCE (2026-10-18, tickets 2026-10-16_11-14-41 /
   // 2026-10-17_21-03-25; assets/shaders/far_select.wgsl). `fardown` used to run
-  // over every chunk written THIS tick, so a chunk that running water writes
-  // every tick was re-downsampled into all eight cascade levels every tick
-  // (2.2 ms of a 9.6 ms tick on the slope pour). Now `farDownSelect` picks the
+  // over every chunk written THIS tick, so a chunk that running water keeps
+  // rewriting was re-downsampled into all eight cascade levels every time
+  // (farField 4.6 ms/tick on the slope pour, 10.0 on the dam breach). Now
+  // `farDownSelect` picks the
   // tick's work list from dirtyOut: a written chunk is marked PENDING, and a
   // pending chunk is downsampled once at least FAR_DOWN_EVERY ticks have passed
   // since its last downsample -- immediately for a one-off edit, every

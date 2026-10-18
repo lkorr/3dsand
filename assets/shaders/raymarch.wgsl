@@ -10394,6 +10394,9 @@ fn waveBands2(pa : vec2f, pb : vec2f, t : f32, footM : f32, depthM : f32,
                TUNE_WAVE_DISPERSION);
     var band = 1.0;
     if (footM > 0.0) { band = 1.0 - smoothstep(w.len * 0.28, w.len * 0.85, footM); }
+    // A band the footprint has faded to exactly 0 adds exactly 0 to all four
+    // sums: skip its two cos/sin pairs (2026-10-18; far and grazing water).
+    if (band <= 0.0) { continue; }
     let phA = dot(pa, w.dir) * k + t * omega;
     let phB = dot(pb, w.dir) * k + t * omega;
     numA += w.dir * (amp * k * cos(phA)) * band;
@@ -10468,6 +10471,8 @@ fn waveBands(pAdv : vec2f, t : f32, footM : f32, depthM : f32, shore : f32) -> v
     // half a wavelength (Nyquist), gone by the time it exceeds it.
     var band = 1.0;
     if (footM > 0.0) { band = 1.0 - smoothstep(w.len * 0.28, w.len * 0.85, footM); }
+    // Faded to exactly 0: it adds exactly 0 to both sums (see waveBands2).
+    if (band <= 0.0) { continue; }
     // d/dp of (amp * sin(phase)) = amp * k * cos(phase) * dir
     num += w.dir * (amp * k * cos(phase)) * band;
     // GERSTNER SHARPENING. A Gerstner wave displaces the surface horizontally
@@ -11252,6 +11257,12 @@ fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   if (st <= 0.0) { return 0.0; }
   let dir = flowMS / speed;
   let perp = vec2f(-dir.y, dir.x);
+  // Faded out with distance: a fleck is a few centimetres wide. Asked FIRST
+  // since it needs nothing below -- not even the shear's two current taps
+  // (2026-10-18; both exits return 0, so the order cannot change the answer):
+  // a pixel past the fade pays no grid lookup and no noise.
+  let footFade = 1.0 - smoothstep(0.06, 0.25, waterRippleFootprint(hitP));
+  if (footFade <= 0.0) { return 0.0; }
   // The shear across the flow, per second: the along-flow speed 0.6 m to
   // either side. Two more taps of a bilinear grid.
   let e = 0.6;
@@ -11260,10 +11271,6 @@ fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   let shear = abs(aL - aR) * VOXEL_METERS / (2.0 * e);
   let density = clamp(0.45 * st * st + shear * 2.0, 0.0, 1.0);
   if (density <= 0.02) { return 0.0; }
-  // Faded out with distance: a fleck is a few centimetres wide. Asked FIRST
-  // since it needs nothing below: a pixel past the fade pays no noise.
-  let footFade = 1.0 - smoothstep(0.06, 0.25, waterRippleFootprint(hitP));
-  if (footFade <= 0.0) { return 0.0; }
   let v = flowMS * TUNE_WAVE_FLOW_SCALE;
   let tau = R.time / WAVE_FLOW_CYCLE_S;
   let f0 = fract(tau);

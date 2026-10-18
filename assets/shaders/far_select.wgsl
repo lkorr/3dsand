@@ -5,11 +5,11 @@
 // WHY. `fardown` (worldgen.wgsl) used to dispatch over every chunk written this
 // tick (compactNext's dirtyOut list), and a chunk whose far-visible matter moved
 // was re-downsampled into all eight cascade levels -- a genColumn per sample
-// column per level. Running water changes its chunks EVERY tick, so a pour down
-// a hill or a breached dam paid the whole downsample of every wet chunk thirty
-// times a second (2.2 ms of a 9.6 ms tick on the slope pour) for cascade cells
-// that are drawn past ~20 m, where a quarter-second-old water line is not a
-// visible difference.
+// column per level. Running water keeps rewriting its chunks, so a pour down
+// a hill or a breached dam paid the whole downsample of every wet chunk every
+// few ticks (farField 4.6 ms of the slope pour's tick, 10.0 ms of the dam
+// breach's) for cascade cells that are drawn past ~20 m, where a
+// quarter-second-old water line is not a visible difference.
 //
 // THE RULE, per slot, every tick:
 //   * written this tick (dirtyOut != 0)  -> PENDING;
@@ -49,9 +49,14 @@
 @group(1) @binding(8) var<storage, read_write> farDownState : array<u32>;
 @group(1) @binding(9) var<storage, read_write> farDownArgs : array<atomic<u32>>;  // x=count, y=1, z=1
 
-// Ticks between two downsamples of a chunk that keeps changing. 4 = 7.5 Hz at
-// the 30 Hz tick: a running sheet's far image lags it by at most ~0.1 s.
-const FAR_DOWN_EVERY : u32 = 4u;
+// Ticks between two downsamples of a chunk that keeps changing: 8 = 3.75 Hz
+// at the 30 Hz tick, so the cascade's image of running water (drawn past the
+// ~20 m handoff) lags it by at most ~0.25 s. Measured on --perf dam (ticket
+// 21-03-25's breach, farField ms/tick): every tick 10.0, every 4th 7.8, every
+// 16th 4.5 -- a wet chunk is rewritten every few ticks, not every tick, so a
+// cadence of 4 barely bites. 8 is the middle, chosen for the handoff seam: a
+// flood front moving ~1 m/s would stand ~0.25 m apart across it.
+const FAR_DOWN_EVERY : u32 = 8u;
 const FDS_PENDING : u32 = 0x80000000u;
 const FDS_TICK : u32 = 0x7FFFFFFFu;
 
