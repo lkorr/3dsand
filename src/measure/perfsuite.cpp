@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1471,8 +1473,10 @@ bool SetupSlope(Scene& s, std::string& why) {
 void DriveSlope(Scene& s, uint32_t, TickOps& out) {
   SlopeTickOps(s, s.fireTick++, out);
 }
+std::string MpmNodeCensus(Scene& s);
 void VerifySlope(Scene& s) {
   s.note += "; at the end: " + SlopeCensus(s);
+  s.note += "; " + MpmNodeCensus(s);
   if (!s.prevMap.empty()) {
     std::string why;
     if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
@@ -1716,8 +1720,100 @@ void DriveDam(Scene& s, uint32_t, TickOps& out) {
   if (s.fireTick++ == 0) DamBreachOps(g_damHoles, out.ops);
   out.particlesActive = true;
 }
+// ---------------------------------------------------------------------------
+// THE MPM NODE CENSUS (water perf round 2, 2026-10-18). The fluid's per-tick
+// GPU time is two kinds of pass: per PARTICLE (p2g1, p2g2, g2p: live x
+// substeps) and per NODE (clear, gridUpdate: every node of every allocated
+// block x substeps). `--perf dam` reported 4.5 ms of node passes and the bare
+// block count says nothing about how many of those nodes any particle can
+// reach. This reads the end-of-run state ONCE (blocking, after the timed
+// frames: a measurement tool, never the frame path) and says how much of the
+// block set the particles' supports actually cover, at node and brick
+// granularity, both instantaneous (the 3^3 B-spline support this substep) and
+// padded by FLUID_MARK_PAD (a whole tick's CFL-capped travel, which is the
+// set `mark` allocates).
+std::string MpmNodeCensus(Scene& s) {
+  World& w = s.world;
+  uint32_t fa[kFluidArgsWords] = {};
+  if (!rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidArgsStage, 0, fa,
+                             sizeof fa, "mpmCensusArgs"))
+    return "mpm census: args readback failed";
+  const uint32_t live = std::min(fa[7], kFluidCap);
+  const uint32_t blocks = std::min(fa[3], kFluidBlocks);
+  if (blocks == 0 || live == 0) return "mpm census: no live blocks";
+  std::vector<uint32_t> list(blocks);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidBlockList, 0, list.data(),
+                        blocks * 4, "mpmCensusList");
+  std::vector<uint32_t> ymask(kNumSlots);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidBlockMap, (uint64_t)kNumSlots * 4,
+                        ymask.data(), (size_t)kNumSlots * 4, "mpmCensusY");
+  std::vector<int32_t> grid((size_t)blocks * kChunkVol * 8);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidGrid, 0, grid.data(),
+                        grid.size() * 4, "mpmCensusGrid");
+  std::vector<int32_t> parts((size_t)live * 32);
+  rhi::ReadbackBlocking(s.ctx.device, s.ctx.queue, w.fluidParticles[s.sim.Page()], 0,
+                        parts.data(), parts.size() * 4, "mpmCensusParts");
+  // chunk -> block index
+  auto key = [](IVec3 c) {
+    return ((uint64_t)(uint32_t)(c.x + (1 << 20)) << 42) |
+           ((uint64_t)(uint32_t)(c.y + (1 << 20)) << 21) | (uint64_t)(uint32_t)(c.z + (1 << 20));
+  };
+  std::unordered_map<uint64_t, uint32_t> blockOf;
+  for (uint32_t b = 0; b < blocks; b++) blockOf[key(w.SlotToWorldChunk(list[b]))] = b;
+  uint32_t yEmpty = 0;
+  for (uint32_t b = 0; b < blocks; b++) yEmpty += (ymask[list[b]] & 0xFFFFu) == 0 ? 1 : 0;
+  uint64_t massNodes = 0;
+  for (size_t n = 0; n < (size_t)blocks * kChunkVol; n++) massNodes += grid[n * 8] >= 16 ? 1 : 0;
+  // supports
+  std::unordered_set<uint64_t> sup, brick4, brick8, brick4pad, brick8pad, partBlocks;
+  constexpr int kPad = 5;   // FLUID_MARK_PAD at the 9-substep default
+  uint32_t alive = 0;
+  auto fdiv = [](int a, int d) { return a >= 0 ? a / d : -((-a + d - 1) / d); };
+  for (uint32_t i = 0; i < live; i++) {
+    const int32_t* p = &parts[(size_t)i * 32];
+    if ((p[18] & 0xFFF) == 0) continue;
+    alive++;
+    IVec3 base{(p[0] - 65536) >> 16, (p[1] - 65536) >> 16, (p[2] - 65536) >> 16};
+    IVec3 cell{p[0] >> 16, p[1] >> 16, p[2] >> 16};
+    partBlocks.insert(key(IVec3{cell.x >> 4, cell.y >> 4, cell.z >> 4}));
+    for (int k = 0; k < 3; k++)
+      for (int j = 0; j < 3; j++)
+        for (int a = 0; a < 3; a++) {
+          IVec3 n{base.x + a, base.y + j, base.z + k};
+          sup.insert(key(n));
+          brick4.insert(key(IVec3{n.x >> 2, n.y >> 2, n.z >> 2}));
+          brick8.insert(key(IVec3{n.x >> 3, n.y >> 3, n.z >> 3}));
+        }
+    for (int d = 4; d <= 8; d += 4) {
+      IVec3 lo{fdiv(base.x - kPad, d), fdiv(base.y - kPad, d), fdiv(base.z - kPad, d)};
+      IVec3 hi{fdiv(base.x + 2 + kPad, d), fdiv(base.y + 2 + kPad, d), fdiv(base.z + 2 + kPad, d)};
+      for (int z = lo.z; z <= hi.z; z++)
+        for (int y = lo.y; y <= hi.y; y++)
+          for (int x = lo.x; x <= hi.x; x++)
+            (d == 4 ? brick4pad : brick8pad).insert(key(IVec3{x, y, z}));
+    }
+  }
+  const double nodes = (double)blocks * kChunkVol;
+  char buf[640];
+  std::snprintf(buf, sizeof buf,
+                "mpm census: %u live (%u alive) in %u blocks (%u hold a particle, %u Y-mask "
+                "empty); nodes/substep %.0f, with mass>=16 %llu (%.1f%%), in an instantaneous "
+                "support %zu (%.1f%%); bricks 4^3 touched %zu of %u (%.1f%%), padded %zu "
+                "(%.1f%%); bricks 8^3 touched %zu of %u (%.1f%%), padded %zu (%.1f%%)",
+                live, alive, blocks, (unsigned)partBlocks.size(), yEmpty, nodes,
+                (unsigned long long)massNodes, 100.0 * (double)massNodes / nodes, sup.size(),
+                100.0 * (double)sup.size() / nodes, brick4.size(), blocks * 64,
+                100.0 * (double)brick4.size() / (blocks * 64.0), brick4pad.size(),
+                100.0 * (double)brick4pad.size() / (blocks * 64.0), brick8.size(), blocks * 8,
+                100.0 * (double)brick8.size() / (blocks * 8.0), brick8pad.size(),
+                100.0 * (double)brick8pad.size() / (blocks * 8.0));
+  std::printf("  %s\n", buf);
+  return buf;
+}
+
 void VerifyDam(Scene& s) {
   s.note += "; at the end: " + DamCensus(s, g_damHoles);
+  s.note += "; " + MpmNodeCensus(s);
   if (!s.prevMap.empty()) {
     std::string why;
     if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
