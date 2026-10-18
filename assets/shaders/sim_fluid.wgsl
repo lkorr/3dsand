@@ -498,6 +498,11 @@ fn fpTo248(q : i32, rc : i32) -> i32 {
   return (fpUnwrapCell(q >> 16u, rc) << 8u) | ((q >> 8u) & 0xFF);
 }
 
+// THE SPOUT'S NOZZLE (g2p): ticks after birth a thrown lip particle keeps at
+// least its throw. 2 = 18 substeps at the default 9, enough to carry a 0.5
+// cell/tick throw clear of the settled water's node support.
+const SPOUT_NOZZLE_TICKS : u32 = 2u;
+
 fn axisOf(p : i32, rc : i32) -> Axis {
   let xs = p - FLUID_HALF;              // node-index space (node n at coord n)
   // arithmetic shift = floor, then the cell nearest the window (see above).
@@ -1711,6 +1716,23 @@ fn g2pParticle(gi : u32) -> u32 {
   p.vx = clamp(mq(v.x, damp), -FLUID_VMAX, FLUID_VMAX);
   p.vy = clamp(mq(v.y, damp), -FLUID_VMAX, FLUID_VMAX);
   p.vz = clamp(mq(v.z, damp), -FLUID_VMAX, FLUID_VMAX);
+  // THE SPOUT'S NOZZLE (sim_fluid_seam.wgsl THE SPOUT JET; ticket
+  // 2026-10-17_11-44-48). A thrown lip cell is born one cell from the water
+  // it came out of, and that water is SETTLED: clearGrid seeds its nodes with
+  // zero-velocity mass (sim.fluidSettledMass), and the particle's quadratic
+  // support still gives that node ~28% of its gather. So each substep kept
+  // ~72% of the throw and a whole tick left ~5% -- measured, the jet's
+  // particles left their birth tick at 0.02 cells/tick against a 1.0 seed.
+  // Real water leaving a spout is still being pushed by the head behind it
+  // until it clears the mouth, so for SPOUT_NOZZLE_TICKS from birth the
+  // particle's horizontal velocity is at least its throw (_r4, _r5: written
+  // only by exciteEmit, 0 on every other particle) along the throw's own
+  // direction. After that it is ordinary MPM water in flight. Integer, its
+  // own state only; bounded by the throw, which is clamped to FLUID_VMAX.
+  if ((p._r4 | p._r5) != 0 && T.tick - p.birthTick < SPOUT_NOZZLE_TICKS) {
+    if (p._r4 > 0) { p.vx = max(p.vx, p._r4); } else if (p._r4 < 0) { p.vx = min(p.vx, p._r4); }
+    if (p._r5 > 0) { p.vz = max(p.vz, p._r5); } else if (p._r5 < 0) { p.vz = min(p.vz, p._r5); }
+  }
   if (ghost) {
     // THE SCOOP STREAM (FP_GHOST): steer onto the vessel's mouth. The homing
     // velocity covers what is left of the way in the ticks it has left; the

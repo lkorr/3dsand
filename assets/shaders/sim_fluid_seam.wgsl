@@ -1050,13 +1050,59 @@ fn spoutJetCode(c : vec3<i32>, mat : u32) -> u32 {
   var u = c + back;
   if (!seamIsMat(u, mat)) { u = u + up; }
   if (!seamIsMat(u, mat)) { return 0u; }   // the push was the other axis'
+  let head = spoutHead(u, back, c.y, mat);
+  return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | dir;
+}
+
+// The head of the water at `u` (this liquid) over row `cy`, in cells: climb
+// UP while the cell above is this liquid, otherwise one cell further
+// UPSTREAM (`back`) if that is, at most SPOUT_CLIMB steps; the row reached,
+// + 1, minus cy.
+fn spoutHead(u0 : vec3<i32>, back : vec3<i32>, cy : i32, mat : u32) -> i32 {
+  let up = vec3<i32>(0, 1, 0);
+  var u = u0;
   for (var k = 0; k < SPOUT_CLIMB; k++) {
     if (seamIsMat(u + up, mat)) { u = u + up; continue; }
     if (seamIsMat(u + back, mat)) { u = u + back; continue; }
     break;
   }
-  let head = u.y - c.y + 1;
-  return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | dir;
+  return u.y - cy + 1;
+}
+
+// THE SPOUT'S MOUTH: the cell the water LEAVES from. Measured (`fluid-spout`,
+// 2026-10-18): thrown fall cells alone barely moved the stream -- the CA
+// takes a spout's water out of its mouth DIAGONALLY, straight to the cell
+// under the lip, and on down the face as a sheet whose cells have their own
+// water over them, so trigger (a) (free surface + air under) sees only the
+// sheet's top and its tip: 12% of the water the spout poured left with a
+// throw. So the mouth itself is taken: a cell RESTING on something (not its
+// own liquid), with a lateral neighbour that is air over air (the drop it
+// would pour into -- the perch configuration, whose trigger is off by
+// default for ramps' sake), and BEHIND it, on the opposite side, this
+// liquid standing at least SPOUT_MOUTH_HEAD rows over it (spoutHead). The
+// head is what makes it a spout and not a film on a ramp: `ca-slope-hybrid`'s
+// sealed ramp, the reason the perch trigger is off, has no water standing
+// over its treads. Then it is excited with a throw toward the drop, rolled
+// like the fall cells. It is still a subset of what settleCheck's stability
+// veto refuses (that tests the FULL perch predicate), so the hysteresis
+// guarantee holds: settle can never build what this takes. 0 = not a mouth.
+const SPOUT_MOUTH_HEAD : i32 = 3;
+fn spoutMouthCode(c : vec3<i32>, mat : u32) -> u32 {
+  if (spoutChanceQ() == 0u || spoutGainQ() == 0) { return 0u; }
+  let dn = vec3<i32>(0, -1, 0);
+  for (var d = 0u; d < 4u; d++) {
+    let n = c + seamLateral(d);
+    if (!cellResident(n, T.origin) || !cellResident(n + dn, T.origin)) { continue; }
+    if (voxMat(voxWordAt(n)) != MAT_AIR || voxMat(voxWordAt(n + dn)) != MAT_AIR) { continue; }
+    let back = -seamLateral(d);
+    if (!seamIsMat(c + back, mat)) { continue; }
+    let head = spoutHead(c + back, back, c.y, mat);
+    if (head < SPOUT_MOUTH_HEAD) { continue; }
+    let h = pcg(hash3(T.seed, T.tick, cellIndexW(c)) ^ 0x5B0D7E71u);
+    if ((h & 0xFFFFu) >= spoutChanceQ()) { return 0u; }
+    return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | d;
+  }
+  return 0u;
 }
 
 // ---- trigger (d): a SURFACE STANDING PROUD of the water beside it ----------
@@ -1342,6 +1388,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     var excite = false;
     var byFall = false;
     var kind = 4u;   // EX_BY_* index of the trigger that took it: wake unless set
+    var spoutMouth = 0u;   // THE SPOUT'S MOUTH's throw code, when it took the cell
     if (T.fluidExciteEnable != 0u && atSurface) {
       let below = c + vec3<i32>(0, -1, 0);
       if (cellResident(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
@@ -1373,6 +1420,12 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       let bw = c + vec3<i32>(0, -1, 0);
       if (cellResident(bw, T.origin)) {
         onBase = !seamLiquid(voxMat(voxWordAt(bw)));
+      }
+      // THE SPOUT'S MOUTH (spoutMouthCode): the perch configuration with a
+      // head of water behind it, taken with a throw.
+      if (!excite && onBase) {
+        spoutMouth = spoutMouthCode(c, mat);
+        if (spoutMouth != 0u) { excite = true; kind = 1u; }
       }
       if (!excite && onBase && SEAM_EX_PERCH) {
         for (var d = 0u; d < 4u; d++) {
@@ -1507,6 +1560,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // A fall cell's depth is 0 (trigger (a) requires the free surface), so its
     // nibble carries the jet instead.
     if (byFall && depth == 0u) { depth = spoutJetCode(c, mat); }
+    if (spoutMouth != 0u) { depth = spoutMouth; }
     voxels[idx] = (w & ~EXCITE_SCRATCH_BITS) | EXCITE_PEND_BIT |
                   (depth << EXCITE_DEPTH_SHIFT);
     parts += voxState(w) + 1u;   // this chunk's EX_COUNTS slot; folded below
@@ -1918,7 +1972,9 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
       p.attr = fpPack(mat, 1u, stainT, stainA) | FP_EXCITED;
       p.birthTick = T.tick;
       p._r0 = 0; p._r1 = 0; p._r2 = 0; p._r3 = 0;
-      p._r4 = 0; p._r5 = 0; p._r6 = 0; p._r7 = 0;
+      // _r4/_r5: THE SPOUT JET's throw, which sim_fluid.wgsl g2p's NOZZLE
+      // holds the particle to for its first SPOUT_NOZZLE_TICKS (0 = none).
+      p._r4 = p.vx; p._r5 = p.vz; p._r6 = 0; p._r7 = 0;
       p._r8 = 0; p._r9 = 0; p._r10 = 0; p._r11 = 0;
       let slot = emitBaseW + off;
       if (slot < FLUID_CAP) { fluidParticles[slot] = p; }

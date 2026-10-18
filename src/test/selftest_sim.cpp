@@ -2706,6 +2706,12 @@ Status GateFluidSpout(Ctx& c, std::string& detail) {
     ctx.WaitIdle();
     uint32_t ft = 60000, liveEst = 0;
     double distSum = 0.0;
+    // ATTRIBUTION (CLAUDE.md rule 6): the excited particles BORN each tick
+    // (birthTick == the tick, FP_EXCITED), how many of them leave moving
+    // sideways, their mean outward speed, and where they are born.
+    uint64_t born = 0, bornThrown = 0, bornPit = 0, bornJet = 0;
+    uint64_t bornRow[4] = {0, 0, 0, 0};   // born at the lip row, 1, 2, >= 3 under
+    double bornVx = 0.0;
     for (int i = 0; i < kTicks; i++) {
       std::vector<CellOp> cops;
       if (i == 0) cops = box;
@@ -2726,6 +2732,16 @@ Status GateFluidSpout(Ctx& c, std::string& detail) {
       for (uint32_t k = 0; k < live; k++) {
         const uint32_t* p = &pbuf[(size_t)k * kFluidParticleWords];
         if ((p[18] & 0xFFFu) != waterId || ((p[18] >> 12) & 0x7u) == 0u) continue;
+        if (p[19] == ft && (p[18] & (1u << 22)) != 0u) {
+          born++;
+          const int32_t vx = (int32_t)p[3];
+          bornVx += vx / 65536.0;
+          if (std::abs(vx) > 3277 || std::abs((int32_t)p[5]) > 3277) bornThrown++;
+          if ((double)(int32_t)p[0] / 65536.0 >= faceX) bornPit++;
+          if ((p[24] | p[25]) != 0u) bornJet++;   // _r4/_r5: the throw
+          const int under = shelfY + 1 - ((int32_t)p[1] >> 16);
+          bornRow[std::min(std::max(under, 0), 3)]++;
+        }
         const int y = (int)((int32_t)p[1] >> 16);
         if (y < bandLo || y > bandHi || (int32_t)p[4] > fallVy) continue;
         const double x = (double)(int32_t)p[0] / 65536.0;
@@ -2739,6 +2755,14 @@ Status GateFluidSpout(Ctx& c, std::string& detail) {
                 "%.2f cells from the dam, peak live %u\n",
                 run, a.sim.fluidSpoutGain, a.sim.fluidSpoutChance,
                 (unsigned long long)samples[run], meanDist[run], peakLive[run]);
+    std::printf("    born excited %llu (%llu in the pit), %llu leaving sideways, mean "
+                "vx %.3f cells/tick; %llu carry a throw; born at the lip row %llu, "
+                "1 under %llu, 2 under %llu, deeper %llu\n",
+                (unsigned long long)born, (unsigned long long)bornPit,
+                (unsigned long long)bornThrown, born ? bornVx / (double)born : 0.0,
+                (unsigned long long)bornJet, (unsigned long long)bornRow[0],
+                (unsigned long long)bornRow[1], (unsigned long long)bornRow[2],
+                (unsigned long long)bornRow[3]);
     if (run > 0) worldHash[run - 1] = HashWorldNow(ctx, world, sim, kDefaultSeed);
   }
   SetCurrentTuning(saved);
