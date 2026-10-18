@@ -753,6 +753,21 @@ static void ParseAbsorb(const json& m, const std::string& path, MaterialDef& d,
   d.absorbCapacity = (uint32_t)capacity;
   d.gpu.stainPack = (d.gpu.stainPack & ~(kStainPackAbsorbMask << kStainPackAbsorbShift)) |
                     ((uint32_t)capacity << kStainPackAbsorbShift);
+  // "sealed": a liquid STANDS on this surface -- a drying rule does not fire
+  // on a cell resting on it (kFluidPackSealedBit, kCondDrying). The opposite
+  // of absorbing, so the two together are a contradiction, not a combination.
+  // Written after the fluid block has set fluidPack (the caller's order).
+  if (a.contains("sealed")) {
+    if (!a["sealed"].is_boolean()) {
+      errors += path + ": material \"" + d.name + "\": absorb sealed must be true or false\n";
+    } else if (a["sealed"].get<bool>()) {
+      if (capacity > 0)
+        errors += path + ": material \"" + d.name +
+                  "\": a sealed surface cannot also absorb (capacity must be 0)\n";
+      d.sealed = true;
+      d.gpu.fluidPack |= kFluidPackSealedBit;
+    }
+  }
 }
 
 // ---- EVERY LIQUID COATS A BODY (2026-09-29) ---------------------------------
@@ -2136,13 +2151,16 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
       }
     }
     // ---- a DRYING rule (materials.h RuleFx::drying) -----------------------
-    // CPU-side only: no fx id, no GPU field. Inherited by any neighborChance
-    // tail below with the rest of the RuleFx.
+    // The bench's half is CPU-side (RuleFx). The world's half is one cond bit
+    // (kCondDrying): the CA does not dry a cell resting on a SEALED surface
+    // (2026-10-18, ticket 2026-10-17_00-19-10). Set before the neighborChance
+    // split so its tails carry it, as they carry an fx id.
     if (r.contains("drying")) {
       if (!r["drying"].is_boolean())
         errors += path + ": reaction self=\"" + self + "\": \"drying\" must be true or false\n";
       else
         fx.drying = r["drying"].get<bool>();
+      if (fx.drying) g.cond |= kCondDrying;
     }
     // A per-member exception splits this rule in two (see ExpandNeighborChance).
     // The base rule keeps its place; the exact-neighbour rules go to the tail

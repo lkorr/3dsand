@@ -1518,6 +1518,215 @@ void VerifySilverrun(Scene& s) {
 }
 
 // ---------------------------------------------------------------------------
+// THE DAM BREACH (2026-10-18, ticket 2026-10-17_21-03-25: "blowing two holes
+// in the wall and fps drops to around 20 ... use this scene as a reference
+// and make testing scenarios with water flowing from holes in the dam here").
+// Shared by the --perf scenarios `dam` / `damground` and the --render-budget
+// cameras `dam` / `damlake` / `damground`, so the timed frame and the
+// attributed frame are one scene.
+//
+// The place: the default map's Mirrormere where its south rim is a stone wall
+// ~2 m thick, 3.5 m of lake standing over the ground outside it (the voxels
+// read 2026-10-18: stone x = 46..64 along the ticket's heading, the lake from
+// 66 on, level 569, the bed under 513). The owner blew two holes in it with
+// spells; here they are CARVED (a row of overwrite-air spheres from the wall
+// face through to the lake, through the queue: rule 3), at the two places the
+// ticket's shot 1 shows them -- 2 m left of the crosshair and 0.6 m up, 3.1 m
+// right and 0.9 m up. A carve rather than an explosion so the breach is the
+// same hole on every run: an explosion's rubble half-plugs it by chance.
+// The wall and the lake are FOUND along each hole's line (DamFindHoles), not
+// assumed, so a repaint of the map moves the scene with the wall or refuses it.
+//
+// Three views of the one world:
+//   dam       shot 1: the eye 4.6 m from the wall, both breaches pouring
+//   damlake   shot 2: over the lake behind the wall, -35.6 deg, the measured
+//             flow pulling the lake toward the breaches (the "flow vector
+//             field" view the owner timed at 40 ms)
+//   damground the shot-1 eye turned round, looking at the ground: no water.
+//             The owner's control ("if i stare at the ground fps goes up").
+// ---------------------------------------------------------------------------
+constexpr float kDamEyeX = 5053.69f, kDamEyeY = 534.40f, kDamEyeZ = -23404.65f;
+constexpr float kDamYawDeg = 45.0f, kDamPitchDeg = -8.5f;
+constexpr uint32_t kDamTicketTick = 2419;
+constexpr float kDamLakeEyeX = 5086.25f, kDamLakeEyeY = 585.40f, kDamLakeEyeZ = -23354.11f;
+constexpr float kDamLakeYawDeg = 46.5f, kDamLakePitchDeg = -35.6f;
+constexpr uint32_t kDamLakeTicketTick = 4082;
+constexpr float kDamGroundYawDeg = 225.0f, kDamGroundPitchDeg = -55.0f;
+// The holes: lateral offset (voxels, + = screen right, see DamLine) and
+// height over the eye, from shot 1's pixels at fovY 1.35.
+constexpr int kDamHoleLat[2] = {-20, 31};
+constexpr int kDamHoleUp[2] = {6, 9};
+constexpr int kDamHoleR = 9;
+constexpr uint32_t kDamBudgetTicks = 600;   // 20 s of pour before the frame
+
+enum class DamView { Wall, Lake, Ground };
+void DamEye(Scene& s, DamView v) {
+  if (v == DamView::Lake) {
+    s.eye = {kDamLakeEyeX, kDamLakeEyeY, kDamLakeEyeZ};
+    s.cam.yaw = kDamLakeYawDeg * 0.0174532925f;
+    s.cam.pitch = kDamLakePitchDeg * 0.0174532925f;
+    return;
+  }
+  s.eye = {kDamEyeX, kDamEyeY, kDamEyeZ};
+  const bool g = v == DamView::Ground;
+  s.cam.yaw = (g ? kDamGroundYawDeg : kDamYawDeg) * 0.0174532925f;
+  s.cam.pitch = (g ? kDamGroundPitchDeg : kDamPitchDeg) * 0.0174532925f;
+}
+// A cell `d` voxels along the ticket's heading from the shot-1 eye, `lat` to
+// the side along Camera::Right (forward x +Y = (-fz, 0, fx): the screen's
+// right), `up` over the eye.
+IVec3 DamLine(int d, int lat, int up) {
+  const float yaw = kDamYawDeg * 0.0174532925f;
+  const float fx = std::cos(yaw), fz = std::sin(yaw);
+  const float lx = -fz, lz = fx;
+  return {(int)std::floor(kDamEyeX + fx * (float)d + lx * (float)lat),
+          (int)std::floor(kDamEyeY) + up,
+          (int)std::floor(kDamEyeZ + fz * (float)d + lz * (float)lat)};
+}
+// Per hole: where along its line the wall starts and where the lake starts.
+struct DamHoles {
+  int wall[2] = {0, 0};
+  int lake[2] = {0, 0};
+};
+bool DamFindHoles(Scene& s, DamHoles& h, std::string& why) {
+  const uint32_t water = MatId(s.mats, "water");
+  std::vector<uint32_t> buf(kChunkVol);
+  IVec3 have{INT32_MIN, 0, 0};
+  auto matAt = [&](IVec3 c) -> int {
+    const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
+    if (!s.world.ChunkInWindow(wc)) return -1;
+    if (wc.x != have.x || wc.y != have.y || wc.z != have.z) {
+      ReadVoxelsSync(s.ctx, s.world, World::SlotChunkIndex(wc), 1, buf.data(), "damHoles");
+      have = wc;
+    }
+    return (int)(buf[(uint32_t)((c.x & 15) + 16 * ((c.y & 15) + 16 * (c.z & 15)))] & 0xFFFu);
+  };
+  for (int k = 0; k < 2; k++) {
+    h.wall[k] = h.lake[k] = 0;
+    for (int d = 0; d < 200; d++) {
+      const int m = matAt(DamLine(d, kDamHoleLat[k], kDamHoleUp[k]));
+      if (m < 0) break;
+      if (h.wall[k] == 0) {
+        if (m != 0 && (uint32_t)m != water) h.wall[k] = d;
+      } else if ((uint32_t)m == water) {
+        h.lake[k] = d;
+        break;
+      }
+    }
+    if (h.wall[k] == 0 || h.lake[k] == 0) {
+      why = "dam: hole " + std::to_string(k) + " found " +
+            (h.wall[k] ? "the wall but no lake behind it" : "no wall") +
+            " along the ticket's heading (default map repainted?)";
+      return false;
+    }
+  }
+  return true;
+}
+// The breach ops: overwrite-air spheres every 4 voxels from just in front of
+// the wall face to a radius past the lake's edge, both holes in one tick
+// (2 x ~7 ops, under kMaxOpsPerTick).
+void DamBreachOps(const DamHoles& h, std::vector<BrushOp>& ops) {
+  for (int k = 0; k < 2; k++)
+    for (int d = h.wall[k] - 2; d <= h.lake[k] + kDamHoleR / 2; d += 4) {
+      const IVec3 c = DamLine(d, kDamHoleLat[k], kDamHoleUp[k]);
+      ops.push_back({c.x, c.y, c.z, kDamHoleR, 0u, 1u, 0u, 0u});
+    }
+}
+std::string DamNote(const DamHoles& h) {
+  char buf[200];
+  std::snprintf(buf, sizeof buf,
+                "ticket 21-03-25's dam (default map, Mirrormere's south wall): two r%d "
+                "breaches carved, wall %d..%d / %d..%d voxels along the heading",
+                kDamHoleR, h.wall[0], h.lake[0], h.wall[1], h.lake[1]);
+  return buf;
+}
+// Water census of the breach: CA water cells on the near side of the wall's
+// plane (the half-space before the wall face along the heading) within 40 m,
+// split by fullness, against the same count taken before the carve: the
+// half-space also holds parts of Mirrormere's wiggly shore, so the number that
+// says "water ran out" is the difference. Counted, not assumed.
+struct DamCount { uint64_t full = 0, part = 0; uint32_t chunks = 0; };
+DamCount g_damPre;
+DamCount DamCount1(Scene& s, const DamHoles& h) {
+  const uint32_t water = MatId(s.mats, "water");
+  const float yaw = kDamYawDeg * 0.0174532925f;
+  const float fx = std::cos(yaw), fz = std::sin(yaw);
+  const int face = std::min(h.wall[0], h.wall[1]);
+  uint64_t full = 0, part = 0;
+  uint32_t chunks = 0;
+  const IVec3 org = s.world.WindowOrigin();
+  const IVec3 ec{(int)std::floor(kDamEyeX) >> 4, (int)std::floor(kDamEyeY) >> 4,
+                 (int)std::floor(kDamEyeZ) >> 4};
+  std::vector<uint32_t> row((size_t)kNChunk * kChunkVol);
+  for (int cy = std::max(org.y, ec.y - 4); cy <= std::min(org.y + (int)kNChunk - 1, ec.y + 3); cy++)
+    for (int cz = std::max(org.z, ec.z - 25); cz <= std::min(org.z + (int)kNChunk - 1, ec.z + 25);
+         cz++) {
+      const uint32_t first = World::SlotChunkIndex({0, cy, cz}) & ~(kNChunk - 1);
+      ReadVoxelsSync(s.ctx, s.world, first, kNChunk, row.data(), "damCensus");
+      for (uint32_t sx = 0; sx < kNChunk; sx++) {
+        const IVec3 wc = s.world.SlotToWorldChunk(first + sx);
+        if (std::abs(wc.x - ec.x) > 25) continue;
+        const uint32_t* c = row.data() + (size_t)sx * kChunkVol;
+        bool wet = false;
+        for (uint32_t li = 0; li < kChunkVol; li++) {
+          if ((c[li] & 0xFFFu) != water) continue;
+          const float dx = (float)(wc.x * 16 + (int)(li & 15)) - kDamEyeX;
+          const float dz = (float)(wc.z * 16 + (int)(li >> 8)) - kDamEyeZ;
+          if (dx * fx + dz * fz >= (float)face) continue;   // the lake side
+          wet = true;
+          if (((c[li] >> 12) & 15u) >= 7u) full++; else part++;
+        }
+        chunks += wet;
+      }
+    }
+  return {full, part, chunks};
+}
+std::string DamCensus(Scene& s, const DamHoles& h) {
+  const DamCount c = DamCount1(s, h);
+  const long long d = (long long)(c.full + c.part) - (long long)(g_damPre.full + g_damPre.part);
+  const long long dp = (long long)c.part - (long long)g_damPre.part;
+  char out[240];
+  std::snprintf(out, sizeof out,
+                "%+lld water cells outside the wall since the carve (%+lld of them partial; "
+                "%llu before, in %u chunks; %u wet chunks now)",
+                d, dp, (unsigned long long)(g_damPre.full + g_damPre.part), g_damPre.chunks,
+                c.chunks);
+  return out;
+}
+DamHoles g_damHoles;
+bool SetupDamImpl(Scene& s, std::string& why, DamView v) {
+  std::string prev;
+  if (!SlopeEnterMap(s, &prev, why)) return false;
+  s.prevMap = prev;
+  DamEye(s, DamView::Wall);
+  s.stream.OnRegen();
+  CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
+  if (!DamFindHoles(s, g_damHoles, why)) return false;
+  g_damPre = DamCount1(s, g_damHoles);
+  DamEye(s, v);
+  s.fireTick = 0;
+  s.note = DamNote(g_damHoles);
+  return true;
+}
+bool SetupDam(Scene& s, std::string& why) { return SetupDamImpl(s, why, DamView::Wall); }
+bool SetupDamGround(Scene& s, std::string& why) {
+  return SetupDamImpl(s, why, DamView::Ground);
+}
+void DriveDam(Scene& s, uint32_t, TickOps& out) {
+  if (s.fireTick++ == 0) DamBreachOps(g_damHoles, out.ops);
+  out.particlesActive = true;
+}
+void VerifyDam(Scene& s) {
+  s.note += "; at the end: " + DamCensus(s, g_damHoles);
+  if (!s.prevMap.empty()) {
+    std::string why;
+    if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
+      std::fprintf(stderr, "dam: could not restore map '%s': %s\n", s.prevMap.c_str(),
+                   why.c_str());
+  }
+}
+
+// ---------------------------------------------------------------------------
 // SCENARIO: surface-sprint
 //
 // `--frames 600 --autofly-surface` as a recorded, attributed scenario.
@@ -1855,6 +2064,21 @@ const Scenario kScenarios[] = {
      "raymarch of it.",
      "caLoop;fluidSys;waterBodies;renderPass", 300, 300, SetupSlope, DriveSlope,
      VerifySlope},
+
+    {"dam", "Dam breach (ticket 21-03-25)",
+     "The default map at ticket 2026-10-17_21-03-25's pose: two breaches carved "
+     "through Mirrormere's 2 m stone wall, the lake pouring out of both. 600 "
+     "warm ticks of pour, then 300 frames looking at the wall and the falls: "
+     "the tick under the breach beside the raymarch of it.",
+     "caLoop;fluidSys;waterBodies;farField;renderPass", 600, 300, SetupDam, DriveDam,
+     VerifyDam},
+
+    {"damground", "Dam breach, looking at the ground",
+     "The dam scenario with the eye turned round to the ground: the same pour "
+     "and the same tick, no water in the frame. The owner's control: its "
+     "renderPass beside dam's is what the water costs to DRAW.",
+     "caLoop;fluidSys;waterBodies;farField;renderPass", 600, 300, SetupDamGround,
+     DriveDam, VerifyDam},
 
     {"silverrun", "The silverrun waterfall (ticket 23-58-24)",
      "The default map's river_silverrun at its waterfall, from ticket "
@@ -3057,6 +3281,19 @@ const RenderArm kExtraArms[] = {
      [](Tuning& t) { t.debug.perfExp = 12; }, true, 1,
      "whatever experiment 12 in the shaders is — see TUNE_PERF_EXP",
      false, false, /*anyCamera=*/true},
+    // 13..15: the rest of the knob's range (tuning_params.def max 15).
+    {"exp13", "debug.perfExp 0 -> 13",
+     [](Tuning& t) { t.debug.perfExp = 13; }, true, 1,
+     "whatever experiment 13 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp14", "debug.perfExp 0 -> 14",
+     [](Tuning& t) { t.debug.perfExp = 14; }, true, 1,
+     "whatever experiment 14 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp15", "debug.perfExp 0 -> 15",
+     [](Tuning& t) { t.debug.perfExp = 15; }, true, 1,
+     "whatever experiment 15 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
     // The baseline AGAIN, last: arms share one world and one set of render
     // caches (shadow cache, GI cache, openness), so an arm that changes what
     // those caches hold hands the NEXT arm a different warm state. `base2`
@@ -3452,6 +3689,70 @@ bool CamSilverrun(Scene& s, uint32_t& tick, std::string& why) {
            "(default map), 120 ticks after settle, the ticket's tick";
   tick = BudgetTickOr(kRunTicketTick);
   return true;
+}
+// THE DAM BREACH (SetupDam): the breaches carved, kDamBudgetTicks of pour,
+// then frozen. The three cameras share ONE pour: the first of them in a
+// budget run pours, the others re-render the same world (the window and the
+// far field stay where the pour left them; nothing ticks between cameras). A
+// camera listed between them that moves the window forces a fresh pour.
+struct DamWorld {
+  bool poured = false;
+  IVec3 origin{};
+  std::string note;
+} g_damWorld;
+bool CamDamImpl(Scene& s, uint32_t& tick, std::string& why, DamView v) {
+  const IVec3 org = s.world.WindowOrigin();
+  const bool reuse = g_damWorld.poured && worldmap::CurrentWorldMap().name == "default" &&
+                     org.x == g_damWorld.origin.x && org.y == g_damWorld.origin.y &&
+                     org.z == g_damWorld.origin.z;
+  if (!reuse) {
+    if (!SlopeEnterMap(s, nullptr, why)) return false;
+    DamEye(s, DamView::Wall);
+    s.stream.OnRegen();
+    CentreWindowOnEye(s.ctx, s.world, s.sim, s.eye.x, s.eye.y, s.eye.z, 120);
+    if (!DamFindHoles(s, g_damHoles, why)) return false;
+    g_damPre = DamCount1(s, g_damHoles);
+    const IVec3 pc{(int)std::floor(s.eye.x) >> 4, (int)std::floor(s.eye.y) >> 4,
+                   (int)std::floor(s.eye.z) >> 4};
+    s.fluidLive = 0;
+    const uint32_t t0 = 6000;
+    for (uint32_t i = 0; i < kDamBudgetTicks; i++) {
+      TickOps ops;
+      if (i == 0) DamBreachOps(g_damHoles, ops.ops);
+      SubmitTick(s.ctx, s.world, s.sim, t0 + i, kDefaultSeed, ops.ops, ops.exps, ops.cells,
+                 (t0 + i) % 15 == 0, pc, /*wantReadback=*/true, true, {}, 0, {},
+                 s.fluidLive);
+      s.ctx.ProcessEvents();
+      const WorldSnapshot& sn = s.world.Snap();
+      if (sn.valid) s.fluidLive = sn.fluidLive;
+      if ((i & 15u) == 0u) s.ctx.WaitIdle();
+    }
+    s.ctx.WaitIdle();
+    s.ctx.ProcessEvents();
+    if (s.world.Snap().valid) s.fluidLive = s.world.Snap().fluidLive;
+    g_damWorld.note = DamNote(g_damHoles) + ", " + std::to_string(kDamBudgetTicks) +
+                      " ticks of pour, frozen; " + DamCensus(s, g_damHoles) + "; " +
+                      std::to_string(s.fluidLive) + " MPM particles live";
+    g_damWorld.origin = s.world.WindowOrigin();
+    g_damWorld.poured = true;
+    std::printf("  dam: %s\n", g_damWorld.note.c_str());
+  }
+  DamEye(s, v);
+  s.note = g_damWorld.note +
+           (v == DamView::Wall ? "; shot 1 (the wall, both breaches)"
+            : v == DamView::Lake ? "; shot 2 (over the lake, the flow toward the breaches)"
+                                 : "; the shot-1 eye turned round to the ground (control)");
+  tick = BudgetTickOr(v == DamView::Lake ? kDamLakeTicketTick : kDamTicketTick);
+  return true;
+}
+bool CamDam(Scene& s, uint32_t& tick, std::string& why) {
+  return CamDamImpl(s, tick, why, DamView::Wall);
+}
+bool CamDamLake(Scene& s, uint32_t& tick, std::string& why) {
+  return CamDamImpl(s, tick, why, DamView::Lake);
+}
+bool CamDamGround(Scene& s, uint32_t& tick, std::string& why) {
+  return CamDamImpl(s, tick, why, DamView::Ground);
 }
 
 // ---------------------------------------------------------------------------
@@ -4025,6 +4326,8 @@ const char* const kArmsPour[] = {"baseline", "noshadow", "noreflect", "nomist",
                                  "halfres", nullptr};
 const char* const kArmsSlope[] = {"baseline", "noshadow", "noreflect", "nomist",
                                   "nomicro", "nofar", "halfres", nullptr};
+const char* const kArmsDam[] = {"baseline", "noshadow", "noreflect", "nofar",
+                                "halfres", nullptr};
 // THE PEAKS SUMMIT (map v2 H1). On the `peaks` test map's 1,400 m summit
 // looking out over the range: the far cascade, the cascade-to-horizon seam,
 // the horizon past it and the height fog in one frame -- the camera the
@@ -4103,6 +4406,15 @@ const BudgetCam kBudgetCams[] = {
               "harness camera)",
      CamSlope, kArmsSlope},
     {"slopenoon", "the same running sheet at noon", CamSlopeNoon, kArmsSlope},
+    {"dam", "ticket 21-03-25: two breaches in Mirrormere's south wall pouring, "
+            "shot 1 (loads the default map; the dam cameras share one pour)",
+     CamDam, kArmsDam},
+    {"damlake", "the same pour from over the lake behind the wall, shot 2: the "
+                "measured flow toward the breaches",
+     CamDamLake, kArmsDam},
+    {"damground", "the shot-1 eye turned round to the ground: the owner's "
+                  "no-water control",
+     CamDamGround, kArmsDam},
     {"silverrun", "ticket 23-58-24: river_silverrun's waterfall from 14 m, looking "
                   "down at the fall (loads the default map)",
      CamSilverrun, kArmsSlope},
@@ -4652,6 +4964,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
   }
   runner.SettleWorld();
   g_foliage = FoliageScan{};   // the scan describes THIS settled world only
+  g_damWorld = DamWorld{};     // ...and so does the dam's pour
 
   // Which cameras. `--scenario <id>` keeps its old meaning exactly — one
   // camera, borrowed from a --perf scenario, all 16 arms — and bypasses the

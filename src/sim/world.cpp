@@ -488,6 +488,15 @@ void World::Init(const rhi::Device& device) {
                           U::Storage | U::CopyDst, "farPatch");
   farSig = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
                         "farSig");
+  // The far downsample cadence (world.h, far_select.wgsl). Zero state = never
+  // downsampled, nothing pending.
+  farDownState = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
+                              "farDownState");
+  farDownList = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
+                             "farDownList");
+  farDownArgsStage = CreateBuffer(device, 12, U::Storage | U::CopySrc | U::CopyDst,
+                                  "farDownArgsStage");
+  farDownArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "farDownArgs");
   // Zero-initialised = every entry INVALID (kFarMapValid clear), which is the
   // safe state: the renderer refines nothing it was not told about.
   // + the FEATURE plane after it (sim/farfeat.h, LOD-seam package F): the

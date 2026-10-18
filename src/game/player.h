@@ -289,6 +289,18 @@ class Player {
   Vec3 vel{0, 0, 0};
   bool fly = true;          // start in fly mode until the first mirror arrives
   bool grounded = false;
+  // HELD UP BY A BODY, not by voxels (2026-10-18, ticket 2026-10-17_21-33-53).
+  // The voxel ground probe cannot see a rigid body, so standing on a felled
+  // log was ground only between ApplyPush (which sets `grounded` AFTER the
+  // tick's Update) and the next Update, which re-probed the voxels and put it
+  // back to false. The avatar's air clock reads the flag between the two, saw
+  // a player who had been airborne for as long as they stood there, and at
+  // ragdoll.fallSeconds knocked them over. ApplyPush sets this when a body
+  // pushed the player UP while falling (standing on it); the next Update
+  // consumes it into its end-of-move `grounded`, once -- so it lapses one tick
+  // after the body stops holding the player, and a jump (`rising`) or a swim
+  // still reads as off the ground.
+  bool bodySupport = false;
   // ---- THE STANCE: stand, crouch (sneak), prone (crawl) — 2026-10-12 ----
   //
   // Ctrl is a TOGGLE on a tap and a crawl on a HOLD (owner request):

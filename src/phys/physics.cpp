@@ -3360,7 +3360,8 @@ void Physics::SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec) {
 }
 
 bool Physics::ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy,
-                            float linearDrag, float angularDrag, float dt) {
+                            float linearDrag, float angularDrag, float dt,
+                            Vec3 currentVoxPerSec) {
   if (!system_ || handle == 0 || dt <= 0.0f) return false;
   JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), ToBodyID(handle));
   if (!lock.Succeeded()) return false;
@@ -3374,9 +3375,17 @@ bool Physics::ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy
   // irrelevant to a horizontal plane and Jolt only uses it to place the plane,
   // so 0 is not a hidden assumption about where the water is.
   const JPH::RVec3 surface(0.0f, VoxToM(surfaceYVoxel), 0.0f);
-  return body.ApplyBuoyancyImpulse(surface, JPH::Vec3(0, 1, 0), buoyancy,
-                                   linearDrag, angularDrag, JPH::Vec3::sZero(),
-                                   system_->GetGravity(), dt);
+  // THE WATER'S FRAME (see the header): out with the current, still-water
+  // buoyancy, back in with it. A zero current is the old call exactly.
+  const JPH::Vec3 cur(VoxToM(currentVoxPerSec.x), VoxToM(currentVoxPerSec.y),
+                      VoxToM(currentVoxPerSec.z));
+  const bool moving = !cur.IsNearZero(1.0e-12f);
+  if (moving) body.SetLinearVelocity(body.GetLinearVelocity() - cur);
+  const bool applied = body.ApplyBuoyancyImpulse(
+      surface, JPH::Vec3(0, 1, 0), buoyancy, linearDrag, angularDrag,
+      JPH::Vec3::sZero(), system_->GetGravity(), dt);
+  if (moving) body.SetLinearVelocity(body.GetLinearVelocity() + cur);
+  return applied;
 }
 
 // ---- ROLE -> LAYER (W2-N; the table is in physics.h) -----------------------

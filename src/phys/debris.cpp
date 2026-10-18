@@ -21,6 +21,7 @@
 #include "measure/perfscope.h"
 #include "sim/mattable.h"
 #include "sim/bytestream.h"
+#include "sim/currentprim.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/tuning.h"
@@ -2745,11 +2746,17 @@ float DebrisSystem::FloatingDensityOf(uint64_t handle) {
 }
 
 void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
-  (void)tick;
   if (!phys_ || bodies_.empty()) return;
   const float dt = 1.0f / kSimTicksPerSecond;
   const float linDrag = CurrentTuning().physics.waterLinearDrag;
   const float angDrag = CurrentTuning().physics.waterAngularDrag;
+  // A CURRENT WAKES A SLEEPER (physics.waterCurrentWake; ticket
+  // 2026-10-17_20-54-57). Cells/s; 0 = never. Sleepers are looked at on a
+  // stride phased by the body's serial, so the cost of every body asleep on
+  // dry land is two mirror reads per kCurrentWakeStride ticks.
+  constexpr uint32_t kCurrentWakeStride = 8;
+  const float wakeVox =
+      std::max(CurrentTuning().physics.waterCurrentWake, 0.0f) / kVoxelMeters;
 
   // One-chunk memo: a column walk hits the same chunk 16 times running, and
   // World::Cached is a hash lookup. Nothing is cached ACROSS bodies — a stale
@@ -2784,7 +2791,18 @@ void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
     const uint32_t lift =
         (mg.fluidPack >> kFluidPackLiftShift) & kFluidPackLiftMask;
     if (lift == 0) continue;  // this stuff does not interact with liquids
-    if (!phys_->IsActive(b.handle)) continue;  // asleep: let it lie
+    // ASLEEP: let it lie -- unless it is lying in running water. A floater
+    // that came to rest in still water, or that a flood reached after it
+    // slept, is asleep in Jolt and buoyancy never wakes a sleeper, so without
+    // this it hung frozen in a river (the ticket's "limbs are frozen when
+    // they should be moving in the direction of water current"). Only on the
+    // stride, and never a body this machine does not step or one that is
+    // driven (a ghost, a strapped follower, a fixture).
+    const bool asleep = !phys_->IsActive(b.handle);
+    if (asleep && (wakeVox <= 0.0f || b.Follower() || b.fixture ||
+                   !OwnedLocally(b) ||
+                   (tick + b.serial) % kCurrentWakeStride != 0u))
+      continue;
     Vec3 com;
     if (!phys_->BodyCenterOfMass(b.handle, com)) continue;
 
@@ -2830,10 +2848,51 @@ void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
                                        CurrentTuning().ragdoll.corpseAirFraction);
     const float full = rhoF / rhoB;
     const float buoy = 1.0f + (full - 1.0f) * ((float)lift / (float)kFluidMax);
+    // THE WATER'S OWN VELOCITY (ticket 2026-10-17_20-54-57): rivers and lakes
+    // (the solved flow field), a breach's measured flood and the sim-licensed
+    // current primitives, over the submerged span. Until 2026-10-18 the drag
+    // aimed at still water, so a floating limb in a river was braked to rest
+    // where it fell in and went to sleep there.
+    const sandvox::FloaterCurrent fc = sandvox::CurrentOnFloaterSplit(
+        com, com.y - b.radiusVoxels, com.y + b.radiusVoxels, (float)surfY);
+    const Vec3 cur = fc.total;
+    const float curSpeed = std::sqrt(cur.x * cur.x + cur.z * cur.z);
+    if (asleep) {
+      // Still water -- or only the measured flow's small change, which a
+      // body at rest makes some of itself (FloaterCurrent::Wakes): sleep on.
+      if (!fc.Wakes(wakeVox)) continue;
+      // PINNED: the last wake found it right here and the current carried it
+      // nowhere (against a bank, wedged in reeds). One wake, not one a stride.
+      const Vec3 d = com - b.currentWokeAt;
+      if (b.currentWoke && d.x * d.x + d.y * d.y + d.z * d.z < 1.0f) {
+        floaters_.currentPinned++;
+        continue;
+      }
+      b.currentWoke = true;
+      b.currentWokeAt = com;
+      b.inactiveTicks = 0;
+      phys_->ActivateBody(b.handle);
+      // ...AT THE WATER'S SPEED. A floater at rest in a current is a state
+      // only sleeping produces, and the drag alone is far too gentle to undo
+      // it in time: a 1 m limb starts at ~4 mm/s a tick, Jolt's sleep test
+      // (0.5 s under ~1.5 cm of travel) put it straight back to sleep, and the
+      // pinned memo then kept it there (measured, float-current: 15 impulses,
+      // +0.2 voxels). Handed the current outright, a free floater moves with
+      // the water from the first tick and a pinned one is stopped by the bank
+      // it is pinned against -- which is what the memo is for.
+      Vec3 lin{}, ang{};
+      if (phys_->GetBodyVelocities(b.handle, lin, ang))
+        phys_->SetBodyVelocities(b.handle, Vec3{cur.x, lin.y, cur.z}, ang);
+      floaters_.currentWakes++;
+    }
     if (phys_->ApplyBuoyancy(b.handle, (float)surfY, buoy, linDrag, angDrag,
-                             dt)) {
+                             dt, cur)) {
       floaters_.floatedBodies++;
       floaters_.floatLastSurfaceY = (float)surfY;
+      if (curSpeed > 0.0f) {
+        floaters_.currentCarried++;
+        floaters_.currentLastSpeed = curSpeed;
+      }
     }
   }
 }
@@ -2907,6 +2966,9 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     settle_.maxInactiveTicks =
         std::max(settle_.maxInactiveTicks, b.inactiveTicks);
     if (b.inactiveTicks < settleAfterTicks) continue;
+    // Outside the window there is no grid to stamp it into (PostStep keeps it
+    // asleep on the analytic ground until the window returns).
+    if (b.outside) continue;
     if (b.wound.open) continue;
     if (b.inactiveTicks % 30 != 0) continue;  // re-test alignment cheaply
 
@@ -6942,6 +7004,10 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // GetBodyVelocities already answers in VOXELS per second.
     Vec3 lin{}, ang{};
     if (phys_->IsActive(b.handle)) phys_->GetBodyVelocities(b.handle, lin, ang);
+    // Asleep outside the window (PostStep's DropOutside): nothing out there
+    // to build, and listing its lattice every tick is the idle cost rule 2
+    // forbids. The window coming back over it clears `outside`.
+    else if (b.outside) continue;
     needBody(b);
     sweepAhead(b.xf.pos, lin, 0.0f);
   }
@@ -7309,6 +7375,10 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     uint8_t dens[kMcOccCells] = {};
     bool anyPartial = false;
     uint32_t outMask = 0, missMask = 0;
+    // The analytic ground per occupancy column, for the out-of-window
+    // neighbours (INT_MIN = not asked yet).
+    int outGround[kMcOccDim * kMcOccDim];
+    std::fill(std::begin(outGround), std::end(outGround), INT_MIN);
     auto put = [&](int x, int y, int z, uint32_t d) {
       dens[McOccIndex(x, y, z)] = (uint8_t)d;
       if (d >= 4u) McOccSet(occ, x, y, z);
@@ -7337,8 +7407,8 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
           bool inWin = world.ChunkInWindow(nwc);
           const CachedChunk* n = inWin ? world.Cached(nwc) : nullptr;
           bool haveVox = n && n->voxels.size() == kChunkVol;
-          // Outside the residency window is solid and inert (matches the sim
-          // rule); in-window but not yet fetched reads as empty until it lands.
+          // Outside the residency window is the ANALYTIC GROUND (below);
+          // in-window but not yet fetched reads as empty until it lands.
           // Both are recorded (TerrainEntry::outMask / missMask) so the patch
           // is re-gathered when the guess stops holding -- except a missing
           // neighbour the snapshot counts EMPTY, which air is the right answer
@@ -7355,9 +7425,27 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
             if (!snapEmpty) missMask |= nbit;
           }
           if (!inWin) {
+            // OUTSIDE THE WINDOW: solid at or below World::TerrainHeight,
+            // air above (2026-10-18, ticket 2026-10-17_00-12-10). It was
+            // solid outright -- the sim's rule for a cell it cannot see --
+            // and for a COLLIDER that rule builds an invisible wall up every
+            // side face of the window and a floor across its bottom face: a
+            // limb that rolled off a cliff came to rest in mid-air on the
+            // window's floor, and stayed there. The analytic column is the
+            // ground worldgen built, so a face now continues the slope it
+            // cuts through and opens where the ground is lower than the
+            // window. One TerrainHeight per column of the 18x18 box, cached
+            // across the neighbours of this gather; only patches on the
+            // window's faces have out-of-window neighbours at all.
             for (int z = blo[2]; z <= bhi[2]; z++)
-              for (int y = blo[1]; y <= bhi[1]; y++)
-                for (int x = blo[0]; x <= bhi[0]; x++) put(x, y, z, kPowderFull);
+              for (int x = blo[0]; x <= bhi[0]; x++) {
+                int& g = outGround[z * kMcOccDim + x];
+                if (g == INT_MIN)
+                  g = World::TerrainHeight(origin.x + x - 1, origin.z + z - 1,
+                                           world.WorldSeed());
+                for (int y = blo[1]; y <= bhi[1]; y++)
+                  if (origin.y + y - 1 <= g) put(x, y, z, kPowderFull);
+              }
             continue;
           }
           if (!haveVox) continue;
@@ -7551,9 +7639,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
 }
 
 bool DebrisSystem::ColliderVouched(IVec3 wc) const {
-  // Outside the residency window there is no sim, no voxel data and no body
-  // that survives arriving (PostStep despawns past kPad), and the occupancy
-  // sampler above reads it as solid — nothing to vouch for.
+  // Outside the residency window there is no sim and no voxel data, a body
+  // that arrives there is laid on the analytic ground by PostStep, and the
+  // occupancy sampler above reads it as that ground -- nothing to vouch for.
   if (world_ == nullptr || !world_->ChunkInWindow(wc)) return true;
   auto it = terrain_.find(World::PackChunkKey(wc));
   // builtVersion != 0 is "polygonized at least once from real voxels", which
@@ -7974,6 +8062,42 @@ void DebrisSystem::CollectImpacts() {
   impacts_.insert(impacts_.end(), cand.begin(), cand.begin() + keep);
 }
 
+void DebrisSystem::DropOutside(Body& b) {
+  if (world_ == nullptr || b.handle == 0) return;
+  float mn[3], mx[3];
+  if (!phys_->BodyWorldBoundsM(b.handle, mn, mx)) return;
+  const float lo[3] = {mn[0] / kVoxelMeters, mn[1] / kVoxelMeters,
+                       mn[2] / kVoxelMeters};
+  const float hi[3] = {mx[0] / kVoxelMeters, mx[1] / kVoxelMeters,
+                       mx[2] / kVoxelMeters};
+  // The FOOTPRINT's highest ground: its four corners and its middle. A body
+  // lying across a slope rests on the high side, and taking the highest
+  // sample is what keeps a straddling body from being pushed down into the
+  // in-window ground its other end lies on.
+  const uint32_t seed = world_->WorldSeed();
+  const float xs[5] = {lo[0], hi[0], lo[0], hi[0], 0.5f * (lo[0] + hi[0])};
+  const float zs[5] = {lo[2], lo[2], hi[2], hi[2], 0.5f * (lo[2] + hi[2])};
+  int ground = INT_MIN;
+  for (int k = 0; k < 5; k++)
+    ground = std::max(ground,
+                      World::TerrainHeight(ifloor(xs[k]), ifloor(zs[k]), seed));
+  // DOWN ONLY. Above the column it is dropped to the ground's top face; below
+  // it -- a cave the window cut through, a dug pit -- the analytic column is
+  // the wrong answer and it is left where it is, asleep, for the window's
+  // return to settle against the real voxels.
+  const float dy = (float)(ground + 1) - lo[1];
+  if (dy < 0.0f) {
+    b.xf.pos.y += dy;
+    phys_->SetBodyPosition(b.handle, b.xf.pos);
+    settle_.lastDropFell = -dy;
+  } else {
+    settle_.lastDropFell = 0.0f;
+  }
+  phys_->SetBodyVelocities(b.handle, Vec3{}, Vec3{});
+  phys_->DeactivateBody(b.handle);
+  settle_.outsideDrops++;
+}
+
 void DebrisSystem::PostStep() {
   stepCount_++;
   // The gate the contact listener applies, refreshed from tuning every step so
@@ -8002,19 +8126,55 @@ void DebrisSystem::PostStep() {
       UntunnelBody(b.handle, b.xf.pos);
     }
     if (!b.Follower()) phys_->GetTransform(b.handle, b.xf);
-    // bodies that leave the residency window despawn: there is no terrain to
-    // collide with out there (Noita despawns offscreen bodies the same way)
+    // How far a point is outside the residency window, voxels (0 inside).
+    auto outBy = [&](const Vec3& p) {
+      const float hiX = wlo.x + (float)kWorldN, hiY = wlo.y + (float)kWorldN,
+                  hiZ = wlo.z + (float)kWorldN;
+      return std::max({0.0f, wlo.x - p.x, wlo.y - p.y, wlo.z - p.z, p.x - hiX,
+                       p.y - hiY, p.z - hiZ});
+    };
+    // ---- OUTSIDE THE WINDOW A BODY LIES ON THE ANALYTIC GROUND --------------
+    // (2026-10-18, ticket 2026-10-17_00-12-10: "limb ... fell off a mountain,
+    // then when progressing down a lod seam to find the limb again its
+    // floating in the air.") There is no terrain patch out there -- patches
+    // are built from fetched voxels, and outside the window there are none --
+    // so a body that crossed a face either fell toward the cull below, or
+    // (asleep) hung wherever it was when the window moved off it. Now a body
+    // MOVING outside the window is laid on World::TerrainHeight under its
+    // footprint, the ground worldgen built with (DropOutside), and put to
+    // sleep. It stays a body -- drawn, saved, kept up to kOutsideKeepVox past
+    // the face -- and when the window comes back over it the first patch
+    // built under it wakes it (ManageTerrain's WakeInBox) and it settles on
+    // the real voxels, which differ from the analytic column only where the
+    // world was dug, built on or roofed. Bounded: one TerrainHeight per
+    // footprint sample, once per body that crosses (a dropped body is asleep
+    // and is not dropped again until something wakes it). Ghosts, followers,
+    // fixtures and welded shards are not dropped: their owner, host, hinge or
+    // joints place them.
+    {
+      Vec3 com = b.xf.pos;
+      phys_->BodyCenterOfMass(b.handle, com);
+      b.outside = outBy(com) > 0.0f;
+      if (b.outside && !b.Follower() && !b.fixture && b.assembly == 0 &&
+          OwnedLocally(b) && phys_->IsActive(b.handle))
+        DropOutside(b);
+    }
+    // ITEMS PARK at the pad, as since 2026-10-08 (below). Everything else is
+    // kept, asleep on the analytic ground, out to kOutsideKeepVox -- half a
+    // window, so a limb that fell off the edge of the world you stand in is
+    // still there when you climb down after it -- and destroyed past it
+    // (Noita despawns offscreen bodies the same way; the body budget bounds
+    // the count either way).
     const float kPad = 32.0f;
-    bool dead = b.xf.pos.x < wlo.x - kPad || b.xf.pos.y < wlo.y - kPad ||
-                b.xf.pos.z < wlo.z - kPad ||
-                b.xf.pos.x > wlo.x + (float)kWorldN + kPad ||
-                b.xf.pos.y > wlo.y + (float)kWorldN + kPad ||
-                b.xf.pos.z > wlo.z + (float)kWorldN + kPad;
+    constexpr float kOutsideKeepVox = (float)kWorldN * 0.5f;
+    const float outOrigin = outBy(b.xf.pos);
+    const bool pastPad = outOrigin > kPad;
+    bool dead = outOrigin > kOutsideKeepVox;
     // ...UNLESS IT IS SOMETHING THE WORLD KEEPS (2026-10-08): a ground
     // item's strap group is PARKED by the hook (debris.h SetParkHook), whole,
     // after this loop -- not here, because the group's other bodies sit at
     // other indices of the list this loop is compacting.
-    if (dead && parkHook_.park && OwnedLocally(b) && parkHook_.isParked) {
+    if (pastPad && parkHook_.park && OwnedLocally(b) && parkHook_.isParked) {
       std::vector<uint64_t> group;
       StrapGroupOf(b.handle, group);
       bool keep = false;
@@ -8028,7 +8188,9 @@ void DebrisSystem::PostStep() {
         continue;
       }
     }
+    if (b.outside && !dead) settle_.outsideKept++;
     if (dead) {
+      settle_.outsideCulled++;
       ReleaseBody(b);
       bodies_[i] = std::move(bodies_.back());
       bodies_.pop_back();

@@ -357,8 +357,12 @@ WaveImpactRing& WaveImpacts() {
 // Transcribed from currentPrimEvalF in assets/shaders/common.wgsl, line for
 // line, in the same order and with the same clamps. Read the two side by side
 // when changing either.
+// `measuredOut` (optional) receives the measured flow's share as sampled
+// (x carry), and `blend` = false leaves it OUT of the result: the standing
+// field alone (CurrentOnFloaterSplit).
 static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
-                             float wetHi);
+                             float wetHi, Vec3* measuredOut = nullptr,
+                             bool blend = true);
 Vec3 CurrentAtCpu(Vec3 posVox) {
   return CurrentAtCpuImpl(posVox, false, posVox.y, posVox.y);
 }
@@ -370,8 +374,39 @@ Vec3 CurrentAtCpuSim(Vec3 posVox, float wetLo, float wetHi) {
                           std::max(wetLo, wetHi));
 }
 
+Vec3 CurrentOnFloater(Vec3 comVox, float keelY, float topY, float surfY) {
+  const float lo = keelY;
+  const float hi = std::max(lo, std::min(topY, surfY));
+  const Vec3 c = CurrentAtCpuSim(Vec3{comVox.x, 0.5f * (lo + hi), comVox.z},
+                                 lo, hi);
+  return Vec3{c.x, 0.0f, c.z};
+}
+
+FloaterCurrent CurrentOnFloaterSplit(Vec3 comVox, float keelY, float topY,
+                                     float surfY) {
+  const float lo = keelY;
+  const float hi = std::max(lo, std::min(topY, surfY));
+  const Vec3 p{comVox.x, 0.5f * (lo + hi), comVox.z};
+  FloaterCurrent f;
+  Vec3 m{};
+  const Vec3 s = CurrentAtCpuImpl(p, true, lo, hi, &m, false);
+  const Vec3 t = CurrentAtCpuImpl(p, true, lo, hi, nullptr, true);
+  f.standing = Vec3{s.x, 0.0f, s.z};
+  f.measured = Vec3{m.x, 0.0f, m.z};
+  f.total = Vec3{t.x, 0.0f, t.z};
+  return f;
+}
+
+bool FloaterCurrent::Wakes(float wakeVoxPerSec) const {
+  if (!(wakeVoxPerSec > 0.0f)) return false;
+  const float st = std::sqrt(standing.x * standing.x + standing.z * standing.z);
+  const float me = std::sqrt(measured.x * measured.x + measured.z * measured.z);
+  return st >= wakeVoxPerSec ||
+         me >= std::max(wakeVoxPerSec, flowfield::kFlowMeasTakeover);
+}
+
 static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
-                             float wetHi) {
+                             float wetHi, Vec3* measuredOut, bool blend) {
   // The terrain flow field first: rivers and lakes (flowfield.h). A pure
   // function of (map, seed, tuning, world position), so it is sim-licensed
   // and both arms read it -- the same words the renderer's flowGridAt reads.
@@ -387,7 +422,10 @@ static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
     const uint32_t* grid = flowfield::PublishedMeasured();
     if (carry > 0.0f && grid != nullptr) {
       const Vec3 m = flowfield::SampleMeasuredSpan(grid, posVox, wetLo, wetHi);
-      acc = flowfield::BlendMeasured(acc, Vec3{m.x * carry, 0.0f, m.z * carry});
+      if (measuredOut != nullptr)
+        *measuredOut = Vec3{m.x * carry, 0.0f, m.z * carry};
+      if (blend)
+        acc = flowfield::BlendMeasured(acc, Vec3{m.x * carry, 0.0f, m.z * carry});
     }
   }
   const CurrentPrimSystem& cp = CurrentPrims();

@@ -1764,6 +1764,8 @@ TP_F(physics, debrisLinearDamping, NO_WGSL, 0.05f, 0.0f, 2.0f)
 TP_F(physics, debrisAngularDamping, NO_WGSL, 0.15f, 0.0f, 2.0f)
 TP_F(physics, waterLinearDrag, NO_WGSL, 0.8f, 0.0f, 4.0f)
 TP_F(physics, waterAngularDrag, NO_WGSL, 0.25f, 0.0f, 4.0f)
+// m/s: a floater asleep in water wakes when the current at it is this fast
+TP_F(physics, waterCurrentWake, NO_WGSL, 0.05f, 0.0f, 2.0f)
 TP_F(physics, terrainFriction, NO_WGSL, 0.85f, 0.0f, 2.0f)
 TP_F(physics, playerProxyFriction, NO_WGSL, 0.3f, 0.0f, 2.0f)
 TP_F(physics, explosionImpulseScale, NO_WGSL, 0.15f, 0.0f, 2.0f)
@@ -2563,6 +2565,13 @@ TP_F(sim, currentStreamScale, NO_WGSL, 1.2f, 0.0f, 20.0f)
 // RECORD the flow name it only so the record keeps running for the bodies
 // when the renderers' gain is 0. 0 = bodies feel the solved field only.
 TP_F(sim, currentMeasuredCarry, TUNE_CURRENT_MEASURED_CARRY, 1.0f, 0.0f, 4.0f)
+// THE MEASURED FLOW's REACH (flow_measure.wgsl, ticket 2026-10-17_20-56-48):
+// the radius in flow nodes (0.8 m) over which a node's measured current is
+// felt by its neighbours, through a tent that falls to zero at reach + 1.
+// 1 = the old 3 x 3 tent alone (a breach's pull ended 1.6 m out, and the
+// arrows switched from the lake's current to the breach's in one node).
+// Sim input: the bodies read the published grid.
+TP_I(sim, currentMeasuredReach, TUNE_CURRENT_MEASURED_REACH, 4, 1, 6)
 
 
 // ==== dayNight ====

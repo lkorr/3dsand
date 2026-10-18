@@ -17,7 +17,11 @@
 //   1. GATHER the flux over the node's 3 x 3 neighbourhood (a [1 2 1] tent):
 //      the CA moves water in 1-cell hops at the free surface, and a node bin
 //      is 8 x 8 columns, so the raw bins are lumpy; the tent spreads a breach
-//      over its neighbours the way the water's pull spreads.
+//      over its neighbours the way the water's pull spreads. Then THE REACH
+//      (2026-10-18): the same flux over a wider tent (sim.currentMeasuredReach
+//      nodes), counted where it is stronger than the node's own reading, so
+//      the current bends round a breach for a few metres and fades into the
+//      solved field instead of stopping one node out.
 //   2. CONVERT eighths x cells per tick into a velocity: the discharge per
 //      unit width over the bin, divided by a reference depth (FLOWM_DEPTH).
 //      The CA moves the SURFACE of a body, not its depth, so the flux is per
@@ -47,7 +51,8 @@
 // GPU's schedule. No GPU sim kernel reads flowMeas; the CPU reads its GRID
 // only through the fixed-latency snapshot, never on the frame path.
 //
-// COST. 67 x 67 threads, nine 4-word loads each. Recorded on the ticks the CA
+// COST. 67 x 67 threads, (2R+1)^2 4-word loads each (R = the reach, 81 at the
+// default 4; nine at 1). Recorded on the ticks the CA
 // or the fluid seam ran, then for kFlowMeasTailTicks after the last one (the
 // decay), then never: a settled world records nothing, and one Fill zeroes the
 // published field when the tail ends (Simulation::EncodeTick, Cond::FlowMeasure
@@ -94,6 +99,12 @@ const FLOWM_FLUX_MAX : i32 = 559223;     // FLOWM_STATE_MAX x 2 / 15
 // One accumulator word, clamped before it is weighted: nine of them at
 // weights summing to 16 then stay under 2^30.
 const FLOWM_TERM_MAX : i32 = 67108864;   // 2^26
+// THE REACH (sim.currentMeasuredReach, step 1 below): at most FLOWM_REACH_MAX
+// nodes, so its weights sum to at most (6+1)^4 = 2401 and each term is held to
+// 2^19 (64 full bins of eighths moved a cell in one tick: never binding) --
+// 2401 x 2^19 = 1.26e9, inside i32.
+const FLOWM_REACH_MAX : i32 = 6;
+const FLOWM_WIDE_TERM_MAX : i32 = 524288;  // 2^19
 // The follow, a fraction of the gap closed per tick in Q11:
 // 1 - exp(-1 / (tau x 30)) x 2048.
 const FLOWM_RISE_Q11 : i32 = 132;        // tau 0.50 s
@@ -156,25 +167,67 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (i >= n || j >= n) { return; }
   let k = node0 + vec2<i32>(i, j);
 
-  // ---- 1. the tick's flux over the 3 x 3 tent ----
+  // ---- 1. the tick's flux over the 3 x 3 tent, and over the REACH ----
+  // The 3 x 3 tent is the node's own reading (`flux`). THE REACH (ticket
+  // 2026-10-17_20-56-48: "the arrows discretely change from the natural
+  // current of the lake to this manmade flow ... all arrows should be
+  // influencing other arrows ... the sphere of influence a bit larger"): the
+  // same flux over a tent of radius R = sim.currentMeasuredReach nodes
+  // (`wide`), weights (R+1-|di|)(R+1-|dj|), normalised to the 3 x 3 tent's
+  // sum of 16 so a broad flood reads the same through either. With the 3 x 3
+  // alone a breach's pull ended 1.6 m out, and an arrow one node further on
+  // pointed wherever the map's solved field did. The band is gathered over
+  // the reach too: a node the reach alone moves must be read at its rows.
+  let R = clamp(TUNE_CURRENT_MEASURED_REACH, 1, FLOWM_REACH_MAX);
   var flux = vec2<i32>(0);
+  var wide = vec2<i32>(0);
   var topE = 0;
   var botE = 0;
-  for (var dj = -1; dj <= 1; dj++) {
-    for (var di = -1; di <= 1; di++) {
+  for (var dj = -R; dj <= R; dj++) {
+    for (var di = -R; di <= R; di++) {
       // A neighbour off the grid would alias the far edge's slot.
       if (i + di < 0 || i + di >= n || j + dj < 0 || j + dj >= n) { continue; }
       let a = flowmSlot(k + vec2<i32>(di, dj)) * 4u;
-      let w = (2 - abs(di)) * (2 - abs(dj));
       let acc = vec2<i32>(bitcast<i32>(flowMeasRW[a]), bitcast<i32>(flowMeasRW[a + 1u]));
-      flux += w * clamp(acc, vec2<i32>(-FLOWM_TERM_MAX), vec2<i32>(FLOWM_TERM_MAX));
+      if (abs(di) <= 1 && abs(dj) <= 1) {
+        let w = (2 - abs(di)) * (2 - abs(dj));
+        flux += w * clamp(acc, vec2<i32>(-FLOWM_TERM_MAX), vec2<i32>(FLOWM_TERM_MAX));
+      }
+      if (R > 1) {
+        let ww = (R + 1 - abs(di)) * (R + 1 - abs(dj));
+        wide += ww * clamp(acc, vec2<i32>(-FLOWM_WIDE_TERM_MAX), vec2<i32>(FLOWM_WIDE_TERM_MAX));
+      }
       topE = max(topE, bitcast<i32>(flowMeasRW[a + 2u]));
       botE = max(botE, bitcast<i32>(flowMeasRW[a + 3u]));
     }
   }
   // ---- 2. convert: STATE units, |inst| <= FLOWM_STATE_MAX ----
-  let inst = (clamp(flux, vec2<i32>(-FLOWM_FLUX_MAX), vec2<i32>(FLOWM_FLUX_MAX)) *
+  var inst = (clamp(flux, vec2<i32>(-FLOWM_FLUX_MAX), vec2<i32>(FLOWM_FLUX_MAX)) *
               FLOWM_TO_NUM) / FLOWM_TO_DEN;
+  // ---- 2b. the reach: added where it is stronger than the node's own ----
+  // v = local + wide x (1 - a^2), a^2 = min(|local|^2 / |wide|^2, 1): where
+  // the node measures as much as its surroundings (inside a flood, at a jet's
+  // core) it reads exactly what it did with the 3 x 3 alone; where it measures
+  // nothing (outside the flood) it reads its surroundings, falling to zero at
+  // R + 1 nodes; in between, continuously. Every step is an integer with its
+  // range bounded (the AUTHORITY note above): the normalisation divides in two
+  // halves so 16 x the sum never leaves i32, a^2 is Q10, and the reach is
+  // scaled down by 8 before its Q10 weight.
+  if (R > 1) {
+    let s2 = (R + 1) * (R + 1);
+    let wideFlux = ((wide / vec2<i32>(s2)) * 16) / vec2<i32>(s2);
+    let instW = (clamp(wideFlux, vec2<i32>(-FLOWM_FLUX_MAX), vec2<i32>(FLOWM_FLUX_MAX)) *
+                 FLOWM_TO_NUM) / FLOWM_TO_DEN;
+    let m2L = flowmMag2(inst);
+    let m2W = flowmMag2(instW);
+    if (m2W > m2L) {
+      var a2 = 0u;
+      if (m2W >= (1u << 21u)) { a2 = m2L / (m2W >> 10u); } else { a2 = (m2L << 10u) / m2W; }
+      let keepW = i32(1024u - min(a2, 1024u));
+      inst = clamp(inst + ((instW / 8) * keepW) / 128, vec2<i32>(-FLOWM_STATE_MAX),
+                   vec2<i32>(FLOWM_STATE_MAX));
+    }
+  }
 
   // ---- the node's state, reset if the slot held another node ----
   let s = FLOWM_STATE + flowmSlot(k) * 4u;

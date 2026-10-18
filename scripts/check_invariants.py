@@ -3383,6 +3383,27 @@ def check_react_fx():
                             f"{m.group(1)}")
 
 
+def check_far_down_cadence():
+    """The far downsample cadence (world.h kFarDownEvery <-> far_select.wgsl
+    FAR_DOWN_EVERY). The shader is the rule; the C++ twin is how long the far
+    gates settle after an edit before they read the cascades. Drifted, a gate
+    reads a cascade the cadence has not caught up with yet (or waits for
+    nothing)."""
+    sel = read("assets/shaders/far_select.wgsl")
+    wh = read("src/sim/world.h")
+    if not sel or not wh:
+        return
+    checked.append("far downsample cadence")
+    a = re.search(r"constexpr\s+uint32_t\s+kFarDownEvery\s*=\s*(\d+)\s*;", wh)
+    b = re.search(r"const\s+FAR_DOWN_EVERY\s*:\s*u32\s*=\s*(\d+)u", sel)
+    if not a or not b:
+        problems.append("far downsample cadence: cannot read world.h kFarDownEvery or "
+                        "far_select.wgsl FAR_DOWN_EVERY")
+    elif int(a.group(1)) != int(b.group(1)):
+        problems.append(f"far downsample cadence: world.h kFarDownEvery = {a.group(1)} but "
+                        f"far_select.wgsl FAR_DOWN_EVERY = {b.group(1)}")
+
+
 def check_ticket_record():
     """The chunk-ticket record in pageFaults (docs/PLAN_chunk_tickets.md P2):
     sim_particle.wgsl's TK_* constants <-> world.h kTicketReq* / kTicketDep* /
@@ -3762,6 +3783,7 @@ ALL = {
     "heat": check_heat_mirror,
     "elec": check_elec_mirror,
     "ticket": check_ticket_record,
+    "fardown": check_far_down_cadence,
     "reactfx": check_react_fx,
     "coatrule": check_coat_rule,
     "stainprec": check_stain_prec,

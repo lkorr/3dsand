@@ -331,6 +331,7 @@
     },
     {
       "id": "ice",
+      "absorb": {"sealed": true},
       "thermal": {"melt": {"above": 4, "full": 64, "chance": 25, "into": "water"}},
       "footstep": "path",
       "class": "solid",
@@ -562,6 +563,7 @@
     },
     {
       "id": "glass",
+      "absorb": {"sealed": true},
       "footstep": "path",
       "class": "solid",
       "density": 2400,
@@ -1284,6 +1286,7 @@
     },
     {
       "id": "gem_arcane",
+      "absorb": {"sealed": true},
       "bleed": 0.2,
       "class": "solid",
       "density": 2600,
@@ -1337,6 +1340,7 @@
     },
     {
       "id": "steel",
+      "absorb": {"sealed": true},
       "electric": {"resist": 3},
       "arcane": 12,
       "footstep": "stone",
@@ -3056,6 +3060,7 @@
     {
       "//": "THE ONLY LIGHT UNDER THE WORLD THAT IS NOT LAVA. Worldgen has no sun direction and a cave has no sky, so Lin 13.3.4's \"place plants by how open the sky is\" bottoms out down here as \"place what grows in the dark\". caveBands (worldgen.wgsl) gives a deep cavern's floor and ceiling in CLOSED FORM per column, so a seam can be hung off either without a march.\n\nemission 120 is deliberately under lava's 255: a crystal seam should let you SEE the cavern you are standing in, not light it like a furnace, and the magma table at LAVA_LEVEL stays the thing that reads as heat. Placement keeps a margin above that level so a seam never grows into the lava it is lighting.\n\nINERT, and that is load-bearing (CLAUDE.md rule 2): no reaction names it as `self` or as an emit, it is not flammable and it does not melt, so a cavern full of it generates AT REST and its chunks sleep on the first tick exactly as the stone around them does.\n\nhardness 6 is above stone's, so a seam survives the blast that opens the rock around it and reads as a vein rather than as coloured gravel.",
       "id": "crystal",
+      "absorb": {"sealed": true},
       "bleed": 0.2,
       "class": "solid",
       "density": 2600,
@@ -3159,6 +3164,7 @@
     {
       "//": "WROUGHT IRON: the plate set's material (scripts/gen_stock_armor.py iron_helm/cuirass/greaves/sabatons). A SECOND metal, not a tint of steel, because it carries a rule steel does not: reactions.json's `acid + iron -> air` at 10 per-mille a tick. Steel has no tag:dissolvable and no rule of its own, so acid cannot touch a sword at all and armor-react measures 0 voxels lost under a steel plate; a suit that acid eats SLOWLY (against 250 for flesh and cloth, 45 for the generic dissolvable tag) is a different fact, and here a fact is a material. Not flammable and not organic, so fire has nothing on it to catch and the burn pass never lists it -- a limb under it reads its neighbour as iron rather than as fire (mob.cpp WornAlong). Hardness under steel's 200: a blade beats it in sooner than it would a blade. Never placed by worldgen, so the nibble is free for the metal finishes below.",
       "id": "iron",
+      "absorb": {"sealed": true},
       "electric": {"resist": 3},
       "footstep": "stone",
       "class": "solid",
@@ -3335,6 +3341,7 @@
     {
       "comment": "The dearest common matter (docs/PLAN_magic_grammar.md): the top of the arcane tariff, so making it is what kills alchemists. Never placed by worldgen; exists so the tongue has the word.",
       "id": "gold",
+      "absorb": {"sealed": true},
       "electric": {"resist": 1},
       "arcane": 40,
       "footstep": "stone",
@@ -4946,6 +4953,7 @@
     {
       "//": "THE ROBOT RACES (assets/editor/automaton.js, assets/editor/android.js; DESIGN.md 'Robots are matter'). Ten rows, appended (ids > 127), so a mob .vox paints each solid as a STAND-IN and the sidecar's anatomy.becomes rewrites it at load, exactly as the snake's venom gland. What a robot DOES is these rows and nothing else: `shell` (a blow carves this matter the way it carves a worn plate -- gear.cutHardnessRef over its hardness, game/shellresponse.h -- so plating takes a chip where flesh takes a gash), `bleedFluid` (what a wound in it leaks), `struck` (what a blow knocks out of it: a ball of that matter laid in the air at the hit), `burst` (what it lets go when a wound breaches it or its body dies). No row here is flammable, organic or dissolvable, so fire, acid, rot and venom have nothing to take hold of; every rotRate is 0. BRASS: the automaton's plating. Hardness 70 (a sword takes a ninth of a kerf; cut through, it costs nine times skin to part), it leaks a little oil where it is holed and throws the odd spark when an edge rings off it.",
       "id": "brass",
+      "absorb": {"sealed": true},
       "electric": {"resist": 3},
       "footstep": "stone",
       "class": "solid",
@@ -5215,6 +5223,7 @@
     {
       "//": "ELECTRICITY E1. DRAWN COPPER: wire, bar, sheet -- the solid form of `copper` (which is FILINGS, a powder, and would slump). The best conductor in the world (electric.resist 1: a spark's 200 runs ~200 cells of it) and what the elec-field gate's wire is made of. Hard enough to stand as a rod; broken, it falls to filings.",
       "id": "copper_bar",
+      "absorb": {"sealed": true},
       "electric": {"resist": 1},
       "footstep": "stone",
       "class": "solid",
@@ -5849,6 +5858,7 @@
     {
       "//": "Rime crystal (frost-glass): the GLACIER's signature -- clear blades of hoarfrost ice standing up off the ice sheet, faintly lit from within. Melts like ice above 4 (the glacier's day is far below that: the loader's climate check proves it).",
       "id": "rime_crystal",
+      "absorb": {"sealed": true},
       "footstep": "path",
       "class": "solid",
       "density": 900,
@@ -5878,6 +5888,7 @@
     {
       "//": "Crystal spire: violet quartz needles growing out of the CRYSTAL BARRENS' rock -- a surface cousin of the cave `crystal`, dimmer (70) so a field of them reads as glitter, not as a lamp. INERT mineral (rule 2), not flammable, does not melt.",
       "id": "crystal_spire",
+      "absorb": {"sealed": true},
       "footstep": "path",
       "class": "solid",
       "density": 2600,
@@ -6066,6 +6077,7 @@
     {
       "//": "Glacier ice: the GLACIER's skin, subsoil and seracs -- old compacted ice, blue-white and OPAQUE (unlike pond `ice`, which is clear: a translucent ice sheet a kilometre wide would make the renderer march through it). Melts like ice above 4; the glacier's climate never reaches that.",
       "id": "glacier_ice",
+      "absorb": {"sealed": true},
       "thermal": {
         "melt": {
           "above": 4,

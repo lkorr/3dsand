@@ -1176,6 +1176,9 @@ const char* const kOrder[] = {
     "chem-sodium", "chem-acid-fumes", "chem-electrolysis", "chem-toxic",
     // Package E (the creative expansion): same fixture discipline.
     "chem-gunpowder", "chem-thermite", "chem-frost", "chem-holy-water", "chem-recipes",
+    // Blood pools on a sealed surface (ticket 2026-10-17_00-19-10): same
+    // fixture discipline (own basins, regenerates on the way out).
+    "blood-pool",
     // Electricity E3: a forced weather strike on a rod-and-collar fixture,
     // run twice; same fixture discipline (own pad, regenerates on the way out).
     "elec-strike",
@@ -1357,6 +1360,13 @@ const char* const kOrder[] = {
     // metres under instead of stopping on the surface. Ticks the world and
     // regenerates it on the way out.
     "water-entry",
+    // The body tickets of 2026-10-17 (ticks the world; each regenerates it on
+    // the way out): a player standing on a turned log for ten seconds is not
+    // knocked down by the air clock; a cut arm and a corpse afloat in a
+    // stamped basin settle in still water, drift with a stream primitive and
+    // settle again; a block thrown out through the window's +x face lands on
+    // the analytic ground out there, asleep, and is kept.
+    "player-stand-body", "float-current", "debris-outside",
     // The swimmers: a shark circles and charges a man in a stamped pool,
     // piranha nip him, a dry man is ignored, a fish out of water flops and
     // suffocates. Ticks the world and regenerates it on the way out.

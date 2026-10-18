@@ -928,10 +928,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(1, T::Storage),          // farOcc
         entry(2, T::ReadOnlyStorage),  // farList
         entry(3, T::Uniform),          // FarParams
-        entry(4, T::ReadOnlyStorage),  // dirtyList (phase-2 downsample work set)
+        // The phase-2 downsample work set: the far downsample cadence's list
+        // (world.h farDownList), WRITTEN by far_select.wgsl and read by the
+        // four fardown entries -- Storage so the select can write it here.
+        entry(4, T::Storage),          // farDownList
         entry(5, T::ReadOnlyStorage),  // farPatch (cascade edit persistence)
         entry(6, T::Storage),          // farSig (fardown's unchanged-chunk skip)
         entry(7, T::Storage),          // farMap (the surface map: farmap / farpatch / fardown)
+        entry(8, T::Storage),          // farDownState (the cadence's per-slot state)
+        entry(9, T::Storage),          // farDownArgsStage (the cadence list's args)
     };
     farBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1422,10 +1427,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(1, world_->farOcc),
         b(2, world_->farList),
         b(3, world_->farUBO),
-        b(4, world_->dirtyList),
+        b(4, world_->farDownList),
         b(5, world_->farPatch),
         b(6, world_->farSig),
         b(7, world_->farMap),
+        b(8, world_->farDownState),
+        b(9, world_->farDownArgsStage),
     };
     farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
   }
@@ -2371,6 +2378,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // function was entered (the tuning, the tree lattice, the world map) and
   // writes only its own handle.
   rhi::ShaderModule mWorldgen, mMutate, mCompact, mStep, mOcc, mPick;
+  rhi::ShaderModule mFarSelect;
   // The rain exposure map (sim_rain_expo.wgsl): one tick entry on simPL_.
   rhi::ShaderModule mRainExpo;
   // The measured flow's fold (flow_measure.wgsl): one tick entry on simPL_.
@@ -2445,6 +2453,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mStream, "sim_stream.wgsl");
     mod(&mDraft, "sim_draft.wgsl");
     mod(&mCompact, "sim_compact.wgsl");
+    mod(&mFarSelect, "far_select.wgsl");
     mod(&mStep, "sim_step.wgsl");
     mod(&mSolute, "sim_solute.wgsl");
     mod(&mHeat, "sim_heat.wgsl");
@@ -2480,7 +2489,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDenoise, "denoise.wgsl");
     loads.Run(buildThreads);
   }
-  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mSolute || !mHeat || !mElec || !mOcc || !mPick ||
+  if (!mWorldgen || !mMutate || !mCompact || !mFarSelect || !mStep || !mSolute || !mHeat || !mElec || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
@@ -2743,10 +2752,12 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   farDownClaim_ = {};
   farDownStalk_ = {};
   farDownFeat_ = {};
+  farDownSelect_ = {};
   farPublished_ = false;
   farStarted_ = false;
   farReady_.store(false, std::memory_order_release);
   farModule_ = mWorldgen;
+  farSelectModule_ = mFarSelect;
   farBuildThreads_ = buildThreads;
   // Serial under `--shader-stats` for the same reason the pool is: that mode
   // exists to interrogate every pipeline the driver compiled this run — so it
@@ -2827,7 +2838,8 @@ void Simulation::StartFarBuild(unsigned threads) {
   const rhi::Device dev = device_;
   const rhi::PipelineLayout layout = farPL_;
   const rhi::ShaderModule module = farModule_;
-  auto build = [dev, layout, module]() {
+  const rhi::ShaderModule selModule = farSelectModule_;
+  auto build = [dev, layout, module, selModule]() {
     FarPipelines r;
     // One thread per entry point: sequentially these are the sum, in
     // parallel they are max(), which is the wall clock this whole package is
@@ -2858,6 +2870,8 @@ void Simulation::StartFarBuild(unsigned threads) {
     r.downClaim = MakeComputePipeline(dev, layout, module, "fardownClaim", "farDownClaim");
     r.downStalk = MakeComputePipeline(dev, layout, module, "fardownStalk", "farDownStalk");
     r.downFeat = MakeComputePipeline(dev, layout, module, "fardownFeat", "farDownFeat");
+    // The cadence's selection: a few loads per slot, its own tiny module.
+    r.downSelect = MakeComputePipeline(dev, layout, selModule, "main", "farDownSelect");
     map.join();
     patch.join();
     down.join();
@@ -2905,6 +2919,7 @@ void Simulation::StartFarBuild(unsigned threads) {
     farDownClaim_ = std::move(r.downClaim);
     farDownStalk_ = std::move(r.downStalk);
     farDownFeat_ = std::move(r.downFeat);
+    farDownSelect_ = std::move(r.downSelect);
     farPublished_ = true;
     farReady_.store(true, std::memory_order_release);
   } else {
@@ -2923,12 +2938,13 @@ void Simulation::PublishFarPipelines() {
   farDownClaim_ = std::move(r.downClaim);
   farDownStalk_ = std::move(r.downStalk);
   farDownFeat_ = std::move(r.downFeat);
+  farDownSelect_ = std::move(r.downSelect);
   farPublished_ = true;
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
   if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farMapStalk_ || !farPatchFill_ || !farDown_ ||
-      !farDownClaim_ || !farDownStalk_ || !farDownFeat_)
+      !farDownClaim_ || !farDownStalk_ || !farDownFeat_ || !farDownSelect_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
                  "stay empty (worldgen.wgsl far/farmap/farpatch/fardown)\n");
@@ -3050,6 +3066,10 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarUBO:         return world_->farUBO;
     case B::FarPatch:       return world_->farPatch;
     case B::FarSig:         return world_->farSig;
+    case B::FarDownState:   return world_->farDownState;
+    case B::FarDownList:    return world_->farDownList;
+    case B::FarDownArgsStage: return world_->farDownArgsStage;
+    case B::FarDownArgs:    return world_->farDownArgs;
     case B::FarMap:         return world_->farMap;
     case B::PageTable:      return world_->pageTable;
     case B::PageFaults:     return world_->pageFaults;
@@ -3203,6 +3223,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FarDownClaim:   return farDownClaim_;
     case P::FarDownStalk:   return farDownStalk_;
     case P::FarDownFeat:    return farDownFeat_;
+    case P::FarDownSelect:  return farDownSelect_;
     case P::OpennessDirty:   return opennessDirty_;
     case P::OpennessRefresh: return opennessRefresh_;
     case P::GlowSrc:         return glowSrc_;
