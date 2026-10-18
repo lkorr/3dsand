@@ -8772,6 +8772,9 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     // a liquid face-neighbour (soak from the water), else air straight above
     // (an exposed top: rain, a drip), else neither (wicked through the rock).
     uint32_t sByLiquid = 0, sByAirAbove = 0, sByNeither = 0;
+    // Wake checks a re-versioned chunk passed because no cell in the body's
+    // box moved (MobSystem::DeadMatterSameTotal over the arm).
+    uint64_t matterSame = 0;
     uint32_t sTypes[8] = {};
     std::string lastMoved, drift;   // drift: root x,z and current every 120
   };
@@ -8856,6 +8859,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
           }
     };
     watchMirror(false);
+    const uint64_t matterSame0 = mobs.DeadMatterSameTotal();
     for (int i = 0; i < kTicks; i++) {
       support::RunTicks(rig, 1);
       watchMirror(true);
@@ -8904,6 +8908,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       a.why = w ? w : "";
       a.wokeHow = m->DeadWokeHow();
     }
+    a.matterSame = mobs.DeadMatterSameTotal() - matterSame0;
   }
   // THE LIVE LIMP ARM. Same basin, same drop; StartRagdoll instead of Die,
   // with a minimum longer than the watch so the get-up never starts and what
@@ -9045,7 +9050,8 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   auto line = [&](const Arm& a) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
-                  "rig %s, corpse %s (%s, last woken how %d), mirror bumps %u "
+                  "rig %s, corpse %s (%s, last woken how %d, slept through %llu "
+                  "chunk changes outside its box), mirror bumps %u "
                   "(cells moved: mat %u, fullness %u, stain %u [wall %u floor %u "
                   "inside %u, wetter %u, y%u..%u; by liquid %u, open top %u, "
                   "neither %u; types %u/%u/%u/%u/%u/%u/%u/%u], stamp-only %u; "
@@ -9053,7 +9059,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                   a.rho, a.lowest, a.final, a.pushes,
                   a.rigActive ? "MOVING" : "still",
                   a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.wokeHow,
-                  a.bumps, a.cMat, a.cFull, a.cStain, a.sWall, a.sFloor, a.sIn,
+                  (unsigned long long)a.matterSame, a.bumps, a.cMat, a.cFull, a.cStain, a.sWall, a.sFloor, a.sIn,
                   a.sUp, a.yLo == (1u << 30) ? 0u : a.yLo, a.yHi, a.sByLiquid,
                   a.sByAirAbove, a.sByNeither, a.sTypes[0], a.sTypes[1],
                   a.sTypes[2], a.sTypes[3], a.sTypes[4], a.sTypes[5], a.sTypes[6],
