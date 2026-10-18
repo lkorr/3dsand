@@ -829,6 +829,9 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[1], 1u);
     atomicStore(&fluidArgs[2], 1u);
     atomicStore(&fluidArgs[3], blocks);
+    // THE BRICK LEDGER: this tick's first clear is a full one (the block
+    // indices just changed); gridUpdate lowers the flag behind it.
+    atomicStore(&fluidBlockMap[fbmBrickFull()], 1u);
   }
   workgroupBarrier();
   if (asleep) { return; }
@@ -857,6 +860,85 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   }
 }
 
+// ---- THE BRICK LEDGER: node passes over the bricks particles touch ---------
+// (2026-10-18, water perf round 2; tickets 2026-10-16_11-14-41 and
+// 2026-10-17_21-03-25.) `mark` pads the block set by FLUID_MARK_PAD cells so
+// the map can be built once per tick, so the node passes (clear, gridUpdate)
+// used to run every node of every block on every substep. Measured on
+// `--perf dam`: 75 blocks = 307,200 nodes a substep, of which 8,287 (2.7%)
+// lie in any particle's 3^3 support and 359 of the 4,800 4^3 bricks (7.5%)
+// are touched -- 1.5 ms a tick of the solver's 3.9 spent on nodes no particle
+// reads.
+//
+// A BRICK is 4^3 nodes, 64 per block. Its ledger word (after the near-block
+// bits of fluidBlockMap; render and CA never read it):
+//   BRICK_DIRTY    p2g1 scattered into it THIS substep (set at the support's 8
+//                  corner taps: three consecutive nodes cross at most one
+//                  4-aligned boundary, so the middle tap shares a corner's
+//                  brick -- and therefore its block -- on every axis);
+//   BRICK_RECLEAR  gridUpdate processed it this substep, so it holds particle
+//                  sums / velocities the next substep's clear must wipe;
+//   OWED (6 bits)  substeps whose gridUpdate this brick skipped: foam decays
+//                  not yet applied;
+//   DCOUNT (6)     substeps it was processed (dirty) this tick.
+// THE INVARIANT that makes skipping exact: a brick that is neither DIRTY nor
+// RECLEAR holds exactly what clear+seed leaves (zero momentum, the settled
+// static mass), the state every one of its skipped substeps would have
+// rebuilt. Nobody reads it in between -- p2g/g2p touch only the support, which
+// is DIRTY by construction -- so the per-substep result is needed only at the
+// END of the tick, where `gridFinish` (the first row of PT_FLUIDSETTLE) writes
+// it: the static velocity of every clean brick, the owed foam decays of every
+// brick (k decays of an un-added-to value ARE k decays: g2p adds foam only at
+// dirty substeps, after that substep's gridUpdate has caught the brick up),
+// and FA_CLAMPED for the static substeps. Everything read after the tick -- the
+// renderer, the seam's settle and wake, the CA's fluidOccMat, the Y/XZ mask --
+// is word for word what the dense passes left (rule 1).
+// The first substep of a tick clears every brick (alloc raises BRICK_FULL):
+// block indices are reassigned each tick, so last tick's ledger is meaningless.
+const BRICK_DIRTY : u32 = 1u;
+const BRICK_RECLEAR : u32 = 2u;
+const BRICK_OWED_SH : u32 = 8u;
+const BRICK_DCOUNT_SH : u32 = 16u;
+fn fbmBrickFull() -> u32 { return 2u * NUM_SLOTS + 8u + (NUM_SLOTS + 31u) / 32u; }
+fn fbmBrickWord(block : u32, brick : u32) -> u32 {
+  return fbmBrickFull() + 1u + block * 64u + brick;
+}
+// Brick of chunk-local node coords l (0..15 each).
+fn brickOfLocal(l : vec3<u32>) -> u32 {
+  return (l.z >> 2u) * 16u + (l.y >> 2u) * 4u + (l.x >> 2u);
+}
+// THE NODE PASSES' THREAD MAP: a 256-thread workgroup is FOUR bricks of one
+// block (16 workgroups a block, as before), 64 threads a brick, so a brick's
+// threads share a workgroup (its ledger word has one writer behind a barrier)
+// and a skipped brick idles whole warps. Which thread owns which node changes
+// nothing -- every node's update is its own; only the Y-mask OR and the
+// FA_CLAMPED sum are shared, and both are associative.
+fn nodeBrickOf(wgx : u32, li : u32) -> u32 { return ((wgx & 15u) << 2u) | (li >> 6u); }
+fn nodeLocalOf(brick : u32, n : u32) -> u32 {
+  let x = ((brick & 3u) << 2u) | (n & 3u);
+  let y = (((brick >> 2u) & 3u) << 2u) | ((n >> 2u) & 3u);
+  let z = ((brick >> 4u) << 2u) | (n >> 4u);
+  return (z * CHUNK + y) * CHUNK + x;
+}
+
+// The settled liquid's static mass at cell c (see clearGrid): (vm, mat), vm 0
+// when the cell seeds nothing. A pure function of the voxel word, which nothing
+// writes during the substeps.
+fn settledSeedAt(c : vec3<i32>) -> vec2<i32> {
+  if (FLUID_SETTLED_Q8 <= 0) { return vec2<i32>(0, 0); }
+  if (!cellResident(c, T.origin)) { return vec2<i32>(0, 0); }
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
+  if (mat == MAT_AIR) { return vec2<i32>(0, 0); }
+  if (materials[mat].klass != CLASS_LIQUID) { return vec2<i32>(0, 0); }
+  // A full cell is `rest` in Q16.16, i.e. rest >> 6 in the grid's Q10 mass.
+  // Bounds: rest <= 32<<16, so (rest>>6)*8/8 <= 32768 and the Q8 scale (<= 512)
+  // keeps the product under 2^24.
+  let full = FLUID_REST_DENSITY >> 6u;
+  let vm = (((full * i32(voxState(w) + 1u)) / 8) * FLUID_SETTLED_Q8) >> 8u;
+  return vec2<i32>(max(vm, 0), i32(mat));
+}
+
 // ---- clear: zero the active blocks' node accumulators -----------------------
 // Only active blocks are touched (indirect over blocks*16 workgroups); stale
 // data in inactive blocks is unreachable because every access goes through the
@@ -879,8 +961,24 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
 fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
              @builtin(local_invocation_index) li : u32) {
   let block = wg.x >> 4u;                        // same addressing as gridUpdate
-  let localIdx = (wg.x & 15u) * 256u + li;
-  let node = block * CHUNK_VOL + localIdx;       // == wg.x * 256 + li
+  // THE BRICK LEDGER (above): the first substep of the tick clears every
+  // brick and resets its word; a later one re-clears only the bricks the last
+  // gridUpdate processed. A brick nobody touched since still holds exactly
+  // what this would write.
+  let brick = nodeBrickOf(wg.x, li);
+  let bw = fbmBrickWord(block, brick);
+  let full = atomicLoad(&fluidBlockMap[fbmBrickFull()]) != 0u;
+  let st = atomicLoad(&fluidBlockMap[bw]);
+  // Every thread has read its brick's word before the owner rewrites it.
+  storageBarrier();
+  workgroupBarrier();
+  let redo = full || (st & BRICK_RECLEAR) != 0u;
+  if ((li & 63u) == 0u && redo) {
+    atomicStore(&fluidBlockMap[bw], select(st & ~BRICK_RECLEAR, 0u, full));
+  }
+  if (!redo) { return; }
+  let localIdx = nodeLocalOf(brick, li & 63u);
+  let node = block * CHUNK_VOL + localIdx;
   let b = node * FLUID_GW;
   for (var w = 0u; w < 7u; w++) {
     atomicStore(&fluidGrid[b + w], 0);
@@ -939,17 +1037,9 @@ fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
                      i32(localIdx >> 8u));
   // Node nc sits at the CENTRE of cell nc (see axisOf / the dpos terms in p2g),
   // so "this node's cell" is an identity, not an approximation.
-  let c = slotWorldChunk(slot, T.origin) * i32(CHUNK) + lo;
-  if (!cellResident(c, T.origin)) { return; }
-  let w = voxWordAt(c);
-  let mat = voxMat(w);
-  if (mat == MAT_AIR) { return; }
-  if (materials[mat].klass != CLASS_LIQUID) { return; }
-  // A full cell is `rest` in Q16.16, i.e. rest >> 6 in the grid's Q10 mass.
-  // Bounds: rest <= 32<<16, so (rest>>6)*8/8 <= 32768 and the Q8 scale (<= 512)
-  // keeps the product under 2^24.
-  let full = FLUID_REST_DENSITY >> 6u;
-  let vm = (((full * i32(voxState(w) + 1u)) / 8) * FLUID_SETTLED_Q8) >> 8u;
+  let seed = settledSeedAt(slotWorldChunk(slot, T.origin) * i32(CHUNK) + lo);
+  let vm = seed.x;
+  let mat = u32(seed.y);
   if (vm <= 0) { return; }
   atomicStore(&fluidGrid[b + 0u], vm);
   // Composition accounting must match p2g1's: the settled liquid's own
@@ -1016,6 +1106,15 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
         let bm = supBlock(sb, i, j, k);
         if (bm == 0u) { continue; }
+        // THE BRICK LEDGER: the support's 8 corner taps name every brick it
+        // touches (see BRICK_DIRTY). A load first: a crowd shares bricks, so
+        // the word is usually already set and an RMW would only contend.
+        if (i != 1 && j != 1 && k != 1) {
+          let bw = fbmBrickWord(bm - 1u, brickOfLocal(vec3<u32>(nc & vec3<i32>(CHUNK_MASK))));
+          if ((atomicLoad(&fluidBlockMap[bw]) & BRICK_DIRTY) == 0u) {
+            atomicOr(&fluidBlockMap[bw], BRICK_DIRTY);
+          }
+        }
         let w = mq(wxy[j * 3 + i], az.w[k]);   // Q16.16 <= 0.42
         // dpos = node - particle, Q16.16 in [-1.5, 1.5] per axis.
         let dx = dxs[i];
@@ -1248,11 +1347,34 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&guYMask, 0u);
     atomicStore(&guClamped, 0u);
   }
+  // THE BRICK LEDGER: only a brick p2g1 scattered into this substep is
+  // updated; it first pays the foam decays it was owed. Any other brick only
+  // counts the substep it skipped (gridFinish settles it at the end).
+  let block = wg.x >> 4u;
+  let brick = nodeBrickOf(wg.x, li);
+  let bw = fbmBrickWord(block, brick);
+  let st = atomicLoad(&fluidBlockMap[bw]);
+  storageBarrier();
   workgroupBarrier();
-  let r = gridUpdateNode(wg.x, li);
+  let dirty = (st & BRICK_DIRTY) != 0u;
+  var r = vec2<u32>(0u, 0u);
+  if (dirty) {
+    r = gridUpdateNode(block, nodeLocalOf(brick, li & 63u),
+                       ((st >> BRICK_OWED_SH) & 63u) + 1u, 1u);
+  }
   if (r.x != 0u) { atomicOr(&guYMask, r.x); }
   if (r.y != 0u) { atomicAdd(&guClamped, r.y); }
   workgroupBarrier();
+  if ((li & 63u) == 0u) {
+    // DIRTY -> RECLEAR (the next clear wipes it), OWED paid, DCOUNT + 1; or
+    // one more owed decay. The DIRTY bit is the next p2g1's to set again.
+    let dc = (st >> BRICK_DCOUNT_SH) & 63u;
+    atomicStore(&fluidBlockMap[bw],
+                select(st + (1u << BRICK_OWED_SH),
+                       BRICK_RECLEAR | ((dc + 1u) << BRICK_DCOUNT_SH), dirty));
+  }
+  // The first substep's full clear has happened; the rest are per brick.
+  if (wg.x == 0u && li == 0u) { atomicStore(&fluidBlockMap[fbmBrickFull()], 0u); }
   if (li == 0u) {
     let ym = atomicLoad(&guYMask);
     if (ym != 0u) {
@@ -1263,28 +1385,95 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }
 
-// One node of gridUpdate. Returns (this node's Y-mask bits, 1 if the VMAX
-// clamp engaged) for the workgroup fold above; every other effect is its own.
-fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
-  let block = wgx >> 4u;
-  let localIdx = (wgx & 15u) * 256u + li;
+// ---- gridFinish: the end-of-tick state of every brick (THE BRICK LEDGER) ----
+// The first row of PT_FLUIDSETTLE, once per tick after the last substep, with
+// gridUpdate's dispatch and thread map. Per node:
+//   * the foam decays the brick still owes (every brick ends the tick with
+//     exactly FLUID_SUBSTEPS decays applied, as the dense pass did);
+//   * a CLEAN brick (not processed by the last substep's gridUpdate) holds the
+//     clear+seed state, so the dense pass's last-substep result for it is
+//     gridUpdateNode on what is there -- velocity, Y/XZ bits -- and its
+//     FA_CLAMPED share is that node's clamp once per substep it was static;
+//   * a RECLEAR brick holds the last substep's real result already; its
+//     static substeps (if any) still owe FA_CLAMPED, from the seed alone.
+// Its Y/XZ bits need nothing more: a node static for some substeps had the
+// seed mass then and seed + particles (>= seed) at its dirty ones, which lit
+// the same bits when gridUpdate processed it.
+@compute @workgroup_size(256)
+fn gridFinish(@builtin(workgroup_id) wg : vec3<u32>,
+              @builtin(local_invocation_index) li : u32) {
+  if (li == 0u) {
+    atomicStore(&guYMask, 0u);
+    atomicStore(&guClamped, 0u);
+  }
+  workgroupBarrier();
+  let block = wg.x >> 4u;
+  let brick = nodeBrickOf(wg.x, li);
+  let st = atomicLoad(&fluidBlockMap[fbmBrickWord(block, brick)]);
+  let owed = (st >> BRICK_OWED_SH) & 63u;
+  let stat = u32(max(FLUID_SUBSTEPS - i32((st >> BRICK_DCOUNT_SH) & 63u), 0));
+  let localIdx = nodeLocalOf(brick, li & 63u);
+  var r = vec2<u32>(0u, 0u);
+  if ((st & BRICK_RECLEAR) == 0u) {
+    r = gridUpdateNode(block, localIdx, owed, stat);
+  } else {
+    let ni = (block * CHUNK_VOL + localIdx) * FLUID_GW;
+    foamDecay(ni, owed);
+    if (stat != 0u) {
+      let c = slotWorldChunk(fluidBlockList[block], T.origin) * i32(CHUNK) +
+              vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
+                        i32(localIdx >> 8u));
+      let m = settledSeedAt(c).x;
+      if (m >= FLUID_MASS_MIN) {
+        let fv = nodeForces(c, m, vec3<i32>(0, -(FLUID_GRAVITY / FLUID_SUBSTEPS), 0));
+        r.y = u32(fv.w) * stat;
+      }
+    }
+  }
+  if (r.x != 0u) { atomicOr(&guYMask, r.x); }
+  if (r.y != 0u) { atomicAdd(&guClamped, r.y); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let ym = atomicLoad(&guYMask);
+    if (ym != 0u) {
+      atomicOr(&fluidBlockMap[fbmYMaskIndex(fluidBlockList[block])], ym);
+    }
+    let nc = atomicLoad(&guClamped);
+    if (nc != 0u) { atomicAdd(&fluidArgs[FA_CLAMPED], nc); }
+  }
+}
+
+// `k` substeps of the foam field's decay on node row ni (word 7) -- one per
+// substep, exactly the dense pass's per-substep step repeated.
+// BEFORE the low-mass early-out on purpose: foam left behind by water that
+// has since drained away must still fade, and those are exactly the nodes
+// that fail the mass test. Skipping them would strand a permanent white
+// patch in mid-air wherever a splash once was.
+// One thread owns one node, so this is a plain read-modify-write with no
+// contention — order-independent by construction (rule 1).
+fn foamDecay(ni : u32, k : u32) {
+  if (k == 0u) { return; }
+  let f0 = atomicLoad(&fluidGrid[ni + 7u]);
+  if (f0 <= 0) { return; }
+  var f = f0;
+  for (var s = 0u; s < k && f > 0; s++) {
+    // The -1 floor guarantees termination: a pure Q16 multiply by a factor
+    // < 1 stalls at small values, leaving a faint permanent haze.
+    f = max(mq(f, FLUID_FOAM_DECAY) - 1, 0);
+  }
+  atomicStore(&fluidGrid[ni + 7u], f);
+}
+
+// One node of gridUpdate (block, chunk-local node index). `decays` foam
+// decays first (the owed ones plus this substep's); `clampMul` is how many
+// substeps this result stands for in FA_CLAMPED (1 from gridUpdate, the
+// static substep count from gridFinish). Returns (this node's Y/XZ-mask bits,
+// clamp count) for the workgroup fold; every other effect is its own.
+fn gridUpdateNode(block : u32, localIdx : u32, decays : u32, clampMul : u32) -> vec2<u32> {
   let ni = (block * CHUNK_VOL + localIdx) * FLUID_GW;
 
   // ---- foam field decay (word 7) ----
-  // BEFORE the low-mass early-out on purpose: foam left behind by water that
-  // has since drained away must still fade, and those are exactly the nodes
-  // that fail the mass test. Skipping them would strand a permanent white
-  // patch in mid-air wherever a splash once was.
-  // One thread owns one node, so this is a plain read-modify-write with no
-  // contention — order-independent by construction (rule 1).
-  {
-    let f = atomicLoad(&fluidGrid[ni + 7u]);
-    if (f > 0) {
-      // The -1 floor guarantees termination: a pure Q16 multiply by a factor
-      // < 1 stalls at small values, leaving a faint permanent haze.
-      atomicStore(&fluidGrid[ni + 7u], max(mq(f, FLUID_FOAM_DECAY) - 1, 0));
-    }
-  }
+  foamDecay(ni, decays);
 
   let m = atomicLoad(&fluidGrid[ni + 0u]);
   if (m < FLUID_MASS_MIN) {
@@ -1298,7 +1487,6 @@ fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
   // point above; the word is retired once per tick by `alloc`'s phase A.
   let ybits = fbmYBits(i32((localIdx >> 4u) & 15u)) |
               fbmXZBits(i32(localIdx & 15u), i32(localIdx >> 8u));
-  var clamped = 0u;
   var v : vec3<i32>;
   // Momentum is MASS-weighted (p2g1), so divide by the node's mass, not its
   // volume: the same pressure force moves a lava node a 2.8th as far as a
@@ -1318,6 +1506,20 @@ fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
+  let fv = nodeForces(c, m, v);
+  atomicStore(&fluidGrid[ni + 1u], fv.x);
+  atomicStore(&fluidGrid[ni + 2u], fv.y);
+  atomicStore(&fluidGrid[ni + 3u], fv.z);
+  return vec2<u32>(ybits, u32(fv.w) * clampMul);
+}
+
+// What gridUpdate does to a node's velocity after the momentum divide and
+// gravity: wind, the current, the separate BC, friction, the VMAX clamp.
+// Returns (velocity, 1 if the clamp engaged). A function of (cell, mass,
+// velocity) and this tick's uniforms only -- which is what lets gridFinish
+// evaluate a static node's substep from its seed (THE BRICK LEDGER).
+fn nodeForces(c : vec3<i32>, m : i32, vIn : vec3<i32>) -> vec4<i32> {
+  var v = vIn;
 
   // ---- wind (research doc §4.6) -------------------------------------------
   // Per NODE, so the field varies across a splash for free — that is the whole
@@ -1443,16 +1645,14 @@ fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
   // combination of these already-clamped node velocities, so it cannot exceed
   // VMAX except by rounding. Diagnostic only — nothing keys on it, and an
   // atomic counter sum is order-independent (rule 1).
+  var clamped = 0;
   if (abs(v.x) > FLUID_VMAX || abs(v.y) > FLUID_VMAX || abs(v.z) > FLUID_VMAX) {
-    clamped = 1u;   // summed per workgroup by the entry point
+    clamped = 1;   // summed per workgroup by the entry point
   }
   v.x = clamp(v.x, -FLUID_VMAX, FLUID_VMAX);
   v.y = clamp(v.y, -FLUID_VMAX, FLUID_VMAX);
   v.z = clamp(v.z, -FLUID_VMAX, FLUID_VMAX);
-  atomicStore(&fluidGrid[ni + 1u], v.x);
-  atomicStore(&fluidGrid[ni + 2u], v.y);
-  atomicStore(&fluidGrid[ni + 3u], v.z);
-  return vec2<u32>(ybits, clamped);
+  return vec4<i32>(v, clamped);
 }
 
 // ---- this kernel's two words of the FA_* map (world.h kFluidArgsWords) ------

@@ -188,7 +188,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "shows up on exactly one of the two rows depending on how far away it "
      "is."},
     {"fluidSys", "MLS-MPM Fluid", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "fluidMark;fluidAlloc;fluidClear;fluidP2g1;fluidP2g2;fluidGridUp;fluidG2p;"
+     "fluidMark;fluidAlloc;fluidClear;fluidP2g1;fluidP2g2;fluidGridUp;fluidG2p;fluidFinish;"
      "seam_compact_count;seam_compact_scan;seam_compact_scatter;seam_spawn;"
      "seam_consume_apply;seam_excite_detect;seam_excite_scan;seam_excite_emit;"
      "seam_cell_clear;seam_particle_tick;seam_stain_apply;seam_settle_judge;"
