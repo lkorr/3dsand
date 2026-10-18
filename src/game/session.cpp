@@ -2029,6 +2029,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         if (pMat != 0 && pStart == 0) pStart = tick + (uint32_t)std::max(pAfter, 1);
         if (pMat != 0 && tick >= pStart && tick < pStart + (uint32_t)pTicks && tick != pLast) {
           pLast = tick;
+          const size_t before = fluidSpawns.size();
           for (int z = -pr; z <= pr; z++)
             for (int y = -pr; y <= pr; y++)
               for (int x = -pr; x <= pr; x++) {
@@ -2052,6 +2053,12 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                   fluidSpawns.push_back(op);
                 }
               }
+          // What this tick poured: the first tick and every REFUSED one (a
+          // full particle pool refuses a pour silently otherwise).
+          const size_t n = fluidSpawns.size() - before;
+          if (tick == pStart || n == 0)
+            std::printf("SANDVOX_AT_POUR tick %u: %zu particles spawned, live estimate "
+                        "%u (cap %u)\n", tick, n, fluidCount, kFluidCap);
         }
       }
 

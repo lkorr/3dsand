@@ -4974,6 +4974,52 @@ them voxels, which DO persist normally). The CA liquid movement rules are
 still live — Phase 3 (deleting them, flipping `fluidExciteMode` default,
 re-baselining the pinned hash) is a separate, later step.
 
+**A particle position is world cells MODULO 2^16** (2026-10-18; ticket
+2026-10-17_00-11-06, "mpm fluid isn't placeable at high elevations"). `px/py/pz`
+are Q16.16 in an `i32`, which holds ±32,768 cells, and the default map spans
+±100,352 — the owner's mountain was at z = −69,497 (it read as altitude; y was
+19,832 and fine). `p.px >> 16` landed 65,536 cells away, out of residency, so
+every particle there was alive, counted and frozen, never drawn. Nothing is
+widened: positions are stored modulo 2^32 (2^16 cells), additions wrap (WGSL's
+concrete `i32` arithmetic and C++20's `<<` both do), every difference of two
+positions (the node offsets, a ghost's target) is exact while the true distance
+is under 32,768 cells, and the ONE lossy operation — position → cell — goes
+through `fpUnwrapCell`, which takes the copy nearest the residency window's
+centre (`sim_fluid.wgsl` / `sim_fluid_seam.wgsl` `fpRefCell`/`fpCellOf`;
+`axisOf` unwraps its node base the same way; droplets leave as unwrapped 24.8
+through `fpTo248`; `debris.wgsl vsFluid` unwraps against the camera). Where a
+position already fitted, the unwrapped cell IS `p >> 16`, so nothing near the
+origin moves. CPU writers: `(x << 16)` spawn writers wrap by C++20; the
+container pours go through `container.cpp Q16Pos` (64-bit, because MSVC's
+`lround` returns a 32-bit `long` and came back garbage past 32,767 cells).
+Repro harness: `SANDVOX_AT_POUR=x,y,z,r,material,ticks[,after[,vx,vz]]` with
+`--at` (session.cpp, the mpm tool's own pour).
+
+**THE SPOUT JET** (2026-10-18; owner-approved ticket 2026-10-17_11-44-48, "falling
+water has a bit of horizontal magnitude when it comes from a spout"). Excite
+seeded every cell at rest, so water the FALL trigger took over a lip slid
+straight down the face it came out of. Now `exciteDetect` gives a
+`sim.fluidSpoutChance` share of FALL cells a jet: direction AWAY from the
+lateral neighbours holding the same liquid at the cell's row or the row above
+(a tie between axes is hashed; a net of zero — water on both sides, a hole dug
+under a pond — throws nothing), magnitude `sim.fluidSpoutGain × sqrt(2 g h)`
+(Torricelli) for the head h of that water, found by climbing up through it and,
+where stone roofs it (a hole in a tank wall), one cell further upstream at a
+time, ≤ 16 steps. The code rides the cell's excite nibble: a fall cell's depth
+is always 0 (trigger (a) requires the free surface), so bit 23 marks a jet and
+bits 20..22 carry direction + strength (h ≥ 4); a shell cell's depth is capped
+at 7 to leave the bit free, which changes no J at the shipped tuning (it floors
+at depth 3). `exciteEmit` turns it into the particles' horizontal velocity
+(two strengths, ±1/8 per-particle spread, clamped to `FLUID_VMAX`). Only
+velocity: no cell is excited that was not already being excited, so held water
+at rest (refused above it) is never thrown and `held-splash` / `rivers` /
+`stream-natural` cannot see it; the energy is the head the water falls from.
+Both knobs are `NO_WGSL`, packed by `SubmitTick` into `TickParams._padSplash1`
+(no layout or prelude change; F1-live). Gate `fluid-spout`: a reservoir behind
+a dam pours through a 3×1 hole into a 13-deep pit; the shipped arm's falling
+water must sit `fluidSpout.minGain` cells farther from the dam than the
+gain-0 control's, and run twice to the same hash.
+
 **The fluid lab (2026-08-24; `src/lab/`, docs/PLAN_fluid_overhaul.md §4).**
 The dedicated place fluid is looked at, tuned and benchmarked. `--lab
 [basin|hill|faucet|pool|slosh]` runs the windowed game on a flat-slab world:

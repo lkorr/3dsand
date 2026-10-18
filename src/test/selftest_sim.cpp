@@ -2632,9 +2632,9 @@ Status GateFluidOnWater(Ctx& c, std::string& detail) {
 // THE ASSERTION IS A DIFFERENTIAL: the same pour with the knob at 0 (the
 // control: every fall excite at rest, so the stream slides down the dam's
 // face) and at the shipped tuning, on this build. The measure is where the
-// falling water IS in the lower half of the fall: the mean distance, in
-// cells, of live particles in that band from the dam's outer face, summed
-// over the whole run. The shipped arm must be at least
+// falling water IS low in its fall, over the pool it fills: the mean
+// distance, in cells, of live particles still FALLING in that band from the
+// dam's outer face, summed over the whole run. The shipped arm must be at least
 // `fluidSpout.minGain` cells farther out than the control. Both arms must
 // actually pour (`fluidSpout.minSamples` particle-samples in the band), and
 // the shipped arm runs twice: equal world hashes (rule 1).
@@ -2667,8 +2667,14 @@ Status GateFluidSpout(Ctx& c, std::string& detail) {
   const int kTicks = (int)BaselineNumber("fluidSpout.ticks", 150);
   const double minGain = BaselineNumber("fluidSpout.minGain", 1.0);
   const double minSamples = BaselineNumber("fluidSpout.minSamples", 200);
-  // The band: the lower half of the fall, over the pit floor.
-  const int bandLo = bedY + 1, bandHi = bedY + 6;
+  // The band: the lower part of the FALL, over the pool the pit collects
+  // (the reservoir fills it ~5 deep, so a band on the floor measured the
+  // pool's spread, not the stream: control 4.8 cells there). Only particles
+  // still falling (vy below -minFallVy cells/tick) count.
+  const int bandLo = bedY + (int)BaselineNumber("fluidSpout.bandAboveBed", 7);
+  const int bandHi = shelfY - (int)BaselineNumber("fluidSpout.bandBelowShelf", 1);
+  const int32_t fallVy =
+      -(int32_t)(BaselineNumber("fluidSpout.minFallVy", 0.5) * 65536.0);
   const double faceX = (double)(damX + 1);   // the dam's outer face
 
   std::vector<CellOp> box;
@@ -2721,7 +2727,7 @@ Status GateFluidSpout(Ctx& c, std::string& detail) {
         const uint32_t* p = &pbuf[(size_t)k * kFluidParticleWords];
         if ((p[18] & 0xFFFu) != waterId || ((p[18] >> 12) & 0x7u) == 0u) continue;
         const int y = (int)((int32_t)p[1] >> 16);
-        if (y < bandLo || y > bandHi) continue;
+        if (y < bandLo || y > bandHi || (int32_t)p[4] > fallVy) continue;
         const double x = (double)(int32_t)p[0] / 65536.0;
         if (x < faceX) continue;   // not in the pit
         distSum += x - faceX;
