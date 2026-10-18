@@ -968,6 +968,97 @@ fn seamLateral(d : u32) -> vec3<i32> {
   return vec3<i32>(0, 0, -1);
 }
 
+// ---- THE SPOUT JET (ticket 2026-10-17_11-44-48) ----------------------------
+//
+// The owner: "falling water has a bit of horizontal magnitude when it comes
+// from a spout, which naturally will have a high pressure/current". Water the
+// FALL trigger (a) takes is a cell that has just gone over a lip -- air under
+// it, its own water beside it -- and every excite seeded it AT REST, so it
+// slid straight down the wall it came out of. Now a `sim.fluidSpoutChance`
+// share of those cells leaves with a horizontal velocity AWAY from that water,
+// `sim.fluidSpoutGain` x sqrt(2 g h) (Torricelli), h the head of the water
+// standing behind the lip, and arcs out as particles do.
+//
+// WHERE THE NUMBERS COME FROM, all in detect (it reads only bits 0..17 of
+// other cells, so the walk is race-free; emit could not read a neighbour,
+// which may be turning to air under it in another workgroup):
+//   * DIRECTION: each lateral neighbour holding this liquid at the cell's row
+//     OR THE ROW ABOVE (water that came over a lip diagonally has the wall
+//     beside it and its source one row up) pushes the cell away from it. The
+//     net picks one of four axis directions; a tie between the axes takes a
+//     hashed one; a net of zero (water on both sides: a hole dug under a
+//     pond) throws nothing -- that is a drain, not a spout.
+//   * HEAD: from that water, climb UP while the cell above is this liquid and
+//     otherwise step one cell further UPSTREAM if that is this liquid (a hole
+//     in a tank wall has stone over its throat and the reservoir behind it),
+//     at most SPOUT_CLIMB steps. h = how far over the lip's row it got, + 1.
+//   * The roll is hash3 on the cell's slot index with its own salt, as every
+//     seam choice is (state-keyed, rule 1).
+// It is carried to emit in the cell's EXCITE scratch nibble (bits 20..23): a
+// fall cell's depth field is always 0 (trigger (a) requires the free surface,
+// so the depth walk stops at once), so the nibble's top bit marks a JET and
+// the low three carry direction (bits 0..1) and strength (bit 2: h >=
+// SPOUT_STRONG_H). The depth a SHELL cell carries is capped at 7 to leave that
+// bit free; the J it seeds floors at SEAM_JFLOOR by depth 3 at the shipped
+// tuning, so the cap changes nothing there (it would only for a stiffness
+// past ~67,000, over the row's 43,200 bound).
+//
+// BOUNDED, AND IT CANNOT REOPEN THE HELD LOOPS: no particle is added and no
+// cell is excited that was not already being excited -- the jet is the
+// initial velocity of water already on its way down, clamped to FLUID_VMAX,
+// its energy the head it falls from. Held water at rest never reaches this
+// line (heldStill refuses it above), and the knob at 0 is the old seam
+// exactly (`fluid-spout` A/B).
+const SPOUT_JET_BIT : u32 = 8u;
+const SPOUT_CLIMB : i32 = 16;
+const SPOUT_STRONG_H : i32 = 4;
+// sqrt(2 g h) in Q16.16 cells/tick for the two strengths' representative
+// heads (2 and 6 cells), g = sim.fluidGravity in cells/tick^2 (/900: vox/s^2
+// at 30 ticks/s). Const-eval, IEEE-exact; the kernel sees integers.
+const SPOUT_V_WEAK : i32 =
+    i32(round(sqrt(2.0 * (TUNE_FLUID_GRAVITY / 900.0) * 2.0) * 65536.0));
+const SPOUT_V_STRONG : i32 =
+    i32(round(sqrt(2.0 * (TUNE_FLUID_GRAVITY / 900.0) * 6.0) * 65536.0));
+fn spoutChanceQ() -> u32 { return T._padSplash1 & 0xFFFFu; }
+fn spoutGainQ() -> i32 { return i32(T._padSplash1 >> 16u); }
+fn seamIsMat(c : vec3<i32>, mat : u32) -> bool {
+  return cellResident(c, T.origin) && voxMat(voxWordAt(c)) == mat;
+}
+// The jet code for fall cell c of liquid `mat` (SPOUT_JET_BIT | strength << 2
+// | direction), or 0 for no throw. See the block above.
+fn spoutJetCode(c : vec3<i32>, mat : u32) -> u32 {
+  if (spoutChanceQ() == 0u || spoutGainQ() == 0) { return 0u; }
+  let h = pcg(hash3(T.seed, T.tick, cellIndexW(c)) ^ 0x5B0D7E71u);
+  if ((h & 0xFFFFu) >= spoutChanceQ()) { return 0u; }
+  let up = vec3<i32>(0, 1, 0);
+  var push = vec2<i32>(0, 0);
+  for (var d = 0u; d < 4u; d++) {
+    let n = c + seamLateral(d);
+    if (seamIsMat(n, mat) || seamIsMat(n + up, mat)) {
+      push -= seamLateral(d).xz;
+    }
+  }
+  if (push.x == 0 && push.y == 0) { return 0u; }
+  var dir = 0u;   // seamLateral's order: +x, -x, +z, -z
+  let ax = abs(push.x);
+  let az = abs(push.y);
+  let useX = ax > az || (ax == az && (h & 0x10000u) != 0u);
+  if (useX) { dir = select(1u, 0u, push.x > 0); }
+  else { dir = select(3u, 2u, push.y > 0); }
+  // The water it came out of: beside the cell, or one row up.
+  let back = -seamLateral(dir);
+  var u = c + back;
+  if (!seamIsMat(u, mat)) { u = u + up; }
+  if (!seamIsMat(u, mat)) { return 0u; }   // the push was the other axis'
+  for (var k = 0; k < SPOUT_CLIMB; k++) {
+    if (seamIsMat(u + up, mat)) { u = u + up; continue; }
+    if (seamIsMat(u + back, mat)) { u = u + back; continue; }
+    break;
+  }
+  let head = u.y - c.y + 1;
+  return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | dir;
+}
+
 // ---- trigger (d): a SURFACE STANDING PROUD of the water beside it ----------
 //
 // The disturbance trigger the other three structurally cannot see. Drop a
@@ -1404,13 +1495,18 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // J = 1 is exactly the "every drained lake bounces like jelly" the
     // pre-compression exists to stop (plan §7 O-4). It is a PRESSURE seed, not a
     // velocity one, so the settle/excite pair stays strictly dissipative.
+    // Capped at 7, not 15: the nibble's top bit is THE SPOUT JET's flag (see
+    // there -- J floors by depth 3 at the shipped tuning).
     if (byFall || byShell) {
-      for (var d = 1; d <= 15; d++) {
+      for (var d = 1; d <= 7; d++) {
         let a = c + vec3<i32>(0, d, 0);
         if (!cellResident(a, T.origin) || voxMat(voxWordAt(a)) != mat) { break; }
         depth += 1u;
       }
     }
+    // A fall cell's depth is 0 (trigger (a) requires the free surface), so its
+    // nibble carries the jet instead.
+    if (byFall && depth == 0u) { depth = spoutJetCode(c, mat); }
     voxels[idx] = (w & ~EXCITE_SCRATCH_BITS) | EXCITE_PEND_BIT |
                   (depth << EXCITE_DEPTH_SHIFT);
     parts += voxState(w) + 1u;   // this chunk's EX_COUNTS slot; folded below
@@ -1761,7 +1857,16 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     }
     let mat = voxMat(w);
     let fullness = voxState(w) + 1u;
-    let depth = (w >> EXCITE_DEPTH_SHIFT) & 0xFu;
+    // The nibble is a depth (0..7) or, top bit set, THE SPOUT JET's code.
+    let exNib = (w >> EXCITE_DEPTH_SHIFT) & 0xFu;
+    let isJet = (exNib & SPOUT_JET_BIT) != 0u;
+    let depth = select(exNib, 0u, isJet);
+    var jetV = vec2<i32>(0, 0);
+    if (isJet) {
+      let sp = (select(SPOUT_V_WEAK, SPOUT_V_STRONG, (exNib & 4u) != 0u) *
+                (spoutGainQ() >> 4u)) >> 8u;   // Q16.16 x Q12 (<= 2^19 x 2^8)
+      jetV = seamLateral(exNib & 3u).xz * min(sp, FLUID_VMAX);
+    }
     let stainT = voxStainType(w);
     let stainA = voxStainAmt(w);
     // Hydrostatic pre-compression: J shrinks with depth so the reawakened
@@ -1769,7 +1874,9 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     // p2g2 turns (1 - J) into pressure). Without this every drained lake
     // bounces like jelly — plan §7 O-4.
     let j0 = max(FLUID_ONE - i32(depth) * SEAM_HYDRO, SEAM_JFLOOR);
-    // Every excite seeds at REST. The task-book option of seeding wake cells
+    // Every excite seeds at REST but a thrown FALL cell (THE SPOUT JET: water
+    // already going over a lip, its energy the head it falls from -- not the
+    // wake case below). The task-book option of seeding wake cells
     // with the local grid velocity is an energy injection when paired with
     // settle (see the dissipation note in detect); P2G hands the new
     // particles the neighbourhood's momentum on the very next substep, which
@@ -1792,7 +1899,14 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
       p.px = (c.x << 16u) + clamp(ox, 2048, 63488);
       p.py = (c.y << 16u) + clamp(oy, 2048, 63488);
       p.pz = (c.z << 16u) + clamp(oz, 2048, 63488);
-      p.vx = 0; p.vy = 0; p.vz = 0;
+      // At rest, unless THE SPOUT JET threw this cell: then horizontal, each
+      // particle 7/8 .. 9/8 of the cell's speed (a fresh hash of hk, so it
+      // is independent of the lattice jitter) so the stream spreads along its
+      // arc. Zero jetV (every other cell) is the old seed exactly.
+      let jk = 56 + i32(pcg(hk) >> 28u);
+      p.vx = clamp((jetV.x * jk) / 64, -FLUID_VMAX, FLUID_VMAX);
+      p.vy = 0;
+      p.vz = clamp((jetV.y * jk) / 64, -FLUID_VMAX, FLUID_VMAX);
       p.c00 = 0; p.c01 = 0; p.c02 = 0;
       p.c10 = 0; p.c11 = 0; p.c12 = 0;
       p.c20 = 0; p.c21 = 0; p.c22 = 0;
