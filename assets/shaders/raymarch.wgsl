@@ -10957,6 +10957,14 @@ fn rainRipples(pm : vec2f, t : f32, amount : f32, footM : f32) -> vec2f {
 // row is a bank, and its edge is not a slope), added to currentAt by the two
 // surface terms that draw motion (waterWaveNormal's advection and
 // flowFoamLines). Zero on the far field, which has no columns.
+// HELD COLUMNS ONLY (gHeldKind != 0; 2026-10-18, ticket 2026-10-17_00-04-26).
+// Live CA water is moved by the sim, so the measured flow already says where
+// it runs, smoothed over nodes and ticks. Its column gradient is the CA's
+// scattered fullness, re-rolled every tick: read as a current it gave every
+// column of a churned surface its own 0.5..3 m/s in its own direction, and
+// the streaks and foam lines advected by it jumped from column to column
+// every frame (an acid pour that woke the held river around it, at the
+// ticket's camera: 3 m/s across the whole near surface, SEAM_DBG 21).
 var<private> gSlopeFlow : vec2f = vec2f(0.0);
 // The flow a NEAR surface's waterWaveNormal drew with (xz, m/s; y = 1 when
 // set), handed to flowFoamLines on the same hit: the foam lines asked
@@ -11130,7 +11138,8 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   var slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
   // Downhill is where the column heights fall: +x when hx0 > hx1.
-  if (dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, hx0, hx1, hz0, hz1, slope); }
+  // A held column only (RUNNING WATER'S OWN CURRENT): live water has the measured flow.
+  if (gHeldKind != 0u && dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, hx0, hx1, hz0, hz1, slope); }
   // An ADOPTED stream column's wet neighbours are drawn at their played-back
   // heights (THE FROZEN STREAM PLAYS BACK), so the surface tilts by those, as
   // a live partial cell's does by its neighbours' fullness. A map RIVER's

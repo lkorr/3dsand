@@ -25825,10 +25825,20 @@ of its live surface relative to T8, one per 4 ticks; written by
 `sim_stream.wgsl`; -128 = no water, drawn dry), played back at 7.5 samples/s
 from a per-column phase and stepped in whole eighths; with no recording (both
 words 0) a procedural -3..+3 eighth flicker. A map RIVER column (its
-`STILL_MOUTH` word set — worldgen writes it for river water only) takes the
-procedural flicker scaled by its current (none under 0.08 m/s, all of it from
-0.6 m/s), so a slack reach stays glassy; a lake and the sea never flicker
-(ticket 11-37-20's "frozen waterfall" is map river water, not a stream). In fs the ray is re-met against the column's box topped at that height
+`STILL_MOUTH` word set — worldgen writes it for river water only) is NOT
+moved (2026-10-18, ticket 2026-10-17_00-04-26): drawn the stream's way it was a
+surface of flat per-column facets, one normal per column at up to 0.375 of
+slope, an eighth of them re-rolled every frame -- from 6 cm over the water a
+checkerboard of flat quads across the whole river. Its flicker is instead a
+continuous SLOPE field on the normal (`riverFlickerSlope`): the same per-column
+hash and phase, eased in time, quintic-interpolated between column centres so
+height and gradient are both continuous, `RIVER_FLICKER_SLOPE` (0.06, the
+chop's size) times the current's scale (none under 0.08 m/s, all of it from
+0.6 m/s, so a slack reach stays glassy) and faded with the pixel footprint
+like a 0.2 m wave band. A lake and the sea never flicker
+(ticket 11-37-20's "frozen waterfall" is map river water, not a stream).
+`SEAM_DBG 21` shows the near water normal's inputs, one set per screen
+quadrant. For a stream, in fs the ray is re-met against the column's box topped at that height
 (`streamSurfaceHit`): lowered, the ray goes down onto it or out of its side onto
 the next column (drawn as surface); raised, it is met earlier through its top or
 side; dry, the bed shows. `waterNormal` adds the neighbours' drawn offsets to
