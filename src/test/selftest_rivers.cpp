@@ -1692,6 +1692,15 @@ Status GateRivers(Ctx& c, std::string& detail) {
             }
           return k;
         };
+        // The MPM seam's held-water census (sim_fluid_seam.wgsl STILL_DIAG
+        // [8..14]: held water at rest a trigger fired on, by trigger, and the
+        // targets it stood in), read before and after the run: which body's
+        // water the seam's held rule refuses while the stream runs.
+        uint32_t seamDiag0[7] = {}, seamDiag1[7] = {};
+        const uint64_t seamDiagOff = (uint64_t(kWorldN) * kWorldN * 4u + 4u + uint64_t(kWorldN) * kWorldN + 8u) * 4u;
+        c.ctx.WaitIdle();
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), seamDiagOff, seamDiag0,
+                              sizeof seamDiag0, "riversSeamDiag");
         sandvox::support::TickOps byLining;
         byLining.cells = byWalls;
         tick(byLining);
@@ -1762,6 +1771,14 @@ Status GateRivers(Ctx& c, std::string& detail) {
                     "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s%s; after the plug tick:wet/adopted%s)\n",
                     sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
                     flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), runWho.c_str(), curve2.c_str());
+        c.ctx.WaitIdle();
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), seamDiagOff, seamDiag1,
+                              sizeof seamDiag1, "riversSeamDiag");
+        std::printf("rivers:   S held water at rest a trigger fired on (eighths): fall %u perch %u step %u shell %u wake %u; "
+                    "targets T8 %u..%u (the lake's %d, main's %d)\n",
+                    seamDiag1[0] - seamDiag0[0], seamDiag1[1] - seamDiag0[1], seamDiag1[2] - seamDiag0[2],
+                    seamDiag1[3] - seamDiag0[3], seamDiag1[4] - seamDiag0[4], 0x7FFFFFFFu - seamDiag1[5], seamDiag1[6],
+                    8 * lakeLevel + 8, 8 * topM + 8);
         RecordObserved("rivers.observedStreamAdopted", std::to_string(adopted));
         if (!sOk)
           problems.push_back(Format("S: channel %d cols, %d wet, %d adopted, %d awake, %d released while running; after plug "

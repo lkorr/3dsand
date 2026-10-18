@@ -2315,7 +2315,7 @@ PASS(copy_fluidConsumeArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 88,0,12, G
 PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) R(FluidBlockMap)
           A(FluidCellScratch) A(FluidArgsStage) A(FluidExciteScratch)
-          I(FluidPDispatchArgs) R(PageTable)))
+          I(FluidPDispatchArgs) R(PageTable) R(Voxels) R(StillWater)))
 // read-only in practice on FluidBlockMap: read_write for the module (stainApply
 // writes the Y-occupancy mask); the wake probe only reads the index half.
 // C_CAACTIVE: detect runs over THIS tick's compacted dirty list; when the CA
@@ -2335,7 +2335,7 @@ PASS(seam_excite_detect, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_DETECT, K_
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) R(DirtyList)
           R(FluidBlockMap) R(FluidGrid) A(FluidExciteScratch)
           A(FluidArgsStage) A(WaterBodyState) I(DispatchArgs)
-          R(SolTable) A(SolPool) A(SolMeta)))
+          R(SolTable) A(SolPool) A(SolMeta) A(StillWater)))
 PASS(seam_excite_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) A(FluidExciteScratch) A(FluidArgsStage)))
 // The emit dispatch is list-shaped (one workgroup per candidate slot):

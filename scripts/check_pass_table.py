@@ -617,7 +617,11 @@ _FLUID_SEAM_GROUP1 = {"fluidSrc", "fluidParticles", "fluidSpawnOps",
                       "fluidMirror",
                       # The solute layer, bindings 14..17 (docs/PLAN_solutes.md):
                       # exciteDetect refuses a solute-carrying cell.
-                      "solTable", "solPool", "solMeta", "solSpec"}
+                      "solTable", "solPool", "solMeta", "solSpec",
+                      # The still-water table, binding 18: held water is not
+                      # excited and absorbs its own particles; binding 19 the
+                      # same buffer as atomics (the excite census).
+                      "stillWater", "stillLedger"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,

@@ -4543,6 +4543,17 @@ fn ledgerNote(dep : u32, wd : u32) {
   if (dep != 0u) { atomicAdd(&stillLedger[STILL_LEDGER + 2u], dep); }
   if (wd != 0u) { atomicAdd(&stillLedger[STILL_LEDGER + 3u], wd); }
 }
+// DIAGNOSTIC, never read by the sim (CLAUDE.md rule 6): sixteen CUMULATIVE
+// words after the STILL_MOUTH region (simulation.cpp sizes the buffer for
+// them; a dense worldgen Fill clears them with the table): [0] GIVE, [1]
+// TAKE, [2] GROW, the eighths the reservoir wrote (non-POOL and POOL alike);
+// [3..14] the MPM seam's excite census (sim_fluid_seam.wgsl writes them
+// through its own alias of this buffer); [15] spare. `held-splash` and
+// `rivers` S read them.
+const STILL_DIAG : u32 = WORLD_N * WORLD_N * STILL_WORDS + 4u + WORLD_N * WORLD_N;
+fn stillNote(want : u32, eighths : u32) {
+  if (eighths != 0u) { atomicAdd(&stillLedger[STILL_DIAG + want - 1u], eighths); }
+}
 // Is the held record of column (x, z) a POOL stream's? Asked only of a column
 // stillLevel8 found held (its tag already matched).
 fn stillPool(x : i32, z : i32) -> bool {
@@ -4629,6 +4640,31 @@ fn heldRest(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   if (t8 == STILL_UNHELD) { return HELD_NO; }
   let pool = stillPool(c.x, c.z);
   if (8 * c.y + i32(f) <= t8) { return select(HELD_REST, HELD_REST_POOL, pool); }
+  // THE TOP CELL OVER ITS TARGET IS AT REST TOO (bug 2026-10-17_11-21-36).
+  // A map column's top cell (the target's, y = (T8 - 1) >> 3) holding more
+  // than its target was NOT at rest, so stages 2-3 moved it as any water: a
+  // split into air takes HALF the cell, an equalize half the difference, a
+  // diagonal descent all it fits -- the excess AND the held eighths under it.
+  // The cell fell under its target, stage 0 refilled it from the reservoir,
+  // and the water it moved stood over the next column's target: the same
+  // again, one column on. On a ramp there is always a lower neighbour, so
+  // stage 5's GIVE was rarely reached and the excess ran down the river as a
+  // CONVEYOR the reservoir fed at every step. MEASURED, `held-splash` C (a
+  // radius-5 blast at a held river's surface, no particle involved at all):
+  // TAKE 12.5k / GROW 5.8k / GIVE 1.9k eighths in the first 100 ticks, then
+  // ~5k / 3.5k / 6k every 100 ticks for good, 49 chunks awake; A (a dropped
+  // block of water) the same. At rest, it pours into no held column at or
+  // over ITS target (heldBlocks) -- still into a crater and into a column
+  // that is not held -- so its excess stands until stage 5 gives it back, an
+  // eighth a roll, as THE CONDUIT's CAPPED head waits below. Water over the
+  // top cell (dy > 0) holds no held eighths: it still runs across the held
+  // surface, and wherever it lands it is a top cell's excess. (An unrolled
+  // stage-0 trim of the excess ended the conveyor as well, measured first;
+  // held at rest instead, the excess leaves at the reservoir's own GIVE pace,
+  // as it always did, and a map surface is not an instant sink for whatever
+  // lands on it.) The MAP's water only (the still record's word [1]): a stream's column is
+  // sim_stream.wgsl's to judge.
+  if (!pool && c.y == ((t8 - 1) >> 3u) && stillWater[stillIndex(c.x, c.z) + 1u] != 0u) { return HELD_REST; }
   // THE CONDUIT, CAPPED: a POOL column over its target while the ledger is
   // full is AT REST too -- the head waits (its excess stands in it, the
   // source stops pouring once level with it) instead of running down the
@@ -4783,19 +4819,22 @@ fn stillReservoir(c : vec3<i32>, mat : u32, f : u32, want : u32, pool : bool) ->
       else { voxStore(iw.x, packVoxKeepStain(mat, keep - 1u, stamp, iw.y)); }
       atomicAdd(&stillLedger[STILL_LEDGER], f - keep);
       ledgerNote(f - keep, 0u);
-    } else if (f <= 1u) { voxStore(iw.x, 0u); }
-    else { voxStore(iw.x, packVoxKeepStain(mat, f - 2u, stamp, iw.y)); }
+      stillNote(want, f - keep);
+    } else if (f <= 1u) { voxStore(iw.x, 0u); stillNote(want, 1u); }
+    else { voxStore(iw.x, packVoxKeepStain(mat, f - 2u, stamp, iw.y)); stillNote(want, 1u); }
   } else if (want == STILL_TAKE) {
     let t8 = stillLevel8(c.x, c.z, mat);
     let yt = (t8 - 1) >> 3u;
     let full = select(8u, u32(t8 - 8 * yt), c.y == yt);
     voxStore(iw.x, packVoxKeepStain(mat, full - 1u, stamp, iw.y));
     if (pool) { atomicSub(&stillLedger[STILL_LEDGER], full - f); ledgerNote(0u, full - f); }
+    stillNote(want, full - f);
   } else {
     let ai = voxWordIndex(c + vec3<i32>(0, 1, 0));
     voxStore(ai, packVoxKeepStain(mat, 0u, stamp, 0u));
     markVoxActive(ai);
     if (pool) { atomicSub(&stillLedger[STILL_LEDGER], 1u); ledgerNote(0u, 1u); }
+    stillNote(want, 1u);
   }
   markVoxActive(iw.x);
   markDirtyR(c, DIRTY_R_MOVE | DIRTY_R_WATERBODY);
