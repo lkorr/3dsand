@@ -130,6 +130,9 @@ fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
   if (d.z != 0) { atomicAdd(&flowMeasAcc[s + 1u], d.z * q); }
   atomicMax(&flowMeasAcc[s + 2u], src.y + FLOWM_Y_BIAS);
   atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - src.y);
+  if (d.y != 0) { return; }
+  let up = src + vec3<i32>(0, 1, 0);
+  if (!inBounds(up) || voxMat(voxWordAt(up)) == MAT_AIR) { return; }
   let g = i32(eighths) * i32(eighths);
   let yc = clamp(src.y - (T.origin.y * i32(CHUNK) + 256), -256, 255);
   atomicAdd(&flowMeasAcc[s + 4u], g);

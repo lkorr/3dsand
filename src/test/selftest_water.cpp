@@ -4000,6 +4000,15 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
   Simulation& sim = c.sim;
+  // THE GAME AS IT SHIPS (owner 2026-10-18: MLS-MPM water is off and may be
+  // scrapped; b7260e94 starts play with sim.fluidEnabled 0): every flood here
+  // is the CA's alone. flowMeasure.fluidEnabled 1 re-runs it with MPM.
+  const Tuning savedTune = CurrentTuning();
+  {
+    Tuning t = savedTune;
+    t.sim.fluidEnabled = (int)BaselineNumber("flowMeasure.fluidEnabled", 0.0);
+    SetCurrentTuning(t);
+  }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
@@ -4020,23 +4029,39 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   // nothing, and the first support-loss scan after the breach (the dam's cut
   // cells) turned the whole box into a debris body and poured the reservoir
   // out (the first run: "island of 4711 voxels -> 1 body shard").
-  auto addBox = [&](int bx, int bz, int deep, int rowLo, int rowHi) {
+  // dam = false: no dam and no gap, the whole box `deep` full (a pool).
+  // chamber > 0 (with dam = false): an air room under the floor, chamber
+  // cells round (bx, bz) and floorY - 10 .. floorY - 2, and the breach is a
+  // kGap x kGap hole through the floor's top two rows into it (claim F).
+  auto addBox = [&](int bx, int bz, int deep, int rowLo, int rowHi, bool dam = true,
+                    int chamber = 0) {
     const int ax0 = bx - kHalfX, ax1 = bx + kHalfX, az0 = bz - kHalfZ, az1 = bz + kHalfZ;
     const int bfy = FixtureYOver(ax0 - 1, az0 - 1, ax1 + 1, az1 + 1, kDefaultSeed, 1);
     const int top = bfy + deep + 3;
     for (int z = az0 - 1; z <= az1 + 1; z++)
       for (int x = ax0 - 1; x <= ax1 + 1; x++)
         for (int y = bfy - 12; y <= top + 6; y++) {
-          const bool wall = x < ax0 || x > ax1 || z < az0 || z > az1 || x == bx;
-          const bool solid = (y <= top && wall) || y <= bfy;
+          const bool wall = x < ax0 || x > ax1 || z < az0 || z > az1 || (dam && x == bx);
+          bool solid = (y <= top && wall) || y <= bfy;
+          if (chamber > 0 && std::abs(x - bx) <= chamber && std::abs(z - bz) <= chamber &&
+              y >= bfy - 10 && y <= bfy - 2)
+            solid = false;
           build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
-          if (x >= ax0 && x < bx && z >= az0 && z <= az1 && y >= bfy + 1 && y <= bfy + deep)
+          if (x >= ax0 && (x < bx || !dam) && z >= az0 && z <= az1 && y >= bfy + 1 &&
+              y <= bfy + deep)
             fill.push_back({World::SlotCellIndex({x, y, z}), PackVoxNew(kMatWater, 7u)});
         }
     const int gz0 = bz - kGap / 2, gz1 = gz0 + kGap - 1;
-    for (int z = gz0; z <= gz1; z++)
-      for (int y = bfy + rowLo; y <= std::min(bfy + rowHi, top); y++)
-        breach.push_back({World::SlotCellIndex({bx, y, z}), 0u});
+    if (dam) {
+      for (int z = gz0; z <= gz1; z++)
+        for (int y = bfy + rowLo; y <= std::min(bfy + rowHi, top); y++)
+          breach.push_back({World::SlotCellIndex({bx, y, z}), 0u});
+    } else if (chamber > 0) {
+      for (int z = gz0; z <= gz1; z++)
+        for (int x = bx - kGap / 2; x < bx - kGap / 2 + kGap; x++)
+          for (int y = bfy - 1; y <= bfy; y++)
+            breach.push_back({World::SlotCellIndex({x, y, z}), 0u});
+    }
     return bfy;
   };
   // Box 1: the full-height breach (claims Q G V K W D R C).
@@ -4051,6 +4076,17 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const int kSubHi = (int)BaselineNumber("flowMeasure.subHi", 6);
   const int cx2 = cx, cz2 = cz + (int)BaselineNumber("flowMeasure.subDz", 96);
   const int fy2 = addBox(cx2, cz2, kDeep2, kSubLo, kSubHi);
+  // Box 3 (ticket 2026-10-18_15-21-34 shot 2: "an explosion under water makes
+  // every arrow round it point one way"): a still pool, kDeep2 deep, and at
+  // the breach tick a blast at its middle, mid-depth. Claim X.
+  const int cx3 = cx, cz3 = cz - (int)BaselineNumber("flowMeasure.subDz", 96);
+  const int fy3 = addBox(cx3, cz3, kDeep2, 0, 0, false);
+  // Box 4 (the same ticket, shot 1: "a giant hole in the ground underwater
+  // ... pointing directly to the side instead of down"): a pool over an air
+  // room, and at the breach tick a kGap x kGap hole through its floor.
+  // Claim F.
+  const int cx4 = cx - (int)BaselineNumber("flowMeasure.holeDx", 128), cz4 = cz;
+  const int fy4 = addBox(cx4, cz4, kDeep2, 0, 0, false, 9);
 
   const int kBreachAt = (int)BaselineNumber("flowMeasure.breachAt", 90);
   const int kAt = (int)BaselineNumber("flowMeasure.at", 45);
@@ -4185,7 +4221,7 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   // kFlowMeasVertOffset), decoded, with the node's band: what the reader
   // turned into vy, so an S failure names the cause (where the fold put the
   // pulling water, and whether it called it submerged).
-  auto vertNode = [&](float x, float z) {
+  auto vertNodeAt = [&](float x, float z, int ox, int fyRef) {
     const int n = (int)grid[2];
     if (n == 0) return std::string("no grid");
     const int ix = (int)std::lround((x - (float)(int32_t)grid[0]) / (float)kFlowStep);
@@ -4194,9 +4230,94 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     const size_t node = (size_t)iz * n + ix;
     const uint32_t b = grid[kFlowHeaderWords + 2 * node + 1];
     const uint32_t w = grid[kFlowMeasVertOffset + node];
-    return Format("x%+d: H %d HW %u D %u on %u band %d..%d", (int)std::lround(x) - cx2,
-                  (int)(int16_t)(w & 0xFFFFu) - fy2, (w >> 16) & 63u, ((w >> 22) & 63u) * 2u, w >> 28,
-                  (int)(int16_t)(b >> 16) - fy2, (int)(int16_t)(b & 0xFFFFu) - fy2);
+    return Format("x%+d: H %d HW %u D %u on %u band %d..%d", (int)std::lround(x) - ox,
+                  (int)(int16_t)(w & 0xFFFFu) - fyRef, (w >> 16) & 63u, ((w >> 22) & 63u) * 2u, w >> 28,
+                  (int)(int16_t)(b >> 16) - fyRef, (int)(int16_t)(b & 0xFFFFu) - fyRef);
+  };
+  auto vertNode = [&](float x, float z) { return vertNodeAt(x, z, cx2, fy2); };
+  // X (box 3, the blast) and F (box 4, the floor hole): a ring of 8 points
+  // round a centre, per point the angle between the published horizontal
+  // current and the direction to the centre (0 = inward) at its speed, the
+  // counts inward (<= 60 deg) / outward (>= 120 deg) of the points moving at
+  // >= pullSpeed, how UNIFORM their directions are (the length of the mean of
+  // their unit vectors: 1 = every point the same way, the bug shot 2 shows;
+  // a radial field reads ~0), and how many are pulled down (vy <= -vertMin).
+  struct Radial {
+    int inward = 0, outward = 0, moving = 0, down = 0;
+    float uniform = 0.0f, meanSpd = 0.0f, meanVy = 0.0f;
+    std::string angles;
+  };
+  auto radial = [&](Vec3 ctr, float r, float y) {
+    Radial st;
+    float ux = 0.0f, uz = 0.0f;
+    for (int k = 0; k < 8; k++) {
+      const double a = 6.28318530717959 * (k + 0.5) / 8.0;
+      const Vec3 p{ctr.x + (float)(r * std::cos(a)), y, ctr.z + (float)(r * std::sin(a))};
+      const Vec3 v = at(p);
+      const float sp = speed(v);
+      const float ix = ctr.x - p.x, iz = ctr.z - p.z, il = std::sqrt(ix * ix + iz * iz);
+      float ang = -1.0f;
+      if (sp >= pullSpeed && il > 0.0f) {
+        st.moving++;
+        ang = std::acos(std::clamp((v.x * ix + v.z * iz) / (sp * il), -1.0f, 1.0f)) * 57.2957795f;
+        if (ang <= 60.0f) st.inward++;
+        if (ang >= 120.0f) st.outward++;
+        ux += v.x / sp;
+        uz += v.z / sp;
+      }
+      if (v.y <= -vertMin) st.down++;
+      st.meanSpd += sp / 8.0f;
+      st.meanVy += v.y / 8.0f;
+      st.angles += Format("%s%.0f@%.1f/%.1f", k ? " " : "", ang, sp, v.y);
+    }
+    st.uniform = st.moving ? std::sqrt(ux * ux + uz * uz) / (float)st.moving : 0.0f;
+    return st;
+  };
+  auto radialStr = [&](const char* name, const Radial& st) {
+    return Format("%s in %d out %d of %d moving, uniform %.2f, mean %.2f vy %.2f, down %d [%s]", name,
+                  st.inward, st.outward, st.moving, st.uniform, st.meanSpd, st.meanVy, st.down,
+                  st.angles.c_str());
+  };
+  const int kBlastR = (int)BaselineNumber("flowMeasure.blastR", 5);
+  const int kBlastPower = (int)BaselineNumber("flowMeasure.blastPower", 256);
+  const float blastRing = (float)BaselineNumber("flowMeasure.blastRing", 12.0);
+  const int blastMin = (int)BaselineNumber("flowMeasure.blastMin", 6);
+  const double blastUniform = BaselineNumber("flowMeasure.blastUniform", 0.5);
+  const int blastAt = (int)BaselineNumber("flowMeasure.blastAt", 15);
+  const Vec3 blastP{(float)cx3 + 0.5f, (float)(fy3 + kDeep2 / 2) + 0.5f, (float)cz3 + 0.5f};
+  Radial blastQuiet, blastSt;
+  std::string blastTrace;
+  const float holeRing = (float)BaselineNumber("flowMeasure.holeRing", 8.0);
+  const Vec3 holeP{(float)cx4, (float)fy4 + 1.0f, (float)cz4};
+  Radial holeFloor, holeTop;
+  Vec3 holeMid{0, 0, 0};
+  std::string holeNodes, holeTrace;
+  // A (ticket 2026-10-18_15-27-30: "pointing a bit off to the side of the
+  // breach"): the near ring's worst heading error at +at, degrees.
+  const double aimMax = BaselineNumber("flowMeasure.aimMax", 180.0);
+  float nearWorst = 0.0f;
+  // THE NODE MAP round box 1's gap at +at: the published node words
+  // themselves (not the bilinear sample), heading in degrees (0 = east, +90 =
+  // +z) @ cells/s, rows of z, columns of x -- where along the dam the field
+  // turns, and whether the bins that straddle the dam read the flood beyond it.
+  std::string nodeMap;
+  auto nodeMapAt = [&](int ox, int oz) {
+    std::string m;
+    const int n = (int)grid[2];
+    if (n == 0) return std::string("no grid");
+    for (int dz = -16; dz <= 16; dz += 8) {
+      m += Format("%sz%+d:", dz == -16 ? "" : " /", dz);
+      for (int dx = -24; dx <= 16; dx += 8) {
+        const int ix = (ox + dx - (int)(int32_t)grid[0]) / (int)kFlowStep;
+        const int iz = (oz + dz - (int)(int32_t)grid[1]) / (int)kFlowStep;
+        if (ix < 0 || iz < 0 || ix >= n || iz >= n) { m += " off"; continue; }
+        const uint32_t w = grid[kFlowHeaderWords + 2 * ((size_t)iz * n + ix)];
+        const float vx = (float)(int16_t)(w & 0xFFFFu) / (float)kFlowVelQ;
+        const float vz = (float)(int16_t)(w >> 16) / (float)kFlowVelQ;
+        m += Format(" %.0f@%.1f", std::atan2(vz, vx) * 57.2957795f, std::sqrt(vx * vx + vz * vz));
+      }
+    }
+    return m;
   };
   std::string subNodes;
   float subPeak = 0.0f, subPeakY = 0.0f;
@@ -4248,10 +4369,10 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       byPrev[k] = ex[k];
     }
   };
-  // The box is ~120k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
+  // The boxes are ~420k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
   // the rest are REFUSED, not queued (the first run built half a box and its
   // reservoir leaked out of the open side; last_run.json opstream.cellTrunc).
-  // So the build goes in over consecutive ticks, then the fill.
+  // So the build goes in over consecutive ticks, then the fill (~92k) likewise.
   const size_t kPerTick = kMaxCellOpsPerTick;
   const int buildTicks = (int)((build.size() + kPerTick - 1) / kPerTick);
   const int fillAt = buildTicks + 1;
@@ -4260,9 +4381,41 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     if (i < buildTicks)
       o.cells.assign(build.begin() + (size_t)i * kPerTick,
                      build.begin() + std::min(build.size(), (size_t)(i + 1) * kPerTick));
-    if (i == fillAt) o.cells = fill;
-    if (i == kBreachAt) o.cells = breach;
+    if (i >= fillAt && (size_t)(i - fillAt) * kPerTick < fill.size())
+      o.cells.assign(fill.begin() + (size_t)(i - fillAt) * kPerTick,
+                     fill.begin() + std::min(fill.size(), (size_t)(i - fillAt + 1) * kPerTick));
+    if (i == kBreachAt) {
+      o.cells = breach;
+      o.exps.push_back(ExplosionOp{(int32_t)blastP.x, (int32_t)blastP.y, (int32_t)blastP.z, kBlastR,
+                                   kBlastPower, 0, 0, 0});
+    }
     ticker(o);
+    if (i == kBreachAt - 1) {
+      readGrid();
+      blastQuiet = radial(blastP, blastRing, blastP.y);
+    }
+    if (i == kBreachAt + 5 || i == kBreachAt + blastAt || i == kBreachAt + kAt ||
+        i == kBreachAt + 120) {
+      readGrid();
+      const Radial b = radial(blastP, blastRing, blastP.y);
+      if (i == kBreachAt + blastAt) blastSt = b;
+      blastTrace += Format("%s+%d: %s", blastTrace.empty() ? "" : "; ", i - kBreachAt,
+                           radialStr("", b).c_str());
+      const Radial hf = radial(holeP, holeRing, (float)fy4 + 2.5f);
+      const Radial ht = radial(holeP, holeRing, (float)(fy4 + kDeep2) - 1.5f);
+      const Vec3 hm = at({holeP.x, (float)fy4 + 0.5f * (float)kDeep2, holeP.z});
+      holeTrace += Format("%s+%d: centre (%.2f, %.2f, %.2f); %s; %s", holeTrace.empty() ? "" : " || ",
+                          i - kBreachAt, hm.x, hm.y, hm.z, radialStr("floor ring", hf).c_str(),
+                          radialStr("top ring", ht).c_str());
+      if (i == kBreachAt + kAt) {
+        holeFloor = hf;
+        holeTop = ht;
+        holeMid = hm;
+        for (int dx : {-8, 0, 8})
+          holeNodes += (holeNodes.empty() ? "" : "; ") +
+                       vertNodeAt((float)(cx4 + dx), (float)cz4, cx4, fy4);
+      }
+    }
     if (i == kBreachAt - 1) {
       readGrid();
       quietGap = speed(at(gapP));
@@ -4275,8 +4428,12 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       ringPull(pulled, ringMean);
       carryGap = carry(gapP);
       carryPulled = carryRing();
-      for (size_t k = 0; k < ring.size(); k++)
-        ringAngles += Format("%s%.0f", k ? "/" : "", angleTo(at(ring[k]), ring[k]));
+      nodeMap = nodeMapAt(cx, cz);
+      for (size_t k = 0; k < ring.size(); k++) {
+        const float a = angleTo(at(ring[k]), ring[k]);
+        nearWorst = std::max(nearWorst, a);
+        ringAngles += Format("%s%.0f", k ? "/" : "", a);
+      }
       for (size_t k = 0; k < farRing.size(); k++) {
         const Vec3 v = at(farRing[k]);
         const float a = angleTo(v, farRing[k]);
@@ -4383,6 +4540,19 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   if (subPeak <= 0.0f || subEnd > relaxMax * subPeak)
     fails.push_back(Format("S-R: the submerged breach's current still %.2f cells/s after %d ticks, peak %.2f "
                            "(allow %.0f%%)", subEnd, kSettle, subPeak, relaxMax * 100.0));
+  if (blastSt.moving < blastMin || std::max(blastSt.inward, blastSt.outward) < blastMin ||
+      blastSt.uniform > blastUniform)
+    fails.push_back(Format("X: round the underwater blast at +%d %d of 8 ring points move, %d inward / %d "
+                           "outward (need %d one way), uniform %.2f (need <= %.2f)", blastAt,
+                           blastSt.moving, blastSt.inward, blastSt.outward, blastMin, blastSt.uniform,
+                           blastUniform));
+  if (holeFloor.inward < pullMin || holeTop.down < pullMin)
+    fails.push_back(Format("F: by the floor hole %d of 8 floor-ring points run toward it (need %d), %d of "
+                           "8 top-ring points are pulled down (vy <= -%.1f, need %d)", holeFloor.inward,
+                           pullMin, holeTop.down, vertMin, pullMin));
+  if (nearWorst > aimMax)
+    fails.push_back(Format("A: the near ring's worst heading error off the gap is %.0f deg (need <= %.0f)",
+                           nearWorst, aimMax));
   if (carryA.y > -0.5 * vertMin)
     fails.push_back(Format("Cv: a body above the submerged gap feels vy %.2f (need <= -%.2f)", carryA.y,
                            0.5 * vertMin));
@@ -4415,6 +4585,13 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     RecordObserved("flowMeasure.tailThrownObserved", (double)phase[2].bornThrown);
     detail += " | SPOUT THROWS " + th;
   }
+  detail += " | NODE MAP box 1 at +" + std::to_string(kAt) + " (x-24..x+16 by 8): " + nodeMap;
+  detail += Format(" | X blast r %d power %d, ring %.0f: quiet %s | %s", kBlastR, kBlastPower, blastRing,
+                   radialStr("", blastQuiet).c_str(), blastTrace.c_str());
+  detail += Format(" | F floor hole %dx%d, ring %.0f: centre at +%d (%.2f, %.2f, %.2f); nodes %s | %s", kGap,
+                   kGap, holeRing, kAt, holeMid.x, holeMid.y, holeMid.z, holeNodes.c_str(),
+                   holeTrace.c_str());
+  SetCurrentTuning(savedTune);
   for (const std::string& f : fails) detail = f + "; " + detail;
   const bool ok = fails.empty();
   std::printf("flow-measure: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
