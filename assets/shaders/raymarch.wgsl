@@ -1088,8 +1088,15 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // levels read as distinct greys), the fullness-gradient macro slope x 8 (a
 // one-eighth step reads 0.5), the sim flux's slope x 16. Anything that steps
 // from one column to the next on open water is one of these three.
+// 20 = THE FAR WATER'S BED (2026-10-18, ticket 2026-10-16_11-05-33): a far
+// water pixel's path to the bed as the CASCADE's cells put it / 30 m, the
+// path farWaterBed returned / 30 m (1 = the cap: no bed shows), and its
+// level / 16 + 0.5 where the map's wet bed overruled the cascade's.
+// Everything else black.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
+var<private> gDbgWet : vec2f = vec2f(0.0);
+var<private> gDbgPath : f32 = -1.0;
 var<private> gDbgLayer : f32 = 0.0;
 var<private> gDbgMap : f32 = 0.0;
 // SEAM_DBG 14: per-pixel tap verdicts of shadowSlotRead (valid, found but
@@ -16788,20 +16795,69 @@ fn farSoakedAlbedo(albedo : vec3f, bedMat : u32, liq : u32) -> vec3f {
   let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, shown);
   return mix(soaked, stainCol, shown * TUNE_STAIN_OPACITY);
 }
+// ---- THE WET BED: THE MAP'S TRUE DEPTH (2026-10-18, ticket 2026-10-16_11-05-33)
+// A fluid-topped sub-column's strata word carries its bed (worldgen.wgsl
+// `farmap`, FAR_STRATA_WET): the fluid's depth over the bed in fine voxels and
+// the bed's skin slot. The CASCADE cannot say it. farSurfaceMat's wetTop
+// paints the bed's topmost cell with the fluid wherever the water is too
+// shallow for any cell centre to land in it, so on a ~1 m river at level 4
+// (1.6 m cells) the only water cell IS the bed cell, and the march below took
+// it as a whole cell of water: the bed a cell low (h is in that cell's upper
+// half by construction), the path doubled, and at the grazing angles level 4
+// is seen at (path ~ 9x depth) Beer-Lambert took the bed -- the river turned
+// uniform past the level-3 sphere. `y` = the bed's top face (fine voxels),
+// `mat` = its skin (0: the slot did not fit seven bits). ok = false wherever
+// the map does not vouch (not VALID, a dry top, outside the level's box).
+const FAR_STRATA_WET : u32 = 0x40000000u;   // worldgen.wgsl FAR_STRATA_WET
+struct FarWetBed { ok : bool, y : f32, mat : u32, }
+fn farWetBedAt(level : u32, p : vec3f) -> FarWetBed {
+  var r : FarWetBed;
+  r.ok = false;
+  r.y = 0.0;
+  r.mat = 0u;
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let m = vec2<i32>(floor(p.xz / w));
+  let c = m >> vec2<u32>(1u);
+  let b = farBox(level);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return r; }
+  let cell = farMapCell(level, c);
+  let q = farMap[cell];
+  let sv = farMap[FAR_STRATA_VEC + cell];
+  let hx = (m.x & 1) != 0;
+  let hz = (m.y & 1) != 0;
+  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), hz);
+  let st = select(select(sv.x, sv.y, hx), select(sv.z, sv.w, hx), hz);
+  if ((e & FAR_MAP_VALID) == 0u ||
+      (st & (FAR_STRATA_PRESENT | FAR_STRATA_WET)) != FAR_STRATA_WET) { return r; }
+  r.ok = true;
+  r.y = f32(farMapTop(e) + 1 - i32(st & 0xFFFFu));
+  // Only a bed that is ground: a slot naming a fluid would paint the bed
+  // the water's own colour.
+  let bm = farPalMat(&materials, (st >> 16u) & 0x7Fu);
+  let bk = materials[bm].klass;
+  if (bm != 0u && (bk == CLASS_SOLID || bk == CLASS_POWDER)) { r.mat = bm; }
+  return r;
+}
 fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> FarBed {
   var r = farBedDeep();
   let s = f32(1u << farCellShift(level));
   let box = farBox(level);
-  // Vertical depth (the wave law's input).
-  let nV = min(i32(ceil(r.depth / s)), 16);
-  let c0 = vec3<i32>(floor(p / s));
-  for (var i = 1; i <= nV; i++) {
-    let c = c0 - vec3<i32>(0, i, 0);
-    if (!farInValid(c, box)) { break; }
-    let mat = farMatAt(level, c);
-    if (mat == 0u || materials[mat].klass != CLASS_LIQUID) {
-      r.depth = clamp(p.y - f32(c.y + 1) * s, 0.0, r.depth);
-      break;
+  // Vertical depth (the wave law's input): the map's, where it has the bed
+  // (exact, two 16-byte loads); else a walk down the cascade's cells.
+  let wb = farWetBedAt(level, p);
+  if (wb.ok) {
+    r.depth = clamp(p.y - wb.y, 0.0, r.depth);
+  } else {
+    let nV = min(i32(ceil(r.depth / s)), 16);
+    let c0 = vec3<i32>(floor(p / s));
+    for (var i = 1; i <= nV; i++) {
+      let c = c0 - vec3<i32>(0, i, 0);
+      if (!farInValid(c, box)) { break; }
+      let mat = farMatAt(level, c);
+      if (mat == 0u || materials[mat].klass != CLASS_LIQUID) {
+        r.depth = clamp(p.y - f32(c.y + 1) * s, 0.0, r.depth);
+        break;
+      }
     }
   }
   // The path along the ray.
@@ -16817,9 +16873,10 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
     // hole under the water: a refined hit (the surface map draws the water
     // top at the column's exact height) lies inside the AIR cell over the
     // cascade's water, and the march walks out of it first. Air after the
-    // water, or leaving the level: no bed shows this way.
+    // water, or leaving the level: no bed shows this way (but see the wet
+    // bed below).
     if (q == 0u) {
-      if (inWater || (p.y - (p + rd * t).y) > s) { return r; }
+      if (inWater || (p.y - (p + rd * t).y) > s) { break; }
     } else if (q != 1u) {
       hitK = q;
       break;
@@ -16829,13 +16886,44 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
     t0 = t;
     t += max(s, t * 0.25);
   }
-  if (hitK == 0u) { return r; }
-  for (var b = 0; b < 3; b++) {
-    let tm = 0.5 * (t0 + t);
-    let q = farWaterLiquidAt(level, box, p + rd * tm, s);
-    // Air inside the bracket can only be the hit's own air cell (above).
-    if (q <= 1u) { t0 = tm; } else { t = tm; hitK = q; }
+  if (hitK != 0u) {
+    for (var b = 0; b < 3; b++) {
+      let tm = 0.5 * (t0 + t);
+      let q = farWaterLiquidAt(level, box, p + rd * tm, s);
+      // Air inside the bracket can only be the hit's own air cell (above).
+      if (q <= 1u) { t0 = tm; } else { t = tm; hitK = q; }
+    }
   }
+  // THE WET BED OVERRULES A BED THE CASCADE PUT TOO LOW. Where the march
+  // ended (in the bed cell it entered, at the cap, or in air) UNDER the map's
+  // bed of its last water sample's sub-column, it walked through a wetTop
+  // cell or a centre-sampled step deeper than that column: the bed is the
+  // plane at the column's true bed, met from above -- a tread, wearing the
+  // bed's skin. A bed the march met over the map's (a bank's riser above
+  // the bed, a shelf deepening away from the eye) stands as found.
+  let t0c = t0;   // the cascade's bracket, for SEAM_DBG 20
+  let tc1 = t;
+  var wet = false;
+  var bedMat = hitK >> 2u;
+  if (rd.y < 0.0) {
+    let wl = farWetBedAt(level, p + rd * t0);
+    if (wl.ok && p.y + rd.y * t < wl.y) {
+      let tB = max((p.y - wl.y) / -rd.y, 0.0);
+      if (tB < maxV && (wl.mat != 0u || hitK != 0u)) {
+        wet = true;
+        t0 = tB;
+        t = tB;
+        if (wl.mat != 0u) { bedMat = wl.mat; }
+      }
+    }
+  }
+  if (SEAM_DBG == 20u) {
+    // The cascade's own answer, before the overrule: the bed it entered, or
+    // the cap.
+    gDbgWet = vec2f(select(r.path, min(0.5 * (t0c + tc1), maxV), hitK != 0u),
+                    select(0.0, 1.0, wet));
+  }
+  if (hitK == 0u && !wet) { return r; }
   // THE BED IS LIT BY THE FAR TERRAIN'S LAW on the face the ray entered
   // (the last water cell to the bed cell): its face weight, farOpenness and
   // farGiBounce, as a cascade hit on dry ground of that orientation is. A
@@ -16848,10 +16936,12 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
   // cell (a DDA's entry face). It was "y if the bracket crossed a y boundary
   // at all", which called a riser a tread whenever the bracket also clipped a
   // row: 53 % of the shelf's shallow bed pixels read as treads far against
-  // 44 % near (now 37 %; the bracket is three bisections wide).
-  let bm = materials[hitK >> 2u];
+  // 44 % near (now 37 %; the bracket is three bisections wide). A wet bed is
+  // a tread, its cell the one under the plane's point (whose top face the
+  // plane stands for: the cascade's own bed cell under a wetTop cell).
+  let bm = materials[bedMat];
   let ca = vec3<i32>(floor((p + rd * t0) / s));
-  let cb = vec3<i32>(floor((p + rd * t) / s));
+  var cb = vec3<i32>(floor((p + rd * t) / s));
   // Per axis, where the ray crossed into cb's slab (-inf where it did not
   // move on that axis); no dynamic vector index (the by-value register
   // gotcha), so the three are spelled out.
@@ -16860,13 +16950,18 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
   var axis = 1;
   if (tc.x > tc.y && tc.x >= tc.z) { axis = 0; }
   else if (tc.z > tc.y && tc.z > tc.x) { axis = 2; }
+  if (wet) {
+    axis = 1;
+    cb = ca - vec3<i32>(0, 1, 0);
+  }
   let rs = sign(axisPick(rd, axis));
   let nb = axisVec(axis, -rs);
   var face = 1.0;
   if (axis == 0) { face = TUNE_FACE_X; } else if (axis == 2) { face = TUNE_FACE_Z; }
   let ob = farOpenness(nb);
-  let albedo = farSoakedAlbedo(paletteMean(bm), hitK >> 2u, liq);
+  let albedo = farSoakedAlbedo(paletteMean(bm), bedMat, liq);
   r.path = min(0.5 * (t0 + t), maxV);
+  if (SEAM_DBG == 20u) { gDbgPath = r.path; }
   var lam = wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP);
   // THE BED'S SUN IS THE FAR TERRAIN'S (2026-10-13, ticket 2026-10-09_14-23-01,
   // the sea seam): its face's far shadow patch (farShadowCached, the resolve's
@@ -19371,6 +19466,21 @@ fn fs(in : VSOut) -> FSOut {
         gDbg = vec4f(f32(flv) / 8.0, gDbgLayer, gDbgMap, 1.0);
       }
       if (SEAM_DBG == 18u) { gDbg.x = select(select(1.0, 0.75, fFeat), 0.5, fRefined); gDbg.z = f32(flv) / 8.0; }
+      if (SEAM_DBG == 20u) {
+        gDbg = select(vec4f(0.0, 0.0, 0.0, 1.0),
+                      vec4f(min(gDbgWet.x * VOXEL_METERS / 30.0, 1.0),
+                            min(select(gDbgPath, FAR_WATER_PATH_MAX_M / VOXEL_METERS, gDbgPath < 0.0) *
+                                VOXEL_METERS / 30.0, 1.0),
+                            f32(flv) / 16.0 + 0.5 * gDbgWet.y, 1.0),
+                      m.klass == CLASS_LIQUID && gDbgWet.x > 0.0);
+        // Not measured: a far liquid hit (1, 0, level / 16 + 0.5 if it took
+        // the far water shade), anything else far (0, 1, level / 16).
+        if (gDbgWet.x <= 0.0) {
+          gDbg = select(vec4f(0.0, 1.0, f32(flv) / 16.0, 1.0),
+                        vec4f(1.0, 0.0, f32(flv) / 16.0 + select(0.0, 0.5, farWater), 1.0),
+                        m.klass == CLASS_LIQUID);
+        }
+      }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
       // moves any more. The plasma field crawls and pulses over its emission,

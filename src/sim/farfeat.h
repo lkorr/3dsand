@@ -46,9 +46,15 @@ inline uint32_t FarFeatHead(uint32_t w) { return (w >> 23) & 0x7Fu; }
 //   bits  0..4   d1 (1..31)       bits  5..9   d2 (d1..31)
 //   bits 10..16  sub slot         bits 17..23  mid slot      bits 24..30 deep slot
 //   bit  31      PRESENT (0 = no strata: the old rule, the sub-skin all the way)
+// With PRESENT clear, bit 30 (WET) marks a FLUID top's word, which carries its
+// bed instead: bits 0..15 the fluid's depth over the bed in fine voxels, 16..22
+// the bed's skin slot (worldgen.wgsl FAR_STRATA_WET, raymarch farWetBedAt).
 constexpr uint64_t kFarStrataWords = kFarMapWords;
 constexpr uint64_t kFarStrataBase = kFarMapWords + kFarFeatWords;
 constexpr uint32_t kFarStrataPresent = 0x80000000u;
+constexpr uint32_t kFarStrataWet = 0x40000000u;
+// A WET word's bed skin slot (0: it did not fit seven bits).
+inline uint32_t FarStrataWetBed(uint32_t w) { return (w >> 16) & 0x7Fu; }
 inline uint64_t FarStrataWord(uint32_t level, int mx, int mz) {
   return kFarStrataBase + kFarMapWord(level, mx, mz);
 }

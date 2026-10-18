@@ -19417,26 +19417,52 @@ where you hear from either (§12b, "The ears are on the character").
     the far bed is the level's centre-sampled staircase, not the near
     voxels; no traced reflection of the far shore; the waterline is a cell
     top (or the refine's exact column top at levels 1-2).
-  - **A shallow river's bed sinks a cell at level 4 (found 2026-10-16, ticket
-    `2026-10-16_11-05-33`, NOT fixed: the cause is in the sieve).** Seen from
-    93 m up, the river's bed shows through its water out to the level-3 box
-    face and the water turns uniform past it. Measured along the river
-    (SEAM_DBG 7, the bed march instrumented): the ray's path to the bed is
+  - **A shallow river's bed sank a cell at level 4 (found 2026-10-16, ticket
+    `2026-10-16_11-05-33`; FIXED 2026-10-18 by the map's WET BED).** Seen from
+    93 m up, the river's bed showed through its water out to the level-3 box
+    face and the water turned uniform past it. Measured along the river
+    (SEAM_DBG 7, the bed march instrumented): the ray's path to the bed was
     2.5-4.6 m at level 3 and 15-24 m at level 4, every bed found (not a
     missed bed, not the cap). Cause: `farSurfaceMat`'s `wetTop`
     (worldgen.wgsl) paints the BED's topmost cell with the fluid wherever the
     water is too shallow for any cell centre to fall inside it -- right for
     the colour from above (the sea shelf it was made for), but `farWaterBed`
-    then treats that bed cell as a full cell of water: the bed drops to the
-    cell's floor, on average a whole cell under the true bed (h is in the
+    then treated that bed cell as a full cell of water: the bed dropped to
+    the cell's floor, on average a whole cell under the true bed (h is in the
     cell's upper half by construction). At 1.6 m cells on a ~1 m river that
     doubles the depth, and at the grazing angles level 4 is seen at (path ~
-    9x depth) Beer-Lambert takes the bed. The cascade alone cannot tell a
-    wetTop cell from a real one-cell column (both put the refined surface in
-    the same range), so the fix needs the sieve or the map to say so: e.g.
-    the surface map's sub-skin bits of a FLUID-topped sub-column (always the
-    fluid itself, so free there) carrying the column's true depth, which
-    farWaterBed would take as the bed under every refined far water hit.
+    9x depth) Beer-Lambert took the bed. The cascade alone cannot tell a
+    wetTop cell from a real one-cell column, so the MAP says it: a FLUID
+    top's strata word (which had nothing to carry -- a fluid top has no
+    riser strata) is its BED, `FAR_STRATA_WET` (bit 30, PRESENT clear): the
+    fluid's depth over the bed in fine voxels (top - h, bits 0..15) and the
+    bed's skin slot (16..22), written by `farmap` from one more probe of its
+    rolled genCellIn loop (y = h, wet sub-columns only; no new call site, so
+    the kernel's size is flat). `farWaterBed` reads it (`farWetBedAt`, the
+    entry + strata vec4s of the hit's level cell):
+    - the vertical DEPTH under the hit (the wave law's shoaling and shore
+      fade) is the map's, exact, and the cascade column walk runs only where
+      the map has no bed (not VALID, a dry top, outside the level);
+    - THE WET BED OVERRULES A BED THE CASCADE PUT TOO LOW: where the march
+      ended (the bed cell it entered, the cap, or air) under the map's bed of
+      its LAST WATER SAMPLE's sub-column, the bed is the plane at that
+      column's bed, met from above -- a tread, wearing the bed's skin (a
+      slot naming a fluid is ignored). A bed the march met over the map's (a
+      bank's riser above the bed, a shelf deepening away from the eye)
+      stands, so the sea shelf's ray-following path of 2026-10-13 is kept.
+    Measured at the ticket camera (`SEAM_DBG 20`: the cascade's path and the
+    returned one in the same frame, per level): level 4 rows of the river
+    14.2-19.0 m -> 5.5-9.7 m (the overrule fired on 0.89-0.94 of them),
+    level 3 4.4-5.5 -> 4.2-4.6, levels 1-2 trimmed by ~8 % (the centre-
+    sampled staircase's half cell). The path now grows smoothly with
+    distance across the 3/4 seam instead of tripling at it. Gate:
+    `far-surface` arm (h) -- every fluid-topped entry over the fixture lake,
+    at levels 1 and 4, carries WET with depth == top - TerrainHeight, and at
+    level 1 the bed slot is the live voxel's at h (its first run caught the
+    probe reading the water: the bed slot was water's). Not covered: a bed
+    EDITED under standing water keeps the map's pristine depth until a
+    pristine refill (`fardown` checks only that the band is far-solid, and
+    water is), so a dug river bed reads at its old depth past the window.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -20287,7 +20313,8 @@ where you hear from either (§12b, "The ears are on the character").
     per column the slope is gentle and a riser is a real single step, read
     at its depth. Level 1 never wraps: there the side IS the near field's.
     Entries with no strata (a fluid top, a cactus stalk -- its side is its
-    body) keep the sub-skin rule. Edits need nothing: the plane is trusted
+    body) keep the sub-skin rule; a fluid top's word carries its BED instead
+    (`FAR_STRATA_WET`, see "A shallow river's bed" under the far water). Edits need nothing: the plane is trusted
     only under a VALID entry.
     **Measured** (ticket camera `--at 78285.77,1214.63,-11857.50,120.4,20.7`,
     minute 660, clear, 2400 frames; red share by r-b unmix): level 1
