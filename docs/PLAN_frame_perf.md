@@ -1092,9 +1092,12 @@ branch 1.6, flat normal 1.7, foam 1.4, traced reflection 1.2, streaks 0.4-0.9.
    the conservative middle for the LOD handoff seam, where a flood front
    moving ~1 m/s stands ~0.25 m apart across it). `--perf slope`: farField
    4.56 -> 3.15 ms, frame p50 25.97 -> 24.77. World hash unchanged (c8931fcd dam, 7b87586a slope: the
-   cascade carries no sim requirement since 2026-10-06). The far gates that
-   read the cascade a fixed 3 ticks after an edit settle `kFarDownEvery` more
-   (world.h, check_invariants "far downsample cadence").
+   cascade carries no sim requirement since 2026-10-06). `far-surface` settles
+   `kFarDownEvery` more ticks after its edits (world.h, check_invariants "far
+   downsample cadence"); `far-layer`, whose oil is still spreading when it
+   reads the cascade, marks every slot pending-and-due for its last tick (it
+   tests what the downsample writes, not when). The 12 far / water gates and
+   determinism (4993b9b0, unchanged) pass in one --verify.
 2. **raymarch, exact up to float rounding:** a lake pixel's 10 m depth cap
    that falls INSIDE a liquid span box is found in one step (the exit of the
    cell holding the cap point; the media sums telescope) instead of the
