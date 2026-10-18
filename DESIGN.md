@@ -5048,9 +5048,19 @@ excited particles born each tick: how many carry a throw, where, how fast):
   a cell resting on something with a lateral neighbour that is air over air
   (the perch configuration) and, on the OPPOSITE side, this liquid with its
   head ≥ 3 rows over the cell — the head is what tells a spout from a film on a
-  ramp, the case `sim.fluidExcitePerch` is off for. Still inside
-  `settleCheck`'s veto (it tests the full perch predicate), so settle can never
-  rebuild what it takes. It needs `fluidExciteMode` on and both knobs non-zero.
+  ramp, the case `sim.fluidExcitePerch` is off for. "Air over air" is the
+  perch predicate itself (`seamLateralExcite` over `seamNeighbourState`, which
+  counts excited MPM mass as water), so the mouth is a strict subset of
+  `settleCheck`'s veto and settle can never rebuild what it takes. It needs
+  `fluidExciteMode` on and both knobs non-zero.
+- **A REAL DROP.** A FALL cell is thrown only if the cell under it holds no
+  excited mass either. Trigger (a) asks for an air VOXEL below, and over a
+  flood that voxel is air with particles in it — a settled cell lying on moving
+  water. Seeded at rest that re-wake is dissipative; thrown, every re-wake
+  handed the body a fresh Torricelli kick and the settle/excite pair pumped
+  energy (measured, `flow-measure` R: a breach that must relax kept 1.97
+  cells/s after 900 ticks, vs 0.37 with the throw off). Such cells still
+  excite, at rest.
 - **THE NOZZLE.** A thrown cell is born one cell from SETTLED water, whose
   nodes `clearGrid` seeds with zero-velocity mass; the particle's quadratic
   support still gathers ~28% from that node, so each substep kept ~72% of the

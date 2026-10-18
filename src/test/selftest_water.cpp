@@ -4095,6 +4095,53 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     return n;
   };
   const int total = kBreachAt + kSettle;
+  // ATTRIBUTION (CLAUDE.md rule 6) for R: THE SPOUT JET (sim_fluid_seam.wgsl)
+  // throws excited water with a horizontal velocity, and a throw that keeps
+  // firing at an equalised breach is an energy pump that R reads as residual
+  // current (measured 2026-10-18: 1.97 cells/s left, vs 0.37 with the throw
+  // off). Per phase of the settle -- the surge (+0..300), the levelling
+  // (+300..600), the tail (+600..900) -- the particles born carrying a throw
+  // (_r4/_r5, written only by exciteEmit's jet) since the previous sample, the
+  // most alive at once, and the eighths each excite trigger took (exciteScratch
+  // [11..15], cumulative EX_BY_*: fall / perch+mouth / step / shell / wake).
+  // A drained breach must show ~0 throws in the tail.
+  struct Phase {
+    uint64_t bornThrown = 0, bornAll = 0;
+    uint32_t aliveThrown = 0;
+    uint32_t by[5] = {};
+  } phase[3];
+  uint32_t lastBirthT = 0, byPrev[5] = {};
+  auto sampleThrows = [&](int since) {
+    Phase& ph = phase[std::min(std::max(since - 1, 0) / 300, 2)];
+    uint32_t fa[32] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa, 128, "flowMeasArgs");
+    const uint32_t live = std::min(fa[7], kFluidCap);
+    uint32_t alive = 0;
+    if (live != 0) {
+      std::vector<uint32_t> pbuf((size_t)live * kFluidParticleWords);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidParticles[sim.Page()], 0, pbuf.data(),
+                            pbuf.size() * 4, "flowMeasP");
+      for (uint32_t k = 0; k < live; k++) {
+        const uint32_t* p = &pbuf[(size_t)k * kFluidParticleWords];
+        if ((p[18] & 0xFFFu) == 0u) continue;
+        const bool thrown = (p[24] | p[25]) != 0u;
+        if (thrown) alive++;
+        if (p[19] > lastBirthT && (p[18] & (1u << 22)) != 0u) {
+          ph.bornAll++;
+          if (thrown) ph.bornThrown++;
+        }
+      }
+    }
+    ph.aliveThrown = std::max(ph.aliveThrown, alive);
+    lastBirthT = t;
+    uint32_t ex[5] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidExciteScratch, 11u * 4u, ex, sizeof ex,
+                          "flowMeasExBy");
+    for (int k = 0; k < 5; k++) {
+      ph.by[k] += ex[k] - byPrev[k];
+      byPrev[k] = ex[k];
+    }
+  };
   // The box is ~120k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
   // the rest are REFUSED, not queued (the first run built half a box and its
   // reservoir leaked out of the open side; last_run.json opstream.cellTrunc).
@@ -4123,8 +4170,16 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       carryGap = carry(gapP);
       carryPulled = carryRing();
     }
+    if (i == kBreachAt) {
+      // Baseline the cumulative census and the birth clock at the breach.
+      ctx.WaitIdle();
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidExciteScratch, 11u * 4u, byPrev, sizeof byPrev,
+                            "flowMeasExBy0");
+      lastBirthT = t;
+    }
     if (i > kBreachAt && (i - kBreachAt) % 15 == 0) {
       readGrid();
+      sampleThrows(i - kBreachAt);
       int p = 0;
       float m = 0.0f;
       ringPull(p, m);
@@ -4189,6 +4244,20 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       2 * kHalfX + 1, 2 * kHalfZ + 1, kDeep, kGap, quietGap, gapV.x, gapV.z, speed(solvedGap), pulled,
       ring.size(), ringR, ringMean, downV.x, downV.z, nearPeak, endNear, kSettle, peak, endMax, boxAwake,
       boxChunks, grid[2], carryQuiet, carryGap.x, carryGap.z, carryPulled, ring.size(), trace.c_str());
+  {
+    static const char* kPhase[3] = {"surge +0..300", "level +300..600", "tail +600..900"};
+    std::string th;
+    for (int k = 0; k < 3; k++) {
+      const Phase& ph = phase[k];
+      th += Format("%s%s: born %llu thrown of %llu excited (max %u thrown alive), eighths by fall %u "
+                   "perch/mouth %u step %u shell %u wake %u",
+                   k ? "; " : "", kPhase[k], (unsigned long long)ph.bornThrown,
+                   (unsigned long long)ph.bornAll, ph.aliveThrown, ph.by[0], ph.by[1], ph.by[2], ph.by[3],
+                   ph.by[4]);
+    }
+    RecordObserved("flowMeasure.tailThrownObserved", (double)phase[2].bornThrown);
+    detail += " | SPOUT THROWS " + th;
+  }
   for (const std::string& f : fails) detail = f + "; " + detail;
   const bool ok = fails.empty();
   std::printf("flow-measure: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
