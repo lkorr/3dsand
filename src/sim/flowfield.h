@@ -159,7 +159,10 @@ constexpr int kFlowDry = -32768;
 //         1/kFlowVelQ cells/s), w1 = top | bot (i16 world cells; top =
 //         kFlowDry where nothing flows); then, from kFlowMeasVertOffset, one
 //         word a node: THE VERTICAL (H i16 | HW << 16 | D/2 << 22 | ON << 28;
-//         common.wgsl flowMeasRise).
+//         common.wgsl flowMeasRise); then, from kFlowMeasVyOffset, one word
+//         a node: the measured VERTICAL velocity (vy i16, 1/kFlowVelQ cells/s).
+//         ACC word 7 is that flux (eighths x dy, every move with a vertical
+//         part); STATE word 6 packs D | ON << 16 and word 7 is the followed vy.
 // The fold (flow_measure.wgsl) runs on ticks the CA or the fluid seam ran
 // and for a tail after (Simulation::EncodeTick), so a settled world records
 // nothing; when the tail ends one Fill zeroes STATE + GRID.
@@ -172,7 +175,12 @@ constexpr uint32_t kFlowMeasStateBase = kFlowMeasAccWords;
 constexpr uint32_t kFlowMeasGridBase =
     kFlowMeasStateBase + kFlowMeasSlots * kFlowMeasStateStride;
 constexpr uint32_t kFlowMeasVertOffset = kFlowHeaderWords + kFlowMeasSlots * 2u;
-constexpr uint32_t kFlowMeasGridWords = kFlowMeasVertOffset + kFlowMeasSlots;
+// THE VERTICAL FLUX's plane (2026-10-18): one word a node, vy i16 in
+// 1/kFlowVelQ cells/s (+ up) -- the water the fold measured going up or
+// down, which the readers add to the tilt (flowfield.cpp SampleMeasuredSpan,
+// common.wgsl flowMeasRise).
+constexpr uint32_t kFlowMeasVyOffset = kFlowMeasVertOffset + kFlowMeasSlots;
+constexpr uint32_t kFlowMeasGridWords = kFlowMeasVyOffset + kFlowMeasSlots;
 constexpr uint32_t kFlowMeasWords = kFlowMeasGridBase + kFlowMeasGridWords;
 constexpr int kFlowMeasAccQ = 16;
 // The fold's dispatch: 8 x 8 threads a group, one thread per grid node.

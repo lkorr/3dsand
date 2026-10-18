@@ -4595,10 +4595,14 @@ fn flowMeasAt(p : vec3f) -> vec3f {
 // inside them), as a slope dy / D clamped to +-1.5 (a point sink's 3D
 // geometry: 45 degrees at dy = D), weighted as flowMeasAt weights the node
 // and by ON; times vh, so it is exactly as strong as the pull it tilts and
-// vanishes with it. Zero cost where the measured flow is zero (the caller
-// passes vh = 0 and nothing is read).
+// vanishes with it (vh = 0 reads no tilt word).
+// PLUS THE MEASURED VERTICAL (2026-10-18, ticket 15-21-34): the fold's own
+// vy plane (flowfield.h kFlowMeasVyOffset) -- water falling down a drain, a
+// cavity, a fall -- bilinear over the nodes whose band is not dry, gated by
+// the band like flowMeasAt, times render.currentMeasured. Unlike the tilt it
+// needs no horizontal current: the column over a floor hole points DOWN.
 fn flowMeasRise(p : vec3f, vh : f32) -> f32 {
-  if (!FLOW_BOUND || vh <= 0.0) { return 0.0; }
+  if (!FLOW_BOUND || TUNE_CURRENT_MEASURED <= 0.0) { return 0.0; }
   let n = i32(flowMeasWord(2u));
   if (n == 0) { return 0.0; }
   let fx = (p.x - f32(bitcast<i32>(flowMeasWord(0u)))) / FLOW_STEP;
@@ -4610,11 +4614,20 @@ fn flowMeasRise(p : vec3f, vh : f32) -> f32 {
   let tz = fz - f32(iz);
   let vbase = FLOW_HEADER + 2u * u32(n * n);
   var f = 0.0;
+  var vy = 0.0;
+  var top = -1e9;
+  var bot = 1e9;
   for (var c = 0; c < 4; c++) {
     let dx = c & 1;
     let dz = c >> 1u;
     let node = u32((iz + dz) * n + (ix + dx));
-    if (flowI16Lo(flowMeasWord(FLOW_HEADER + 2u * node + 1u)) == FLOW_DRY) { continue; }
+    let bw = flowMeasWord(FLOW_HEADER + 2u * node + 1u);
+    if (flowI16Lo(bw) == FLOW_DRY) { continue; }
+    top = max(top, f32(flowI16Lo(bw)));
+    bot = min(bot, f32(flowI16Hi(bw)));
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    vy += w * f32(flowI16Lo(flowMeasWord(vbase + u32(n * n) + node)));
+    if (vh <= 0.0) { continue; }
     let vw = flowMeasWord(vbase + node);
     let on = f32(vw >> 28u);
     if (on == 0.0) { continue; }
@@ -4624,10 +4637,10 @@ fn flowMeasRise(p : vec3f, vh : f32) -> f32 {
     var dy = 0.0;
     if (p.y < h - hw) { dy = (h - hw) - p.y; }
     if (p.y > h + hw) { dy = (h + hw) - p.y; }
-    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
     f += w * (on / 15.0) * clamp(dy / d, -1.5, 1.5);
   }
-  return vh * f;
+  if (top < -1e8 || p.y > top + 1.5 || p.y < bot - 1.5) { return vh * f; }
+  return vh * f + vy / FLOW_VEL_Q * TUNE_CURRENT_MEASURED;
 }
 
 // The two fields together: the measured flow counts in full, the solved one

@@ -919,6 +919,19 @@ Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 p, float yLo, float yHi) {
   // velocity averaged over it, and the pull is linear in height.
   float rise = 0.0f;
   const float vh = std::sqrt(vx * vx + vz * vz);
+  // THE MEASURED VERTICAL (kFlowMeasVyOffset): common.wgsl flowMeasRise's vy
+  // term, line for line -- the band gate is the one above.
+  {
+    float vy = 0.0f;
+    for (int c = 0; c < 4; c++) {
+      const int dx = c & 1, dz = c >> 1;
+      const size_t node = (size_t)(iz + dz) * n + (ix + dx);
+      if ((int)(int16_t)(grid[kFlowHeaderWords + 2 * node + 1] & 0xFFFFu) == kFlowDry) continue;
+      const float w = (dx ? tx : 1.0f - tx) * (dz ? tz : 1.0f - tz);
+      vy += w * (float)(int16_t)(grid[kFlowMeasVyOffset + node] & 0xFFFFu);
+    }
+    rise = vy / (float)kFlowVelQ;
+  }
   if (vh > 0.0f) {
     const size_t vbase = kFlowHeaderWords + 2 * (size_t)n * n;
     float f = 0.0f;
@@ -938,7 +951,7 @@ Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 p, float yLo, float yHi) {
       const float w = (dx ? tx : 1.0f - tx) * (dz ? tz : 1.0f - tz);
       f += w * (on / 15.0f) * std::clamp(dy / d, -1.5f, 1.5f);
     }
-    rise = vh * f;
+    rise += vh * f;
   }
   return Vec3{vx, rise, vz};
 }

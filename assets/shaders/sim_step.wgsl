@@ -102,32 +102,53 @@ const FLOWM_ACC_STRIDE : u32 = 8u;
 // `eighths` of liquid left `src` for `dst` (reach 1). Binned by the source
 // cell onto the node lattice (node k owns cells 8k-4 .. 8k+3), the slot being
 // the node mod FLOWM_N -- the window spans fewer nodes than that, so within a
-// tick no two nodes share a slot. A vertical move is no current and costs
-// nothing; with nothing reading the field (render.currentMeasured AND
-// sim.currentMeasuredCarry both 0) the whole body const-folds away.
+// tick no two nodes share a slot. With nothing reading the field
+// (render.currentMeasured AND sim.currentMeasuredCarry both 0) the whole body
+// const-folds away.
+// THE VERTICAL FLUX (2026-10-18, ticket 2026-10-18_15-21-34: "a giant hole
+// in the ground underwater ... pointing directly to the side instead of
+// down"): every move with a vertical part -- a fall, a diagonal fall, a
+// partial descent -- adds eighths x dy to word 7, and its row to the band,
+// so the fold measures the water going DOWN a drain, a cavity or a fall as
+// directly as the water going sideways. Until this a vertical move was "no
+// current": a floor hole's whole column fell into it unmeasured and the
+// arrows over it read only the sideways mix round it.
 // THE HEIGHT MOMENTS (2026-10-18, ticket 11-30-37: a breach under the
-// surface must pull the water above it down and the water below it up): each
-// move also adds a weight w, w x y and w x y^2, y the source row about the
-// window's middle (-256..255), so the fold knows WHERE in the column a bin's
-// water ran (mean) and how spread (variance) -- a jet through a hole is a
-// thin band, a full-depth breach is not. w = eighths^2 (1..64): a whole cell
-// driven sideways by the head behind it (the jet, the water drawn toward it
-// under the surface) outweighs the surface's levelling, which moves an eighth
-// or two at a time, 16 to 64 times over -- measured, weighting by the eighths
-// alone let the drawn-down surface spread a 3-row hole over 8 rows. Bounded:
-// while the summed weight stays <= 32767 (the fold's trust test) w y^2 <=
-// 64 x 65536 sums inside i32; past it the bin overflows harmlessly and the
-// fold ignores its moments.
+// surface must pull the water above it down and the water below it up): a
+// LATERAL move whose source is CONFINED -- a cell with something other than
+// air directly on top of it (its own liquid under the surface, or the rock
+// over a hole) -- also adds a weight w, w x y and w x y^2, y the source row
+// about the window's middle (-256..255), so the fold knows WHERE in the
+// column a bin's water ran (mean) and how spread (variance) -- a jet through
+// a hole is a thin band, a full-depth breach is not. w = eighths^2 (1..64):
+// a whole cell driven sideways by the head behind it outweighs a partial
+// one. CONFINED, because the free surface is the one place water moves
+// sideways for reasons that are not the pull: the drawn-down surface over a
+// breach levelling itself, and -- 2026-10-18, with MPM water off -- the flood
+// spreading over the floor beyond it, which shares the breach's 8-column bin
+// whenever the dam is in its middle. Measured on `flow-measure`'s submerged
+// gap (rows 4..6 of 10): weighting all moves by eighths^2 read it at rows
+// 6 +- 4 (the band from the floor flood to the surface), so the top row
+// over the hole was INSIDE the pulling water and read no pull at all;
+// confined moves alone read 6 +- 3 and the pull is back. Falls are left out
+// (d.y != 0): water falling is water that has left, not water drawn. The
+// look-up is one cell over the source, inside the acting cell's reach-1 box
+// (src is the acting cell or, for bridgeLevel, one of its laterals), which
+// the colour lattice gives this thread alone, so it is deterministic.
+// Bounded: while the summed weight stays <= 32767 (the fold's trust test)
+// w y^2 <= 64 x 65536 sums inside i32; past it the bin overflows harmlessly
+// and the fold ignores its moments.
 fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
   if (TUNE_CURRENT_MEASURED <= 0.0 && TUNE_CURRENT_MEASURED_CARRY <= 0.0) { return; }
   let d = dst - src;
-  if (d.x == 0 && d.z == 0) { return; }
+  if (d.x == 0 && d.y == 0 && d.z == 0) { return; }
   let kx = ((((src.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let kz = ((((src.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let s = u32(kz * FLOWM_N + kx) * FLOWM_ACC_STRIDE;
   let q = i32(eighths) * FLOWM_ACC_Q;
   if (d.x != 0) { atomicAdd(&flowMeasAcc[s], d.x * q); }
   if (d.z != 0) { atomicAdd(&flowMeasAcc[s + 1u], d.z * q); }
+  if (d.y != 0) { atomicAdd(&flowMeasAcc[s + 7u], d.y * q); }
   atomicMax(&flowMeasAcc[s + 2u], src.y + FLOWM_Y_BIAS);
   atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - src.y);
   if (d.y != 0) { return; }

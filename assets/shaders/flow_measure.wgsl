@@ -34,6 +34,14 @@
 //      flickering off between ticks. Below FLOWM_SNAP it is zero.
 //   4. PUBLISH the node in flowGrid's own layout (GRID region): the reader is
 //      flowGridAt's loop over different words.
+// THE VERTICAL FLUX (2026-10-18, ticket 15-21-34): the writers also sum
+// every move's eighths x dy (ACC word 7). It takes the same 3 x 3 tent and
+// the same conversion, divided by the HEIGHT of the water moving there (the
+// tent's band, in cells, against the horizontal's FLOWM_DEPTH): a column
+// draining through a floor hole moves every row a little, a horizontal flux
+// is one surface layer moving a lot. Followed in time as the horizontal is,
+// and published in its own plane (flowfield.h kFlowMeasVyOffset) as a
+// measured vy the readers ADD to the tilt (common.wgsl flowMeasRise).
 // The STATE is kept per toroidal slot (world node mod kFlowMeasN) with the
 // world node as a tag, so a window move keeps every node that stays in view
 // and starts the ones that scroll in from zero.
@@ -268,6 +276,10 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   // The pulling bin (THE VERTICAL above): its weight and offset.
   var bestA = 0;
   var bestD = vec2<i32>(0);
+  // THE VERTICAL FLUX over the 3 x 3 tent, and that tent's own band.
+  var vflux = 0;
+  var topL = 0;
+  var botL = 0;
   for (var dj = -R; dj <= R; dj++) {
     for (var di = -R; di <= R; di++) {
       // A neighbour off the grid would alias the far edge's slot.
@@ -277,6 +289,9 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
       if (abs(di) <= 1 && abs(dj) <= 1) {
         let w = (2 - abs(di)) * (2 - abs(dj));
         flux += w * clamp(acc, vec2<i32>(-FLOWM_TERM_MAX), vec2<i32>(FLOWM_TERM_MAX));
+        vflux += w * clamp(bitcast<i32>(flowMeasRW[a + 7u]), -FLOWM_TERM_MAX, FLOWM_TERM_MAX);
+        topL = max(topL, bitcast<i32>(flowMeasRW[a + 2u]));
+        botL = max(botL, bitcast<i32>(flowMeasRW[a + 3u]));
       }
       // The node's own bin counts as its flux; every other bin as its PULL
       // on this node (flowmPull): the reach turns the water toward a breach
@@ -324,6 +339,17 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
   }
 
+  // ---- 2b'. the vertical flux: STATE units, |instY| <= FLOWM_STATE_MAX ----
+  // The horizontal's conversion assumes the moving layer is FLOWM_DEPTH (0.5
+  // cells) deep; a vertical flux is spread over the whole height that moved,
+  // so it is divided by 2 x that height (rows, >= 1).
+  var instY = 0;
+  if (topL != 0 && vflux != 0) {
+    let rows = max((topL - FLOWM_Y_BIAS) - (FLOWM_Y_BIAS - botL) + 1, 1);
+    instY = ((clamp(vflux, -FLOWM_FLUX_MAX, FLOWM_FLUX_MAX) * FLOWM_TO_NUM) / FLOWM_TO_DEN) /
+            (2 * rows);
+  }
+
   // ---- 2c. the vertical's target (THE VERTICAL above) ----
   // From the pulling bin's height moments: mean and spread of the rows its
   // water ran in, about the window's middle row (the writers' frame). Every
@@ -357,14 +383,19 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   var vHW = 0;
   var vD = 0;
   var vOn = 0;
+  var vY = 0;
   if (flowMeasRW[s + 2u] == tag) {
     v = clamp(vec2<i32>(bitcast<i32>(flowMeasRW[s]), bitcast<i32>(flowMeasRW[s + 1u])),
               vec2<i32>(-FLOWM_STATE_MAX), vec2<i32>(FLOWM_STATE_MAX));
     band = flowMeasRW[s + 3u];
     vH = bitcast<i32>(flowMeasRW[s + 4u]);
     vHW = clamp(bitcast<i32>(flowMeasRW[s + 5u]), 0, 1 << 20);
-    vD = clamp(bitcast<i32>(flowMeasRW[s + 6u]), 0, 1 << 20);
-    vOn = clamp(bitcast<i32>(flowMeasRW[s + 7u]), 0, FLOWM_ON_Q10);
+    // Word 6 holds D (low 16 bits; tD <= 1056) and ON (high 16), word 7 the
+    // followed vertical velocity (THE VERTICAL FLUX).
+    let w6 = flowMeasRW[s + 6u];
+    vD = i32(w6 & 0xFFFFu);
+    vOn = clamp(i32(w6 >> 16u), 0, FLOWM_ON_Q10);
+    vY = clamp(bitcast<i32>(flowMeasRW[s + 7u]), -FLOWM_STATE_MAX, FLOWM_STATE_MAX);
   }
 
   // ---- 3. follow: fast up, slow down ----
@@ -401,10 +432,17 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   let kOn = select(FLOWM_FALL_Q11, FLOWM_RISE_Q11, onT > vOn);
   vOn += ((onT - vOn) * kOn) / 2048;
   if (abs(onT - vOn) < 16) { vOn = onT; }   // the truncating follow's last step
+  // The vertical flux follows as the horizontal does: fast up, slow down.
+  let kY = select(FLOWM_FALL_Q11, FLOWM_RISE_Q11, abs(instY) > abs(vY));
+  vY = vY + ((instY - vY) * kY) / 2048;
+  let stillY = flowmStill(vec2<i32>(vY, 0));
+  if (stillY) { vY = 0; }
   if (flowmStill(v)) {
     v = vec2<i32>(0);
-    band = u32(FLOW_DRY) & 0xFFFFu;
     vOn = 0;
+    // Dry only when nothing moves either way: a column that only falls (a
+    // drain, a fall) keeps its band, so the readers find its vy.
+    if (stillY) { band = u32(FLOW_DRY) & 0xFFFFu; }
   }
   flowMeasRW[s] = bitcast<u32>(v.x);
   flowMeasRW[s + 1u] = bitcast<u32>(v.y);
@@ -412,8 +450,8 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   flowMeasRW[s + 3u] = band;
   flowMeasRW[s + 4u] = bitcast<u32>(vH);
   flowMeasRW[s + 5u] = bitcast<u32>(vHW);
-  flowMeasRW[s + 6u] = bitcast<u32>(vD);
-  flowMeasRW[s + 7u] = bitcast<u32>(vOn);
+  flowMeasRW[s + 6u] = u32(clamp(vD, 0, 65535)) | (u32(vOn) << 16u);
+  flowMeasRW[s + 7u] = bitcast<u32>(vY);
 
   // ---- 4. publish, flowGrid's layout ----
   let g = FLOWM_GRID + FLOW_HEADER + 2u * u32(j * n + i);
@@ -423,4 +461,8 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   // or not it is ON, so a gate can read where the pulling water is.
   flowMeasRW[FLOWM_GRID + FLOW_HEADER + 2u * u32(n * n) + u32(j * n + i)] =
       select(0u, flowmVertWord(vH, vHW, vD, vOn), vH != 0 || vOn != 0);
+  // THE VERTICAL FLUX's plane (flowfield.h kFlowMeasVyOffset): vy, i16 in
+  // 1/FLOW_VEL_Q cells/s, + up.
+  flowMeasRW[FLOWM_GRID + FLOW_HEADER + 3u * u32(n * n) + u32(j * n + i)] =
+      flowmI16(flowmPublish(vY));
 }

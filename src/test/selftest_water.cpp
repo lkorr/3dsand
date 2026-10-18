@@ -75,6 +75,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -4038,16 +4039,24 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     const int ax0 = bx - kHalfX, ax1 = bx + kHalfX, az0 = bz - kHalfZ, az1 = bz + kHalfZ;
     const int bfy = FixtureYOver(ax0 - 1, az0 - 1, ax1 + 1, az1 + 1, kDefaultSeed, 1);
     const int top = bfy + deep + 3;
+    // The slab goes down to the footprint's LOWEST ground too: a slab that
+    // bridges a dip is an island, and the support scan the build's own
+    // carving sets off drops it as one debris body, pool and all.
+    int hLo = bfy - 12;
+    for (int j = 0; j <= 8; j++)
+      for (int k = 0; k <= 8; k++)
+        hLo = std::min(hLo, World::TerrainHeight(ax0 - 1 + (ax1 - ax0 + 2) * k / 8,
+                                                 az0 - 1 + (az1 - az0 + 2) * j / 8, kDefaultSeed) - 2);
     for (int z = az0 - 1; z <= az1 + 1; z++)
       for (int x = ax0 - 1; x <= ax1 + 1; x++)
-        for (int y = bfy - 12; y <= top + 6; y++) {
+        for (int y = hLo; y <= top + 6; y++) {
           const bool wall = x < ax0 || x > ax1 || z < az0 || z > az1 || (dam && x == bx);
           bool solid = (y <= top && wall) || y <= bfy;
           if (chamber > 0 && std::abs(x - bx) <= chamber && std::abs(z - bz) <= chamber &&
               y >= bfy - 10 && y <= bfy - 2)
             solid = false;
           build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
-          if (x >= ax0 && (x < bx || !dam) && z >= az0 && z <= az1 && y >= bfy + 1 &&
+          if (x >= ax0 && x <= ax1 && (x < bx || !dam) && z >= az0 && z <= az1 && y >= bfy + 1 &&
               y <= bfy + deep)
             fill.push_back({World::SlotCellIndex({x, y, z}), PackVoxNew(kMatWater, 7u)});
         }
@@ -4076,16 +4085,49 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const int kSubHi = (int)BaselineNumber("flowMeasure.subHi", 6);
   const int cx2 = cx, cz2 = cz + (int)BaselineNumber("flowMeasure.subDz", 96);
   const int fy2 = addBox(cx2, cz2, kDeep2, kSubLo, kSubHi);
+  // WHERE boxes 3 and 4 go: the first spots, from a fixed list, whose
+  // footprint is FLAT ENOUGH (the ground within 16 of its highest point, so
+  // the slab addBox runs down to the lowest ground stays a few hundred
+  // thousand ops) and DRY (no map water in or beside it). Measured, the first placement (96 cells north /
+  // 128 west) stood on a slope: both pools were awake and flowing before
+  // anything was done to them, 20 and 37 chunks, water moving 23 rows under
+  // the floor. Deterministic: a pure function of the seed and the window.
+  std::string placeWhy;
+  auto siteOk = [&](int bx, int bz) {
+    int hLo = INT32_MAX, hHi = INT32_MIN;
+    bool wet = false;
+    for (int j = 0; j <= 8; j++)
+      for (int k = 0; k <= 8; k++) {
+        const int x = bx - kHalfX - 8 + (2 * kHalfX + 16) * k / 8;
+        const int z = bz - kHalfZ - 8 + (2 * kHalfZ + 16) * j / 8;
+        const World::Column col = World::TerrainColumn(x, z, kDefaultSeed);
+        hLo = std::min(hLo, col.h);
+        hHi = std::max(hHi, col.h);
+        if (col.water != INT32_MIN) wet = true;
+      }
+    placeWhy += Format("%s(%+d,%+d) h %d..%d%s", placeWhy.empty() ? "" : " ", bx - cx, bz - cz, hLo, hHi,
+                       wet ? " wet" : "");
+    return !wet && hHi - hLo <= 16;
+  };
+  const int kSites[][2] = {{128, 0},  {-128, 0},  {0, -96},  {128, 96},  {-128, 96},
+                           {128, -96}, {-128, -96}, {0, 192}, {128, 192}, {-128, 192}};
+  int site3 = -1, site4 = -1;
+  for (int k = 0; k < (int)(sizeof kSites / sizeof kSites[0]) && site4 < 0; k++) {
+    if (!siteOk(cx + kSites[k][0], cz + kSites[k][1])) continue;
+    if (site3 < 0) site3 = k; else site4 = k;
+  }
+  if (site3 < 0) site3 = 0;
+  if (site4 < 0) site4 = 1;
   // Box 3 (ticket 2026-10-18_15-21-34 shot 2: "an explosion under water makes
   // every arrow round it point one way"): a still pool, kDeep2 deep, and at
   // the breach tick a blast at its middle, mid-depth. Claim X.
-  const int cx3 = cx, cz3 = cz - (int)BaselineNumber("flowMeasure.subDz", 96);
+  const int cx3 = cx + kSites[site3][0], cz3 = cz + kSites[site3][1];
   const int fy3 = addBox(cx3, cz3, kDeep2, 0, 0, false);
   // Box 4 (the same ticket, shot 1: "a giant hole in the ground underwater
   // ... pointing directly to the side instead of down"): a pool over an air
   // room, and at the breach tick a kGap x kGap hole through its floor.
   // Claim F.
-  const int cx4 = cx - (int)BaselineNumber("flowMeasure.holeDx", 128), cz4 = cz;
+  const int cx4 = cx + kSites[site4][0], cz4 = cz + kSites[site4][1];
   const int fy4 = addBox(cx4, cz4, kDeep2, 0, 0, false, 9);
 
   const int kBreachAt = (int)BaselineNumber("flowMeasure.breachAt", 90);
@@ -4230,9 +4272,10 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     const size_t node = (size_t)iz * n + ix;
     const uint32_t b = grid[kFlowHeaderWords + 2 * node + 1];
     const uint32_t w = grid[kFlowMeasVertOffset + node];
-    return Format("x%+d: H %d HW %u D %u on %u band %d..%d", (int)std::lround(x) - ox,
+    return Format("x%+d: H %d HW %u D %u on %u band %d..%d vy %.2f", (int)std::lround(x) - ox,
                   (int)(int16_t)(w & 0xFFFFu) - fyRef, (w >> 16) & 63u, ((w >> 22) & 63u) * 2u, w >> 28,
-                  (int)(int16_t)(b >> 16) - fyRef, (int)(int16_t)(b & 0xFFFFu) - fyRef);
+                  (int)(int16_t)(b >> 16) - fyRef, (int)(int16_t)(b & 0xFFFFu) - fyRef,
+                  (float)(int16_t)(grid[kFlowMeasVyOffset + node] & 0xFFFFu) / (float)kFlowVelQ);
   };
   auto vertNode = [&](float x, float z) { return vertNodeAt(x, z, cx2, fy2); };
   // X (box 3, the blast) and F (box 4, the floor hole): a ring of 8 points
@@ -4301,6 +4344,57 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   // +z) @ cells/s, rows of z, columns of x -- where along the dam the field
   // turns, and whether the bins that straddle the dam read the flood beyond it.
   std::string nodeMap;
+  auto boxWhy = [&](int bx, int bz, int bfy, int deep) {
+    std::vector<uint32_t> flags(kNumSlots, 0u);
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
+                          (size_t)kNumSlots * 4, "flowMeasWhy");
+    uint32_t awake = 0, all = 0, orBits = 0;
+    for (int qz = (bz - kHalfZ - 1) >> 4; qz <= (bz + kHalfZ + 1) >> 4; qz++)
+      for (int qy = (bfy - 12) >> 4; qy <= (bfy + deep + 3) >> 4; qy++)
+        for (int qx = (bx - kHalfX - 1) >> 4; qx <= (bx + kHalfX + 1) >> 4; qx++) {
+          all++;
+          const uint32_t f = flags[World::SlotChunkIndex({qx, qy, qz})];
+          if (f != 0u) awake++;
+          orBits |= f;
+        }
+    std::string why;
+    for (int b = 0; b < kDirtyReasonBits; b++)
+      if (orBits & (1u << b)) why += std::string(why.empty() ? "" : "+") + kDirtyReasonName[b];
+    return Format("%u of %u awake (%s)", awake, all, why.empty() ? "-" : why.c_str());
+  };
+  std::string quietWhy;
+  // A vertical SECTION of the real voxels through a box, along x at z = bz:
+  // '#' stone, '.' air, 1..8 water by eighths, 'o' anything else; rows from
+  // the top. What a pool that should be still is actually doing.
+  auto section = [&](int bx, int bz, int bfy, int deep, bool alongZ = false, int below = 3) {
+    std::map<uint32_t, std::vector<uint32_t>> chunks;
+    auto word = [&](int x, int y, int z) {
+      const uint32_t slot = World::SlotChunkIndex({x >> 4, y >> 4, z >> 4});
+      auto it = chunks.find(slot);
+      if (it == chunks.end()) {
+        std::vector<uint32_t> v(kChunkVol);
+        ReadVoxelsSync(ctx, world, slot, 1, v.data(), "flowMeasSection");
+        it = chunks.emplace(slot, std::move(v)).first;
+      }
+      return it->second[(size_t)World::SlotCellIndex({x, y, z}) % kChunkVol];
+    };
+    std::string out;
+    for (int y = bfy + deep + 2; y >= bfy - below; y--) {
+      out += Format(" %+d:", y - bfy);
+      const int half = alongZ ? kHalfZ : kHalfX;
+      for (int t = -half - 2; t <= half + 2; t++) {
+        const uint32_t w = alongZ ? word(bx, y, bz + t) : word(bx + t, y, bz);
+        const uint32_t m = w & 0xFFFu;
+        char ch = 'o';
+        if (m == 0u) ch = '.';
+        else if (m == (uint32_t)kMatStone) ch = '#';
+        else if (m == (uint32_t)kMatWater) ch = (char)('1' + ((w >> 12) & 7u));
+        out += ch;
+      }
+    }
+    return out;
+  };
   auto nodeMapAt = [&](int ox, int oz) {
     std::string m;
     const int n = (int)grid[2];
@@ -4393,12 +4487,21 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     if (i == kBreachAt - 1) {
       readGrid();
       blastQuiet = radial(blastP, blastRing, blastP.y);
+      quietWhy = Format("box3 section%s; box1 %s; box3 %s; box4 %s; box3 nodes %s; box3 centre %s",
+                        section(cx3, cz3, fy3, kDeep2).c_str(),
+                        boxWhy(cx, cz, fy, kDeep).c_str(), boxWhy(cx3, cz3, fy3, kDeep2).c_str(),
+                        boxWhy(cx4, cz4, fy4, kDeep2).c_str(), nodeMapAt(cx3, cz3).c_str(),
+                        vertNodeAt((float)cx3, (float)cz3, cx3, fy3).c_str());
     }
     if (i == kBreachAt + 5 || i == kBreachAt + blastAt || i == kBreachAt + kAt ||
         i == kBreachAt + 120) {
       readGrid();
       const Radial b = radial(blastP, blastRing, blastP.y);
       if (i == kBreachAt + blastAt) blastSt = b;
+      if (i == kBreachAt + 5)
+        holeTrace += "box 4 at +5: node map " + nodeMapAt(cx4, cz4) + "; section x" +
+                     section(cx4, cz4, fy4, kDeep2, false, 11) + "; section z" +
+                     section(cx4, cz4, fy4, kDeep2, true, 11) + " || ";
       blastTrace += Format("%s+%d: %s", blastTrace.empty() ? "" : "; ", i - kBreachAt,
                            radialStr("", b).c_str());
       const Radial hf = radial(holeP, holeRing, (float)fy4 + 2.5f);
@@ -4546,10 +4649,11 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
                            "outward (need %d one way), uniform %.2f (need <= %.2f)", blastAt,
                            blastSt.moving, blastSt.inward, blastSt.outward, blastMin, blastSt.uniform,
                            blastUniform));
-  if (holeFloor.inward < pullMin || holeTop.down < pullMin)
+  if (holeFloor.inward < pullMin || holeTop.down < pullMin || holeMid.y > -vertMin)
     fails.push_back(Format("F: by the floor hole %d of 8 floor-ring points run toward it (need %d), %d of "
-                           "8 top-ring points are pulled down (vy <= -%.1f, need %d)", holeFloor.inward,
-                           pullMin, holeTop.down, vertMin, pullMin));
+                           "8 top-ring points are pulled down (vy <= -%.1f, need %d), over the hole vy "
+                           "%.2f (need <= -%.1f)", holeFloor.inward, pullMin, holeTop.down, vertMin,
+                           pullMin, holeMid.y, vertMin));
   if (nearWorst > aimMax)
     fails.push_back(Format("A: the near ring's worst heading error off the gap is %.0f deg (need <= %.0f)",
                            nearWorst, aimMax));
@@ -4586,12 +4690,17 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     detail += " | SPOUT THROWS " + th;
   }
   detail += " | NODE MAP box 1 at +" + std::to_string(kAt) + " (x-24..x+16 by 8): " + nodeMap;
+  detail += " | PLACES (box 3 / 4 = sites " + std::to_string(site3) + " / " + std::to_string(site4) +
+            ") " + placeWhy + Format("; box 1 floor %d, 2 %d, 3 %d, 4 %d", fy, fy2, fy3, fy4);
+  detail += " | BEFORE THE BREACH " + quietWhy;
   detail += Format(" | X blast r %d power %d, ring %.0f: quiet %s | %s", kBlastR, kBlastPower, blastRing,
                    radialStr("", blastQuiet).c_str(), blastTrace.c_str());
   detail += Format(" | F floor hole %dx%d, ring %.0f: centre at +%d (%.2f, %.2f, %.2f); nodes %s | %s", kGap,
                    kGap, holeRing, kAt, holeMid.x, holeMid.y, holeMid.z, holeNodes.c_str(),
                    holeTrace.c_str());
   SetCurrentTuning(savedTune);
+  // The blast (claim X) breaks the pool's floor into a debris body.
+  c.debris.Reset();
   for (const std::string& f : fails) detail = f + "; " + detail;
   const bool ok = fails.empty();
   std::printf("flow-measure: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
