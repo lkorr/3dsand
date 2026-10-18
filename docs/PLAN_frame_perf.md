@@ -1042,7 +1042,7 @@ ticks of pour, then:
 
 **What it costs (1080p, RTX 3060 Ti).** Render, exclusive: `dam` 25.7 ms,
 `damlake` 17.4, `damground` 4.1. The tick (`--perf dam`, GPU ms per tick):
-**42.7** -- caLoop 15.0, MLS-MPM 11.5 (fluidGridUp 2.3, fluidClear 2.2, g2p
+**42.7** (WRONG, 3x too high: the per-pass table counted the warm-up -- §11; the real tick was ~13) -- caLoop 15.0, MLS-MPM 11.5 (fluidGridUp 2.3, fluidClear 2.2, g2p
 1.9, p2g1 1.9, p2g2 1.2: nine substeps over the falls' padded blocks), farField
 10.0. At 30 ticks a second that tick alone is more GPU than the frame has: the
 owner's 21 -> 40 ms is mostly this, plus the render below on top of it.
@@ -1124,3 +1124,101 @@ branch 1.6, flat normal 1.7, foam 1.4, traced reflection 1.2, streaks 0.4-0.9.
 4. The current field on `damlake` (~2.9 ms): convergence's four taps and the
    foam lines' two shear taps each re-fetch two bilinear grids; sharing one
    2x2 node fetch when the taps share a node cell is exact (§9 item 4).
+
+## 11. Handoff 2026-10-18 (round 2): the tick under the breach, and the march (tickets 21-03-25, 11-14-41)
+
+**§10's tick numbers were 3x too high.** `--perf`'s per-pass table summed
+`PassTimer::Stats()` from the reset BEFORE the warm-up (600 warm ticks on
+`dam`) and divided by the 300 recorded frames, so every pass read at
+(600 + 300) / 300 = 3x its cost. The per-frame `gpu` series in the same JSON
+was right all along. Real `--perf dam` tick (GPU ms per tick, before this
+round): CA 5.15, MLS-MPM 3.96, far downsample 2.28 -- about 13 ms with the
+small rows, against a raymarch of 29.8 ms in that harness (21.4 ms in
+`--render-budget dam`). The "42.7 ms tick" was the reporter, and §10's
+far-downsample win (10.0 -> 6.6) is likewise ~3.3 -> 2.2 ms a tick. Fixed:
+`Run::passStats` is now summed in `postFrame` from exactly the recorded frames
+(perfsuite.cpp `AddRecordedPass`). **The breach's frame is mostly the render,
+not the tick.**
+
+**New instruments** (all perfsuite.cpp):
+- `MpmNodeCensus` at the end of `dam` / `slope`: one blocking readback after
+  the timed frames. `dam`: 8,000 particles in 75 blocks (18 hold a particle);
+  307,200 nodes a substep, 42% carrying mass (the lake's settled water seeds
+  every node it sits in), **2.7% in any particle's 3^3 support**; 4^3 bricks
+  touched 7.5% (35.6% with the whole tick's FLUID_MARK_PAD).
+- `--render-budget` arms `mpmcoarse` (coarse march only, a hit reads as a
+  miss), `mpmthick` (+ refine + thickness, no MPM shade), `mpmheat` (the step
+  heatmap; picture only) -- the lab's fluid stages on a budget camera.
+- `SANDVOX_BUDGET_ARM_SHOTS=1`: every arm's picture, taken with the arm's
+  shaders bound, so an exact render change A/B'd as a perfExp arm is diffed
+  in ONE process (the only valid comparison with live MPM spray).
+
+### LANDED (all bit-exact: `--perf dam` hash b6a647e4 and the census unchanged; `slope` 7b87586a unchanged; determinism 4993b9b0 matches the pin)
+
+1. **The brick ledger** (`sim_fluid.wgsl`, DESIGN.md MLS-MPM): clear and
+   gridUpdate run only the 4^3 bricks p2g1 scattered into; `gridFinish` (first
+   row of PT_FLUIDSETTLE) writes the end-of-tick state of the rest (static
+   velocity, owed foam decays, FA_CLAMPED). Node passes on `dam`
+   1.52 -> 0.49 ms a tick (clear 0.75 -> 0.17, gridUpdate 0.77 -> 0.24,
+   finish 0.07).
+2. **alloc walks a mark bitmap** (`mark` sets a bit per marked slot): the
+   single-workgroup 34,816-slot walk is now ~6 bitmap words a thread.
+   0.12 -> 0.04 ms.
+3. **The CA takes an MPM chunk's air only in Y-lit rows** (`sim_step.wgsl`
+   caRow): excitedReact is a no-op where no node carried mass, and the block's
+   Y mask proves it. caLoop 5.21 -> 5.03 ms.
+
+`--perf dam`, exclusive, RTX 3060 Ti, 1080p (ms; GPU per tick from the series):
+
+| | before | after |
+|---|---|---|
+| frame p50 | 41.75 | 40.07 |
+| MLS-MPM (fluidSys) | 3.96 | 2.75 |
+| CA (caLoop) | 5.15 | 4.96 |
+| far downsample | 2.28 | 2.26 |
+| raymarch (this harness) | 29.83 | 29.71 |
+
+`--perf slope` (before = the same build with the ledger and the CA filter forced off): frame p50 24.91 -> 24.91, CA 6.49 -> 6.52, MPM 0.79 -> 0.72
+(its 9,024 particles are cheap; the cost is the CA). `--render-budget`
+(unchanged code, for the record): dam 21.35, damlake 14.65, damground 3.67.
+
+### REFUTED -- do not retry
+
+- **The XZ-column occupancy skip for the MPM march** (§10 item 3). Built
+  both ways: (a) a sample whose tap box lies in a 4x4 column group with no
+  mass reads 0 without its taps (exact: the coarse loop only compares the
+  field to iso and iso/4); (b) the ray jumps to the column group's exit.
+  Neither beat the baseline's drift on `dam` (+0.3..0.7 vs drift up to 0.5,
+  three paired runs) and both cost ~0.2 ms on `damlake` (footprint). The
+  heatmap says why: 15.2 march iterations a pixel, 6.7 of them field samples,
+  and the samples sit where the falls and the pool ARE -- the columns are
+  lit. The cost is the isosurface's own work near water, not empty space.
+
+### Where the rest goes, ranked
+
+1. **The render** (`dam` 21.35 ms, `damground` 3.67): MPM shade ~5.8
+   (full - mpmthick; includes the calm raft's second water shade, §10's
+   owner call), refine + thickness ~1.8 (mpmthick - mpmcoarse), the march and
+   the primary trace behind it ~7.4 (mpmheat frame). `damlake` has no MPM in
+   view: it is the lake (§10).
+2. **The CA, 5.0 ms on `dam`, 6.5 on `slope`** -- genuine liquid work, not
+   waste: ~50k (dam) / ~108k (slope) liquid cells a substep in the awake
+   chunks, substep 0 about twice substep 1 (63 vs 31 ns a cell on dam) for
+   the reactions (water's tag:hot PAIR reads 6 faces, the evaporation decay
+   counts neighbours), staining (6 faces) and the solute check. A per-cell
+   face cache shared by doReactions / doStaining is the exact lever (same
+   colour cells are >= 3 apart, so a cell's faces cannot change under it
+   within the pass); not done -- sim_step's water paths are being edited by
+   the water-CA ticket agent.
+3. **MPM particle passes on `dam`, 1.66 ms** (p2g1 0.63, g2p 0.63, p2g2 0.40)
+   for 8,000 particles packed ~8 to a node (the excite ceiling, held by the
+   falls' pool): same-address atomic contention, ~200 adds per node word per
+   substep. `slope`'s 9,024 spread particles cost 0.22. Exact lever: a
+   workgroup-local accumulation (shared-memory node table, integer adds) with
+   one global add per touched word.
+4. **The seam's world-sized walks while water is live**: exciteScan 0.11,
+   settleScan 0.11 ms (single-workgroup walks of all 34,816 slots, like alloc
+   was). Same bitmap fix as alloc (exciteDetect / settleJudge set the bits);
+   not done -- sim_fluid_seam.wgsl is the MPM ticket agent's file this round.
+5. far downsample 2.26 (cadence 16 instead of 8 measured -30% in §10: owner
+   call on the far-image lag).

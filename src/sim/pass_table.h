@@ -499,6 +499,8 @@ enum class Pipe : uint8_t {
   // a crash).
   FluidSpawn, FluidMark, FluidAlloc, FluidClear, FluidP2G, FluidP2G2,
   FluidGridUp, FluidG2P,
+  // THE BRICK LEDGER's end of tick (sim_fluid.wgsl gridFinish, PT_FLUIDSETTLE).
+  FluidFinish,
   // The excite/settle seam (sim_fluid_seam.wgsl).
   FluidCompactCount, FluidCompactScan, FluidCompactScatter,
   FluidExciteDetect, FluidExciteScan, FluidExciteEmit,

@@ -174,6 +174,7 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_P2G2": "fluidP2g2_",
     "PIPE_FLUID_GRIDUP": "fluidGridUp_",
     "PIPE_FLUID_G2P": "fluidG2p_",
+    "PIPE_FLUID_FINISH": "fluidFinish_",
     # The excite/settle seam (sim_fluid_seam.wgsl).
     "PIPE_FLUID_CELL_CLEAR": "fluidCellClear_",
     # Water bodies (docs/PLAN_water_master.md M2; sim_waterbody.wgsl).

@@ -2132,7 +2132,7 @@ PASS(copy_fluidArgs, nullptr, PT_FLUIDMAP, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, 
 PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
-          W(FluidGrid) I(FluidDispatchArgs)))
+          W(FluidGrid) I(FluidDispatchArgs) A(FluidBlockMap)))
 // P2G's scatter is the plan's §5.1 bet made real: i32 atomicAdd accumulation,
 // associative, so the sum cannot depend on scheduling. The fill->mark->alloc
 // chain above already ordered the map; the barrier p2g1 needs is the
@@ -2142,7 +2142,7 @@ PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_F
 // `fluidBlockMap` is written by mark/alloc; p2g only atomicLoads the mapping.
 // R(Materials): a particle's mass is materials[mat].density (W1-B2).
 PASS(fluidP2g1, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(U(TickUBO) R(Materials) R(FluidParticlesWrite) R(FluidBlockMap)
+     USES(U(TickUBO) R(Materials) R(FluidParticlesWrite) A(FluidBlockMap)
           A(FluidGrid) R(FluidArgsStage) I(FluidPDispatchArgs) R(PageTable)))
 // p2g2 is the density-EOS half of the grantkot two-pass P2G: it needs p2g1's
 // COMPLETE mass field (the A->A WAW barrier between these rows orders it),
@@ -2339,6 +2339,21 @@ PASS(copy_fluidPArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 16,0,12, GRP_NON
 // scenes measure 8-22 active blocks. Now a compute clear over the LAST
 // substep's active blocks (plan §7 item 1), which is also zero work when the
 // solver is asleep.
+// THE BRICK LEDGER'S END OF TICK (2026-10-18, sim_fluid.wgsl gridFinish):
+// FIRST in this table, because every reader of the grid after the substeps
+// -- particleTick, stainApply, the settle judge's node velocities, the CA's
+// fluidOccMat next tick, the renderer -- must see the state the dense node
+// passes left: the static velocity of every brick the last substep skipped,
+// every brick's owed foam decays, the static substeps' FA_CLAMPED, and the
+// Y occupancy bits of the clean bricks. Same uses as fluidGridUp (it runs
+// the same node update), dispatched off the same node args.
+// read-only in practice: `fluidBlockList` is read_write for the module because
+// alloc writes it; gridFinish only reads its block's chunk slot.
+PASS(fluidFinish, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_FINISH, K_INDIRECT, IND_FLUIDARGS,0,0,
+     GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
+          RW(FluidGrid) A(FluidBlockMap) A(FluidArgsStage)
+          I(FluidDispatchArgs) R(Draft)))
 PASS(seam_cell_clear, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_CELL_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidCellScratch) I(FluidDispatchArgs)))

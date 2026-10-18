@@ -2672,6 +2672,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { fluidP2g2_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g2", "fluidP2g2"); });
   pool.Add([&] { fluidGridUp_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridUpdate", "fluidGridUp"); });
   pool.Add([&] { fluidG2p_ = MakeComputePipeline(device, fluidPL_, mFluid, "g2p", "fluidG2p"); });
+  pool.Add([&] { fluidFinish_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridFinish", "fluidFinish"); });
 
   // The excite/settle seam (sim_fluid_seam.wgsl; fluidSpawn_ moved here —
   // appends go through the seam's GPU-owned count now).
@@ -2787,7 +2788,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ || !gLeavePrep_ ||
       !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
-      !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
+      !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidFinish_ || !fluidCompactCount_ ||
       !fluidCompactScan_ || !fluidCompactScatter_ || !fluidExciteDetect_ ||
       !fluidExciteScan_ || !fluidExciteEmit_ || !fluidPTick_ ||
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
@@ -3262,6 +3263,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidP2G2:      return fluidP2g2_;
     case P::FluidGridUp:    return fluidGridUp_;
     case P::FluidG2P:       return fluidG2p_;
+    case P::FluidFinish:    return fluidFinish_;
     case P::FluidCompactCount:   return fluidCompactCount_;
     case P::FluidCompactScan:    return fluidCompactScan_;
     case P::FluidCompactScatter: return fluidCompactScatter_;

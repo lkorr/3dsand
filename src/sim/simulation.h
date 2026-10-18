@@ -1160,7 +1160,7 @@ class Simulation {
   rhi::ComputePipeline waterRelevel_, waterSurface_;  // W1, relevel
   rhi::ComputePipeline waterFlux_;                    // W2, surface momentum
   rhi::ComputePipeline fluidSpawn_, fluidMark_, fluidAlloc_, fluidClear_,
-      fluidP2g_, fluidP2g2_, fluidGridUp_, fluidG2p_;
+      fluidP2g_, fluidP2g2_, fluidGridUp_, fluidG2p_, fluidFinish_;
   // The excite/settle seam (sim_fluid_seam.wgsl).
   rhi::ComputePipeline fluidCompactCount_, fluidCompactScan_,
       fluidCompactScatter_, fluidExciteDetect_, fluidExciteScan_,
