@@ -192,8 +192,9 @@ const PT_KERNEL : u32 = PT_K_FLUIDSEAM;
 // floodMax 3221 vs 863). That is sim_stream.wgsl's to retune; see DESIGN.md.
 // The MAP's water only (the still record's word [1]), not a stream that
 // sim_stream.wgsl adopted (its columns are that kernel's to judge) and not a
-// POOL stream's (its ledger is exact). Not another liquid's particles either
-// (acid splashed into a river stays acid). RULE 1: pure reads of the still
+// POOL stream's (its ledger is exact). Another liquid's particles only where
+// they are BURIED in the held water (consumeApply's dilution arm, 2026-10-18):
+// acid splashed onto a river and settling there stays acid. RULE 1: pure reads of the still
 // table, the voxels and the particle's own state; a particle kills only
 // itself. RULE 2: both only remove work.
 // STILL_WORDS / stillIndex / stillTag / STILL_UNHELD / stillLevel8 are
@@ -274,6 +275,10 @@ fn seamBreachEdge(c : vec3<i32>, mat : u32) -> bool {
 // pool under its bed carries the column's record too), and is left to the
 // solver as anywhere else.
 const SEAM_ABSORB_DEPTH : i32 = 8;
+// How deep under a held surface's top cell another liquid's buried particles
+// are diluted (consumeApply), in cells: the deepest authored river (the
+// default map's are 30 voxels) and a margin.
+const SEAM_DILUTE_DEPTH : i32 = 48;
 // exciteScratch [7]: DIAGNOSTIC, never read by the sim -- CUMULATIVE eighths
 // held water absorbed (consumeApply). `held-splash` reads it.
 const EX_ABSORBED : u32 = 7u;
@@ -2048,6 +2053,39 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
       atomicAdd(&exciteScratch[EX_ABSORBED], fpFullness(p.attr));
       fluidParticles[gid.x].attr = 0u;
       return;
+    }
+  } else {
+    // ...AND DILUTES ANOTHER LIQUID'S PARTICLES BURIED IN IT (ticket
+    // 2026-10-17_00-04-26). A particle of a DIFFERENT liquid inside a settled
+    // cell of a held column's water, at or under its top cell: the reservoir
+    // refilled the column ON it (the overlap again), so it is mixed INTO a
+    // body the window holds a few metres of, and the river carries it off,
+    // diluted to nothing. Nothing else could ever take it: a submerged cell
+    // is solid to the solver (sim_fluid FSOLID_SUBM), so it is calm and
+    // stays put; the CA sees the cell as water, so it never reacts; and a
+    // settle walk must not merge it into the water (TWO LIQUIDS DO NOT MERGE)
+    // and has nowhere to carry it when the column holds buried water
+    // particles too. Measured, `acid-pour` without this arm: 18k of the 79k
+    // eighths poured stuck as live acid inside the river for good, their
+    // chunks awake. Acid that SETTLES on the river (a voxel over or at the
+    // surface) is not touched: it sinks through the water and eats the bed,
+    // as acid does, and is spent doing it. SEAM_DILUTE_DEPTH bounds it to the
+    // river itself (a cave pool under the bed carries the column's record
+    // too). Counted as an absorption, so the books still balance.
+    let vw = voxWordAt(cell);
+    let vm = voxMat(vw);
+    if (vm != MAT_AIR && vm != mat && materials[vm].klass == CLASS_LIQUID) {
+      let ht = seamHeldT8(cell.x, cell.z, vm);
+      if (ht != STILL_UNHELD) {
+        let yt = (ht - 1) >> 3u;
+        if (cell.y <= yt && cell.y >= yt - SEAM_DILUTE_DEPTH) {
+          atomicAdd(&fluidArgs[FA_CONSUMED], fpFullness(p.attr));
+          atomicAdd(&fluidArgs[FA_DEAD], 1u);
+          atomicAdd(&exciteScratch[EX_ABSORBED], fpFullness(p.attr));
+          fluidParticles[gid.x].attr = 0u;
+          return;
+        }
+      }
     }
   }
   let bm = atomicLoad(&fluidBlockMapR[csl]);
