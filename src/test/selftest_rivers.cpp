@@ -1661,7 +1661,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // releases, bits 0..7 | adoptions, 8..15; word 7 the release reasons, a byte
         // each: support | flood | event | drained), the most-released column.
         int relMaxS = 0, relSumS = 0, adoptSumS = 0;
-        std::string relWhoS;
+        std::string relWhoS, whyS, relWhyS;
+        std::map<std::pair<int, int>, int> evPrevS;
         auto adoptedCount = [&]() {
           std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
@@ -1670,6 +1671,83 @@ Status GateRivers(Ctx& c, std::string& detail) {
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, kObsS * 4u, obs.data(), obs.size() * 4, "riversStillObs");
           relMaxS = relSumS = adoptSumS = 0;
           relWhoS.clear();
+          // WHY NOT (sim_stream.wgsl STREAM_OBS [6] bits 24..31, the first test
+          // the column's last visit failed): a histogram over the channel's
+          // unheld columns, the longest steady run (windows) and the newest
+          // event at or below any of them (ticks ago).
+          int whyN[16] = {};
+          uint32_t runMax = 0, ageMin = 0xFFFFFFFFu;
+          const uint32_t now16 = std::max((tick.t >> 4) & 0xFFFFu, 1u);
+          for (const auto& xz : byCols) {
+            const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+            if (tab[ci * 4 + 2] == 0u) {
+              whyN[(obs[ci * 8 + 6] >> 24) & 15u]++;
+              runMax = std::max(runMax, obs[ci * 8] >> 20);
+              const uint32_t f = obs[ci * 8 + 2] & 0xFFFFu;
+              if (f != 0u) ageMin = std::min(ageMin, ((now16 - f) & 0xFFFFu) * 16u);
+            }
+          }
+          whyS.clear();
+          for (int w = 0; w < 16; w++)
+            if (whyN[w]) whyS += Format(" %d:%d", w, whyN[w]);
+          // ...and WHO made the events since the last sample (each column's own
+          // fine-event count, STREAM_OBS [6] bits 16..23, diffed): along the
+          // channel from the lake (0) to main (n-1), its distance from the lake.
+          {
+            std::string who;
+            int nWho = 0;
+            for (size_t i = 0; i < byCols.size(); i++) {
+              const auto& xz = byCols[i];
+              const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+              const int n = static_cast<int>((obs[ci * 8 + 6] >> 16) & 0xFFu);
+              int& p = evPrevS[xz];
+              if (n > p && nWho++ < 4) who += Format(" (%d,%d)+%d", xz.first, xz.second, n - p);
+              p = n;
+            }
+            if (nWho) whyS += Format(" events from %d:%s", nWho, who.c_str());
+          }
+          whyS += Format(" run<=%u newest-event %s", runMax, ageMin == 0xFFFFFFFFu ? "none" : std::to_string(ageMin).c_str());
+          // ...and every release by reason (STREAM_OBS [7]: support | flood | - |
+          // drained, a byte each) plus, for the support releases, what the
+          // column's neighbours were at the last one (byte 2, streamSupportWhy:
+          // bit 0 a record under the target, 1 a hop not under ours, 2 a wall at
+          // the row, 3 no record at all; high nibble the column's own hop),
+          // lake-side first.
+          relWhyS.clear();
+          {
+            int byReason[4] = {};
+            std::map<uint32_t, int> lostWhy;
+            int firstRelZ = 0;
+            uint32_t firstRel = 0;
+            for (const auto& xz : byCols) {
+              const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+              const uint32_t o7 = obs[ci * 8 + 7];
+              for (int b = 0; b < 4; b++) byReason[b] += static_cast<int>((o7 >> (8 * b)) & 0xFFu);
+              if (o7 & 0xFFu) lostWhy[(o7 >> 16) & 0xFFu]++;
+              const int dz = std::abs(xz.second - zA);
+              if ((obs[ci * 8 + 6] & 0xFFu) != 0u && (firstRel == 0u || dz < firstRelZ)) {
+                firstRelZ = dz;
+                firstRel = o7;
+                relWhyS = Format(" lake-most (%d,%d) 0x%08x;", xz.first, xz.second, o7);
+              }
+            }
+            relWhyS += Format(" by reason support %d flood %d drained %d; support lost as", byReason[0], byReason[1],
+                              byReason[3]);
+            for (const auto& [k, v] : lostWhy) relWhyS += Format(" %02x:%d", k, v);
+            // WHERE the unheld columns are: (x, distance from the lake end)
+            // why/run, lake-side first, at most 24.
+            std::vector<std::pair<int, std::string>> un;
+            for (const auto& xz : byCols) {
+              const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
+              if (tab[ci * 4 + 2] != 0u) continue;
+              un.push_back({std::abs(xz.second - zA) * 4 + (xz.first - lakeX + 1),
+                            Format(" (%d,+%d)%u/%u", xz.first, std::abs(xz.second - zA), (obs[ci * 8 + 6] >> 24) & 15u,
+                                   obs[ci * 8] >> 20)});
+            }
+            std::sort(un.begin(), un.end());
+            relWhyS += Format("; %zu unheld (x,+dz)why/run:", un.size());
+            for (size_t i = 0; i < un.size() && i < 24; i++) relWhyS += un[i].second;
+          }
           for (const auto& xz : byCols) {
             const size_t ci = size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1));
             const int rel = static_cast<int>(obs[ci * 8 + 6] & 0xFFu);
@@ -1755,7 +1833,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
             adopted = adoptedCount();
             lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            curve += Format(" %d:%d/%d(%dP)/%d/%u", k, wet, adopted, poolN, awake, floodMax);
+            curve += Format(" %d:%d/%d(%dP)/%d/%u [why%s]", k, wet, adopted, poolN, awake, floodMax, whyS.c_str());
           }
         }
         c.ctx.WaitIdle();
@@ -1763,8 +1841,8 @@ Status GateRivers(Ctx& c, std::string& detail) {
         adopted = adoptedCount();
         awake = awakeOn();
         const int relMaxRun = relMaxS;
-        const std::string relRun = Format("; while running %d releases / %d adoptions, at most %d of one column%s", relSumS,
-                                          adoptSumS, relMaxS, relWhoS.c_str());
+        const std::string relRun = Format("; while running %d releases / %d adoptions, at most %d of one column%s;%s", relSumS,
+                                          adoptSumS, relMaxS, relWhoS.c_str(), relWhyS.c_str());
         std::string runWho = Format("; %d POOL; the most flooded: %s; awake by", poolN, floodWho.c_str());
         for (int b = 0; b < kDirtyReasonBits; b++)
           if ((awakeWhy >> b) & 1u) runWho += Format(" %s", kDirtyReasonName[b]);
@@ -2154,9 +2232,8 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   const int extTicks = num("streamNat.extTicks", 900);
   const int rateDelay = num("streamNat.rateDelay", 30), rateTicks = num("streamNat.rateTicks", 150);
   // "Still filling": the region's water moved by more than this many eighths
-  // per column over the steady window -- sim_stream's own news threshold
-  // (STREAM_CHAIN_TOL, half a voxel), so a level wandering inside a few
-  // eighths is not "filling" and a flood rising half a voxel is.
+  // per column over the steady window: half a voxel, so a level wandering
+  // inside a few eighths is not "filling" and a flood rising half a voxel is.
   const long long fillTolPerCol = num("streamNat.fillTolPerCol", 4);
   const int floodAwakeMax = num("streamNat.floodAwakeMax", 0), chanAwakeMax = num("streamNat.chanAwakeMax", 1);
   const double adoptMin = BaselineNumber("streamNat.adoptMin", 0.6);
@@ -2835,22 +2912,42 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   std::printf("stream-natural: phase 1 (tick: volumes in eighths | held columns | awake chunks | pillars | sim_stream's "
               "release / adoption counters):%s\n",
               curve.c_str());
-  // Echo (the render's record, STILL_ECHO): what the held columns kept.
+  // G. ECHO (the render's record, STILL_ECHO, sim_stream.wgsl echoSample):
+  // what the held columns kept for raymarch.wgsl to play back. A held column
+  // with both words 0 plays the procedural flicker instead (not wrong, but
+  // then the recorder did nothing); a sample further than echoRangeMax
+  // eighths from the target (other than -128, "no water") is not the surface
+  // the column was held at -- a recording taken against the wrong anchor, or
+  // not rebased at adoption. Asserted: at least echoRecordedMin of the held
+  // columns carry a recording, and no sample is out of range.
   {
-    int heldN = 0, moving = 0, dry = 0;
+    const double echoRecMin = BaselineNumber("streamNat.echoRecordedMin", 0.5);
+    const int echoRange = num("streamNat.echoRangeMax", 24);
+    int heldN = 0, recorded = 0, moving = 0, dry = 0, outOfRange = 0, vMin = 127, vMax = -127;
+    std::string oorWho;
     for (const auto& xz : end1.heldCols) {
       heldN++;
       bool mv = false, dr = false;
+      if ((echoAt(snap, xz.first, xz.second, 0) | echoAt(snap, xz.first, xz.second, 1)) != 0u) recorded++;
       for (int w = 0; w < 2; w++)
         for (int b = 0; b < 4; b++) {
           const int8_t v = static_cast<int8_t>((echoAt(snap, xz.first, xz.second, w) >> (8 * b)) & 0xFFu);
-          if (v == -128) dr = true;
-          else if (v != 0) mv = true;
+          if (v == -128) { dr = true; continue; }
+          if (v != 0) mv = true;
+          vMin = std::min(vMin, int(v));
+          vMax = std::max(vMax, int(v));
+          if (std::abs(int(v)) > echoRange && outOfRange++ < 4)
+            oorWho += Format(" (%d,%d) slot %d: %d", xz.first, xz.second, w * 4 + b, int(v));
         }
       moving += mv;
       dry += dr;
     }
-    std::printf("stream-natural:   echo: of %d held columns %d recorded a moving surface, %d a dry sample\n", heldN, moving, dry);
+    const bool gOk = heldN > 0 && recorded >= echoRecMin * heldN && outOfRange == 0;
+    std::printf("stream-natural: G echo: %s (of %d held columns %d carry a recording (>= %.2f), %d of them a moving "
+                "surface, %d a dry sample; samples %d..%d eighths, %d past +-%d%s)\n",
+                gOk ? "PASS" : "FAIL", heldN, recorded, echoRecMin, moving, dry, vMin, vMax, outOfRange, echoRange,
+                oorWho.c_str());
+    if (!gOk) problems.push_back(Format("G: %d / %d held columns recorded, %d samples out of range", recorded, heldN, outOfRange));
   }
   if (end1.observed == 0) problems.push_back("sim_stream never observed a footprint column (did its kernels compile?)");
   const int heldFloodEnd = end1.held[K_NOTCH] + end1.held[K_PLAIN];

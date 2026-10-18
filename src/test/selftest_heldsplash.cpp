@@ -291,7 +291,40 @@ Status GateHeldSplash(Ctx& c, std::string& detail) {
         for (int x = cx - r; x <= cx + r; x++) ops.cells.push_back({World::SlotCellIndex({x, y, z}), full});
     return ops;
   };
-  auto arm = [&](const char* tag, const char* what, IVec3 fixture, const sandvox::support::TickOps& ops) {
+  // THE STREAMS ROUND THE SITE (sim_stream.wgsl; CLAUDE.md rule 6): a
+  // disturbance that cuts a bank makes a BREACH, and a breach that runs from
+  // the river back into it is a map-fed stream, which the CA keeps running
+  // until sim_stream holds it. So each arm ends with the still table's view
+  // of the columns within 12 of the site that hold no map record and were
+  // observed: how many are adopted, and for the rest why the last visit did
+  // not adopt them (STREAM_OBS [6] bits 24..31: 2 no resting surface, 3 in
+  // flight, 4 run short, 5 something below moved, 6 no outflow, 7 not
+  // running, 8 no held map-fed feeder, 10 not at its anchor) and the longest
+  // steady run (windows).
+  auto streamCensus = [&](int sx, int sz) {
+    c.ctx.WaitIdle();
+    std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u), obs(size_t(kWorldN) * kWorldN * 8u);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), 0, tab.data(), tab.size() * 4, "hsStill");
+    const uint64_t obsOff = (uint64_t(kWorldN) * kWorldN * 7u + 4u) * 4u;
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.StillWaterBuffer(), obsOff, obs.data(), obs.size() * 4, "hsObs");
+    int observed = 0, adopted = 0, whyN[16] = {};
+    uint32_t runMax = 0;
+    for (int z = sz - 12; z <= sz + 12; z++)
+      for (int x = sx - 12; x <= sx + 12; x++) {
+        const size_t ci = size_t(z & int(kWorldN - 1)) * kWorldN + size_t(x & int(kWorldN - 1));
+        if (tab[ci * 4 + 1] != 0u) continue;   // the map's own water
+        if (tab[ci * 4 + 2] != 0u) { adopted++; continue; }
+        if (obs[ci * 8] == 0u && obs[ci * 8 + 1] == 0u) continue;   // never observed wet
+        observed++;
+        whyN[(obs[ci * 8 + 6] >> 24) & 15u]++;
+        runMax = std::max(runMax, obs[ci * 8] >> 20);
+      }
+    std::string s = Format("streams within 12 of the site: %d adopted, %d observed unheld (why", adopted, observed);
+    for (int w = 0; w < 16; w++)
+      if (whyN[w]) s += Format(" %d:%d", w, whyN[w]);
+    return s + Format("; longest run %u windows)", runMax);
+  };
+  auto arm = [&](const char* tag, const char* what, IVec3 fixture, const sandvox::support::TickOps& ops, int sx, int sz) {
     const int rested = regen(fixture);
     sandvox::support::TickCursor tick{c, t, fixture};
     const Counters k0 = ReadCounters(c);
@@ -317,6 +350,7 @@ Status GateHeldSplash(Ctx& c, std::string& detail) {
                       k.census[4] - prev.census[4], k.refused[2] - prev.refused[2], k.refused[4] - prev.refused[4], awake);
       prev = k;
     }
+    curve += "\n    " + streamCensus(sx, sz);
     const uint32_t absorbed = prev.absorbed - k0.absorbed;
     const uint32_t total = prev.excited - k0.excited;
     const bool ok = firstExcited > 0 && lateExcited <= lateMax && prev.live <= liveMax && awake <= maxAwake;
@@ -335,12 +369,12 @@ Status GateHeldSplash(Ctx& c, std::string& detail) {
   std::printf("held-splash: fixture: main at (%d, %d) surface y%d; falls' first crest at (%d, %d) y%d\n", mx, mz, my, fx,
               fz, fy);
   arm("A", "splash on main (a 5x5x4 block dropped from 10 over the surface)", IVec3{mx >> 4, my >> 4, mz >> 4},
-      waterBlock(mx, my + 10, mz, 2, 4));
-  arm("B", "splash over falls' first crest", IVec3{fx >> 4, fy >> 4, fz >> 4}, waterBlock(fx, fy + 10, fz, 2, 4));
+      waterBlock(mx, my + 10, mz, 2, 4), mx, mz);
+  arm("B", "splash over falls' first crest", IVec3{fx >> 4, fy >> 4, fz >> 4}, waterBlock(fx, fy + 10, fz, 2, 4), fx, fz);
   {
     sandvox::support::TickOps ops;
     ops.exps.push_back(ExplosionOp{mx, my, mz, 5, 256, 0, 0, 0});
-    arm("C", "blast at main's surface (radius 5)", IVec3{mx >> 4, my >> 4, mz >> 4}, ops);
+    arm("C", "blast at main's surface (radius 5)", IVec3{mx >> 4, my >> 4, mz >> 4}, ops, mx, mz);
   }
 
   // ---- the pristine world back ----
