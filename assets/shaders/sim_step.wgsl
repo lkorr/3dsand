@@ -4662,9 +4662,14 @@ fn heldRest(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   // stage-0 trim of the excess ended the conveyor as well, measured first;
   // held at rest instead, the excess leaves at the reservoir's own GIVE pace,
   // as it always did, and a map surface is not an instant sink for whatever
-  // lands on it.) The MAP's water only (the still record's word [1]): a stream's column is
-  // sim_stream.wgsl's to judge.
-  if (!pool && c.y == ((t8 - 1) >> 3u) && stillWater[stillIndex(c.x, c.z) + 1u] != 0u) { return HELD_REST; }
+  // lands on it.) The map's water AND a map-fed adopted stream's (2026-10-17,
+  // sim_stream.wgsl STREAMS ADOPT ONLY WHEN NATURAL): a held stream is the
+  // same ramp, and its top cells over their targets ran down it as the same
+  // conveyor (measured, `stream-natural`: a fully held channel's 5 chunks
+  // never slept, its top cells trading an eighth or two with their held
+  // neighbours every few ticks). Not a POOL column: THE CONDUIT deposits its
+  // excess at stage 0.
+  if (!pool && c.y == ((t8 - 1) >> 3u)) { return HELD_REST; }
   // THE CONDUIT, CAPPED: a POOL column over its target while the ledger is
   // full is AT REST too -- the head waits (its excess stands in it, the
   // source stops pouring once level with it) instead of running down the
@@ -4771,6 +4776,19 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
   if (dy == 0 && f > ft) { return STILL_GIVE; }
   // At or under the level, resting on something (the lake or its bed).
   if (bm == MAT_AIR) { return STILL_NONE; }
+  // A MAP-FED STREAM IS NOT REFILLED FROM THE RESERVOIR (2026-10-17,
+  // sim_stream.wgsl STREAMS ADOPT ONLY WHEN NATURAL). Its deficit is the
+  // water it delivered, and it is made up the way the live stream made it
+  // up: the held neighbours upstream pour into a held column under its
+  // target (HELD WATER), and so on up to the map's water, which the
+  // reservoir refills. So a held stream delivers what the live one did --
+  // the channel's own resistance is still there -- and rests when nothing
+  // below it takes water. Refilled at once from the reservoir, a held edge
+  // was an instant pipe to the map: measured, `stream-natural`, a held basin
+  // filled a dug extension at 3.6 times the live stream's rate. Not a POOL
+  // column (THE CONDUIT withdraws from its ledger) and not the map's own.
+  let si = stillIndex(c.x, c.z);
+  if (stillWater[si + 1u] == 0u && (stillWater[si + 3u] & STILL_POOL_BIT) == 0u) { return STILL_NONE; }
   if (f < select(8u, ft, dy == 0)) { return STILL_TAKE; }
   if (dy < 0 && voxWordIndex(a) != PT_NO_WORD) { return STILL_GROW; }
   return STILL_NONE;

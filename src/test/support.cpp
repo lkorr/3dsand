@@ -1565,7 +1565,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // sim.streamPoolRoot (bit 16). Riding a pad keeps the layout -- and so
     // world.h, common.wgsl and every shader's SPIR-V cache -- untouched; rename
     // the field the next time either file changes anyway.
-    tp._padSplash0 = (uint32_t)std::clamp(wtun.sim.streamSteadyTicks, 32, 4000) |
+    tp._padSplash0 = (uint32_t)std::clamp(wtun.sim.streamSteadyTicks, 32, 65535) |
                      (wtun.sim.streamPoolRoot != 0 ? (1u << 16) : 0u);
     // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
     // for the WindQuantize reason — the rounding mode is part of what the sim

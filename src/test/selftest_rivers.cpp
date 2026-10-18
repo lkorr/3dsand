@@ -2101,18 +2101,20 @@ Status GateRivers(Ctx& c, std::string& detail) {
 //   A. no column of the FLOOD (notch + plain) is held while the plain is still
 //      filling (its water moved by more than fillTolPerCol eighths a column over
 //      the last steady window), and the plain pools and its chunks sleep (<= floodAwakeMax);
-//   B. no PILLAR at any sample: a held column whose target stands more than a
-//      voxel over every wet neighbour (or over open dry ones);
+//   B. no PILLAR four samples running (200 ticks): a held column whose target
+//      stands more than a voxel over every wet neighbour (or over open dry
+//      ones);
 //   C. no CHANNEL column is held while the basin is still filling, and once it
 //      is a through-flow the channel is held (>= adoptMin) and its chunks
 //      sleep (<= chanAwakeMax);
 //   D. no cycling: at most releaseMax releases per column over phase 1
 //      (sim_stream's own per-column counter, STREAM_OBS word 6), and the held
 //      channel never loses columns between samples while nothing changes;
-//   E. DELIVERY: the extension is opened under the held stream; the water
-//      the basin region gains per tick over rateTicks (from rateDelay after
-//      the opening) is within [rateLo, rateHi] of what it gained per tick
-//      while the LIVE stream first filled the basin;
+//   E. DELIVERY: the extension is opened under the held stream, and in a
+//      CONTROL world under the same stream never held (sim.streamSteadyTicks
+//      at its ceiling, the same ticks, the door opened at the same tick); the
+//      water the basin region gains per tick over rateTicks (from rateDelay
+//      after the opening) held is within [rateLo, rateHi] of live;
 //   F. DETERMINISM: detRuns runs of the first detTicks of phase 1 from a fresh
 //      worldgen hash the fixture's voxels and still-table words equal.
 // Every sample prints the volumes, held counts, awake chunks and the largest
@@ -2161,7 +2163,7 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   const int releaseMax = num("streamNat.releaseMax", 1);
   const double rateLo = BaselineNumber("streamNat.rateLo", 0.5), rateHi = BaselineNumber("streamNat.rateHi", 2.0);
   const int detRuns = num("streamNat.detRuns", 3), detTicks = num("streamNat.detTicks", 600);
-  const int steadyTicks = std::clamp(CurrentTuning().sim.streamSteadyTicks, 32, 4000);
+  const int steadyTicks = std::clamp(CurrentTuning().sim.streamSteadyTicks, 32, 65535);
   const int steadySamples = std::max(1, steadyTicks / sampleTicks);
 
   // ---- the synthetic map: flat ground, two lakes ----
@@ -2514,6 +2516,8 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   struct Census {
     long long vol[K_COUNT] = {};
     int held[K_COUNT] = {}, pool = 0, awake[K_COUNT] = {};
+    uint32_t awakeWhy[K_COUNT] = {};   // OR of the awake chunks' dirty reasons
+    std::string awakeWhere;            // the awake channel chunks (slot -> world chunk)
     int pillars = 0, relMax = 0, relTotal = 0, adoptTotal = 0;
     // CLIFF: a held column over a voxel above ANY open neighbour's water (a
     // sheer held face); UNDER: a held column whose water stands over a voxel
@@ -2526,7 +2530,7 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
     int observed = 0;
     uint32_t relWhy = 0;   // OR of the reason bytes of every column that released
     std::string pillarWho, relWho;
-    std::set<std::pair<int, int>> heldCols;
+    std::set<std::pair<int, int>> heldCols, pillarCols;
   };
   auto census = [&](Snap& s) -> Census {
     snapshot(s);
@@ -2567,6 +2571,7 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
         const int own = restS8(s, x, z);
         if (own == INT_MIN || own < t8 - 8) r.under++;
         if ((best != INT_MIN && t8 > best + 8) || (best == INT_MIN && openDry)) {
+          r.pillarCols.insert(xz);
           if (!r.pillars++)
             r.pillarWho = Format(" first (%d,%d) %s t8 %d (y%d), highest wet neighbour %d", x, z, kKindName[kd], t8, yt, best);
         }
@@ -2590,7 +2595,14 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
     rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl.data(), kNumSlots * 4, "streamNatAwake");
     for (int k = 0; k < K_COUNT; k++)
       for (uint32_t sl : chunksOf[k])
-        if (sl < kNumSlots && fl[sl] != 0u) r.awake[k]++;
+        if (sl < kNumSlots && fl[sl] != 0u) {
+          r.awake[k]++;
+          r.awakeWhy[k] |= fl[sl];
+          if (k == K_CHAN) {
+            const IVec3 w = c.world.SlotToWorldChunk(sl);
+            r.awakeWhere += Format(" (%d,%d,%d)", w.x, w.y, w.z);
+          }
+        }
     return r;
   };
 
@@ -2661,6 +2673,8 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   struct Hist { int tick; long long plain, basin; int heldFlood, heldChan; };
   std::vector<Hist> hist;
   int floodEarly = 0, chanEarly = 0, pillarsMax = 0, lost = 0, done = 0;
+  std::set<std::pair<int, int>> prevPillars;
+  std::map<std::pair<int, int>, int> pillarAge;   // samples in a row each pillar has stood
   std::string floodEarlyWho, chanEarlyWho, pillarWho;
   long long liveRate10 = 0;   // the basin region's gain per 10 ticks while the LIVE stream fills it
   int liveFrom = -1, liveTo = -1;
@@ -2758,7 +2772,23 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
       }
       if (heldChan < prevHeldChan && poolAt >= 0) lost += prevHeldChan - heldChan;
       prevHeldChan = heldChan;
-      if (s.pillars > pillarsMax) { pillarsMax = s.pillars; pillarWho = Format(" at tick %d:%s", done, s.pillarWho.c_str()); }
+      // A PILLAR that stands FOUR samples running (200 ticks): the unheld
+      // water round a held column flickers, and the adoption front leaves a
+      // held column over a neighbour it has not reached yet for a few ticks --
+      // neither is what the owner saw (a column standing for good).
+      {
+        int persistent = 0;
+        for (const auto& xz : s.pillarCols)
+          if (pillarAge[xz] >= 3) persistent++;
+        std::map<std::pair<int, int>, int> nextAge;
+        for (const auto& xz : s.pillarCols) nextAge[xz] = prevPillars.count(xz) ? pillarAge[xz] + 1 : 1;
+        pillarAge = nextAge;
+        if (persistent > pillarsMax) {
+          pillarsMax = persistent;
+          pillarWho = Format(" at tick %d:%s", done, s.pillarWho.c_str());
+        }
+        prevPillars = s.pillarCols;
+      }
       // The live fill: from the first water in the basin to half its capacity
       // under the sill.
       if (liveFrom < 0 && s.vol[K_BASIN] > 0) { liveFrom = done; liveVol0 = s.vol[K_BASIN] + s.vol[K_CHAN]; }
@@ -2774,6 +2804,34 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   }
   if (liveTo > liveFrom && liveFrom >= 0) liveRate10 = (liveVol1 - liveVol0) * 10 / (liveTo - liveFrom);
   const Census end1 = s;
+  // WHAT MOVES in the awake channel chunks (CLAUDE.md rule 6): the channel's
+  // water cells now and 16 ticks on, every changed one with its column's held
+  // target -- an inner conveyor names its columns.
+  if (end1.awake[K_CHAN] > chanAwakeMax) {
+    Snap a = snap;
+    {
+      sandvox::support::TickCursor tick{c, t, fixture};
+      for (int k = 0; k < 16; k++) tick();
+    }
+    Snap b;
+    snapshot(b);
+    std::string moved;
+    int nMoved = 0;
+    for (const auto& [xz, kf] : interior) {
+      if (kf.first != K_CHAN) continue;
+      for (int y = kf.second; y <= kf.second + 6; y++) {
+        const uint32_t wa = a.At(xz.first, y, xz.second) & 0xFF00FFFFu, wb = b.At(xz.first, y, xz.second) & 0xFF00FFFFu;
+        if (wa == wb) continue;
+        if (nMoved++ < 12) {
+          const int t8 = recAt(b, xz.first, xz.second, 2) != 0u ? static_cast<int>(recAt(b, xz.first, xz.second, 2) << 12) >> 12 : -1;
+          moved += Format(" (%d,%d,%d) %u/%u->%u/%u t8 %d (y%d+%d)", xz.first, y, xz.second, wa & 0xFFFu, ((wa >> 12) & 15u) + 1u,
+                          wb & 0xFFFu, ((wb >> 12) & 15u) + 1u, t8, t8 >= 0 ? (t8 - 1) >> 3 : -1,
+                          t8 >= 0 ? t8 - 8 * ((t8 - 1) >> 3) : 0);
+        }
+      }
+    }
+    std::printf("stream-natural:   the channel over 16 more ticks: %d water words changed:%s\n", nMoved, moved.c_str());
+  }
   std::printf("stream-natural: phase 1 (tick: volumes in eighths | held columns | awake chunks | pillars | sim_stream's "
               "release / adoption counters):%s\n",
               curve.c_str());
@@ -2806,10 +2864,13 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
   std::printf("stream-natural: B pillars: %s (worst sample %d%s)\n", bOk ? "PASS" : "FAIL", pillarsMax, pillarWho.c_str());
   if (!bOk) problems.push_back(Format("B: %d pillars%s", pillarsMax, pillarWho.c_str()));
   const bool cOk = chanEarly == 0 && chanHeldAt >= 0 && end1.awake[K_CHAN] <= chanAwakeMax;
+  std::string chanWhy;
+  for (int b = 0; b < kDirtyReasonBits; b++)
+    if ((end1.awakeWhy[K_CHAN] >> b) & 1u) chanWhy += Format(" %s", kDirtyReasonName[b]);
   std::printf("stream-natural: C channel: %s (held while the basin filled: %d samples%s; >= %.2f of %d held at tick %d; "
-              "at the end %d held, %d channel chunks awake (<= %d))\n",
+              "at the end %d held, %d channel chunks awake (<= %d):%s, by%s)\n",
               cOk ? "PASS" : "FAIL", chanEarly, chanEarlyWho.c_str(), adoptMin, chanCols, chanHeldAt, end1.held[K_CHAN],
-              end1.awake[K_CHAN], chanAwakeMax);
+              end1.awake[K_CHAN], chanAwakeMax, end1.awakeWhere.c_str(), chanWhy.c_str());
   if (!cOk) problems.push_back(Format("C: channel held early %d, held at %d, %d awake", chanEarly, chanHeldAt, end1.awake[K_CHAN]));
   const bool dOk = end1.relMax <= releaseMax && lost == 0;
   std::printf("stream-natural: D cycling: %s (most releases of one column %d (<= %d)%s%s; %d releases, %d adoptions in all, "
@@ -2818,35 +2879,88 @@ Status GateStreamNatural(Ctx& c, std::string& detail) {
               end1.relTotal, end1.adoptTotal, end1.relWhy, lost);
   if (!dOk) problems.push_back(Format("D: %d releases of one column, %d lost", end1.relMax, lost));
 
-  // ---- phase 2: the extension opened under the held stream ----
-  {
+  // ---- phase 2: the extension opened -- under the held stream, and (E's
+  // CONTROL) under the same stream never held: a fresh world, the same
+  // build, the same ticks with sim.streamSteadyTicks at its ceiling (65535
+  // ticks: nothing is adopted), the door opened at the same tick. What the
+  // extension and the basin region gain per tick after the opening is the
+  // stream's DELIVERY; held must deliver what live does. ----
+  auto region = [&](const Census& q) { return q.vol[K_CHAN] + q.vol[K_BASIN] + q.vol[K_EXT] + q.vol[K_DOOR]; };
+  struct Arm {
+    long long rate10 = 0, gainEnd = 0;
+    int t0 = -1, t1 = -1, heldAtOpen = 0, heldEnd = 0, relEnd = 0, relMax = 0;
+    std::string curve, relWho;
+  };
+  auto openAndMeasure = [&](Arm& arm) {
     sandvox::support::TickCursor tick{c, t, fixture};
+    s = census(snap);
+    const long long vOpen = region(s);
+    arm.heldAtOpen = s.held[K_CHAN] + s.held[K_BASIN];
     sandvox::support::TickOps o;
     o.cells = openDoor;
     tick(o);
-    std::string curve2;
     long long v0 = -1, v1 = -1;
-    int t0 = -1, t1 = -1;
-    auto region = [&](const Census& q) { return q.vol[K_CHAN] + q.vol[K_BASIN] + q.vol[K_EXT] + q.vol[K_DOOR]; };
     const int step = std::max(10, std::min(sampleTicks, rateDelay));
     for (int k = 1; k <= extTicks;) {
       for (int j = 0; j < step && k <= extTicks; j++, k++) tick();
-      if (k - 1 >= rateDelay && v0 < 0) { s = census(snap); v0 = region(s); t0 = k - 1; curve2 += "\n " + line(k - 1, s); continue; }
-      if (t0 >= 0 && v1 < 0 && k - 1 - t0 >= rateTicks) { s = census(snap); v1 = region(s); t1 = k - 1; curve2 += "\n " + line(k - 1, s); continue; }
-      if ((k - 1) % (step * 5) == 0) { s = census(snap); curve2 += "\n " + line(k - 1, s); }
+      const int at = k - 1;
+      if (at >= rateDelay && v0 < 0) { s = census(snap); v0 = region(s); arm.t0 = at; arm.curve += "\n " + line(at, s); continue; }
+      if (arm.t0 >= 0 && v1 < 0 && at - arm.t0 >= rateTicks) { s = census(snap); v1 = region(s); arm.t1 = at; arm.curve += "\n " + line(at, s); continue; }
+      if (at % (step * 5) == 0) { s = census(snap); arm.curve += "\n " + line(at, s); }
     }
-    std::printf("stream-natural: phase 2, the extension opened:%s\n", curve2.c_str());
-    const long long frozen10 = (t1 > t0 && t0 >= 0) ? (v1 - v0) * 10 / (t1 - t0) : 0;
-    const double ratio = liveRate10 > 0 ? double(frozen10) / double(liveRate10) : 0.0;
-    const bool eOk = liveRate10 > 0 && ratio >= rateLo && ratio <= rateHi;
-    std::printf("stream-natural: E delivery: %s (live: the basin region gained %lld eighths / 10 ticks over ticks %d..%d of "
-                "phase 1; held: %lld / 10 ticks over ticks %d..%d after the extension opened (%d channel columns held at "
-                "%d); ratio %.2f in [%.2f, %.2f])\n",
-                eOk ? "PASS" : "FAIL", liveRate10, liveFrom, liveTo, frozen10, t0, t1, end1.held[K_CHAN], done, ratio, rateLo,
-                rateHi);
-    RecordObserved("streamNat.observedLiveRate10", static_cast<double>(liveRate10));
-    RecordObserved("streamNat.observedHeldRate10", static_cast<double>(frozen10));
-    if (!eOk) problems.push_back(Format("E: delivery ratio %.2f (live %lld, held %lld per 10 ticks)", ratio, liveRate10, frozen10));
+    s = census(snap);
+    arm.gainEnd = region(s) - vOpen;
+    arm.heldEnd = s.held[K_CHAN] + s.held[K_BASIN];
+    arm.relEnd = s.relTotal;
+    arm.relMax = s.relMax;
+    arm.relWho = s.relWho;
+    arm.rate10 = (arm.t1 > arm.t0 && arm.t0 >= 0) ? (v1 - v0) * 10 / (arm.t1 - arm.t0) : 0;
+  };
+  Arm heldArm, liveArm;
+  openAndMeasure(heldArm);
+  std::printf("stream-natural: phase 2, the extension opened under the held stream:%s\n", heldArm.curve.c_str());
+  const int phase1Ticks = done;
+  {
+    Tuning never = CurrentTuning();
+    never.sim.streamSteadyTicks = 65535;
+    SetCurrentTuning(never);
+    setup();
+    sandvox::support::TickCursor tick{c, t, fixture};
+    sandvox::support::TickOps o;
+    o.cells = openGate;
+    tick(o);
+    for (int k = 1; k < phase1Ticks; k++) tick();
+    s = census(snap);
+    std::printf("stream-natural:   CONTROL at the opening (never held):%s\n", line(phase1Ticks, s).c_str());
+    openAndMeasure(liveArm);
+    std::printf("stream-natural: phase 2 CONTROL, the extension opened under the live stream:%s\n", liveArm.curve.c_str());
+    Tuning back = CurrentTuning();
+    back.sim.streamSteadyTicks = steadyTicks;
+    SetCurrentTuning(back);
+  }
+  {
+    const double ratio = liveArm.rate10 > 0 ? double(heldArm.rate10) / double(liveArm.rate10) : 0.0;
+    const double ratioEnd = liveArm.gainEnd > 0 ? double(heldArm.gainEnd) / double(liveArm.gainEnd) : 0.0;
+    const bool eOk = liveArm.rate10 > 0 && heldArm.heldAtOpen > 0 && ratio >= rateLo && ratio <= rateHi;
+    std::printf("stream-natural: E delivery: %s (the basin region's gain after the extension opened, per 10 ticks over "
+                "ticks %d..%d: HELD (%d channel + basin columns held at the opening, %d at the end) %lld, LIVE (never "
+                "held) %lld, ratio %.2f in [%.2f, %.2f]; over all %d ticks %lld vs %lld eighths, ratio %.2f; for reference "
+                "the live stream first filled the basin at %lld / 10 ticks)\n",
+                eOk ? "PASS" : "FAIL", heldArm.t0, heldArm.t1, heldArm.heldAtOpen, heldArm.heldEnd, heldArm.rate10,
+                liveArm.rate10, ratio, rateLo, rateHi, extTicks, heldArm.gainEnd, liveArm.gainEnd, ratioEnd, liveRate10);
+    // D, after the opening: a dug extension drains the held basin and lets
+    // its columns go -- once each; nothing may be taken and let go again.
+    const bool d2Ok = heldArm.relMax <= releaseMax;
+    std::printf("stream-natural: D cycling after the opening: %s (most releases of one column %d (<= %d)%s%s; %d releases "
+                "in all)\n",
+                d2Ok ? "PASS" : "FAIL", heldArm.relMax, releaseMax, heldArm.relWho.empty() ? "" : ": ", heldArm.relWho.c_str(),
+                heldArm.relEnd);
+    if (!d2Ok) problems.push_back(Format("D: %d releases of one column after the opening", heldArm.relMax));
+    RecordObserved("streamNat.observedLiveRate10", static_cast<double>(liveArm.rate10));
+    RecordObserved("streamNat.observedHeldRate10", static_cast<double>(heldArm.rate10));
+    if (!eOk)
+      problems.push_back(Format("E: delivery ratio %.2f (held %lld, live %lld per 10 ticks; %d held at the opening)", ratio,
+                                heldArm.rate10, liveArm.rate10, heldArm.heldAtOpen));
   }
   RecordObserved("streamNat.observedPoolAt", static_cast<double>(poolAt));
   RecordObserved("streamNat.observedChanHeldAt", static_cast<double>(chanHeldAt));

@@ -1176,7 +1176,7 @@ TP_I(sim, soluteDrift, NO_WGSL, 24, 0, 255)
 // stream must stay live water until it has stopped going anywhere new.
 // NO_WGSL: it reaches sim_stream.wgsl through the TickParams stream word
 // (SubmitTick), so it is live.
-TP_I(sim, streamSteadyTicks, NO_WGSL, 600, 32, 4000)
+TP_I(sim, streamSteadyTicks, NO_WGSL, 600, 32, 65535)
 // THE CONDUIT's ROOTING (phase 3): 1 lets a stream fed by a FINITE source (a
 // pour, a pool) be adopted as a POOL stream. 0 = only streams fed from the
 // map's water are ever held (the owner's rule, 2026-10-17). NO_WGSL, the
