@@ -26091,14 +26091,7 @@ someone digs or explodes, and every one of those arrives through the mutation
 queue. `WaterBodySystem::HoleHint` records that cell against the body whose chunk
 it landed in, and the sink and the vortex sit there. Exact in the case that
 matters (a player boring a shaft), approximate in the case that does not (which
-of several digs the ledger called deepest), and free. ONLY A DIG counts
-(2026-10-18, `SubmitTick`'s `holeEdited`): an op that leaves a void -- an air
-cell op, an erase brush, a blast -- at or below the body's surface. Any
-mutation in a labelled chunk used to, so placing a block in a lake, or a
-fixture re-stamping its own basin, spun up a 30 s whirlpool and sink at the
-op; since bodies afloat feel the sim-licensed current that dragged a floating
-body into a sealed basin's corner (gate `corpse-float`, limp arm). The M5
-re-derive and the drain latch still arm on any edit in a labelled chunk.
+of several digs the ledger called deepest), and free.
 
 **Gamma and chirality come from `hash3` of the hole position.** This is
 physically legitimate rather than a fudge: a real bathtub vortex is not created by

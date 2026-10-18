@@ -566,21 +566,12 @@ class WaterBodySystem {
   // NOT part of any decision about which bodies exist.
   //
   // `editCell` is the world cell of that mutation (meaningless when
-  // `worldEdited` is false); it arms the M5 re-derive. `holeEdited` /
-  // `holeCell` are the first mutation that could have OPENED A HOLE in that
-  // body -- one that removes matter (an air cell op, an erase brush, a blast)
-  // at or below the body's surface -- and only that is recorded as the hole
-  // hint component 8's drain seeder reads (WaterBodyHole above). Placing
-  // matter, re-writing a lake's own water, or clearing the air over it
-  // cannot drain anything: until 2026-10-18 every one of those seeded a 30 s
-  // whirlpool and sink at the op, which bodies afloat have felt since that
-  // day (corpse-float's limp human, dragged into a corner of a sealed basin
-  // the gate had re-stamped). Defaulted so a caller with no cell to offer
-  // still compiles into the M3 behaviour exactly.
+  // `worldEdited` is false). It is recorded per body as the hole hint component
+  // 8's drain seeder reads — see WaterBodyHole above. Defaulted so a caller
+  // that has no cell to offer still compiles into the M3 behaviour exactly.
   void Tick(const World& world, uint32_t seed, uint32_t tick, int mode,
             int testDrain, int drainMax, int relevelMax, bool worldEdited,
-            IVec3 editCell = IVec3{0, 0, 0}, bool holeEdited = false,
-            IVec3 holeCell = IVec3{0, 0, 0});
+            IVec3 editCell = IVec3{0, 0, 0});
 
   // ---- W-D: EVIDENCE ACCOUNTING (§8.2/§8.3) ------------------------------
   //

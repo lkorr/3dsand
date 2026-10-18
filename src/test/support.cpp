@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1755,58 +1754,6 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       for (const ExplosionOp& e : exps)
         touch({e.x >> 4, e.y >> 4, e.z >> 4}, {e.x, e.y, e.z});
     }
-    // ...and the FIRST one of them that could have opened a HOLE: it leaves
-    // a void (an air cell op, an erase brush, a blast) at or below the
-    // surface of the body whose chunk it is in. Only that seeds the hole hint
-    // (component 8's whirlpool + sink, waterbody.h Tick). Writing a solid, a
-    // lake's own water, or air above its surface cannot drain it -- and every
-    // one of those used to seed a 30 s whirlpool at the op. Pure function of
-    // the op list and last tick's descriptors, like `editCell`.
-    bool holeEdited = false;
-    IVec3 holeCell{0, 0, 0};
-    if (worldEdited) {
-      const std::vector<uint32_t>& lbl = wb.ChunkBody();
-      const std::vector<WaterBodyDesc>& bodies = wb.Bodies();
-      auto surfaceOf = [&](uint32_t slot) -> int {
-        if (lbl.size() != kNumSlots || slot >= kNumSlots) return INT_MIN;
-        const uint32_t bi = lbl[slot];
-        if (bi == 0 || bi - 1 >= bodies.size()) return INT_MIN;
-        return bodies[bi - 1].level;
-      };
-      for (uint32_t i = 0; i < cellCount && !holeEdited; i++) {
-        if ((cells[i].word & ~kCellOpIfAir & 0xFFFu) != kMatAir) continue;
-        if (cells[i].word & kCellOpIfAir) continue;   // fills air; removes nothing
-        const uint32_t slot = cells[i].cellIdx / kChunkVol;
-        const int level = surfaceOf(slot);
-        if (level == INT_MIN) continue;
-        const uint32_t loc = cells[i].cellIdx % kChunkVol;
-        const IVec3 wc = world.SlotToWorldChunk(slot);
-        const IVec3 cell{wc.x * (int)kChunk + (int)(loc % kChunk),
-                         wc.y * (int)kChunk + (int)((loc / kChunk) % kChunk),
-                         wc.z * (int)kChunk + (int)(loc / (kChunk * kChunk))};
-        if (cell.y > level) continue;   // clearing the air over the water
-        holeEdited = true;
-        holeCell = cell;
-      }
-      for (const BrushOp& o : ops) {
-        if (holeEdited) break;
-        if (o.material != kMatAir || o.mode != 1u) continue;   // not an erase
-        const IVec3 wc{o.x >> 4, o.y >> 4, o.z >> 4};
-        if (!world.ChunkInWindow(wc)) continue;
-        const int level = surfaceOf(World::SlotChunkIndex(wc));
-        if (level == INT_MIN || o.y - o.radius > level) continue;
-        holeEdited = true;
-        holeCell = {o.x, o.y, o.z};
-      }
-      for (const ExplosionOp& e : exps) {
-        if (holeEdited) break;
-        const IVec3 wc{e.x >> 4, e.y >> 4, e.z >> 4};
-        if (!world.ChunkInWindow(wc)) continue;
-        if (surfaceOf(World::SlotChunkIndex(wc)) == INT_MIN) continue;
-        holeEdited = true;
-        holeCell = {e.x, e.y, e.z};
-      }
-    }
     spanHead.Close();
     {
       sandvox::PerfSpan spanWb(PerfScope::WaterBody);
@@ -1852,7 +1799,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
         WaterBodyNoteBlast(wb, e, wt.sim.waveBlastImpulse);
       wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
               wt.sim.drainMaxEighthsPerTick, wt.sim.waterRelevelMax,
-              worldEdited, editCell, holeEdited, holeCell);
+              worldEdited, editCell);
     }
     const WaterBodyGpu& g = wb.Gpu();
     waterGpu = &g;

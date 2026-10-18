@@ -1192,8 +1192,7 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax,
 
 void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
                            int mode, int testDrain, int drainMax,
-                           int relevelMax, bool worldEdited, IVec3 editCell,
-                           bool holeEdited, IVec3 holeCell) {
+                           int relevelMax, bool worldEdited, IVec3 editCell) {
   mode_ = mode;
   // The hot latch (see waterbody.h). Set from the tick input stream only, so a
   // replay reproduces it and the twice-run determinism gate compares it.
@@ -1289,24 +1288,12 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
         }
         if (!haveDirty)
           curveDirtyUntil_.push_back({basinId, tick + kWaterDrainHotTicks});
-      }
-    }
-    // THE HOLE HINT: only a mutation that could have opened one (the
-    // caller's `holeEdited`, see Tick's declaration), against the same
-    // labelling. The M5 re-derive above still arms on any edit: a raised
-    // partition changes the container without draining it.
-    if (holeEdited && chunkBody_.size() == kNumSlots &&
-        world.ChunkInWindow({holeCell.x >> 4, holeCell.y >> 4, holeCell.z >> 4})) {
-      const uint32_t slot = World::SlotChunkIndex(
-          {holeCell.x >> 4, holeCell.y >> 4, holeCell.z >> 4});
-      const uint32_t bi = slot < kNumSlots ? chunkBody_[slot] : 0u;
-      if (bi != 0 && bi - 1 < bodies_.size()) {
         WaterBodyHole h;
         h.valid = true;
         h.basinId = bodies_[bi - 1].basinId;
-        h.x = holeCell.x;
-        h.y = holeCell.y;
-        h.z = holeCell.z;
+        h.x = editCell.x;
+        h.y = editCell.y;
+        h.z = editCell.z;
         h.tick = tick;
         bool found = false;
         for (WaterBodyHole& e : holeHints_) {
