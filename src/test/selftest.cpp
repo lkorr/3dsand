@@ -45,6 +45,7 @@ const std::vector<Gate>& RiverGates();
 // and ticked flat. The `rivers` seam and exit.
 const std::vector<Gate>& LakeSettleGates();
 const std::vector<Gate>& HeldSplashGates();
+const std::vector<Gate>& AcidPourGates();
 // A stream from a finite source sleeps while it runs (docs/PLAN_running_water.md
 // phase 3, THE CONDUIT): a stone reservoir + channel + basin on the pad.
 const std::vector<Gate>& StreamPoolGates();
@@ -1554,6 +1555,10 @@ const char* const kOrder[] = {
     // the `rivers` seam and exit again (a synthetic map, regenerated per arm,
     // TICKED -- splashes and a blast -- the real environment back).
     "held-splash",
+    // A small acid pour into a held river is finite (ticket
+    // 2026-10-17_00-04-26): held-splash's seam and exit (the same synthetic
+    // valley, regenerated, TICKED -- an MPM pour -- the real environment back).
+    "acid-pour",
     // A stream from a finite source (docs/PLAN_running_water.md phase 3): it
     // regenerates the window on entry, builds a stone reservoir + channel +
     // basin on the pad, ticks thousands of ticks of running water and
@@ -1603,7 +1608,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &HeldSplashGates(), &StreamPoolGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &HeldSplashGates(), &AcidPourGates(), &StreamPoolGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
