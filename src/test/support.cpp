@@ -1567,6 +1567,18 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // the field the next time either file changes anyway.
     tp._padSplash0 = (uint32_t)std::clamp(wtun.sim.streamSteadyTicks, 32, 65535) |
                      (wtun.sim.streamPoolRoot != 0 ? (1u << 16) : 0u);
+    // THE SPOUT WORD (sim_fluid_seam.wgsl THE SPOUT JET; ticket
+    // 2026-10-17_11-44-48), the second pad, `_padSplash1`: sim.fluidSpoutChance
+    // in the low 16 bits (Q16, 65535 = always) and sim.fluidSpoutGain in the
+    // high 16 (Q12, 4096 = the whole Torricelli speed). Rounded here, once,
+    // half-up on non-negative values, so the kernel sees integers only.
+    {
+      const uint32_t chanceQ = (uint32_t)std::clamp(
+          (int)(wtun.sim.fluidSpoutChance * 65536.0f + 0.5f), 0, 65535);
+      const uint32_t gainQ = (uint32_t)std::clamp(
+          (int)(wtun.sim.fluidSpoutGain * 4096.0f + 0.5f), 0, 4096);
+      tp._padSplash1 = chanceQ | (gainQ << 16);
+    }
     // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
     // for the WindQuantize reason — the rounding mode is part of what the sim
     // sees, so it is written here rather than left to a compiler flag. At the

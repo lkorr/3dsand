@@ -13460,14 +13460,30 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
 // entry-cell look drew the cloud only where it touched the surface, and the
 // submerged view (which has no entry cell) never drew it at all.
 //
-// HOW IT WALKS: one sample per cell SLAB of the ray's dominant axis -- at the
-// ray's crossing of each mid-plane (x = k + 0.5, or y, or z) -- weighted by
-// the length of path that slab covers. The sample points are a pure function
-// of the ray and the world grid: no frame index, no dither. The slabs are
+// HOW IT WALKS: every CELL the ray crosses, in order, weighted by the exact
+// length of path inside it (an Amanatides-Woo DDA: integer cell steps, each
+// axis' next face crossing from (face - ro) / rd, a difference of two nearby
+// floats and so exact even 44,000 cells from the origin). A pure function of
+// the ray and the world grid: no frame index, no dither. The cells are
 // composited front to back (SolColumn, below), so the optical depth is that
 // of the cloud actually crossed AND a cloud near the eye covers what is
 // behind it. Tint and glow are strength-weighted, so a red cloud in clean
 // water stays red.
+//
+// WHY NOT ONE SAMPLE PER SLAB (ticket 2026-10-17_11-50-39, "blood in water
+// ... creates weird lines at voxel edges"). Until 2026-10-18 this took one
+// sample per cell slab of the ray's DOMINANT axis, at its mid-plane, and said
+// so: "it can skip a corner a minor axis clips, which a cloud of voxel cells
+// does not show". Blood that has just mixed is exactly such a corner. It sits
+// in the TOP layer of a river, often in a part-full top cell, and a ray at a
+// grazing angle leaves that layer within half a cell of where it entered:
+// the first mid-plane sample landed in the clean cell under it unless the
+// entry point happened to lie just before a mid-plane. Measured with a
+// per-pixel probe (the walk's largest blood share): within one bloody top
+// face only a band of pixels near each mid-plane saw the blood -- red
+// stripes one per voxel across a pink surface, the owner's lines. A DDA has
+// no sample to miss: the entry cell is always the first one visited, for the
+// length the ray actually spends in it.
 //
 // WHY NOT A FEW DITHERED SAMPLES (ticket 2026-10-11 01:29:42, "blood
 // underwater strobes"). The first version took 12 samples evenly over the
@@ -13481,13 +13497,15 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
 // corner a minor axis clips, which a cloud of voxel cells does not show), so
 // the integral is the same every frame and moves only when the view does.
 //
-// Bounded by the same cap: span <= LIQ_VIS_M (100 cells), so at most ~101
-// slab samples, and only inside chunks that hold dissolved matter -- a chunk
-// with no solute (solTable entry 0, the common case) is skipped to its far
-// face in one step, so clean water pays one table load per 16-cell chunk
-// crossed (<= ~8) where it paid 12. After the march, in the shades only --
-// not per DDA step (the register cliff the entry-cell note above is about).
-const SOL_PATH_MAX_STEPS : u32 = 160u;
+// Bounded by the same cap: span <= LIQ_VIS_M (100 cells), so at most ~174
+// cell crossings (100 x the ray's L1/Linf ratio, sqrt 3 at worst), and only
+// inside chunks that hold dissolved matter -- a chunk with no solute
+// (solTable entry 0, the common case) is skipped to its far face in one step,
+// so clean water pays one table load per 16-cell chunk crossed (<= ~8).
+// Past the budget the rest of the path is the clean tail. After the march,
+// in the shades only -- not per DDA step (the register cliff the entry-cell
+// note above is about).
+const SOL_PATH_MAX_STEPS : u32 = 192u;
 
 // WHAT THE WALK RETURNS: the column as ONE equivalent homogeneous body, in
 // the coefficients the shades already speak -- `absorbK` and `scatter` such
@@ -13548,43 +13566,47 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32,
   let path = max(pathVox, 0.0);
   let span = min(path, LIQ_VIS_M / VOXEL_METERS);
   if (span <= 0.0) { return o; }
-  // The dominant axis, its ray component and origin coordinate.
-  let ad = abs(rd);
-  var dM = rd.x;
-  var oM = ro.x;
-  if (ad.y > ad.x && ad.y >= ad.z) { dM = rd.y; oM = ro.y; }
-  else if (ad.z > ad.x && ad.z > ad.y) { dM = rd.z; oM = ro.z; }
-  let dt = 1.0 / max(abs(dM), 1e-4);          // path per slab (1 .. sqrt 3)
-  let pos = dM > 0.0;
-  // The first mid-plane at or ahead of the origin along the axis.
-  let h0 = select(floor(oM + 0.5) - 0.5, ceil(oM - 0.5) + 0.5, pos);
-  var t = (h0 - oM) / dM;
-  // A zero component would make the chunk-exit division -inf on the near
-  // side; a tiny POSITIVE stand-in picks the far face and gives +huge.
+  // A zero component would make a face division -inf on the near side; a
+  // tiny POSITIVE stand-in picks the far face and gives +huge (never taken).
   let rdS = select(rd, vec3f(1e-30), abs(rd) < vec3f(1e-30));
+  let inv = 1.0 / rdS;
+  let up = rdS > vec3f(0.0);
+  let stp = select(vec3<i32>(-1), vec3<i32>(1), up);
+  // The first cell: a hair along the ray, so a hit ON a face starts on the
+  // far side of it. Where the hair is below a float's resolution (a face
+  // 44,000 cells out) the start may be the cell in front instead, which
+  // costs one zero-length visit: its exit face is the hit's own face.
+  var cell = vec3<i32>(floor(ro + rd * 1e-3));
+  var t = 0.0;
   var T = vec3f(1.0);        // transmittance from the entry to `done`
   var L = vec3f(0.0);        // in-scatter gathered so far
   var done = 0.0;            // path integrated so far, voxels
   var wsum = 0.0;
   for (var i = 0u; i < SOL_PATH_MAX_STEPS; i = i + 1u) {
-    if (t - 0.5 * dt >= span) { break; }
-    let cell = vec3<i32>(floor(ro + rd * t));
+    if (t >= span) { break; }
     if (solTable[voxSlotOfCell(cell)] == 0u) {
-      // No dissolved matter anywhere in this chunk: jump to its far face,
-      // then to the first mid-plane past it. The stretch is integrated as
-      // clean body when the next solute slab (or the tail) is reached.
-      let cmin = vec3f(cell - (cell & vec3<i32>(CHUNK_MASK)));
-      let face = select(cmin, cmin + f32(CHUNK), rdS > vec3f(0.0));
-      let te = (face - ro) / rdS;
-      let tExit = min(te.x, min(te.y, te.z));
-      let cM = oM + dM * tExit;
-      let h = select(ceil(cM + 0.5) - 1.5, floor(cM - 0.5) + 1.5, pos);
-      t = max((h - oM) / dM, t + dt);
+      // No dissolved matter anywhere in this chunk: jump to its far face.
+      // The stretch is integrated as clean body when the next solute cell
+      // (or the tail) is reached. The cell there: one step across the face
+      // the ray leaves by, the other two coordinates where the ray is (not
+      // on a face of theirs, so floor is safe).
+      let base = cell & vec3<i32>(~CHUNK_MASK);
+      let te = (vec3f(base + select(vec3<i32>(0), vec3<i32>(i32(CHUNK)), up)) - ro) * inv;
+      let tExit = max(min(te.x, min(te.y, te.z)), t);
+      let q = vec3<i32>(floor(ro + rd * tExit));
+      let lastC = base + select(vec3<i32>(0), vec3<i32>(CHUNK_MASK), up);
+      if (te.x <= te.y && te.x <= te.z) { cell = vec3<i32>(lastC.x + stp.x, q.y, q.z); }
+      else if (te.y <= te.z) { cell = vec3<i32>(q.x, lastC.y + stp.y, q.z); }
+      else { cell = vec3<i32>(q.x, q.y, lastC.z + stp.z); }
+      t = tExit;
       continue;
     }
-    // The stretch of path this slab stands for, clipped to [done, span].
-    let a0 = max(t - 0.5 * dt, done);
-    let a1 = min(t + 0.5 * dt, span);
+    // This cell's exit: the nearest of its three far faces.
+    let tf = (vec3f(cell + select(vec3<i32>(0), vec3<i32>(1), up)) - ro) * inv;
+    let tExit = max(min(tf.x, min(tf.y, tf.z)), t);
+    // The stretch of path inside this cell, clipped to [done, span].
+    let a0 = max(t, done);
+    let a1 = min(tExit, span);
     let s = solLookAt(cell, mat);
     if (a1 > a0 && (s.a > 0.0 || s.g > 0.0)) {
       // Clean body up to the slab...
@@ -13607,7 +13629,10 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32,
       o.g += s.g * (a1 - a0);
       o.any = true;
     }
-    t += dt;
+    if (tf.x <= tf.y && tf.x <= tf.z) { cell.x += stp.x; }
+    else if (tf.y <= tf.z) { cell.y += stp.y; }
+    else { cell.z += stp.z; }
+    t = tExit;
   }
   if (!o.any) { return o; }
   // The clean tail, to the full path the shade will apply (past the cap the
@@ -15442,9 +15467,13 @@ struct FluidSample {
   vel  : vec3f,
   col  : vec3f,
   // The material holding the most of the sampled volume (particles or the
-  // settled liquid behind them): whose liquidOptics the shade uses. MAT_AIR
-  // only when nothing was sampled.
+  // settled liquid behind them). MAT_AIR only when nothing was sampled.
   mat  : u32,
+  // The runner-up and its share of the two (0..1; mat2 == mat, mix2 == 0 for
+  // a pure sample). The shade blends the two liquids' optics by it -- see
+  // TWO LIQUIDS ARE A MIXTURE in fluidSampleAt.
+  mat2 : u32,
+  mix2 : f32,
   foam : f32,
   // Share of the sampled density that is SETTLED voxel water rather than live
   // MPM particles: 0 = all particles, 1 = the march is drawing a surface over
@@ -15454,6 +15483,15 @@ struct FluidSample {
   // region reading as a chunk-shaped patch of a different liquid.
   settled : f32,
 };
+
+// One weighted contribution to fluidSampleAt's two-material tally.
+fn fluidMixAdd(mat : u32, w : f32, matA : ptr<function, u32>, wA : ptr<function, f32>,
+               matB : ptr<function, u32>, wB : ptr<function, f32>) {
+  if (w <= 0.0) { return; }
+  if (mat == *matA || *matA == MAT_AIR) { *matA = mat; *wA += w; return; }
+  if (mat == *matB || *matB == MAT_AIR) { *matB = mat; *wB += w; return; }
+  if (w > *wB) { *matB = mat; *wB = w; }
+}
 
 fn fluidSampleAt(p : vec3f) -> FluidSample {
   let g = p - vec3f(0.5);
@@ -15465,8 +15503,23 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   var vel = vec3f(0.0);
   var colAcc = vec3f(0.0);   // sum of albedo * weighted volume
   var colW = 0.0;
-  var domMat = MAT_AIR;
-  var domW = 0.0;
+  // TWO LIQUIDS ARE A MIXTURE (ticket 2026-10-17_00-04-26, "after pouring a
+  // lil bit of acid in water (mpm fluid) the shaders start tweakin out").
+  // The shade took ALL its optics -- absorption, in-scatter, the clear-water
+  // weight, the interface reflectance -- from ONE material: the one with the
+  // single biggest node contribution among these 8 taps. The colour (colAcc)
+  // was already a weighted blend, but in a stirred acid + water body that
+  // winner flips node by node and tick by tick, and acid (opacity 170: the
+  // derived murky body, Fresnel 0.55) and water (the authored clear look) are
+  // nothing alike, so the surface broke into hard-edged patches of two
+  // different liquids that jumped every frame. Now the two materials with
+  // the most volume are ACCUMULATED (slot A, slot B; a third evicts B only
+  // when its contribution beats B's total -- rare, bounded, and still
+  // continuous) and the shade mixes the two optics by their shares.
+  var matA = MAT_AIR;
+  var wA = 0.0;
+  var matB = MAT_AIR;
+  var wB = 0.0;
   var foam = 0.0;
   for (var i = 0; i < 8; i++) {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
@@ -15507,9 +15560,9 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
           fh = clamp(f32(sh) / (f32(i32(hi) - i32(lo)) * max(f32(mi), 1.0)),
                      0.0, 1.0);
           a = mix(liquidAlbedo(materials[lo]), a, fh);
-          if (w * m * (1.0 - fh) > domW) { domW = w * m * (1.0 - fh); domMat = lo; }
+          fluidMixAdd(lo, w * m * (1.0 - fh), &matA, &wA, &matB, &wB);
         }
-        if (w * m * fh > domW) { domW = w * m * fh; domMat = hi; }
+        fluidMixAdd(hi, w * m * fh, &matA, &wA, &matB, &wB);
         colAcc += a * (w * m);
         colW += w * m;
       }
@@ -15536,7 +15589,7 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
       vmass += w * extra;
       colAcc += liquidAlbedo(materials[vmat]) * (w * extra);
       colW += w * extra;
-      if (w * extra > domW) { domW = w * extra; domMat = vmat; }
+      fluidMixAdd(vmat, w * extra, &matA, &wA, &matB, &wB);
     }
   }
   var out : FluidSample;
@@ -15546,7 +15599,12 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   out.vel = vec3f(0.0);
   if (mass > 1e-4) { out.vel = vel * (30.0 / mass); }   // cells/tick -> vox/s
   out.col = colAcc / max(colW, 1e-4);
-  out.mat = domMat;
+  // The dominant one names the sample; the other is mixed in by its share.
+  let bWins = wB > wA;
+  out.mat = select(matA, matB, bWins);
+  out.mat2 = select(matB, matA, bWins);
+  out.mix2 = min(wA, wB) / max(wA + wB, 1e-6);
+  if (out.mat2 == MAT_AIR) { out.mat2 = out.mat; out.mix2 = 0.0; }
   out.foam = clamp(foam, 0.0, 1.0);
   out.settled = vmass / max(mass + vmass, 1e-4);
   return out;
@@ -16483,7 +16541,18 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // The particles' own liquid through the one optics model: the authored MPM
   // look above is its clear-water end, so water is untouched and a murky
   // liquid shades with the same derived coefficients its pool would have.
-  let po = liquidClearBlend(liquidOptics(materials[s.mat]), absorb, body);
+  // TWO LIQUIDS ARE A MIXTURE (fluidSampleAt): the runner-up's optics are
+  // mixed in by its share, every term, so a stirred acid + water body grades
+  // between the two instead of flipping node by node.
+  var lo = liquidOptics(materials[s.mat]);
+  if (s.mix2 > 0.0) {
+    let lo2 = liquidOptics(materials[s.mat2]);
+    lo.absorbK = mix(lo.absorbK, lo2.absorbK, s.mix2);
+    lo.scatter = mix(lo.scatter, lo2.scatter, s.mix2);
+    lo.clear = mix(lo.clear, lo2.clear, s.mix2);
+    lo.fresnel = mix(lo.fresnel, lo2.fresnel, s.mix2);
+  }
+  let po = liquidClearBlend(lo, absorb, body);
   absorb = po.absorbK;
   body = po.scatter;
   if (caFrac > 0.001) {

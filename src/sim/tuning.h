@@ -3139,6 +3139,17 @@ struct Tuning {
     // churning at rest, set this to 0 first —
     // that is the differential.
     int fluidExciteStep = TPD(sim, fluidExciteStep);
+    // ---- THE SPOUT JET (ticket 2026-10-17_11-44-48) ------------------------
+    // Water the FALL trigger excites off a lip (air under it, its own water
+    // beside it) leaves with a horizontal velocity AWAY from that water:
+    // `fluidSpoutGain` x sqrt(2 g h), h the head of the water behind the lip
+    // (climbed up through a short tunnel to the reservoir's surface), for a
+    // `fluidSpoutChance` share of those cells. Velocity only -- no particle
+    // is added and no new cell is excited, so it is bounded by the fall
+    // trigger it rides and cannot make held water at rest move. NO_WGSL:
+    // SubmitTick packs both into TickParams._padSplash1.
+    float fluidSpoutGain = TPD(sim, fluidSpoutGain);
+    float fluidSpoutChance = TPD(sim, fluidSpoutChance);
     // ---- settled liquid as MPM boundary mass ------------------------------
     // WP4 shipped the two representations passing straight THROUGH each other:
     // sim_fluid.wgsl's fluidSolid() blocks solids and powders only, and a

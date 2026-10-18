@@ -1032,6 +1032,16 @@ TP_I(sim, fluidExcitePerch, TUNE_FLUID_EXCITE_PERCH, 0, 0, 1)
 // 8 is the seam's own surface scan depth (SEAM_EX_STEP_SCAN); a step it
 // cannot see is a trigger that never fires, so the knob stops there.
 TP_I(sim, fluidExciteStep, TUNE_FLUID_EXCITE_STEP, 2, 0, 8)
+// THE SPOUT JET (ticket 2026-10-17_11-44-48): water the FALL trigger takes off
+// a lip leaves with a horizontal velocity, away from the water it came out
+// of, of this fraction of the Torricelli speed sqrt(2 g h) for the head h of
+// that water over it (sim_fluid_seam.wgsl THE SPOUT JET). 0 = falls straight
+// down, as before. NO_WGSL: packed into TickParams._padSplash1 by SubmitTick,
+// so the slider is live and an A/B needs no shader recompile.
+TP_F(sim, fluidSpoutGain, NO_WGSL, 0.3f, 0.0f, 1.0f)
+// The chance each such lip cell is thrown at all; the rest fall straight down,
+// so a spout's stream frays instead of leaving as one rigid bar.
+TP_F(sim, fluidSpoutChance, NO_WGSL, 0.6f, 0.0f, 1.0f)
 // How much of a SETTLED liquid cell's content the MPM grid carries as static
 // mass, as a fraction of rest density (1.0 = a full voxel reads exactly rest).
 // 0 restores the WP4 behaviour where the two representations pass through each
