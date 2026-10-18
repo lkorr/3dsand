@@ -100,11 +100,13 @@ const FLOWM_FLUX_MAX : i32 = 559223;     // FLOWM_STATE_MAX x 2 / 15
 // weights summing to 16 then stay under 2^30.
 const FLOWM_TERM_MAX : i32 = 67108864;   // 2^26
 // THE REACH (sim.currentMeasuredReach, step 1 below): at most FLOWM_REACH_MAX
-// nodes, so its weights sum to at most (6+1)^4 = 2401 and each term is held to
-// 2^19 (64 full bins of eighths moved a cell in one tick: never binding) --
-// 2401 x 2^19 = 1.26e9, inside i32.
+// nodes, so its weights sum to at most (6+1)^4 = 2401. Each neighbour's flux
+// is held to 2^18 a component (32 full rows of a bin moved a cell in one
+// tick: never binding), so its pull (flowmPull: at most |F| x 1.03 long, the
+// octagonal norm's worst case) is under 2^18 x 1.375 x 1.03 a component, and
+// 2401 of those sum to 8.9e8, inside i32.
 const FLOWM_REACH_MAX : i32 = 6;
-const FLOWM_WIDE_TERM_MAX : i32 = 524288;  // 2^19
+const FLOWM_WIDE_TERM_MAX : i32 = 262144;  // 2^18
 // The follow, a fraction of the gap closed per tick in Q11:
 // 1 - exp(-1 / (tau x 30)) x 2048.
 const FLOWM_RISE_Q11 : i32 = 132;        // tau 0.50 s
@@ -141,6 +143,41 @@ fn flowmStill(v : vec2<i32>) -> bool {
   let s = vec2<u32>(min(abs(v), vec2<i32>(46340)));
   return s.x * s.x + s.y * s.y < FLOWM_SNAP2;
 }
+// An integer length, the octagonal norm max + 3/8 min: within -3% / +0% of
+// the Euclidean one (exact on the axes, 1.375 for 1.414 on the diagonal).
+// Integer because bodies read what it feeds (the AUTHORITY note).
+fn flowmOct(v : vec2<i32>) -> i32 {
+  let a = abs(v);
+  return max(a.x, a.y) + (3 * min(a.x, a.y)) / 8;
+}
+// THE PULL of neighbour `d` nodes away (d != 0), whose bin moved flux `f`, on
+// this node (ticket 2026-10-18_11-30-37: "every vector influenced by the dam
+// is pointing in the same direction ... they should all be pointing towards
+// the hole itself"). Not `f` itself -- spreading a breach's own vector over
+// its neighbours draws every arrow round it parallel to the jet, which is
+// what the reach did until this -- but a pull TOWARD the neighbour, as strong
+// as its flux, where this node is UPSTREAM of it (the neighbour's water runs
+// away from here, so water here is drawn after it):
+//   pull = |f| x clamp(3 cos(theta), 0, 1) x d / |d|,
+// theta the angle between f and d. Full strength anywhere within 70 degrees of
+// the flow's axis behind it, fading to nothing square to it, and nothing at
+// all ahead of it (a flood front does not suck the water it is about to reach
+// backwards; the water there measures its own flow when it arrives). Summed
+// over a breach's nodes, every node of the lake behind it points AT the
+// breach, from whatever side it is approached -- the field of a sink, not of
+// a copied jet. Integer (cos in Q8 over octagonal lengths); bounds in the
+// FLOWM_WIDE_TERM_MAX note.
+fn flowmPull(f : vec2<i32>, d : vec2<i32>) -> vec2<i32> {
+  let mF = flowmOct(f);                    // <= 360448
+  if (mF == 0) { return vec2<i32>(0); }
+  let dQ = flowmOct(d * 16);               // |d| in 1/16 nodes, 16 .. 132
+  let dotFD = f.x * d.x + f.y * d.y;       // |.| <= 3.2e6
+  let cos8 = (dotFD * 256) / max((mF * dQ) / 16, 1);
+  let s8 = clamp(3 * cos8, 0, 256);
+  let mS = (mF * s8) / 256;
+  return (mS * d * 16) / vec2<i32>(dQ);
+}
+
 // STATE -> published units, round half away from zero.
 fn flowmPublish(v : i32) -> i32 {
   let q = (abs(v) + FLOWM_SUB / 2) / FLOWM_SUB;
@@ -194,8 +231,13 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
         flux += w * clamp(acc, vec2<i32>(-FLOWM_TERM_MAX), vec2<i32>(FLOWM_TERM_MAX));
       }
       if (R > 1) {
+        // The node's own bin counts as its flux; every other bin as its PULL
+        // on this node (flowmPull): the reach turns the water toward a breach
+        // instead of copying the breach's direction onto it.
         let ww = (R + 1 - abs(di)) * (R + 1 - abs(dj));
-        wide += ww * clamp(acc, vec2<i32>(-FLOWM_WIDE_TERM_MAX), vec2<i32>(FLOWM_WIDE_TERM_MAX));
+        let fw = clamp(acc, vec2<i32>(-FLOWM_WIDE_TERM_MAX), vec2<i32>(FLOWM_WIDE_TERM_MAX));
+        if (di == 0 && dj == 0) { wide += ww * fw; }
+        else { wide += ww * flowmPull(fw, vec2<i32>(di, dj)); }
       }
       topE = max(topE, bitcast<i32>(flowMeasRW[a + 2u]));
       botE = max(botE, bitcast<i32>(flowMeasRW[a + 3u]));

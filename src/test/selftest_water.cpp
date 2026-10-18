@@ -4118,14 +4118,23 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   // K / W (ticket 2026-10-18_11-30-37: "every vector influenced by the dam
   // is pointing in the same direction ... they should all be pointing
   // towards the hole itself ... smoothly curve towards that direction when
-  // you're approaching from the sides"). Per ring point, the angle between
-  // the published current and the direction to the gap, degrees; the SPREAD
-  // is the angle between the two outermost ring points' currents (a field
-  // copied from the gap reads ~0 there, a converging one ~the arc's span).
+  // you're approaching from the sides"). On a FAR ring (farRing cells, out
+  // where the CA moves little and the fold's reach makes the field -- the
+  // near ring's own measured flow already converges), per point the angle
+  // between the published current and the direction to the gap, degrees; the
+  // SPREAD is the angle between the two outermost points' currents (a field
+  // copied from the gap reads ~0 there, a converging one ~the arc's 90). The
+  // near ring's angles are printed beside it.
   // W: two points beside the gap along the dam's lake face, sideDz cells
   // north and south of it, must run along the face toward it.
+  const double farR = BaselineNumber("flowMeasure.farRing", 28.0);
+  std::vector<Vec3> farRing;
+  for (int k = 0; k < 5; k++) {
+    const double a = 3.14159265358979 * (0.75 + 0.5 * k / 4.0);   // 135 .. 225 degrees
+    farRing.push_back({gapP.x + (float)(farR * std::cos(a)), sy, gapP.z + (float)(farR * std::sin(a))});
+  }
   const double convAngle = BaselineNumber("flowMeasure.convAngle", 35.0);
-  const int convMin = (int)BaselineNumber("flowMeasure.convMin", 6);
+  const int convMin = (int)BaselineNumber("flowMeasure.convMin", 4);
   const double convSpread = BaselineNumber("flowMeasure.convSpread", 45.0);
   const double sideDz = BaselineNumber("flowMeasure.sideDz", 12.0);
   const double sideAngle = BaselineNumber("flowMeasure.sideAngle", 60.0);
@@ -4145,7 +4154,8 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const Vec3 sideS{(float)cx - 3.5f, sy, (float)cz - (float)sideDz};
   int converged = 0;
   float spread = 0.0f, sideAngN = 180.0f, sideAngS = 180.0f, sideSpdN = 0.0f, sideSpdS = 0.0f;
-  std::string ringAngles;
+  std::string ringAngles, farAngles;
+  float farMean = 0.0f;
   // S (the same ticket: "if the hole in the wall is located a bit below ...
   // current should be able to pull material down into the water"): box 2's
   // submerged gap. Upstream of it, sub.x cells back from the dam: a point in
@@ -4190,13 +4200,16 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       ringPull(pulled, ringMean);
       carryGap = carry(gapP);
       carryPulled = carryRing();
-      for (size_t k = 0; k < ring.size(); k++) {
-        const Vec3 v = at(ring[k]);
-        const float a = angleTo(v, ring[k]);
+      for (size_t k = 0; k < ring.size(); k++)
+        ringAngles += Format("%s%.0f", k ? "/" : "", angleTo(at(ring[k]), ring[k]));
+      for (size_t k = 0; k < farRing.size(); k++) {
+        const Vec3 v = at(farRing[k]);
+        const float a = angleTo(v, farRing[k]);
         if (speed(v) >= pullSpeed && a <= convAngle) converged++;
-        ringAngles += Format("%s%.0f", k ? "/" : "", a);
+        farAngles += Format("%s%.0f@%.1f", k ? "/" : "", a, speed(v));
+        farMean += speed(v) / (float)farRing.size();
       }
-      spread = angleBetween(at(ring.front()), at(ring.back()));
+      spread = angleBetween(at(farRing.front()), at(farRing.back()));
       const Vec3 vn = at(sideN), vs = at(sideS);
       sideAngN = angleTo(vn, sideN);
       sideAngS = angleTo(vs, sideS);
@@ -4273,8 +4286,8 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
                            carryQuiet, carryGap.x, carryGap.z, kAt, carryMin, carryPulled, ring.size(),
                            pullMin));
   if (converged < convMin || spread < convSpread)
-    fails.push_back(Format("K: %d of %zu ring points within %.0f deg of the gap (need %d), spread %.0f deg "
-                           "(need %.0f)", converged, ring.size(), convAngle, convMin, spread, convSpread));
+    fails.push_back(Format("K: %d of %zu far-ring points within %.0f deg of the gap (need %d), spread %.0f "
+                           "deg (need %.0f)", converged, farRing.size(), convAngle, convMin, spread, convSpread));
   if (sideAngN > sideAngle || sideAngS > sideAngle || sideSpdN < pullSpeed || sideSpdS < pullSpeed)
     fails.push_back(Format("W: beside the gap along the dam the current is %.0f / %.0f deg off the gap at "
                            "%.2f / %.2f cells/s (need <= %.0f deg, >= %.1f)", sideAngN, sideAngS, sideSpdN,
@@ -4289,10 +4302,11 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     fails.push_back(Format("Cv: a body above the submerged gap feels vy %.2f (need <= -%.2f)", carryA.y,
                            0.5 * vertMin));
   detail = Format(
-      "K ring heading error %s deg, %d within %.0f, spread %.0f deg | W side N %.0f deg %.2f, S %.0f deg %.2f | "
+      "K far ring (%.0f cells) heading error deg@speed %s, %d within %.0f, spread %.0f deg, mean %.2f; near "
+      "ring %s deg | W side N %.0f deg %.2f, S %.0f deg %.2f | "
       "S submerged gap rows %d..%d of %d: above (%.2f, %.2f, %.2f) hole (%.2f, %.2f, %.2f) below (%.2f, %.2f, "
       "%.2f), peak %.2f (vy %.2f) -> %.2f; Cv body vy %.2f | ",
-      ringAngles.c_str(), converged, convAngle, spread, sideAngN, sideSpdN, sideAngS, sideSpdS, kSubLo, kSubHi,
+      farR, farAngles.c_str(), converged, convAngle, spread, farMean, ringAngles.c_str(), sideAngN, sideSpdN, sideAngS, sideSpdS, kSubLo, kSubHi,
       kDeep2, subA.x, subA.y, subA.z, subH.x, subH.y, subH.z, subB.x, subB.y, subB.z, subPeak, subPeakY, subEnd,
       carryA.y) + Format(
       "dam breach %dx%dx%d, gap %d: Q quiet %.2f | G gap (%.1f, %.1f) cells/s vs solved %.2f | V %d/%zu ring "
