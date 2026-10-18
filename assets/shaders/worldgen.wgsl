@@ -9942,7 +9942,8 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     noCave.on2 = false;
     // q = 0 the voxel over the top (the cover plant, if any), 1 the skin, 2
     // the sub-skin; 3.. the strata probes (one depth each, while the searches
-    // run). ONE genCellIn call site: each is a whole inlined copy (see
+    // run) -- or, on a WET top, q = 3 alone: the bed's skin at h (the wet
+    // word below). ONE genCellIn call site: each is a whole inlined copy (see
     // unrollFence()). The probes skip the caves (`noCave`): the strata are
     // what the rock is, and a riser the map vouches for is rock.
     var bedS = 0u;                // a wet top's bed skin slot (FAR_STRATA_WET)
