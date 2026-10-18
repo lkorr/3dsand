@@ -332,7 +332,7 @@ const STREAM_SUB : u32 = 64u;
 // How far a window's mean may sit off the anchor and still be steady, eighths.
 const STREAM_MEAN_TOL : i32 = 2;
 // How far a column's block level must move to be news to the columns above
-// (a FINE event), eighths.
+// (a FINE event), eighths: half a voxel.
 const STREAM_CHAIN_TOL : i32 = 4;
 // Windows per BLOCK: the level a column reports upstream is its mean over
 // this many windows (8 x 64 = 512 visits), compared block to block.
@@ -357,7 +357,8 @@ const STILL_ECHO : u32 = STREAM_MOUTH_END;
 //   [1] the window: sum of (s8 - anchor) (14 bits signed) | visits << 14 |
 //       visits with no resting surface << 21 | wet (the column's class at the
 //       last window end) bit 28 | anchored bit 29 | moved this window bit 30 |
-//       moved in the last window bit 31
+//       moved in the last window bit 31. HELD: the drain count (visits more
+//       than a voxel under the target, net; released DRAINED at STREAM_SUB)
 //   [2] the newest event stamps, own and downstream (fine | coarse << 16),
 //       SCRATCH: written by `scan`
 //   [3] the same, PUBLISHED: copied by `commit`; what neighbours read
@@ -375,9 +376,13 @@ const STILL_ECHO : u32 = STREAM_MOUTH_END;
 //       something below moved, 6 no outflow, 7 not running, 8 no held map-fed
 //       feeder, 9 a POOL feeder, 10 not at its anchor, 15 adopted) --
 //       diagnostic, saturating
-//   [7] releases by reason, a byte each: support | flood | event | drained
+//   [7] releases by reason, a byte each: support | flood | - | drained; on a
+//       support release byte 2 is overwritten with what the neighbours were
+//       (streamSupportWhy -- the event release it once counted is retired)
 // A stamp is (tick >> 4) & 0xFFFF, never 0 (0 = never).
 const STREAM_OBS : u32 = STILL_ECHO + 2u * WORLD_N * WORLD_N;
+// THE FRONT's own steadiness: windows of STREAM_SUB visits (scan, `front`).
+const STREAM_FRONT_RUN : u32 = 2u;
 const STREAM_REL_SUPPORT : u32 = 1u;
 const STREAM_REL_FLOOD : u32 = 2u;
 const STREAM_REL_EVENT : u32 = 3u;
@@ -797,6 +802,56 @@ fn isRoot(nx : i32, ys : i32, nz : i32, sN : i32, mat : u32) -> bool {
 fn streamSupport(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32) -> vec2<u32> {
   return streamSupportTo(x, z, t8, mat, hopBelow, STREAM_HOP_MAX);
 }
+// FED BY A HELD STREAM: some lateral neighbour is an adopted map-rooted
+// stream column (hop >= 1, not POOL) whose target stands at or over `t8`,
+// with an open way into this column at that row -- whatever else feeds it.
+// THE FRONT's test (scan): the best hop alone (streamSupportTo) is 0 beside
+// the map's water, and a column between a held stream and the river it runs
+// into then had to pass the HEAD's tests -- a whole quiet window of its own --
+// which the water running through it into the river never gave it (measured,
+// `rivers` S: the held channel stopped 20 columns short of main, those
+// columns' runs never past 5 windows, the 6 chunks awake for good).
+fn fedByHeldStream(x : i32, z : i32, t8 : i32, mat : u32) -> bool {
+  for (var i = 0u; i < 4u; i++) {
+    var d = vec2<i32>(1, 0);
+    if (i == 1u) { d = vec2<i32>(-1, 0); }
+    else if (i == 2u) { d = vec2<i32>(0, 1); }
+    else if (i == 3u) { d = vec2<i32>(0, -1); }
+    let t = neighbourTarget(x + d.x, z + d.y, mat);
+    if (t.x == STREAM_NONE || t.x < t8 || t.y < 1 || u32(t.y) >= STREAM_HOP_MAX || t.z != 0) { continue; }
+    let mc = vec3<i32>(x, (t.x - 1) >> 3u, z);
+    if (!inBounds(mc)) { continue; }
+    let mm = voxMat(voxWordAt(mc));
+    if (mm != MAT_AIR && mm != mat && materials[mm].klass != CLASS_GAS) { continue; }
+    return true;
+  }
+  return false;
+}
+
+// WHY SUPPORT WAS LOST (diagnostic, STREAM_OBS [7] byte 2 on a support
+// release -- the byte the retired event release counted): bit 0 a neighbour
+// record stands under t8, bit 1 one at or over t8 has a hop not under ours,
+// bit 2 one would feed but this column's cell at its row is a wall, bit 3 no
+// neighbour has a record at all; the high nibble is the column's own hop.
+fn streamSupportWhy(x : i32, z : i32, t8 : i32, mat : u32, hopBelow : u32) -> u32 {
+  var bits = 0u;
+  var any = false;
+  for (var i = 0u; i < 4u; i++) {
+    var d = vec2<i32>(1, 0);
+    if (i == 1u) { d = vec2<i32>(-1, 0); }
+    else if (i == 2u) { d = vec2<i32>(0, 1); }
+    else if (i == 3u) { d = vec2<i32>(0, -1); }
+    let t = neighbourTarget(x + d.x, z + d.y, mat);
+    if (t.x == STREAM_NONE) { continue; }
+    any = true;
+    if (t.x < t8) { bits |= 1u; continue; }
+    if (u32(t.y) >= hopBelow) { bits |= 2u; continue; }
+    bits |= 4u;
+  }
+  if (!any) { bits |= 8u; }
+  return bits | (min(hopBelow, 15u) << 4u);
+}
+
 // streamSupport with `poolStepMax`: a POOL feeder counts only if its target
 // stands at most this many eighths over t8. A FALL ENDS A CONDUIT: the basin
 // under a waterfall at a POOL stream's mouth is "fed" by a target ten voxels
@@ -977,11 +1032,26 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
       // side lane got wet for the first time after thousands of ticks --
       // measured, `stream-natural`: 238 columns held, all released 100
       // ticks later, by two outlet columns of an established chute.)
-      let drained = (r.ok && r.mat == mat && r.s8 < t8 - 8) || (r.known && !r.ok && r.hasFloor && r.floor8 < t8 - 8);
-      if (drained && yt <= top) {
+      // ...for a WINDOW, not a visit: STREAM_OBS [1] is the held column's
+      // drain count (`commit` zeroes it on adoption; the observer's [1] is
+      // not used while held), up on a drained visit, down on any other. One
+      // drained visit let the stream go: the head beside a lake whose bank is
+      // a breach edge dips more than a voxel under its target for a few ticks
+      // whenever the seam's splash lands (measured, `rivers` S: 46 columns
+      // held at tick 1500, 9 of them released DRAINED -- the lake-most among
+      // them -- and the 42 below them for want of support, a tick later).
+      let drainedNow = (r.ok && r.mat == mat && r.s8 < t8 - 8) || (r.known && !r.ok && r.hasFloor && r.floor8 < t8 - 8);
+      if (drainedNow && yt <= top) { o1 = min(o1 + 1u, STREAM_SUB); }
+      else if (o1 > 0u) { o1 = o1 - 1u; }
+      let drained = o1 >= STREAM_SUB;
+      if (drained) {
         held = false;
         reason = STREAM_REL_DRAINED;
       }
+    }
+    if (!held && pool == 0u && reason == STREAM_REL_SUPPORT) {
+      let o7 = stillWater[oi + 7u];
+      stillWater[oi + 7u] = (o7 & 0xFF00FFFFu) | (streamSupportWhy(x, z, t8, mat, dyn >> 20u) << 16u);
     }
     // ...and when what feeds it now stands LOWER -- the pool it drains has
     // fallen, or the column above was lowered -- it is RETARGETED to that
@@ -1273,7 +1343,15 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
         // Waiting on it, the front stopped at a basin's sill for good and the
         // held channel and basin above ran as a conveyor into the live chute
         // below for ever (measured, `stream-natural`: 5 channel chunks awake).
-        let front = sup.x >= 1u && sup.x < STREAM_HOP_MAX && sup.y == 0u && fallLast == 0u && !floodedBefore;
+        // ...and not a column still FILLING: STREAM_FRONT_RUN windows of its
+        // own steady (no re-anchor, no new-area event). A held stream's front
+        // took a dug extension the moment the basin first wet it and held it
+        // at that low first level -- the basin pours into a held column only
+        // under its target, so the extension stopped filling at once
+        // (measured, `stream-natural` E: 361 eighths delivered against the
+        // live stream's 3,467 in 900 ticks, the extension held).
+        let front = fedByHeldStream(x, z, tgt, r.mat) && sup.x < STREAM_HOP_MAX && sup.y == 0u && fallLast == 0u &&
+                    !floodedBefore && run >= STREAM_FRONT_RUN;
         if (front && abs(r.s8 - anchor) > STREAM_AT_TOL) { why = 10u; }
         else if (!front && !quiet) { why = 5u; }
         else if (front) {
@@ -1404,6 +1482,8 @@ fn commit(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index
       stillWater[si + 2u] = (w3 & 0xFFFFFu) | (((w3 >> 20u) & STREAM_HOP_MAX) << 20u);
       stillWater[si + 3u] = (s.mat & 0xFFFu) | select(0u, STREAM_POOL_BIT, act == STREAM_ACT_ADOPT_POOL);
       stillWater[oi + 5u] = T.tick;
+      // [1] is the held column's DRAIN COUNT from here (scan's adopted branch).
+      stillWater[oi + 1u] = 0u;
       let o6 = stillWater[oi + 6u];
       stillWater[oi + 6u] = (o6 & 0xFFFF00FFu) | (min(((o6 >> 8u) & 0xFFu) + 1u, 0xFFu) << 8u);
     } else {
