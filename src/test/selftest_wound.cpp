@@ -80,6 +80,9 @@
 #include "game/bodyreg.h"  // heal-restore's optional picture sequence
 #include "gpu/resources.h"  // CreateBuffer, ditto
 #include "sim/currentprim.h"  // float-current: a stream through the basin
+#include "sim/flowfield.h"    // corpse-float: the solved field at the site
+#include "sim/worldmap.h"     // corpse-float: the map's water round the site
+#include "sim/waterbody.h"    // corpse-float: the registry's hole hints
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
 #include "phys/floatrho.h"    // corpse-float: the one floating-density rule
@@ -8742,6 +8745,43 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   const IVec3 pchunk{site.x >> 4, waterTop >> 4, site.z >> 4};
   support::TickRig rig(c, 71000u, pchunk);
 
+  // THE WATER-BODY REGISTRY'S VIEW OF THE BASIN (rule 6). Every op the gate
+  // stamps into a chunk the registry has labelled reads to it as a possible
+  // dig (WaterBodySystem::Tick's hole hint), and a hint seeds a whirlpool +
+  // sink (CurrentPrimSystem::SeedDrains) that bodies afloat have felt since
+  // 2026-10-18. Bodies, their levels, and every live hint with its cell
+  // relative to the basin centre.
+  auto bodyView = [&]() {
+    std::string v;
+    for (const WaterBodyDesc& b : WaterBodies().Bodies()) {
+      const WaterBodyHole h = WaterBodies().HoleHint(b.basinId);
+      v += Format(" [basin %u level %d state %u%s", b.basinId, b.level,
+                  (unsigned)b.state, h.valid ? "" : "]");
+      if (h.valid)
+        v += Format(" HOLE (%+d,%d,%+d) at t%u]", h.x - site.x, h.y, h.z - site.z,
+                    h.tick);
+    }
+    v += Format(" prims %u", CurrentPrims().Count());
+    return v.empty() ? std::string(" none") : v;
+  };
+  // A FRESH BASIN, and the registry's memory of the last one goes with it.
+  // Re-stamping the basin the previous arm floated in is a mutation in a
+  // labelled lake, which the registry cannot tell from a dig: it seeded a
+  // 30 s whirlpool at the first op, and the limp human was dragged into the
+  // basin's corner by it (measured 2026-10-18: a standing current of 5-7
+  // cells/s in a sealed tub, with no hole anywhere). The first arm stamps
+  // into a world with no discovered body, and every arm now starts as it did:
+  // the discovered probe withdrawn (ClearDiscovered, then the ticks the CPU
+  // and the GPU ledger take to let go of it) and the current list empty.
+  auto freshBasin = [&]() {
+    WaterBodies().ClearDiscovered();
+    CurrentPrims().Clear();
+    support::RunTicks(rig, 4);
+    CurrentPrims().Clear();
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+  };
+  std::string hintWhy;
+
   const int kTicks = (int)BaselineNumber("corpseFloatTicks", 600);
   struct Arm {
     const char* label;
@@ -8758,6 +8798,25 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     std::string limbs;      // each limb's final y / density
     float surf = -1;        // the waterline it was last pushed against
     int wokeHow = 0;        // Mob::DeadWokeHow at the end (rule 6)
+    // WHAT MOVED IN THE MIRROR (rule 6): "last woken how 2" means a chunk
+    // round the corpse re-versioned, which is every cause at once. Over the
+    // basin's chunks, every version bump the watch saw, split by the field
+    // that moved (material / liquid fullness / stain / bits 16-23 only),
+    // plus the last moved cell's old and new word.
+    uint32_t bumps = 0, cMat = 0, cFull = 0, cStain = 0, cOther = 0;
+    // ...and where the stained cells were: a WALL (the stamp's outer ring),
+    // the FLOOR, or inside the basin; the y band they fell in; and how many
+    // were wetter after than before.
+    uint32_t sWall = 0, sFloor = 0, sIn = 0, sUp = 0, yLo = 1u << 30, yHi = 0;
+    // ...and what touched each one in the mirror that carried the change:
+    // a liquid face-neighbour (soak from the water), else air straight above
+    // (an exposed top: rain, a drip), else neither (wicked through the rock).
+    uint32_t sByLiquid = 0, sByAirAbove = 0, sByNeither = 0;
+    // Wake checks a re-versioned chunk passed because no cell in the body's
+    // box moved (MobSystem::DeadMatterSameTotal over the arm).
+    uint64_t matterSame = 0;
+    uint32_t sTypes[8] = {};
+    std::string lastMoved, drift;   // drift: root x,z and current every 120
   };
   Arm arms[] = {{"human", "human"},
                 {"automaton", "tinker"},
@@ -8770,7 +8829,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     c.debris.Reset();
     // A FRESH BASIN PER ARM: each arm is measured against the stamp, not
     // against whatever the arm before it left in the water.
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    freshBasin();
     support::RunTicks(rig, 20);  // the water settles; the mirror fetches it
     const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
     Mob* m = id ? mobs.FindMobById(id) : nullptr;
@@ -8779,8 +8838,71 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     const int root = m->Def()->rootLimb;
     m->Die();
     a.ran = true;
+    std::unordered_map<uint64_t, std::pair<uint32_t, std::vector<uint32_t>>> seen;
+    auto watchMirror = [&](bool count) {
+      for (int cy = (bedY - 1) >> 4; cy <= (waterTop + 22) >> 4; cy++)
+        for (int cz = (site.z - R) >> 4; cz <= (site.z + R) >> 4; cz++)
+          for (int cx = (site.x - R) >> 4; cx <= (site.x + R) >> 4; cx++) {
+            const IVec3 wc{cx, cy, cz};
+            const CachedChunk* cc = c.world.Cached(wc);
+            if (!cc || cc->voxels.size() != kChunkVol) continue;
+            auto& e = seen[World::PackChunkKey(wc)];
+            if (e.second.size() == kChunkVol && e.first != cc->version && count) {
+              a.bumps++;
+              for (uint32_t k = 0; k < kChunkVol; k++) {
+                const uint32_t o = e.second[k], n = cc->voxels[k];
+                if (o == n) continue;
+                if ((o ^ n) & 0xFFFu) a.cMat++;
+                else if ((o ^ n) & 0xF000u) a.cFull++;
+                else if ((o ^ n) & 0xFF000000u) {
+                  a.cStain++;
+                  const int wx = cx * 16 + (int)(k & 15),
+                            wy = cy * 16 + (int)((k >> 4) & 15),
+                            wz = cz * 16 + (int)(k >> 8);
+                  if (std::abs(wx - site.x) >= R - 1 || std::abs(wz - site.z) >= R - 1)
+                    a.sWall++;
+                  else if (wy <= bedY)
+                    a.sFloor++;
+                  else
+                    a.sIn++;
+                  if (((n >> 24) & 0xFu) > ((o >> 24) & 0xFu)) a.sUp++;
+                  a.sTypes[(n >> 28) & 7u]++;
+                  auto mirMat = [&](int x, int y, int z) -> uint32_t {
+                    const CachedChunk* q = c.world.Cached({x >> 4, y >> 4, z >> 4});
+                    if (!q || q->voxels.size() != kChunkVol) return 0xFFFFu;
+                    return q->voxels[((uint32_t)(z & 15) * 16u + (uint32_t)(y & 15)) * 16u +
+                                     (uint32_t)(x & 15)] & 0xFFFu;
+                  };
+                  bool wetNb = false;
+                  const int nb[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+                  for (const auto& d : nb) {
+                    const uint32_t mm = mirMat(wx + d[0], wy + d[1], wz + d[2]);
+                    if (mm != 0xFFFFu && mm != 0u && mm < c.mats.size() &&
+                        c.mats[mm].gpu.klass == CLASS_LIQUID)
+                      wetNb = true;
+                  }
+                  if (wetNb) a.sByLiquid++;
+                  else if (mirMat(wx, wy + 1, wz) == 0u) a.sByAirAbove++;
+                  else a.sByNeither++;
+                  a.yLo = std::min(a.yLo, (uint32_t)wy);
+                  a.yHi = std::max(a.yHi, (uint32_t)wy);
+                }
+                else { a.cOther++; continue; }
+                a.lastMoved = Format(
+                    "(%d,%d,%d) 0x%08x->0x%08x v%u", cx * 16 + (int)(k & 15),
+                    cy * 16 + (int)((k >> 4) & 15), cz * 16 + (int)(k >> 8), o,
+                    n, cc->version);
+              }
+            }
+            e.first = cc->version;
+            e.second = cc->voxels;
+          }
+    };
+    watchMirror(false);
+    const uint64_t matterSame0 = mobs.DeadMatterSameTotal();
     for (int i = 0; i < kTicks; i++) {
       support::RunTicks(rig, 1);
+      watchMirror(true);
       m = mobs.FindMobById(id);
       if (!m) break;
       Vec3 com{};
@@ -8788,6 +8910,15 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       if (h && c.phys.BodyCenterOfMass(h, com)) {
         a.lowest = std::min(a.lowest, com.y);
         a.final = com.y;
+        if (i % 120 == 0) {
+          const sandvox::FloaterCurrent fc = sandvox::CurrentOnFloaterSplit(
+              com, com.y - 2.0f, com.y + 2.0f, (float)(waterTop + 1));
+          a.drift += Format(" (%.1f,%.1f cur %.2f,%.2f = standing %.2f,%.2f + measured "
+                            "%.2f,%.2f)",
+                            com.x - (float)site.x, com.z - (float)site.z, fc.total.x,
+                            fc.total.z, fc.standing.x, fc.standing.z, fc.measured.x,
+                            fc.measured.z);
+        }
         if (i % 60 == 0) {
           const char* r = m->DeadAwakeReason();
           a.trace += Format(" %.1f", com.y);
@@ -8820,6 +8951,8 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       a.why = w ? w : "";
       a.wokeHow = m->DeadWokeHow();
     }
+    a.matterSame = mobs.DeadMatterSameTotal() - matterSame0;
+    hintWhy += Format(" %s:", a.label) + bodyView() + ";";
   }
   // THE LIVE LIMP ARM. Same basin, same drop; StartRagdoll instead of Die,
   // with a minimum longer than the watch so the get-up never starts and what
@@ -8829,7 +8962,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   if (const int d = mobs.FindDef(limp.def); d >= 0) {
     mobs.Reset();
     c.debris.Reset();
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    freshBasin();
     support::RunTicks(rig, 20);
     const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
     Mob* m = id ? mobs.FindMobById(id) : nullptr;
@@ -8849,13 +8982,29 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
           limp.lowest = std::min(limp.lowest, com.y);
           limp.final = com.y;
           if (i % 30 == 0) limp.trace += Format(" %.1f", com.y);
+          if (i % 60 == 0) {
+            const sandvox::FloaterCurrent fc = sandvox::CurrentOnFloaterSplit(
+                com, com.y - 2.0f, com.y + 2.0f, (float)(waterTop + 1));
+            limp.drift += Format(" (%.1f,%.1f cur %.2f,%.2f = standing %.2f,%.2f + "
+                                 "measured %.2f,%.2f)",
+                                 com.x - (float)site.x, com.z - (float)site.z,
+                                 fc.total.x, fc.total.z, fc.standing.x, fc.standing.z,
+                                 fc.measured.x, fc.measured.z);
+          }
         }
       }
       if (m) {
+        for (int li = 0; li < m->LimbCount(); li++) {
+          const uint64_t hl = mobs.LimbBody(id, li);
+          Vec3 lc{};
+          if (!hl || !c.phys.BodyCenterOfMass(hl, lc)) continue;
+          limp.limbs += Format(" %d:%.1f", li, lc.y);
+        }
         limp.pushes = m->FloatedLimbs();
         limp.surf = m->FloatSurfaceY();
         limpHeld = m->Alive() && m->Ragdoll() == Mob::RagdollPhase::Limp;
       }
+      hintWhy += " limp:" + bodyView() + ";";
     }
   }
   // THE SEVERED ARM. Owner, 2026-10-14: "corpses will float but their limbs
@@ -8884,7 +9033,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   if (const int d = mobs.FindDef("human"); d >= 0) {
     mobs.Reset();
     c.debris.Reset();
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    freshBasin();
     support::RunTicks(rig, 20);
     const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
     Mob* m = id ? mobs.FindMobById(id) : nullptr;
@@ -8917,6 +9066,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
         }
       }
       for (Piece& p : pieces) p.debrisRho = c.debris.FloatingDensityOf(p.h);
+      hintWhy += " severed:" + bodyView() + ";";
     }
   }
   bool severOk = severRan;
@@ -8961,24 +9111,84 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   auto line = [&](const Arm& a) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
-                  "rig %s, corpse %s (%s, last woken how %d), y every 60:%s; ",
+                  "rig %s, corpse %s (%s, last woken how %d, slept through %llu "
+                  "chunk changes outside its box), mirror bumps %u "
+                  "(cells moved: mat %u, fullness %u, stain %u [wall %u floor %u "
+                  "inside %u, wetter %u, y%u..%u; by liquid %u, open top %u, "
+                  "neither %u; types %u/%u/%u/%u/%u/%u/%u/%u], stamp-only %u; "
+                  "last %s), drift from centre every 120:%s, y every 60:%s; ",
                   a.rho, a.lowest, a.final, a.pushes,
                   a.rigActive ? "MOVING" : "still",
                   a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.wokeHow,
-                  a.trace.c_str())
+                  (unsigned long long)a.matterSame, a.bumps, a.cMat, a.cFull, a.cStain, a.sWall, a.sFloor, a.sIn,
+                  a.sUp, a.yLo == (1u << 30) ? 0u : a.yLo, a.yHi, a.sByLiquid,
+                  a.sByAirAbove, a.sByNeither, a.sTypes[0], a.sTypes[1],
+                  a.sTypes[2], a.sTypes[3], a.sTypes[4], a.sTypes[5], a.sTypes[6],
+                  a.sTypes[7], a.cOther,
+                  a.lastMoved.empty() ? "-" : a.lastMoved.c_str(),
+                  a.drift.c_str(), a.trace.c_str())
            + " | limbs" + a.limbs + "; ";
   };
-  detail = Format("site [%s] bed y%d waterline y%d | ", siteWhy.c_str(), bedY,
-                  waterTop) + line(hu) +
+  // THE MAP'S WATER ROUND THE SITE (rule 6): the solved flow field
+  // (WaterFlow, the standing current a floater feels since 2026-10-18) is
+  // composed from worldmap::WaterColumnAt, not from the voxels the site test
+  // read. Where the map says the nearest water is, and what the field says
+  // at the basin's centre on the waterline.
+  std::string mapWater;
+  {
+    int best = INT_MAX, bx = 0, bz = 0, bw = 0, bh = 0;
+    for (int dz = -64; dz <= 64; dz += 8)
+      for (int dx = -64; dx <= 64; dx += 8) {
+        const worldmap::WaterColumn wc =
+            worldmap::WaterColumnAt(site.x + dx, site.z + dz, kDefaultSeed);
+        if (wc.water <= wc.h) continue;
+        const int d2 = dx * dx + dz * dz;
+        if (d2 < best) { best = d2; bx = dx; bz = dz; bw = wc.water; bh = wc.h; }
+      }
+    const Vec3 f = WaterFlow().Sample(Vec3{(float)site.x + 0.5f, (float)waterTop,
+                                           (float)site.z + 0.5f});
+    const std::vector<uint32_t>& fw = WaterFlow().Words();
+    mapWater = best == INT_MAX
+                   ? std::string("map water: none within 64")
+                   : Format("map water nearest (%+d,%+d): surface y%d over ground y%d",
+                            bx, bz, bw, bh);
+    mapWater += Format("; solved field at centre %.2f,%.2f (grid origin %d,%d n %u)",
+                       (double)f.x, (double)f.z,
+                       fw.size() > 2 ? (int)(int32_t)fw[0] : 0,
+                       fw.size() > 2 ? (int)(int32_t)fw[1] : 0,
+                       fw.size() > 2 ? fw[2] : 0u);
+  }
+  detail = Format("site [%s] bed y%d waterline y%d; %s; water bodies at each arm's "
+                  "end:%s | ", siteWhy.c_str(), bedY, waterTop, mapWater.c_str(),
+                  hintWhy.c_str()) + line(hu) +
            line(au) + line(an) + line(sy) +
            (limp.ran ? Format("limp human: %s, surface y%.0f, pelvis lowest "
-                              "y%.1f final y%.1f, %u pushes, y every 30:%s",
+                              "y%.1f final y%.1f, %u pushes, y every 30:%s, drift "
+                              "every 60:%s, limbs%s",
                               limpHeld ? "held limp" : "NOT LIMP AT END",
                               limp.surf, limp.lowest, limp.final, limp.pushes,
-                              limp.trace.c_str())
+                              limp.trace.c_str(), limp.drift.c_str(),
+                              limp.limbs.c_str())
                      : std::string("limp human: (no def)")) +
            (severRan ? " | severed:" + severWhy
                      : std::string(" | severed: (no human)"));
+  // WHICH CLAIM (rule 6): the detail carries every number, but a red line
+  // used to leave the reader to re-derive eight comparisons from it.
+  if (!ok) {
+    std::string bad;
+    auto add = [&bad](bool failed, const char* what) {
+      if (failed) bad += bad.empty() ? what : (std::string(", ") + what);
+    };
+    add(!humanOk, "human-floats-asleep");
+    add(!sank(au), "automaton-sinks");
+    add(au.ran && au.asleepAt < 0, "automaton-asleep");
+    add(!sank(an), "android-sinks");
+    add(!sylvanOk, "sylvan-rides-high");
+    add(!limpOk, "limp-floats");
+    add(!severOk, "severed-pieces");
+    detail += Format(" | FAILED: %s (human final %.3f, limp final %.3f)",
+                     bad.c_str(), (double)hu.final, (double)limp.final);
+  }
   std::printf("corpse-float: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

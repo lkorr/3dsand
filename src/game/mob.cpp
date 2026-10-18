@@ -4662,6 +4662,7 @@ void MobSystem::UpdateDeadSleep(World& world, uint32_t tick) {
     if (m.deadQuiet_ >= kDeadSleepTicks) {
       m.deadAsleep_ = true;
       m.deadWakeKey_ = m.DeadWakeKey(world);
+      m.deadMatterKey_ = m.DeadMatterKey(world);
       // A passive coat still drying goes on drying, on its own cadence
       // (StainLimbs visits it on this tick; Mob::DeadDryVisit).
       m.dryScale_ = CurrentTuning().coat.decayScale;
@@ -4930,6 +4931,7 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   deadAsleep_ = false;
   deadQuiet_ = 0;
   deadWakeKey_ = 0;
+  deadMatterKey_ = 0;
   deathSeq_ = 0;
   bodyUp_ = Vec3{0, 1, 0};
   footInit_ = false;
@@ -10213,7 +10215,23 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         // asleep on dry land pays two mirror reads every kCurrentWakeStride
         // ticks to find out it is not in water.
         constexpr uint32_t kCurrentWakeStride = 8;
-        if (mob.RigActive() || mob.DeadWakeKey(world) != mob.deadWakeKey_) {
+        // A chunk round it re-versioned: wake only if a cell in the body's
+        // box moved (DeadMatterKey). Otherwise the change was elsewhere in
+        // the chunk -- take the new versions as the baseline and sleep on.
+        bool chunksMoved = false;
+        if (!mob.RigActive()) {
+          const uint64_t vk = mob.DeadWakeKey(world);
+          if (vk != mob.deadWakeKey_) {
+            const uint64_t mk = mob.DeadMatterKey(world);
+            if (mk != mob.deadMatterKey_) {
+              chunksMoved = true;
+            } else {
+              mob.deadWakeKey_ = vk;
+              deadMatterSame_++;
+            }
+          }
+        }
+        if (mob.RigActive() || chunksMoved) {
           mob.WakeDead();
           mob.deadWokeHow_ = mob.RigActive() ? 1 : 2;
           roused = mob.deadWokeHow_ == 2;
@@ -30196,6 +30214,64 @@ uint64_t Mob::DeadWakeKey(World& world) const {
         }
         mix((uint64_t)(uintptr_t)cc);
         mix(cc->version);
+      }
+  return h;
+}
+
+uint64_t Mob::DeadMatterKey(World& world) const {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+  };
+  const IVec3 wo = world.WindowOrigin();
+  mix((uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
+  mix((uint64_t)(uint32_t)wo.z);
+  // DeadWakeKey's box, in cells rather than chunks.
+  Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+  float reach = 1.0f;
+  for (const MobLimb& l : limbs_) {
+    if (!l.body) continue;
+    const Vec3 p = l.xf.pos;
+    lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y);
+    lo.z = std::min(lo.z, p.z);
+    hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y);
+    hi.z = std::max(hi.z, p.z);
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(l));
+    reach = std::max(
+        reach, (float)std::max({l.size.x, l.size.y, l.size.z}) * inv);
+  }
+  if (lo.x > hi.x) return h;
+  const IVec3 c0{ifloor(lo.x - reach - 1.0f), ifloor(lo.y - reach - 1.0f),
+                 ifloor(lo.z - reach - 1.0f)};
+  const IVec3 c1{ifloor(hi.x + reach + 1.0f), ifloor(hi.y + reach + 1.0f),
+                 ifloor(hi.z + reach + 1.0f)};
+  // The stamp + excite scratch move every tick in an active chunk without
+  // the matter moving (World::SeedCacheFromMirror's kMatterMask).
+  constexpr uint32_t kMatterMask = 0xFF00FFFFu;
+  for (int cz = c0.z >> 4; cz <= c1.z >> 4; cz++)
+    for (int cy = c0.y >> 4; cy <= c1.y >> 4; cy++)
+      for (int cx = c0.x >> 4; cx <= c1.x >> 4; cx++) {
+        const IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) {
+          mix(0x0FFu);
+          continue;
+        }
+        const CachedChunk* cc = world.Cached(wc);
+        if (!cc || cc->voxels.size() != kChunkVol) {
+          mix(0xCACEu);
+          continue;
+        }
+        // The box clipped to this chunk.
+        const int x0 = std::max(c0.x, cx * 16), x1 = std::min(c1.x, cx * 16 + 15);
+        const int y0 = std::max(c0.y, cy * 16), y1 = std::min(c1.y, cy * 16 + 15);
+        const int z0 = std::max(c0.z, cz * 16), z1 = std::min(c1.z, cz * 16 + 15);
+        for (int z = z0; z <= z1; z++)
+          for (int y = y0; y <= y1; y++) {
+            const uint32_t* row =
+                cc->voxels.data() + ((uint32_t)(z & 15) * 16u + (uint32_t)(y & 15)) * 16u;
+            for (int x = x0; x <= x1; x++) mix(row[x & 15] & kMatterMask);
+          }
       }
   return h;
 }

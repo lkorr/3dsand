@@ -4971,8 +4971,19 @@ class Mob {
                     uint32_t& rainBudget);
   // Digest of what could wake a sleeping corpse from outside without touching
   // it: the residency window and the version of every cached chunk the body's
-  // box overlaps. Equal = nothing around it changed.
+  // box overlaps. Equal = nothing around it changed. The FAST test only: a
+  // chunk re-versions for a change anywhere in its 4,096 cells, so a changed
+  // key is then confirmed against DeadMatterKey before it wakes anything.
   uint64_t DeadWakeKey(World& world) const;
+  // Digest of the CELLS the body could be touching: every mirror word in its
+  // box (the same box DeadWakeKey walks the chunks of), less the tick stamp
+  // and excite scratch (bits 16-23, World::SeedCacheFromMirror's matter
+  // mask). Asked only when DeadWakeKey moved. Equal = the chunk changed
+  // somewhere this body is not -- measured on `corpse-float` (2026-10-18): a
+  // floating human was woken 768 times in 1,500 ticks by water stain creeping
+  // into the basin's stone walls a dozen cells away, never by anything that
+  // touched it, and so never slept.
+  uint64_t DeadMatterKey(World& world) const;
   // A SLEEPING CORPSE IN RUNNING WATER WAKES (ticket 2026-10-17_20-54-57).
   // DeadWakeKey only sees the chunks change, and a lake's solved current or
   // a current primitive moves no voxel, so a corpse that fell asleep afloat
@@ -5872,6 +5883,7 @@ class Mob {
   uint8_t stainWriters_ = 0;
   int16_t stainWriterLimb_ = -1;
   uint64_t deadWakeKey_ = 0;   // DeadWakeKey() when it fell asleep
+  uint64_t deadMatterKey_ = 0; // DeadMatterKey() when it fell asleep
   uint64_t deathSeq_ = 0;      // see DeathSeq()
   bool playerCorpse_ = false;  // see PlayerCorpse()
   std::string refId_;          // see RefId()
@@ -8760,6 +8772,9 @@ class MobSystem {
   // untunnel + DriveWornShells) run, over the life of this system. An asleep
   // corpse adds to neither except the anchor's kDeadAnchorStride refresh.
   uint64_t DeadAnchorsTotal() const { return deadAnchors_; }
+  // Sleeping-corpse checks where a chunk round the body re-versioned but no
+  // cell in its box moved (Mob::DeadMatterKey), so it slept on.
+  uint64_t DeadMatterSameTotal() const { return deadMatterSame_; }
   uint64_t DeadPostStepsTotal() const { return deadPostSteps_; }
   uint32_t MobOwner(uint64_t mobId) const;
   // Set one creature's owner directly. The handoff path and the gate use it;
@@ -10629,6 +10644,7 @@ class MobSystem {
   static constexpr uint64_t kPlayerCorpseIdBase = 1ull << 61;
   uint64_t playerCorpseSeq_ = 0;
   uint64_t deadAnchors_ = 0;    // DeadAnchorsTotal
+  uint64_t deadMatterSame_ = 0; // DeadMatterSameTotal
   uint64_t deadPostSteps_ = 0;  // DeadPostStepsTotal
   std::vector<PendingRise> rises_;
   uint32_t tick_ = 0;                  // this tick, for booking a rising

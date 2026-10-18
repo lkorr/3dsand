@@ -7327,7 +7327,14 @@ neighbors, so this needs an explicit connectivity pass:
   it is deterministic and replayable). Odd-angle bodies stay bodies — snapping
   them would resample to mush. One body per tick, whole body or nothing (no
   partial settles losing matter). This closes the grid → body → grid loop and
-  applies to blast debris and severed mob limbs alike.
+  applies to blast debris and severed mob limbs alike. The snap is
+  `floor(pos + 0.75)` per axis, not `lround(pos)`: the terrain collider is
+  marching cubes through cell SAMPLES, so a solid cell n's top face is at
+  n + 0.5 and a body at rest lies half a cell below the lattice it was born
+  on (pos n − 0.5, against a wall on either side too). `lround` split exactly
+  between the two, so contact slop could round a body lying flat into the
+  ground; since a target cell that is not air holds the settle (audit SB-2,
+  2026-10-14) such a body never settled (gate `floaters`, fixed 2026-10-18).
 - **Body burn (2026-08-19, implemented):** bodies are outside the CA, so
   without this a burning plank froze mid-flame the moment it detached.
   `DebrisSystem::BurnBodies` runs a CPU mirror of the reaction table (same
@@ -14100,8 +14107,13 @@ debris for the network). All of that is gone.
   in Jolt, no burn front or `alight`, no active coat (washer, corrosive, hot)
   and nothing dirty, no bleed budget or gush, twins clean. Asleep it skips
   `PostStep`, the burn/stain scans and all but a strided terrain anchor; it
-  wakes on Jolt activity, any damage entry point or a change in the chunk
-  versions around it (`DeadWakeKey`). A PASSIVE coat (one that only dries --
+  wakes on Jolt activity, any damage entry point or a change in the CELLS
+  round it: a moved chunk version (`DeadWakeKey`, the per-tick test) is
+  confirmed against a digest of the mirror words in the body's own box
+  (`DeadMatterKey`, bits 16-23 masked) before it wakes anything, so a chunk
+  that changed somewhere the body is not -- water stain creeping into a
+  basin wall a dozen cells off, measured 2026-10-18 waking a floating
+  corpse 768 times in 1,500 ticks -- leaves it asleep. A PASSIVE coat (one that only dries --
   blood, ichor, oil: `MobSystem::CoatDriesAsleep`) does not hold it awake: it
   gets one visit per tick its next drying level is due (`Mob::NextDryTick`,
   `DeadDryVisit` = the awake `StainTick` of that tick), so the coat ends
@@ -25832,10 +25844,20 @@ of its live surface relative to T8, one per 4 ticks; written by
 `sim_stream.wgsl`; -128 = no water, drawn dry), played back at 7.5 samples/s
 from a per-column phase and stepped in whole eighths; with no recording (both
 words 0) a procedural -3..+3 eighth flicker. A map RIVER column (its
-`STILL_MOUTH` word set — worldgen writes it for river water only) takes the
-procedural flicker scaled by its current (none under 0.08 m/s, all of it from
-0.6 m/s), so a slack reach stays glassy; a lake and the sea never flicker
-(ticket 11-37-20's "frozen waterfall" is map river water, not a stream). In fs the ray is re-met against the column's box topped at that height
+`STILL_MOUTH` word set — worldgen writes it for river water only) is NOT
+moved (2026-10-18, ticket 2026-10-17_00-04-26): drawn the stream's way it was a
+surface of flat per-column facets, one normal per column at up to 0.375 of
+slope, an eighth of them re-rolled every frame -- from 6 cm over the water a
+checkerboard of flat quads across the whole river. Its flicker is instead a
+continuous SLOPE field on the normal (`riverFlickerSlope`): the same per-column
+hash and phase, eased in time, quintic-interpolated between column centres so
+height and gradient are both continuous, `RIVER_FLICKER_SLOPE` (0.06, the
+chop's size) times the current's scale (none under 0.08 m/s, all of it from
+0.6 m/s, so a slack reach stays glassy) and faded with the pixel footprint
+like a 0.2 m wave band. A lake and the sea never flicker
+(ticket 11-37-20's "frozen waterfall" is map river water, not a stream).
+`SEAM_DBG 21` shows the near water normal's inputs, one set per screen
+quadrant. For a stream, in fs the ray is re-met against the column's box topped at that height
 (`streamSurfaceHit`): lowered, the ray goes down onto it or out of its side onto
 the next column (drawn as surface); raised, it is met earlier through its top or
 side; dry, the bed shows. `waterNormal` adds the neighbours' drawn offsets to

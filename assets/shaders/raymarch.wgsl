@@ -1093,8 +1093,21 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // path farWaterBed returned / 30 m (1 = the cap: no bed shows), and its
 // level / 16 + 0.5 where the map's wet bed overruled the cascade's.
 // Everything else black.
+// 21 = THE NEAR WATER NORMAL'S INPUTS, one set per screen QUADRANT (2026-10-18,
+// ticket 2026-10-17_00-04-26: flat facets over a river): top-left = the
+// ripple footprint / 0.5 m, the fetch (openness), waterDepthM / 3 m;
+// top-right = the advecting flow / 3 m/s, the macro slope x 4, the river
+// flicker amplitude (gRiverAmp); bottom-left = the wave slope x 8, a river's
+// flicker slope (riverFlickerSlope) x 8, and a stream's drawn offset / 6
+// eighths + 0.5 (else the held kind / 2); bottom-right = the final normal x
+// 0.5 + 0.5. Near water surface pixels only, black elsewhere. (One run of it
+// showed the ticket's facets to be single COLUMNS seen from 6 cm.)
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
+var<private> gDbgN0 : vec4f = vec4f(0.0);
+var<private> gDbgN1 : vec4f = vec4f(0.0);
+var<private> gDbgN2 : vec4f = vec4f(0.0);
+var<private> gDbgN3 : vec4f = vec4f(0.0);
 var<private> gDbgWet : vec2f = vec2f(0.0);
 var<private> gDbgPath : f32 = -1.0;
 var<private> gDbgLayer : f32 = 0.0;
@@ -10944,6 +10957,14 @@ fn rainRipples(pm : vec2f, t : f32, amount : f32, footM : f32) -> vec2f {
 // row is a bank, and its edge is not a slope), added to currentAt by the two
 // surface terms that draw motion (waterWaveNormal's advection and
 // flowFoamLines). Zero on the far field, which has no columns.
+// HELD COLUMNS ONLY (gHeldKind != 0; 2026-10-18, ticket 2026-10-17_00-04-26).
+// Live CA water is moved by the sim, so the measured flow already says where
+// it runs, smoothed over nodes and ticks. Its column gradient is the CA's
+// scattered fullness, re-rolled every tick: read as a current it gave every
+// column of a churned surface its own 0.5..3 m/s in its own direction, and
+// the streaks and foam lines advected by it jumped from column to column
+// every frame (an acid pour that woke the held river around it, at the
+// ticket's camera: 3 m/s across the whole near surface, SEAM_DBG 21).
 var<private> gSlopeFlow : vec2f = vec2f(0.0);
 // The flow a NEAR surface's waterWaveNormal drew with (xz, m/s; y = 1 when
 // set), handed to flowFoamLines on the same hit: the foam lines asked
@@ -11223,18 +11244,23 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   var slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
   // Downhill is where the column heights fall: +x when hx0 > hx1.
-  if (dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, hx0, hx1, hz0, hz1, slope); }
-  // A running HELD column's wet neighbours are drawn at their played-back
+  // A held column only (RUNNING WATER'S OWN CURRENT): live water has the measured flow.
+  if (gHeldKind != 0u && dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, hx0, hx1, hz0, hz1, slope); }
+  // An ADOPTED stream column's wet neighbours are drawn at their played-back
   // heights (THE FROZEN STREAM PLAYS BACK), so the surface tilts by those, as
-  // a live partial cell's does by its neighbours' fullness. The current above
-  // keeps the held slope: the flicker is not a flow.
-  if (gHeldKind == 2u || gRiverAmp > 0.0) {
+  // a live partial cell's does by its neighbours' fullness. A map RIVER's
+  // flicker is the continuous field instead (riverFlickerSlope: no per-column
+  // tilt, ticket 2026-10-17_00-04-26). The current above keeps the held
+  // slope: the flicker is not a flow.
+  if (gHeldKind == 2u) {
     var o = vec4f(0.0);
     if (hx0 > 0.0) { o.x = heldNeighbourOff(cell.x - 1, cell.z); }
     if (hx1 > 0.0) { o.y = heldNeighbourOff(cell.x + 1, cell.z); }
     if (hz0 > 0.0) { o.z = heldNeighbourOff(cell.x, cell.z - 1); }
     if (hz1 > 0.0) { o.w = heldNeighbourOff(cell.x, cell.z + 1); }
     slope += vec2f(o.x - o.y, o.z - o.w) * 0.5;
+  } else if (gRiverAmp > 0.0) {
+    slope += riverFlickerSlope(hitP);
   }
 
   // Ripples on top of the macro slope, in world metres (waterWaveNormal).
@@ -11291,9 +11317,15 @@ fn waterWaveNormal(hitP : vec3f, macroSlope : vec2f, depthM : f32, openness : f3
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
   let flowMS = waterCurrentAt(hitP).xz * VOXEL_METERS + gSlopeFlow;
   if (gFlowSlack < 0.0) { gWaveFlow = vec3f(flowMS.x, 1.0, flowMS.y); }
-  var slope = macroSlope +
-              waveSlope(pm, R.time, waterRippleFootprint(hitP), depthM, flowMS) * openness;
+  let wsl = waveSlope(pm, R.time, waterRippleFootprint(hitP), depthM, flowMS) * openness;
+  var slope = macroSlope + wsl;
   slope += flux * TUNE_WAVE_SIM_SLOPE;
+  if (SEAM_DBG == 21u && gFlowSlack < 0.0) {
+    gDbgN0 = vec4f(waterRippleFootprint(hitP) / 0.5, openness, depthM / 3.0, 1.0);
+    gDbgN1 = vec4f(length(flowMS) / 3.0, length(macroSlope) * 4.0, gRiverAmp, 1.0);
+    gDbgN2.x = length(wsl) * 8.0;
+    gDbgN3 = vec4f(normalize(vec3f(-slope.x, 1.0, -slope.y)) * 0.5 + 0.5, 1.0);
+  }
   return normalize(vec3f(-slope.x, 1.0, -slope.y));
 }
 // Schlick on WATER_F0, scaled by the liquid's optics, faded on a partial
@@ -11605,12 +11637,14 @@ fn heldSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
 //     relative to the target, one every 4 ticks, played back at the sim's
 //     rate from a per-column phase and stepped in whole eighths, as the CA
 //     stepped them; a sample of -128 is "no water" (the bed shows);
-//   * or, for a stream with no recording (both words 0) and for a map river
-//     column (its STILL_MOUTH word set: worldgen writes it for river water
-//     only, never a lake or the sea), a procedural flicker of the same kind:
-//     a hash of (column, sample) over -3..+3 eighths, mean 0 -- on a river
-//     scaled by its current (RIVER_FLICKER_V0..V1), so a slack reach stays
-//     glassy and a fast one churns.
+//   * or, for a stream with no recording (both words 0), a procedural
+//     flicker of the same kind: a hash of (column, sample) over -3..+3
+//     eighths, mean 0.
+// A map RIVER column (its STILL_MOUTH word set: worldgen writes it for river
+// water only, never a lake or the sea) is NOT moved: its flicker is a
+// continuous field over the surface's NORMAL (riverFlickerSlope, below),
+// scaled by its current (RIVER_FLICKER_V0..V1), so a slack reach stays glassy
+// and a fast one shimmers.
 // RENDER-ONLY: nothing is written; the voxels stay held (swimming, fire,
 // buoyancy, the sim all see T8). The surface is moved in fs by intersecting
 // the ray with the column's box topped at the drawn height
@@ -11697,7 +11731,7 @@ fn echoProc(col : u32, k : u32) -> i32 {
 // The drawn offset of window column `col` from its target now, in eighths (a
 // whole number of them, as the CA's surface is): an adopted stream's
 // recording if it has one (`stream`), else the procedural flicker times
-// `amp`.
+// `amp`. Streams only: a map river's flicker is riverFlickerSlope.
 fn columnOff8(col : u32, stream : bool, amp : f32) -> f32 {
   var e0 = 0u;
   var e1 = 0u;
@@ -11727,19 +11761,18 @@ fn columnOff8(col : u32, stream : bool, amp : f32) -> f32 {
   return round(mix(f32(a), f32(b), f));
 }
 // The SHADED column's drawn offset (eighths; 0 = drawn as held), after
-// heldColumnT8 found it held: a stream plays back; a map river column flickers
-// by its current at `p` (and sets gRiverAmp); a lake or the sea is still.
+// heldColumnT8 found it held: a stream plays back; a map river column is
+// drawn where it is held and only sets its flicker amplitude by its current
+// at `p` (gRiverAmp, for riverFlickerSlope); a lake or the sea is still.
 fn heldDrawnOff8(c : vec3<i32>, p : vec3f) -> f32 {
   let col = rmStillCol(c.x, c.z);
   if (gHeldKind == 2u) { return columnOff8(col, true, 1.0); }
   if (gHeldKind != 1u || stillWater[RM_STILL_MOUTH + col] == 0u) { return 0.0; }
   let sp = length(waterCurrentAt(p).xz) * VOXEL_METERS;
   gRiverAmp = smoothstep(RIVER_FLICKER_V0, RIVER_FLICKER_V1, sp);
-  if (gRiverAmp <= 0.0) { return 0.0; }
-  return columnOff8(col, false, gRiverAmp);
+  return 0.0;
 }
-// A NEIGHBOUR column's drawn offset, in cells: a stream's (its target word
-// set) or, around a flickering river column, a river's (its mouth word set);
+// A NEIGHBOUR stream column's drawn offset, in cells (its target word set),
 // else 0. Its tag and liquid are not checked -- a neighbour's offset only
 // tilts the shaded column's normal.
 fn heldNeighbourOff(x : i32, z : i32) -> f32 {
@@ -11747,10 +11780,68 @@ fn heldNeighbourOff(x : i32, z : i32) -> f32 {
   if (stillWater[col * RM_STILL_WORDS + 2u] != 0u) {
     return max(columnOff8(col, true, 1.0), -8.0) / 8.0;
   }
-  if (gRiverAmp > 0.0 && stillWater[RM_STILL_MOUTH + col] != 0u) {
-    return columnOff8(col, false, gRiverAmp) / 8.0;
-  }
   return 0.0;
+}
+
+// ---- A MAP RIVER'S FLICKER IS A CONTINUOUS FIELD (2026-10-18, ticket
+// 2026-10-17_00-04-26) -------------------------------------------------------
+// The first cut gave a river the stream's playback: every column drawn at its
+// own -3..+3 eighths, re-rolled 7.5 times a second at its own phase, met as a
+// box (streamSurfaceHit) and tilted by its four neighbours' offsets. That is a
+// surface made of FLAT per-column facets -- one normal over a whole column,
+// up to 0.375 of slope (20 degrees) against the chop's 0.03..0.05, with a
+// step at every column edge -- and with the phases scattered, an eighth of the
+// columns jump every frame. From 6 cm over the water (the ticket's camera)
+// each column was a third of the screen: a checkerboard of flat quads of
+// different brightness over the whole river, changing every frame; from head
+// height a speckle of per-voxel mirrors. A stream keeps that look on purpose
+// (it plays back what the CA did, and the CA steps in eighths); a map river
+// never was CA water and has no such excuse.
+// So a river column is drawn where it is held, and the flicker is a SLOPE
+// field added to the macro slope: a value per column CENTRE (the same
+// two-dice hash and per-column phase as the stream's stand-in, but eased in
+// time instead of rounded to eighths), quintic-interpolated across columns so
+// the height it describes and its gradient are both continuous; the gradient
+// is the slope. Scaled by the current (gRiverAmp) and faded with the pixel
+// footprint like a wave band of RIVER_FLICKER_LEN (a pattern two columns
+// across: past the fade it would alias into sparkle). Four column hashes and
+// no memory reads (the field does not ask which neighbours are river: it only
+// tilts the shaded river column).
+// The slope at a value step of 1 (the hash's -3..+3 is -1..+1): typical
+// |slope| is ~0.8 x this, the size of the chop's, so it shimmers rather than
+// facets.
+const RIVER_FLICKER_SLOPE : f32 = 0.06;
+const RIVER_FLICKER_LEN : f32 = 0.2;   // m
+// One column centre's value, -1..+1, eased between its samples.
+fn riverFlickerNode(x : i32, z : i32) -> f32 {
+  let col = rmStillCol(x, z);
+  var s = R.time * ECHO_RATE;
+  if (ECHO_PHASE_JITTER) { s += f32(pcg(col + 0x7A5Eu) & 0xFFFFu) * (8.0 / 65536.0); }
+  let k = u32(floor(s));
+  let f = s - floor(s);
+  let e = f * f * (3.0 - 2.0 * f);
+  return mix(f32(echoProc(col, k)), f32(echoProc(col, k + 1u)), e) * (1.0 / 3.0);
+}
+// The field's gradient at `hitP` (voxels of height per voxel: the slope
+// waterNormal adds), times gRiverAmp and the footprint fade.
+fn riverFlickerSlope(hitP : vec3f) -> vec2f {
+  let foot = waterRippleFootprint(hitP);
+  let amp = gRiverAmp * RIVER_FLICKER_SLOPE *
+            (1.0 - smoothstep(RIVER_FLICKER_LEN * 0.28, RIVER_FLICKER_LEN * 0.85, foot));
+  if (amp <= 0.0) { return vec2f(0.0); }
+  let q = vec2f(hitP.x, hitP.z) - 0.5;   // column centres on the integer lattice
+  let i = vec2<i32>(floor(q));
+  let f = q - floor(q);
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+  let a = riverFlickerNode(i.x, i.y);
+  let b = riverFlickerNode(i.x + 1, i.y);
+  let c = riverFlickerNode(i.x, i.y + 1);
+  let d = riverFlickerNode(i.x + 1, i.y + 1);
+  let k = a - b - c + d;
+  let g = du * vec2f(b - a + k * u.y, c - a + k * u.x) * amp;
+  if (SEAM_DBG == 21u) { gDbgN2.y = length(g) * 8.0; }
+  return g;
 }
 // The ray against column (col.x, col.y)'s water drawn up to `topY` (voxels):
 // the box [x, x+1] x (-inf, topY] x [z, z+1]. Returns (t, axis, sign of rd
@@ -20635,6 +20726,7 @@ fn fs(in : VSOut) -> FSOut {
         let t8 = heldColumnT8(liqCell, lm);
         var off8 = 0.0;
         if (gHeldKind != 0u) { off8 = heldDrawnOff8(liqCell, hitP); }
+        if (SEAM_DBG == 21u) { gDbgN2.z = select(f32(gHeldKind) * 0.5, off8 / 6.0 + 0.5, off8 != 0.0); }
         if (off8 != 0.0) {
           let topY = (f32(t8) + off8) / 8.0;
           let sh = streamSurfaceHit(R.camPos, rd, liqCell.xz, topY);
@@ -20975,6 +21067,14 @@ fn fs(in : VSOut) -> FSOut {
     let wet = gDbgW0.x == 1.0 || gDbgW0.x == 0.5;
     let bandM = select(gDbgT, gDbgW0.y, wet) * VOXEL_METERS;
     gDbg = select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(color, 1.0), bandM >= 10.0 && bandM <= 19.0);
+  }
+  if (SEAM_DBG == 21u) {
+    let qw = R.viewPx * R.aspect;
+    let right = in.pos.x >= qw * 0.5;
+    let bottom = in.pos.y >= R.viewPx * 0.5;
+    var q = select(gDbgN0, gDbgN1, right);
+    if (bottom) { q = select(vec4f(gDbgN2.xyz, gDbgN0.w), gDbgN3, right); }
+    gDbg = select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(q.xyz, 1.0), gDbgN0.w > 0.0);
   }
   if (SEAM_DBG != 0u) { out.color = vec4f(gDbg.xyz, 1.0); }
   out.depth = depth;
