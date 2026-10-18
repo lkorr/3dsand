@@ -9611,9 +9611,15 @@ const FAR_MAP_SLOT_MAX : u32 = 0x7Fu;
 //   bits 10..16 sub slot, 17..23 mid slot, 24..30 deep slot (d2+1 and down)
 //   bit  31     PRESENT; 0 = no strata (a fluid top, a stalk): the sub-skin
 //               paints the whole side, the rule before the plane
+//   bit  30     WET (PRESENT clear): a fluid top's BED instead -- see
+//               FAR_STRATA_WET below; every PRESENT reader ignores it
 // Written by `farmap` with its entry and trusted only under a VALID entry.
 const FAR_STRATA_BASE : u32 = FAR_FEAT_BASE + FAR_FEAT_LEVELS * FAR_N * FAR_N * 4u;
 const FAR_STRATA_PRESENT : u32 = 0x80000000u;
+// PRESENT clear and this set: a FLUID top's bed, not strata -- bits 0..15 the
+// fluid's depth over the bed (fine voxels: top - h), 16..22 the bed's skin
+// slot (0: none fits). Read by raymarch.wgsl farWetBedAt; see `farmap`.
+const FAR_STRATA_WET : u32 = 0x40000000u;
 const FAR_STRATA_DMAX : i32 = 31;
 // Worst case: the far bound's slot, a 5-step search per run, and one wasted
 // probe at the phase change.
@@ -9939,10 +9945,13 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     // run). ONE genCellIn call site: each is a whole inlined copy (see
     // unrollFence()). The probes skip the caves (`noCave`): the strata are
     // what the rock is, and a riser the map vouches for is rock.
+    var bedS = 0u;                // a wet top's bed skin slot (FAR_STRATA_WET)
     for (var q = unrollFenceU(); q < 3u + FAR_STRATA_PROBES; q++) {
       var y = top + 1 - i32(q);
       if (q >= 3u) {
-        if (sPhase == 3u) { break; }
+        // A wet top has no search: its one probe is the bed's skin, at h.
+        if (sPhase == 3u && (dry || q > 3u)) { break; }
+        if (!dry) { y = col.h; }
         // The far bound's slot when it is not known yet (dS past the field).
         if (sHiS == 0xFFFFu) { y = top - sHi; }
         else { y = top - (sLo + sHi) / 2; }
@@ -9954,6 +9963,8 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
         under = mq;
         sRun = matFarPal(&materials, mq);
         if (!farCellIsSolid(mq)) { sPhase = 3u; }
+      } else if (!dry) {
+        bedS = matFarPal(&materials, mq);
       } else {
         let s = matFarPal(&materials, mq);
         if (sHiS == 0xFFFFu) { sHiS = s; }
@@ -10074,6 +10085,18 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
       let a = clamp(d1, 1, FAR_STRATA_DMAX);
       st = u32(a) | (u32(clamp(d2, a, FAR_STRATA_DMAX)) << 5u) | (subS << 10u) |
            (midS << 17u) | (deepS << 24u) | FAR_STRATA_PRESENT;
+    }
+    // A WET TOP'S WORD IS ITS BED (FAR_STRATA_WET, 2026-10-18, ticket
+    // 2026-10-16_11-05-33). A fluid top has no riser strata, so its word
+    // carries what the cascade cannot: the water's true depth over the bed
+    // (fine voxels, top - h) and the bed's skin slot. farSurfaceMat's wetTop
+    // paints a bed cell with the fluid wherever the water is too shallow for
+    // any cell centre to land in it, and the far bed march then took that
+    // cell as a whole cell of water -- the bed a cell low under a shallow
+    // river past level 3. raymarch.wgsl farWetBedAt reads this instead.
+    if (!dry && !stalked) {
+      st = u32(clamp(top - col.h, 0, 0xFFFF)) |
+           (select(0u, bedS, bedS <= FAR_MAP_SLOT_MAX) << 16u) | FAR_STRATA_WET;
     }
     atomicStore(&farMap[farStrataWord(level, m)], st);
   }
