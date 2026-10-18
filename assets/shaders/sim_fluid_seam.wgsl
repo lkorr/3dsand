@@ -1028,19 +1028,6 @@ fn seamIsMat(c : vec3<i32>, mat : u32) -> bool {
 // | direction), or 0 for no throw. See the block above.
 fn spoutJetCode(c : vec3<i32>, mat : u32) -> u32 {
   if (spoutChanceQ() == 0u || spoutGainQ() == 0) { return 0u; }
-  // A REAL DROP UNDER IT, not an MPM body. Trigger (a) asks only for an AIR
-  // VOXEL below, and over excited water that voxel is air with the flood's
-  // particles in it: a settled cell lying ON moving water. Seeded at rest
-  // (every excite until the jet) that re-wake is dissipative and the flood
-  // settles; thrown, every such re-wake hands the body a fresh Torricelli
-  // kick and the settle/excite pair is an energy pump. MEASURED, `flow-measure`
-  // R (a dam breach that must relax): gap/ring 1.97 cells/s left after 900
-  // ticks with the throw, 0.37 with chance 0. So the cell under a thrown one
-  // must hold no excited mass either (seamNeighbourState, the predicate the
-  // perch trigger and settle's veto read). Falls over water still excite,
-  // at rest, as before.
-  let sb = seamNeighbourState(c + vec3<i32>(0, -1, 0));
-  if (sb.x != 0u || sb.y != 0u) { return 0u; }
   let h = pcg(hash3(T.seed, T.tick, cellIndexW(c)) ^ 0x5B0D7E71u);
   if ((h & 0xFFFFu) >= spoutChanceQ()) { return 0u; }
   let up = vec3<i32>(0, 1, 0);
@@ -1064,6 +1051,19 @@ fn spoutJetCode(c : vec3<i32>, mat : u32) -> u32 {
   if (!seamIsMat(u, mat)) { u = u + up; }
   if (!seamIsMat(u, mat)) { return 0u; }   // the push was the other axis'
   let head = spoutHead(u, back, c.y, mat);
+  // A REAL HEAD, the mouth's own bound (SPOUT_MOUTH_HEAD). Trigger (a) asks
+  // only for an air VOXEL below, and over a flood that voxel is air with the
+  // flood's particles in it: a cell lying on the moving water, its "source"
+  // the flood's own surface beside it, one or two rows over it. Seeded at
+  // rest (every excite until the jet) that re-wake is dissipative; thrown,
+  // each one handed the body a fresh Torricelli kick and settle/excite became
+  // an energy pump. MEASURED, `flow-measure` R (a dam breach that must
+  // relax): 1.97 cells/s left at the gap/ring after 900 ticks with the throw,
+  // 0.37 at chance 0. A spout has water STANDING over its lip -- a reservoir
+  // behind a dam, a tank behind a hole -- and a drained or equalised breach
+  // has none, so the throw stops when the head does; a cell under it still
+  // excites, at rest, as before.
+  if (head < SPOUT_MOUTH_HEAD) { return 0u; }
   return SPOUT_JET_BIT | (select(0u, 4u, head >= SPOUT_STRONG_H)) | dir;
 }
 
@@ -1105,12 +1105,8 @@ fn spoutMouthCode(c : vec3<i32>, mat : u32) -> u32 {
   let dn = vec3<i32>(0, -1, 0);
   for (var d = 0u; d < 4u; d++) {
     let n = c + seamLateral(d);
-    // The perch predicate ITSELF (seamLateralExcite over seamNeighbourState),
-    // not "air voxel over air voxel": that counted a drop full of the
-    // stream's or a flood's particles as empty, which settle's veto (it
-    // reads the excited mass) does not -- so settle could build a cell this
-    // took straight back, the oscillation the subset rule exists to forbid.
-    if (!seamLateralExcite(seamNeighbourState(n), seamNeighbourState(n + dn))) { continue; }
+    if (!cellResident(n, T.origin) || !cellResident(n + dn, T.origin)) { continue; }
+    if (voxMat(voxWordAt(n)) != MAT_AIR || voxMat(voxWordAt(n + dn)) != MAT_AIR) { continue; }
     let back = -seamLateral(d);
     if (!seamIsMat(c + back, mat)) { continue; }
     let head = spoutHead(c + back, back, c.y, mat);
