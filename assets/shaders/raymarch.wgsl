@@ -4880,6 +4880,39 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
           tCur = t;
           continue;
         }
+        // ---- ...AND THE 10 m CAP INSIDE IT, ALSO IN ONE STEP (2026-10-18,
+        // ticket 2026-10-17_21-03-25: a breached lake from over its surface).
+        // When the depth cap falls inside the box the jump above declines, and
+        // the per-cell loop below walked the box's cells to it: every one the
+        // same key, so all that walk decides is WHERE it stops -- the first
+        // cell boundary past tCapJ, i.e. the exit of the cell holding the
+        // point at tCapJ -- and the sums, which telescope to (stop - tCur).
+        // That is the last chunk of every capped lake pixel, ~20 cells a
+        // pixel looking down into Mirrormere. Computed here instead. Exact up
+        // to float rounding in the stop's t, and the stop is a saturated
+        // column whose transmission liqVisFade has already taken to 0, so the
+        // picture cannot see even that. Declined (back to the walk) when the
+        // stop would reach the march's exit or its step budget, where the walk
+        // stops differently.
+        if (tCapJ <= tOut) {
+          let pc = floor(ro + rd * tCapJ);
+          let tb = (pc + select(vec3f(0.0), vec3f(1.0), rd > vec3f(0.0)) - ro) * inv;
+          let tS = max(min(tb.x, min(tb.y, tb.z)), tCur);
+          let dc = abs(vec3<i32>(pc) - cell);
+          let nC = dc.x + dc.y + dc.z + 1;
+          if (tS < tExit && i + nC + 1 < maxSteps) {
+            i += nC;
+            let seg = tS - tCur;
+            out.liqPath += seg;
+            let dT = seg * cellOp;
+            out.mediaTau += dT;
+            out.mediaTint += cellTint * dT;
+            rsAdd(RS_CHUNK_SKIP, 1u);
+            out.saturated = true;
+            out.t = tS;
+            break;
+          }
+        }
       }
       if (!runGas) {
         if ((cchPt & PT_SENTINEL_BIT) == 0u &&
