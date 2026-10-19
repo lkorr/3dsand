@@ -2813,10 +2813,30 @@ void Overlay::DrawDevView(UIState& s) {
     ImGui::SetItemTooltip(
         "The caustic web: on the bed seen through the surface, and on lit\n"
         "underwater surfaces.");
-    ImGui::Checkbox("no side sheets", &s.wfxNoSheets);
+    ImGui::Checkbox("no risers", &s.wfxNoRisers);
     ImGui::SetItemTooltip(
-        "waterSideKind: every side face of a liquid is a plain wall - no\n"
-        "white falling sheet, no riser lit as surface.");
+        "A riser is a side face where the water steps down less than 3/4 of a\n"
+        "cell; it is lit as surface so a running river does not stripe.\n"
+        "On: every riser is a plain wall.");
+    ImGui::Checkbox("full riser shade (old)", &s.wfxFullRiser);
+    ImGui::SetItemTooltip(
+        "Risers normally take a CHEAP top shade (flat normal, sky reflection,\n"
+        "no caustics/glint/foam). On: the full top-surface shade they had\n"
+        "before, traced reflection and all - the A/B for the saving.");
+    ImGui::Checkbox("no white water", &s.wfxNoWhite);
+    ImGui::SetItemTooltip(
+        "fallingSheet: the streaked white cover on falling sheets and on\n"
+        "water in flight.");
+    {
+      Tuning t = CurrentTuning();
+      ImGui::SetNextItemWidth(160);
+      if (EditableSliderFloat("white water strength", &t.render.fallSheetStrength,
+                              0.0f, 1.0f, "%.2f"))
+        SetCurrentTuning(t);
+      ImGui::SetItemTooltip(
+          "render.fallSheetStrength: how white falling water goes. Live, no\n"
+          "recompile; save it into tuning.json to keep it.");
+    }
     ImGui::SeparatorText("base shade (cost only - the look is wrong)");
     ImGui::Checkbox("openness = 1", &s.wfxNoOpenness);
     ImGui::SetItemTooltip("waterOpenness: the 12-cell ring around each surface\n"
@@ -2837,14 +2857,17 @@ void Overlay::DrawDevView(UIState& s) {
                           "mobs and items behind water be tinted. They will look\n"
                           "un-watered with this on.");
     if (ImGui::Button("all on (shipped look)")) {
-      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = s.wfxNoSheets = false;
+      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = false;
+      s.wfxNoRisers = s.wfxNoWhite = s.wfxFullRiser = false;
       s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = false;
       s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = false;
       s.wfxReflShift = 0;
     }
     ImGui::SameLine();
     if (ImGui::Button("all off")) {
-      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = s.wfxNoSheets = true;
+      s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = true;
+      s.wfxNoRisers = s.wfxNoWhite = true;
+      s.wfxFullRiser = false;
       s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = true;
       s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = true;
       s.wfxReflShift = 3;

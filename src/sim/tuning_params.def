@@ -532,6 +532,11 @@ TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f, 0.0f, 1.0f)
 // because these are look knobs with no stability hazard behind them.
 TP_F(render, mistDensity, TUNE_MIST_DENSITY, 1.0f, 0.0f, 4.0f)
 TP_F(render, mistBrightness, TUNE_MIST_BRIGHTNESS, 0.9f, 0.0f, 4.0f)
+// The white-water cover on falling sheets and water in flight (raymarch.wgsl
+// fallingSheet / farFallingSheet), 0..1. NO_WGSL on purpose: WriteRenderParams
+// packs it into RenderParams.flags bits 24..31, so an F1/F5 edit is live with
+// no shader recompile. 0 = clear water and the sheet term costs nothing.
+TP_F(render, fallSheetStrength, NO_WGSL, 1.0f, 0.0f, 1.0f)
 TP_F(render, mistRadius, TUNE_MIST_RADIUS, 10.0f, 0.5f, 48.0f)
 TP_F(render, mistFallSpeed, TUNE_MIST_FALL_SPEED, 2.2f, 0.0f, 12.0f)
 TP_F(render, sprayDensity, TUNE_SPRAY_DENSITY, 1.3f, 0.0f, 4.0f)

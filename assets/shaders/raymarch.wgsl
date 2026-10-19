@@ -894,7 +894,7 @@ const RFLAG_GASFAR : u32 = 32u;
 const RFLAG_NO_MIST : u32 = 256u;        // waterfallMist: mist + spray + its sun ray
 const RFLAG_NO_REFL : u32 = 512u;        // traceReflection: sky lookup only
 const RFLAG_NO_CAUSTIC : u32 = 1024u;    // waterCausticCurv + bedCaustic
-const RFLAG_NO_SHEETS : u32 = 2048u;     // waterSideKind: every side face a plain wall
+const RFLAG_NO_RISERS : u32 = 2048u;     // waterSideKind: a riser is a plain wall
 // Bits 12..13: traced-reflection step budget shift (0 = TUNE_REFLECTION_STEPS,
 // 1 = half, 2 = quarter, 3 = eighth).
 const RFLAG_REFL_STEP_SHIFT : u32 = 12u;
@@ -907,6 +907,13 @@ const RFLAG_NO_SLOPE : u32 = 65536u;      // waterNormal's 4 liquidColumn reads 
 const RFLAG_NO_SOLUTE : u32 = 131072u;    // solPathLook -> body optics, no walk
 const RFLAG_NO_RIPPLE : u32 = 262144u;    // waterWaveNormal: no current/ripple bands
 const RFLAG_NO_VEIL : u32 = 524288u;      // writeWaterVeil: no 7-word store
+const RFLAG_NO_WHITE : u32 = 1048576u;    // shadeWater: no white sheet / in-flight cover
+const RFLAG_FULL_RISER : u32 = 2097152u;  // shadeWater: a riser takes the full top shade
+// Bits 24..31 are NOT a probe: render.fallSheetStrength (0..1, x255), the
+// white-water cover's strength, packed here by WriteRenderParams so the F1 /
+// F5 value is live with no shader recompile (a TUNE_ const would miss the
+// SPIR-V cache of every shader on each edit).
+fn fallSheetStrength() -> f32 { return f32(R.flags >> 24u) * (1.0 / 255.0); }
 fn reflStepBudget() -> i32 {
   return TUNE_REFLECTION_STEPS >> ((R.flags >> RFLAG_REFL_STEP_SHIFT) & 3u);
 }
@@ -11583,7 +11590,11 @@ const SIDE_WALL : u32 = 0u;
 const SIDE_RISER : u32 = 1u;
 const SIDE_SHEET : u32 = 2u;
 fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
-  if ((R.flags & RFLAG_NO_SHEETS) != 0u) { return SIDE_WALL; }
+  let k = waterSideKindRaw(cell, out);
+  if (k == SIDE_RISER && (R.flags & RFLAG_NO_RISERS) != 0u) { return SIDE_WALL; }
+  return k;
+}
+fn waterSideKindRaw(cell : vec3<i32>, out : vec3<i32>) -> u32 {
   if (gHeldKind != 0u) { return heldSideKind(cell, out); }
   let n = cell + out;
   var level = -1.0;   // out of the window: open, and falling
@@ -12068,8 +12079,10 @@ fn farFallingSheet(hitP : vec3f, axis : i32, tVox : f32) -> f32 {
   let foot = tVox * VOXEL_METERS * (R.tanHalfFov * 2.0 / max(R.viewPx, 1.0));
   let mean = (FALL_SHEET_BASE + (1.0 - FALL_SHEET_BASE) * FALL_SHEET_STREAK_MEAN) * FALL_SHEET_WHITE;
   let w = smoothstep(0.03, 0.12, foot);
-  if (w >= 1.0) { return mean; }
-  return mix(fallingSheetAt(hitP, axis, FAR_SHEET_DEPTH_M, FALL_SHEET_BASE), mean, w);
+  let k = fallSheetStrength();
+  if (k <= 0.0) { return 0.0; }
+  if (w >= 1.0) { return mean * k; }
+  return mix(fallingSheetAt(hitP, axis, FAR_SHEET_DEPTH_M, FALL_SHEET_BASE), mean, w) * k;
 }
 
 // THE STAR FIELD'S MEAN RADIANCE, analytically: what starField averages to
@@ -13911,7 +13924,19 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   if (axis != 1 && !underwater) { side = waterSideKind(cell, vec3<i32>(axisVec(axis, -sgn))); }
   let riser = side == SIDE_RISER;
   let upFacing = (axis == 1 && sgn < 0.0) || riser;
-  var n = waterNormal(cell, mat, axis, sgn, hitP, upFacing);
+  // THE CHEAP RISER (2026-10-18, owner measurement: risers + sheets were the
+  // 2-4 ms of flowing water). A riser is a step of an eighth or two on a
+  // running surface, a sliver a cell wide: it is lit AS surface so it does
+  // not stripe the river, but none of the top's detail is resolvable on it.
+  // So it takes the calm top normal (no column slope, no ripple bands, no
+  // flow lookup -- waterNormal is asked as a side face only to reset its
+  // globals), the sky for its reflection (a side face is seen at grazing, so
+  // its Fresnel fired a full traced ray nearly every pixel), and no caustics,
+  // glint, foam or rain. RFLAG_FULL_RISER is the dev panel's A/B back to the
+  // full top shade.
+  let cheapRiser = riser && (R.flags & RFLAG_FULL_RISER) == 0u;
+  var n = waterNormal(cell, mat, axis, sgn, hitP, upFacing && !cheapRiser);
+  if (cheapRiser) { n = vec3f(0.0, 1.0, 0.0); }
   if (underwater) { n = -n; }   // seen from below, the interface faces down
   if (SEAM_DBG == 19u && upFacing && !underwater) {
     // The near surface's per-COLUMN inputs, the ones that can step from one
@@ -13968,7 +13993,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // the waves that cast it.
   var lit = sceneBehind;
   gVCurv = 0.0;
-  if (!underwater && depthM > 0.02) {
+  if (!underwater && depthM > 0.02 && !cheapRiser) {
     gVCurv = waterCausticCurv(hitP, rd, pathVox, depthM);
     lit *= veilCaustic(gVCurv, depthM);
   }
@@ -14016,6 +14041,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // outside it is total internal reflection of the murk. Approximating that
     // with the in-scatter color is both cheap and closer than a sky lookup.
     reflection = scatter * 1.6;
+  } else if (cheapRiser) {
+    reflection = reflectionSky(reflect(rd, n));
   } else if (upFacing) {
     // Only spend a secondary ray where the reflection can actually be SEEN.
     // Fresnel runs from 2% head-on to ~100% at grazing, so a top-down water
@@ -14064,12 +14091,16 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // A falling SIDE face of a cell that is itself in flight takes the
   // in-flight cover too; a held curtain's face (liquid under it) keeps the
   // sheet's.
+  // render.fallSheetStrength scales the cover (0 = clear water, and then the
+  // probe below costs nothing); RFLAG_NO_WHITE is the dev panel's probe.
+  let sheetK = fallSheetStrength();
+  let whiteOn = sheetK > 0.0 && (R.flags & RFLAG_NO_WHITE) == 0u;
   var inFlight = false;
-  if (!underwater && (axis == 1 || side == SIDE_SHEET)) {
+  if (whiteOn && !underwater && (axis == 1 || side == SIDE_SHEET)) {
     inFlight = (axis == 1 && sgn > 0.0) || openBelow(cell);
   }
-  if (inFlight || side == SIDE_SHEET) {
-    let a = fallingSheet(hitP, axis, cell, select(FALL_SHEET_BASE, FALL_FLIGHT_BASE, inFlight));
+  if (whiteOn && (inFlight || side == SIDE_SHEET)) {
+    let a = fallingSheet(hitP, axis, cell, select(FALL_SHEET_BASE, FALL_FLIGHT_BASE, inFlight)) * sheetK;
     color = mix(color, whiteWaterLight(n), a);
     gVK *= 1.0 - a;
   }
@@ -14079,7 +14110,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // correct-but-dull surface into something that reads as water in motion:
   // the ripple slopes scatter the highlight into moving sparkle rather than
   // one blob. Gated on the sun being above the horizon relative to the normal.
-  if (upFacing && !underwater) {
+  if (upFacing && !underwater && !cheapRiser) {
     // Key light, so a moonlit lake gets a moon track instead of staying flat
     // black at night — a still lake under a full moon is one of the strongest
     // night-lighting cues there is (waterGlint).
@@ -14111,7 +14142,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // shallowness, broken up by the ripple field so it isn't a clean contour
   // ring, sells the boundary between water and land far better than the hard
   // color step it replaces.
-  if (upFacing && !underwater) {
+  if (upFacing && !underwater && !cheapRiser) {
     // FOAM ON CONVERGENCE LINES (plan component 9). Surface water piles up
     // where the flow converges — the inflow line of a drain, the seam where a
     // jet's outward spread meets the bank — and that is where the froth
@@ -14145,7 +14176,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // The speck of a drop's impact: thrown-up water lit like the rain streaks
   // (sky + a little key light), so it is a glint at noon and a dim fleck at
   // night rather than a white dot.
-  if (upFacing && !underwater && gRainSplash > 0.0) {
+  if (upFacing && !underwater && !cheapRiser && gRainSplash > 0.0) {
     let sa = min(gRainSplash, 1.0) * 0.6;
     let splashLit = ambientAt(vec3f(0.0, 1.0, 0.0)) * 1.1 + keyLightColor() * 0.25;
     color = mix(color, splashLit, sa);

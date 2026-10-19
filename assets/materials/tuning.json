@@ -1010,6 +1010,7 @@
     "siltDrift": 0.05,
     "mistDensity": 1,
     "mistBrightness": 0.9,
+    "fallSheetStrength": 0.5,
     "mistRadius": 10,
     "mistFallSpeed": 2.2,
     "sprayDensity": 1.3,

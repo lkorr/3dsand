@@ -4864,6 +4864,10 @@ struct Tuning {
     // mistDensity <= 0 removes the whole term at shader-compile time.
     float mistDensity = TPD(render, mistDensity);
     float mistBrightness = TPD(render, mistBrightness);
+    // How white falling water goes, 0..1: scales the falling-sheet and
+    // in-flight cover (raymarch.wgsl fallingSheet). Rides RenderParams.flags
+    // bits 24..31 (WriteRenderParams), so it is live without a recompile.
+    float fallSheetStrength = TPD(render, fallSheetStrength);
     // voxels the veil wraps around the column
     float mistRadius = TPD(render, mistRadius);
     // m/s the vapour field drifts DOWN
