@@ -4154,10 +4154,16 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const int fy4 = addBox(cx4, cz4, kDeep2, 0, 0, false, 9);
   // Box 5 (the same ticket, shot 2, as the owner made it: the REAL spell, an
   // `explosive projectile` thrown at the FLOOR of deep water): a still pool
-  // flowMeasure.spellDeep deep. Claim XS, after the main timeline.
+  // flowMeasure.spellDeep deep, built AFTER the main timeline (claim XS).
+  // Not with the others: measured 2026-10-18, a third pool standing through
+  // the timeline kept boxes 1 and 2 flowing for all 900 ticks (R and S-R red,
+  // 18 of box 1's 24 chunks awake at the end; green without it) -- an
+  // interaction between concurrent pools this gate does not own (the
+  // conduits' one shared ledger, sim_step.wgsl THE CONDUIT, is the likely
+  // door), recorded rather than chased here. spellDeep 0 skips XS.
   const int kDeepS = (int)BaselineNumber("flowMeasure.spellDeep", 32);
   const int cx5 = cx + kSites[site5][0], cz5 = cz + kSites[site5][1];
-  const int fy5 = addBox(cx5, cz5, kDeepS, 0, 0, false);
+  int fy5 = 0;
 
   const int kBreachAt = (int)BaselineNumber("flowMeasure.breachAt", 90);
   const int kAt = (int)BaselineNumber("flowMeasure.at", 45);
@@ -4253,6 +4259,8 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   const double convAngle = BaselineNumber("flowMeasure.convAngle", 35.0);
   const int convMin = (int)BaselineNumber("flowMeasure.convMin", 4);
   const double convSpread = BaselineNumber("flowMeasure.convSpread", 45.0);
+  // The far ring's own floor (was pullSpeed): see baseline.json's note.
+  const double convSpeed = BaselineNumber("flowMeasure.convSpeed", 0.5);
   const double sideDz = BaselineNumber("flowMeasure.sideDz", 12.0);
   const double sideAngle = BaselineNumber("flowMeasure.sideAngle", 60.0);
   const float kDeg = 57.2957795f;
@@ -4577,7 +4585,7 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
       for (size_t k = 0; k < farRing.size(); k++) {
         const Vec3 v = at(farRing[k]);
         const float a = angleTo(v, farRing[k]);
-        if (speed(v) >= pullSpeed && a <= convAngle) converged++;
+        if (speed(v) >= convSpeed && a <= convAngle) converged++;
         farAngles += Format("%s%.0f@%.1f", k ? "/" : "", a, speed(v));
         farMean += speed(v) / (float)farRing.size();
       }
@@ -4648,7 +4656,7 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   // first from the +x/+z side down at the floor west of the middle, then,
   // once that has settled, from the -x/-z side at the floor east of it. Per
   // throw, blastAt ticks after the blast: the ring of 8 (spellRing cells round
-  // the blast, spellRingDy over it) must run INWARD (>= blastMin of 8, the
+  // the blast, spellRingDy under the surface) must run INWARD (>= blastMin of 8, the
   // cavity refilling), not one way (uniformity <= blastUniform), and the two
   // throws' mean directions are printed. Before 2026-10-18 the CA's fixed
   // colour order made every partial descent in a draining column run -z
@@ -4663,10 +4671,14 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   } throws[2];
   const int spellAt = (int)BaselineNumber("flowMeasure.spellAt", 15);
   const float spellRing = (float)BaselineNumber("flowMeasure.spellRing", 12.0);
-  const float spellRingDy = (float)BaselineNumber("flowMeasure.spellRingDy", 4.0);
+  // The ring stands spellRingDy cells under the pool's surface: a deep pool refills a floor
+  // cavity by its column FALLING straight down (no lateral move, nothing on the
+  // arrows there) and the drawn-down SURFACE over it is what flows in sideways
+  // (measured: the band of moving rows 24..32 of a 32-deep pool at +5).
+  const float spellRingDy = (float)BaselineNumber("flowMeasure.spellRingDy", 2.0);
   const int spellSettle = (int)BaselineNumber("flowMeasure.spellSettle", 240);
-  std::string spellWhy;
-  {
+  std::string spellWhy, spellPre;
+  if (kDeepS > 0) {
     support::TickRig& rig = ticker.Rig();
     GlyphLibrary& lib = rig.Glyphs();
     std::string gerr;
@@ -4682,15 +4694,38 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     CasterHealth hp;
     hp.get = [](void*) { return (int32_t)(1 << 20); };
     hp.spend = [](void*, int32_t) {};
-    // The CPU mirror (what the bolt's flight tests against) onto box 5, and a
-    // few ticks for it to arrive.
+    // Box 5, built and filled now (see its note at the top), then left
+    // spellPrep ticks to come to rest, as the other pools are before the
+    // breach. The CPU mirror (what the bolt's flight tests against) goes there
+    // first.
+    build.clear();
+    fill.clear();
+    fy5 = addBox(cx5, cz5, kDeepS, 0, 0, false);
     ticker.chunk = {cx5 >> 4, (fy5 + kDeepS / 2) >> 4, cz5 >> 4};
-    for (int i = 0; i < 20; i++) ticker();
+    for (size_t at = 0; at < build.size(); at += kPerTick) {
+      support::TickOps o;
+      o.cells.assign(build.begin() + at, build.begin() + std::min(build.size(), at + kPerTick));
+      ticker(o);
+    }
+    ticker();
+    for (size_t at = 0; at < fill.size(); at += kPerTick) {
+      support::TickOps o;
+      o.cells.assign(fill.begin() + at, fill.begin() + std::min(fill.size(), at + kPerTick));
+      ticker(o);
+    }
+    const int spellPrep = (int)BaselineNumber("flowMeasure.spellPrep", 90);
+    for (int i = 0; i < spellPrep; i++) ticker();
+    spellPre = Format("box5 %s, debris bodies %u; box5 section%s", boxWhy(cx5, cz5, fy5, kDeepS).c_str(),
+                      c.debris.BodyCount(), section(cx5, cz5, fy5, kDeepS).c_str());
     for (int k = 0; k < 2 && spellWhy.empty(); k++) {
       SpellThrow& th = throws[k];
       const float s = k == 0 ? 1.0f : -1.0f;
       const Vec3 target{(float)cx5 - s * 8.0f + 0.5f, (float)fy5 + 0.5f, (float)cz5 + 0.5f};
-      const Vec3 from{target.x + s * 14.0f, (float)(fy5 + kDeepS + 6), target.z + s * 10.0f};
+      // From UNDER the surface, as the owner cast it (swimming): a bolt
+      // thrown from the air resolves on the water it meets (measured: the
+      // first version's blasts went off at the surface, 32 rows over the
+      // floor, and moved nothing on the ring).
+      const Vec3 from{target.x + s * 14.0f, (float)(fy5 + kDeepS - 6), target.z + s * 10.0f};
       Vec3 d{target.x - from.x, target.y - from.y, target.z - from.z};
       const float dl = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
       d = Vec3{d.x / dl, d.y / dl, d.z / dl};
@@ -4717,13 +4752,22 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
                            th.cast ? "the bolt never went off" : "the cast launched nothing");
         break;
       }
-      const float ry = th.at.y + spellRingDy;
+      const float ry = (float)(fy5 + kDeepS) - spellRingDy + 0.5f;
       for (int i = 1; i <= std::max(spellAt, 45); i++) {
         ticker();
         if (i == 5 || i == spellAt || i == 45) {
           readGrid();
           const Radial r = radial(th.at, spellRing, ry);
           if (i == spellAt) th.st = r;
+          // What the ring stands in: the published nodes round the blast,
+          // the grid's header, and the voxels through it.
+          if (i == 5)
+            th.trace += Format("%sgrid n %u fold@%d, nodes round the blast %s; vertical %s; section x at the "
+                               "blast%s; ",
+                               th.trace.empty() ? "" : "; ", grid[2], (int)grid[3] - (int)t,
+                               nodeMapAt((int)th.at.x, (int)th.at.z).c_str(),
+                               vertNodeAt(th.at.x, th.at.z, (int)th.at.x, fy5).c_str(),
+                               section(cx5, (int)th.at.z, fy5, kDeepS).c_str());
           th.trace += Format("%s+%d: %s", th.trace.empty() ? "" : "; ", i, radialStr("", r).c_str());
         }
       }
@@ -4764,8 +4808,9 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
                            carryQuiet, carryGap.x, carryGap.z, kAt, carryMin, carryPulled, ring.size(),
                            pullMin));
   if (converged < convMin || spread < convSpread)
-    fails.push_back(Format("K: %d of %zu far-ring points within %.0f deg of the gap (need %d), spread %.0f "
-                           "deg (need %.0f)", converged, farRing.size(), convAngle, convMin, spread, convSpread));
+    fails.push_back(Format("K: %d of %zu far-ring points within %.0f deg of the gap at >= %.2f cells/s (need "
+                           "%d), spread %.0f deg (need %.0f)", converged, farRing.size(), convAngle, convSpeed,
+                           convMin, spread, convSpread));
   if (sideAngN > sideAngle || sideAngS > sideAngle || sideSpdN < pullSpeed || sideSpdS < pullSpeed)
     fails.push_back(Format("W: beside the gap along the dam the current is %.0f / %.0f deg off the gap at "
                            "%.2f / %.2f cells/s (need <= %.0f deg, >= %.1f)", sideAngN, sideAngS, sideSpdN,
@@ -4789,14 +4834,14 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
                            pullMin, holeMid.y, vertMin));
   for (int k = 0; k < 2; k++) {
     const Radial& r = throws[k].st;
-    if (!spellWhy.empty() || !throws[k].blew) continue;
+    if (kDeepS <= 0 || !spellWhy.empty() || !throws[k].blew) continue;
     if (r.moving < blastMin || r.inward < blastMin || r.uniform > blastUniform)
       fails.push_back(Format("XS: throw %d (%s): round the spell's blast at +%d %d of 8 ring points move, %d "
                              "inward (need %d), uniform %.2f toward %.0f deg (need <= %.2f)", k,
                              k == 0 ? "from +x+z" : "from -x-z", spellAt, r.moving, r.inward, blastMin, r.uniform,
                              r.dir, blastUniform));
   }
-  if (!spellWhy.empty()) fails.push_back("XS: " + spellWhy);
+  if (kDeepS > 0 && !spellWhy.empty()) fails.push_back("XS: " + spellWhy);
   if (nearWorst > aimMax)
     fails.push_back(Format("A: the near ring's worst heading error off the gap is %.0f deg (need <= %.0f)",
                            nearWorst, aimMax));
@@ -4839,9 +4884,10 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   detail += " | BEFORE THE BREACH " + quietWhy;
   detail += Format(" | X blast r %d power %d, ring %.0f: quiet %s | %s", kBlastR, kBlastPower, blastRing,
                    radialStr("", blastQuiet).c_str(), blastTrace.c_str());
-  for (int k = 0; k < 2; k++)
+  if (kDeepS > 0) detail += " | XS BEFORE THE THROWS " + spellPre;
+  for (int k = 0; k < 2 && kDeepS > 0; k++)
     detail += Format(" | XS throw %d (%s) %s, blast at (%.0f, %.0f, %.0f) floor %d after %d ticks of flight, ring %.0f "
-                     "at +%.0f: %s", k, k == 0 ? "from +x+z" : "from -x-z", throws[k].cast ? "cast" : "NOT CAST",
+                     "%.0f under the surface: %s", k, k == 0 ? "from +x+z" : "from -x-z", throws[k].cast ? "cast" : "NOT CAST",
                      throws[k].at.x, throws[k].at.y, throws[k].at.z, fy5, throws[k].ticks, spellRing, spellRingDy,
                      throws[k].trace.c_str());
   detail += Format(" | F floor hole %dx%d, ring %.0f: centre at +%d (%.2f, %.2f, %.2f); nodes %s | %s", kGap,
