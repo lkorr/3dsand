@@ -886,13 +886,14 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
              (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u) |
              (GasFarRenderActive() ? 32u : 0u) |
              (CurrentTuning().render.horizon ? 128u : 0u) |
-             // Bits 8..21: the dev panel's water cost probes (support.h).
-             WaterFxProbe() |
-             // Bits 24..31: render.fallSheetStrength x255 (raymarch.wgsl
-             // fallSheetStrength) -- a value, not a flag, so it is live.
-             ((uint32_t)std::lround(std::clamp(
-                  CurrentTuning().render.fallSheetStrength, 0.0f, 1.0f) * 255.0f)
-              << 24);
+             // Bits 8..25: the dev panel's water cost probes (support.h).
+             WaterFxProbe();
+  // render.fallSheetStrength rides the spare pad word (world.h pad_wi1,
+  // raymarch.wgsl fallSheetStrength): a value, live, no recompile.
+  {
+    const float k = std::clamp(CurrentTuning().render.fallSheetStrength, 0.0f, 1.0f);
+    std::memcpy(&rp.pad_wi1, &k, sizeof k);
+  }
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.

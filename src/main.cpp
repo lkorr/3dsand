@@ -17775,6 +17775,10 @@ int main(int argc, char** argv) {
                       (ui.wfxNoRisers ? kWaterProbeNoRisers : 0u) |
                       (ui.wfxNoWhite ? kWaterProbeNoWhite : 0u) |
                       (ui.wfxFullRiser ? kWaterProbeFullRiser : 0u) |
+                      (ui.wfxLooseRefl ? kWaterProbeLooseRefl : 0u) |
+                      (ui.wfxNoCurrent ? kWaterProbeNoCurrent : 0u) |
+                      (ui.wfxNoFlowMarks ? kWaterProbeNoFlowMarks : 0u) |
+                      (ui.wfxWCache ? kWaterProbeWCacheOn : 0u) |
                       (ui.wfxNoOpenness ? kWaterProbeNoOpenness : 0u) |
                       (ui.wfxNoDepth ? kWaterProbeNoDepth : 0u) |
                       (ui.wfxNoSlope ? kWaterProbeNoSlope : 0u) |

@@ -2802,6 +2802,12 @@ void Overlay::DrawDevView(UIState& s) {
     ImGui::SetItemTooltip(
         "traceReflection returns the sky: no reflected shore, trees or bodies.\n"
         "Water and ice. The sky, sun glint and Fresnel stay.");
+    ImGui::Checkbox("loose reflections (old)", &s.wfxLooseRefl);
+    ImGui::SetItemTooltip(
+        "Reflections are gated TIGHT by default: traced only above 10%% Fresnel\n"
+        "(was render.reflectionCutoff), with a step budget that grows with the\n"
+        "weight. On: the old gate, every reflection above the cutoff at full\n"
+        "budget - the A/B if a reflection looks cut short.");
     const char* kSteps[] = {"full", "1/2", "1/4", "1/8"};
     ImGui::SetNextItemWidth(120);
     ImGui::Combo("reflection steps", &s.wfxReflShift, kSteps, IM_ARRAYSIZE(kSteps));
@@ -2852,6 +2858,16 @@ void Overlay::DrawDevView(UIState& s) {
     ImGui::Checkbox("no ripples / current", &s.wfxNoRipple);
     ImGui::SetItemTooltip("waterWaveNormal: the flow-field lookup and the ripple\n"
                           "bands (trig per band). The surface goes mirror-flat.");
+    ImGui::Checkbox("no current lookup", &s.wfxNoCurrent);
+    ImGui::SetItemTooltip("waterCurrentAt in the wave normal: the flow field's grid\n"
+                          "samples. Also stops the advection and the flow marks.");
+    ImGui::Checkbox("no flow marks", &s.wfxNoFlowMarks);
+    ImGui::SetItemTooltip("waveSlope: the current's streaks (24 noise taps) and\n"
+                          "boils. The bands and advection stay.");
+    ImGui::Checkbox("water cell cache (in-shader, experimental)", &s.wfxWCache);
+    ImGui::SetItemTooltip("Computes each water cell's depth, openness and neighbour\n"
+                          "columns once per frame and shares it. Off by default:\n"
+                          "measured faster on near water, slower on far water.");
     ImGui::Checkbox("no veil write", &s.wfxNoVeil);
     ImGui::SetItemTooltip("writeWaterVeil: the 7-word per-pixel store that lets\n"
                           "mobs and items behind water be tinted. They will look\n"
@@ -2859,6 +2875,7 @@ void Overlay::DrawDevView(UIState& s) {
     if (ImGui::Button("all on (shipped look)")) {
       s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = false;
       s.wfxNoRisers = s.wfxNoWhite = s.wfxFullRiser = false;
+      s.wfxLooseRefl = s.wfxNoCurrent = s.wfxNoFlowMarks = s.wfxWCache = false;
       s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = false;
       s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = false;
       s.wfxReflShift = 0;
@@ -2867,7 +2884,8 @@ void Overlay::DrawDevView(UIState& s) {
     if (ImGui::Button("all off")) {
       s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = true;
       s.wfxNoRisers = s.wfxNoWhite = true;
-      s.wfxFullRiser = false;
+      s.wfxFullRiser = s.wfxLooseRefl = false;
+      s.wfxNoCurrent = s.wfxNoFlowMarks = true;
       s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = true;
       s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = true;
       s.wfxReflShift = 3;
