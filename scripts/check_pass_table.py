@@ -160,6 +160,8 @@ PIPE_TO_MEMBER = {
     "PIPE_GAS_MASK": "gasMask_",
     "PIPE_GI_PREPARE": "giPrepare_",
     "PIPE_GI_GATHER": "giGather_",
+    "PIPE_WC_PREPARE": "wcPrepare_",
+    "PIPE_WC_BAKE": "wcBake_",
     "PIPE_RAIN_EXPO": "rainExpo_",
     "PIPE_FLOWMEAS_FOLD": "flowMeasFold_",
     "PIPE_STREAM_SCAN": "streamScan_",
@@ -292,6 +294,9 @@ BUF_TO_WGSL = {
     # The GI gather request list; GiArgs is indirect-only and never bound.
     "GiReq": {"giReq"},
     "GiArgs": set(),
+    # The water cell cache (water_cell.wgsli); WaterCellArgs is indirect-only.
+    "WaterCell": {"wcache"},
+    "WaterCellArgs": set(),
     "RainExpo": {"rainExpo"},
     # Wind drafts. DraftArgs is indirect-only and never bound, like SolArgs.
     "Draft": {"draftField"},
@@ -943,6 +948,8 @@ def module_for(fname):
         body += "\n" + (read(SHADERS / "worldgen_dungeon.wgsli") or "")
     if fname in ("gi_gather.wgsl", "shadow_resolve.wgsl"):
         body += "\n" + (read(SHADERS / "gi_gather_rays.wgsli") or "")
+    if fname in ("raymarch.wgsl", "water_cell.wgsl"):
+        body += "\n" + (read(SHADERS / "water_cell.wgsli") or "")
     # LoadShader prepends common.wgsl; the call graph spans both. It also keeps
     # exactly ONE of the WIND DRAFTS reader's two blocks (resources.cpp
     # BodyReadsDrafts): both define draftWord, and parse_module keeps the LAST

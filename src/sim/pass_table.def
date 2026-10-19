@@ -1942,6 +1942,23 @@ PASS(gi_gather, "giGather", PT_SHADOWCACHE, PIPE_GI_GATHER, K_INDIRECT, IND_GIAR
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
           A(GiReq) I(GiArgs) W(Irradiance) R(OpennessGen)))
+// ---- THE WATER CELL CACHE'S BAKE (assets/shaders/water_cell.wgsl) ----------
+// The raymarch lists the water cells it drew (one lane per cache slot per
+// frame) and these rows compute each listed cell once, against this frame's
+// voxels, before this frame's raymarch reads them: depth, openness and the
+// four neighbour column heights, which were
+// ~32 dependent loads per water PIXEL. The GI gather's prepare/copy/indirect
+// shape. The fragment read is BeginRendering's flush, as for GiReq. C_ALWAYS: an empty list is a zero-group
+// dispatch, and the count is GPU-side.
+PASS(wc_prepare, "waterCell", PT_SHADOWCACHE, PIPE_WC_PREPARE, K_COMPUTE, 1,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(A(WaterCell)))
+// Header words 4..6 -> the indirect-only args buffer.
+PASS(copy_wcArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(WaterCell) TW(WaterCellArgs)))
+PASS(wc_bake, "waterCell", PT_SHADOWCACHE, PIPE_WC_BAKE, K_INDIRECT, IND_WCARGS,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(RenderUBO) R(PageTable) A(WaterCell) I(WaterCellArgs)))
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
      GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))

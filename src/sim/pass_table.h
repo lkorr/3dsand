@@ -294,6 +294,13 @@ enum class Buf : uint8_t {
   // GiArgs is indirect-only and never bound, like ShadowArgs.
   GiReq,
   GiArgs,
+  // THE WATER CELL CACHE (assets/shaders/water_cell.wgsli): the raymarch's
+  // water pixels list their cells (fragment, atomics) and read the slots; the
+  // next frame's wc_prepare / wc_bake rows on the ShadowCache table fill them.
+  // The GI gather's request/bake shape. Render-private: never hashed, never
+  // saved, no sim binding. WaterCellArgs is indirect-only and never bound.
+  WaterCell,
+  WaterCellArgs,
   // The RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl, src/sim/
   // rainexpo.h): per 4-key texel of the tick's fall-line lattice, the level of
   // the first ray blocker. SIM state, unlike RainMap above: written by the
@@ -603,6 +610,8 @@ enum class Pipe : uint8_t {
   StreamScan, StreamCommit, StreamClear,
   // ShadowCache table. Before ShadowResolve for the copy loop's bound.
   GiPrepare, GiGather,
+  // The water cell cache's bake (water_cell.wgsl), two per-FRAME rows.
+  WaterCellPrepare, WaterCellBake,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
@@ -943,6 +952,8 @@ enum class DispatchSel : uint32_t {
   // Indirect: giArgs @ 0. Same standing as IndShadowArgs: the count is what the
   // fragment shader appended last frame, which nothing on the CPU knows.
   IndGiArgs,
+  // Indirect: waterCellArgs @ 0 (the cells the fragment shader listed).
+  IndWaterCellArgs,
   IndCaArgs,         // indirect: caArgs @ 16 x the ITERATION (colour k of a CA row)
   IndFarDownArgs,    // indirect: world.farDownArgs @ 0 (the far downsample cadence's list)
 };

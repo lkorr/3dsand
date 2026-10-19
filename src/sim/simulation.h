@@ -1037,8 +1037,10 @@ class Simulation {
   // pass::Buf::StillWater (worldgen.wgsl's still-water table, binding 58):
   // per window column, the authored surface of a map lake / river / the sea.
   rhi::Buffer stillWaterBuf_;
-  // The water cell cache (raymarch.wgsl waterCellInfo), render binding 51.
+  // The water cell cache (water_cell.wgsli): renderBGL_ 51 (fragment: list +
+  // read), shadowBGL_ 37 (the bake); its args buffer is indirect-only.
   rhi::Buffer waterCellBuf_;
+  rhi::Buffer waterCellArgsBuf_;
   // pass::Buf::RenderUBOTick (docs/PLAN_async_compute.md).
   rhi::Buffer renderUBOTickBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true;
@@ -1136,6 +1138,8 @@ class Simulation {
   rhi::ComputePipeline gasMask_;
   // The GI gather cache's refresh (gi_gather.wgsl `giPrepare` / `giGather`).
   rhi::ComputePipeline giPrepare_, giGather_;
+  // The water cell cache's bake (water_cell.wgsl `wcPrepare` / `wcBake`).
+  rhi::ComputePipeline wcPrepare_, wcBake_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the

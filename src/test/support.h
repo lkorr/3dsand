@@ -115,7 +115,7 @@ constexpr uint32_t kWaterProbeFullRiser  = 1u << 21;   // riser takes the full t
 constexpr uint32_t kWaterProbeLooseRefl  = 1u << 22;   // reflections: the OLD gate
 constexpr uint32_t kWaterProbeNoFlowMarks = 1u << 23;  // no streaks / boils
 constexpr uint32_t kWaterProbeNoCurrent  = 1u << 24;   // no current lookup (no advection)
-constexpr uint32_t kWaterProbeWCacheOn   = 1u << 25;   // use the in-shader water cell cache (off by default)
+constexpr uint32_t kWaterProbeNoWCache   = 1u << 25;   // bypass the water cell cache (inline)
 constexpr uint32_t kWaterProbeMask      = 0x3FFFF00u;
 uint32_t WaterFxProbe();
 void SetWaterFxProbe(uint32_t bits);

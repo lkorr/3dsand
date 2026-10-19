@@ -768,6 +768,12 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     std::string gi;
     if (ReadFileText(shaderDir + "/gi_gather_rays.wgsli", gi)) body += "\n" + gi;
   }
+  // THE WATER CELL FACTS (water_cell.wgsli's header): the raymarch's inline
+  // fallback + cache reader and the bake that fills the cache share them.
+  if (name == "raymarch.wgsl" || name == "water_cell.wgsl") {
+    std::string wc;
+    if (ReadFileText(shaderDir + "/water_cell.wgsli", wc)) body += "\n" + wc;
+  }
   // The seed accessor the page block's JITTER synthesis calls. Empty unless
   // this shader addresses voxels, which is exactly when the block survives.
   std::string ptSeed;

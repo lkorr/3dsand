@@ -97,7 +97,7 @@ struct UIState {
   bool wfxLooseRefl = false;   // reflections: the OLD (looser) gate
   bool wfxNoCurrent = false;   // probe: no current lookup (and so no advection)
   bool wfxNoFlowMarks = false; // probe: no current streaks / boils
-  bool wfxWCache = false;      // use the in-shader water cell cache (experimental)
+  bool wfxNoWCache = false;    // bypass the water cell cache (the A/B)
   int wfxReflShift = 0;        // reflection step budget >> n (0..3)
   // Base-shade probes: each replaces one per-pixel term with a constant.
   bool wfxNoOpenness = false, wfxNoDepth = false, wfxNoSlope = false,

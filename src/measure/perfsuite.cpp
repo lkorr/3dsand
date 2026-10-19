@@ -3347,8 +3347,8 @@ const RenderArm kRenderArms[] = {
                     kWaterProbeNoCurrent),
     WATER_PROBE_ARM("wp_noflowmarks", "no current streaks / boils",
                     "flowStreakSlope2 + flowBoils", kWaterProbeNoFlowMarks),
-    WATER_PROBE_ARM("wp_wcache", "in-shader water cell cache ON",
-                    "positive = what the in-shader cell cache saves", kWaterProbeWCacheOn),
+    WATER_PROBE_ARM("wp_nowcache", "water cell cache bypassed (inline compute)",
+                    "negative = what the water cell cache saves", kWaterProbeNoWCache),
     // LAST, and identical to `baseline`: the run's own noise floor and drift
     // (the first arm of a camera runs warm), read against baseline's row.
     WATER_PROBE_ARM("wp_none", "no probe (baseline again, measured last)",

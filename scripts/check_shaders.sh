@@ -592,6 +592,11 @@ fn ptTick() -> u32 { return ${u}.tick; }"
     if { [ "$name" = "gi_gather.wgsl" ] || [ "$name" = "shadow_resolve.wgsl" ]; } &&
        [ -f "$SHADER_DIR/gi_gather_rays.wgsli" ]; then
       printf '\n'; cat "$SHADER_DIR/gi_gather_rays.wgsli"
+    fi
+    # the water cell facts (water_cell.wgsli): the raymarch and its bake
+    if { [ "$name" = "raymarch.wgsl" ] || [ "$name" = "water_cell.wgsl" ]; } &&
+       [ -f "$SHADER_DIR/water_cell.wgsli" ]; then
+      printf '\n'; cat "$SHADER_DIR/water_cell.wgsli"
     fi; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.

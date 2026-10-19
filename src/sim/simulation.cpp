@@ -1064,15 +1064,20 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     const std::vector<uint32_t> zero(kStillWaterWords, 0u);
     device.GetQueue().WriteBuffer(stillWaterBuf_, 0, zero.data(), zero.size() * 4u);
   }
-  // THE WATER CELL CACHE (raymarch.wgsl waterCellInfo; WC_SLOT_LOG2 / WC_WORDS
-  // there): 2^18 slots x 12 words = 12 MiB, zeroed so no stale stamp matches.
+  // THE WATER CELL CACHE (water_cell.wgsli: WC_TOTAL_WORDS = header 8 + list
+  // 131072 + 2^18 slots x 6 words, ~6.5 MiB), zeroed so no stale stamp
+  // matches. waterCellArgsBuf_ is indirect-only (copy_wcArgs fills it).
   {
-    constexpr uint64_t kWaterCellWords = (1ull << 18) * 12ull;
+    constexpr uint64_t kWaterCellWords = 8ull + 131072ull + (1ull << 18) * 6ull;
     waterCellBuf_ = CreateBuffer(device, kWaterCellWords * 4u,
-                                 rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                 rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
+                                     rhi::BufferUsage::CopySrc,
                                  "waterCell");
     const std::vector<uint32_t> zero(kWaterCellWords, 0u);
     device.GetQueue().WriteBuffer(waterCellBuf_, 0, zero.data(), zero.size() * 4u);
+    waterCellArgsBuf_ = CreateBuffer(device, 16, rhi::BufferUsage::Indirect |
+                                                     rhi::BufferUsage::CopyDst,
+                                     "waterCellArgs");
   }
   // ...and its ambient wind cache (sim_step.wgsl caWind): 64 blocks x 3 words.
   caWindBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 64u * 3u * 4u,
@@ -1364,6 +1369,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // ...and the MEASURED flow it blends over it (flowfield.h kFlowMeas*),
         // which the tick's fold writes; R(FlowMeasure) on the row.
         entry(36, T::ReadOnlyStorage), // flowMeas
+        // THE WATER CELL CACHE (water_cell.wgsl): wc_prepare reopens its
+        // list, wc_bake fills the slots the raymarch reads at renderBGL_ 51.
+        entry(37, T::Storage),         // waterCell
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -2446,6 +2454,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The GI gather cache's refresh (gi_gather.wgsl): two per-frame entries on
   // shadowPL_.
   rhi::ShaderModule mGiGather;
+  // The water cell cache's bake (water_cell.wgsl): two per-frame entries.
+  rhi::ShaderModule mWaterCell;
   rhi::ShaderModule mWindStreak;
   rhi::ShaderModule mArrowTrail;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
@@ -2486,6 +2496,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mGodVis, "godray_vis.wgsl");
     mod(&mGasMask, "gas_mask.wgsl");
     mod(&mGiGather, "gi_gather.wgsl");
+    mod(&mWaterCell, "water_cell.wgsl");
     mod(&mWindStreak, "wind_streak.wgsl");
     mod(&mArrowTrail, "arrow_trail.wgsl");
     mod(&mCloud, "cloud.wgsl");
@@ -2511,7 +2522,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
       !mRayStart || !mRainMap || !mHzLight || !mWindStreak || !mArrowTrail || !mGodVis || !mGiGather ||
-      !mGasMask) {
+      !mGasMask || !mWaterCell) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -2579,6 +2590,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { gasMask_ = MakeComputePipeline(device, shadowPL_, mGasMask, "gasMaskBuild", "gasMask"); });
   pool.Add([&] { giPrepare_ = MakeComputePipeline(device, shadowPL_, mGiGather, "giPrepare", "giPrepare"); });
   pool.Add([&] { giGather_ = MakeComputePipeline(device, shadowPL_, mGiGather, "giGather", "giGather"); });
+  pool.Add([&] { wcPrepare_ = MakeComputePipeline(device, shadowPL_, mWaterCell, "wcPrepare", "wcPrepare"); });
+  pool.Add([&] { wcBake_ = MakeComputePipeline(device, shadowPL_, mWaterCell, "wcBake", "wcBake"); });
   pool.Add([&] { windStreak_ = MakeComputePipeline(device, shadowPL_, mWindStreak, "update", "windStreak"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
@@ -3119,6 +3132,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasMask:             return gasMaskBuf_;
     case B::GiReq:               return giReqBuf_;
     case B::GiArgs:              return giArgsBuf_;
+    case B::WaterCell:           return waterCellBuf_;
+    case B::WaterCellArgs:       return waterCellArgsBuf_;
     case B::RainExpo:            return rainExpoBuf_;
     case B::Draft:               return draftBuf_;
     case B::DraftMeta:           return draftMetaBuf_;
@@ -3265,6 +3280,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GasMask:        return gasMask_;
     case P::GiPrepare:      return giPrepare_;
     case P::GiGather:       return giGather_;
+    case P::WaterCellPrepare: return wcPrepare_;
+    case P::WaterCellBake:  return wcBake_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FlowMeasFold:   return flowMeasFold_;
@@ -4753,6 +4770,7 @@ void Simulation::BuildShadowBindGroup() {
       b(34, world_->farMap),
       b(35, flowGridBuf_),
       b(36, flowMeasBuf_),
+      b(37, waterCellBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

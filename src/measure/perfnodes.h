@@ -273,7 +273,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
      PerfScope::Count,
      "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce;godray_vis;"
-     "gi_prepare;gi_gather;gas_mask;hz_sky;hz_sun",
+     "gi_prepare;gi_gather;wc_prepare;wc_bake;gas_mask;hz_sky;hz_sun",
      "One media-blind shadow ray per visible surface PATCH, instead of one per "
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
@@ -282,6 +282,9 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "round a submerged eye, ~0 when the eye is dry. And the GI gather "
      "cache's refresh (gi_gather.wgsl): the nine bounce rays per block-face the "
      "raymarch found due last frame, moved out of the fragment shader. And the "
+     "water cell cache's bake (water_cell.wgsl): each water cell the raymarch "
+     "drew last frame, its depth / openness / slope computed once. "
+     "And the "
      "gas empty-brick mask (gas_mask.wgsl), which lets the raymarch's coarse "
      "smoke fill skip empty samples; an empty dispatch when no gas exists. "
      "And the terrain-scale light map (horizon_light.wgsl, map v2 S1): the "

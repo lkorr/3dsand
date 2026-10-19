@@ -1,0 +1,180 @@
+// water_cell.wgsli -- THE WATER CELL FACTS, shared (2026-10-18).
+//
+// Appended by AssembleShaderSource (src/gpu/resources.cpp) and by
+// scripts/check_shaders.sh to BOTH raymarch.wgsl (the inline fallback, and the
+// readers of the cache) and water_cell.wgsl (the per-frame bake), so the cache
+// and the inline path are one set of functions and cannot drift apart.
+// Each includer declares `voxels`, `pageTable`, `materials`, R (RenderParams)
+// and inBounds(); this file adds nothing but functions and constants.
+//
+// ---- THE CACHE (Buf::WaterCell; renderBGL_ 51 fragment, shadowBGL_ 37 compute)
+//   [0] atomic append count (fs)        [1] saved count (prepare -> bake)
+//   [2] raw count last frame (stats)    [3] refused past the cap (stats)
+//   [4..6] indirect args (prepare writes, copy_wcArgs moves to WaterCellArgs)
+//   [7] pad
+//   [WC_HEADER .. + WC_REQ_CAP)         one record per requested cell: the
+//                                       toroidal cell (shadowPackCell, face 0)
+//   [WC_SLOTS_BASE ..)                  2^WC_SLOT_LOG2 slots of WC_WORDS:
+//     [0] election (fs atomicMax of F = frameIdx + 1: the lane that raises it
+//         appends the cell to the list, so a slot is listed once a frame)
+//     [1] stamp (F of the frame whose bake wrote it; the bake writes it LAST)
+//     [2] key (the toroidal cell)
+//     [3] pack(depthM, open)  [4] pack(hx0, hx1)  [5] pack(hz0, hz1)
+// (The current is NOT cached: see raymarch.wgsl's cache note for why.)
+// Protocol: frame F's fragments read a slot whose stamp is F (baked earlier in
+// frame F from frame F-1's requests, against frame F's voxels) and request it
+// again for F+1; anything else (first sight of a cell, a collision, a full
+// list) computes inline, as before the cache. Correctness never depends on it.
+// Render-only derived data: never hashed, never saved, no sim binding.
+
+const WC_HEADER : u32 = 8u;
+const WC_REQ_CAP : u32 = 131072u;
+const WC_SLOT_LOG2 : u32 = 18u;
+const WC_WORDS : u32 = 6u;
+const WC_SLOTS_BASE : u32 = WC_HEADER + WC_REQ_CAP;
+// src/sim/simulation.cpp sizes the buffer: WC_SLOTS_BASE + (1 << 18) * 6.
+const WC_TOTAL_WORDS : u32 = WC_SLOTS_BASE + (1u << WC_SLOT_LOG2) * WC_WORDS;
+
+// The base-shade cost probes these functions honour (raymarch.wgsl's probe
+// block has the rest; R.flags bits, src/test/support.h kWaterProbe*).
+const RFLAG_NO_OPENNESS : u32 = 16384u;   // waterOpenness -> 1 (12-read ring)
+const RFLAG_NO_DEPTH : u32 = 32768u;      // waterDepthM -> 1 m (column walk)
+const RFLAG_NO_SLOPE : u32 = 65536u;      // the 4 neighbour columns -> flat
+
+fn wcKey(c : vec3<i32>) -> u32 { return shadowPackCell(c, 0u); }
+fn wcSlotBase(key : u32) -> u32 {
+  return WC_SLOTS_BASE + ((key * 0x9E3779B1u) >> (32u - WC_SLOT_LOG2)) * WC_WORDS;
+}
+
+struct WaterCellInfo {
+  depthM : f32,
+  open : f32,
+  hx0 : f32,
+  hx1 : f32,
+  hz0 : f32,
+  hz1 : f32,
+}
+
+// ANY LIQUID IS THE SAME SURFACE (ticket 2026-10-13 20:56:51, "lye in a pool
+// has an outline like ice"). The SHAPE of a liquid's top is the interface
+// between liquid and whatever is not liquid; which liquid sits in the next
+// column over does not move that interface. This used to read "is this cell
+// MY material", so where lye met water each side saw the other as a cliff of
+// air at its own level: the column gradient across the seam was a whole
+// cell-height, the normal tilted ~55 degrees over it, the far rim of the patch
+// went grazing and its Fresnel to ~1, and a one-cell staircase of white sky
+// traced every boundary between two liquids -- lye in water, blood in water,
+// brine against fresh, a potion poured into a pond. Every surface-SHAPE probe
+// (this column, waterDepthM, waterOpenness, the viscous density field) now
+// reads any liquid; what each liquid LOOKS like is still its own material's
+// (optics, palette, the slick's sheen), so an immiscible pair such as oil on
+// water stays legible by colour, not by a fake crease at its edge.
+fn liquidFullnessAt(c : vec3<i32>) -> f32 {
+  if (!inBounds(c)) { return 0.0; }
+  let w = voxWordAt(c);
+  let m = voxMat(w);
+  if (m == MAT_AIR || materials[m].klass != CLASS_LIQUID) { return 0.0; }
+  return f32(voxState(w) + 1u) / 8.0;
+}
+
+// Surface height (in voxels, relative to the cell floor) of the liquid column
+// at XZ: full cells below stack, and the topmost partial cell adds its
+// fullness. Sampling the column rather than one cell is what lets the gradient
+// see a slope of more than one cell. Any liquid (liquidFullnessAt).
+fn liquidColumn(c : vec3<i32>) -> f32 {
+  // Walk up from the sample cell while cells stay full; the first non-full
+  // cell contributes its fraction and ends the column.
+  var h = 0.0;
+  for (var i = 0; i < 3; i++) {
+    let f = liquidFullnessAt(c + vec3<i32>(0, i, 0));
+    h += f;
+    if (f < 0.999) { break; }
+  }
+  return h;
+}
+
+// LOCAL DEPTH of the water under a surface cell, in METRES.
+//
+// Component 9's dispersion relation needs `h`, and `h` is what makes the same
+// tanh term pay twice — per-octave speed AND shoaling toward a bank. The plan
+// says "the descriptor provides both", and for a governed body it does; but the
+// renderer must also be right on the 95% of water that is not governed (a
+// puddle, a flooded cellar, the CA's own transient), so this measures it.
+//
+// A GEOMETRIC PROBE, not a linear one: 8 taps at increasing stride reach 26
+// voxels (2.6 m, exactly `pondDepth`) with 1-voxel resolution where it matters.
+// Resolution near the surface is what the shore fade and the shoaling gain are
+// sensitive to; resolution at 2 m is not, because tanh has already saturated.
+// A linear 26-tap probe would spend 18 extra taps buying nothing.
+fn waterDepthM(cell : vec3<i32>) -> f32 {
+  if ((R.flags & RFLAG_NO_DEPTH) != 0u) { return 1.0; }
+  var d = 0;
+  var step = 1;
+  for (var i = 0; i < 8; i++) {
+    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0)) <= 0.0) {
+      break;
+    }
+    d += step;
+    if (i >= 2) { step = step * 2; }
+  }
+  return f32(d + 1) * VOXEL_METERS;
+}
+
+// ---- how OPEN is this body of water? ----
+// Ripples are wind-driven gravity waves, and a gravity wave needs FETCH: an
+// open surface many wavelengths across for the wind to work on. The shortest
+// band in rippleSlope is 0.22 m — three and a half voxels — and the longest is
+// 2.6 m, or forty. A puddle one voxel wide cannot physically carry any of them.
+//
+// Running the field on one anyway is what made single droplets on the ground
+// look like a fast-moving current: the waves are defined in world XZ and
+// animate at 0.55-2.3 m/s regardless of what they are drawn on, so a 6 cm
+// splash shows a full-speed wavefront crossing it and reads as rushing water.
+// Scale is the giveaway — the same slope that looks like gentle chop on a lake
+// looks like whitewater when it crosses a droplet in a fraction of a second.
+//
+// So measure the surface's horizontal extent and fade the ripples out with it.
+// A horizontal probe, deliberately: fetch is a property of how far the surface
+// runs, and depth has nothing to do with it. Samples the COLUMN (not one cell)
+// so a shallow-but-wide pond still counts as open, which is the case that would
+// otherwise go glassy and dead.
+//
+// 12 taps on a 2-voxel spacing, primary up-facing water hits only.
+fn waterOpenness(cell : vec3<i32>) -> f32 {
+  if ((R.flags & RFLAG_NO_OPENNESS) != 0u) { return 1.0; }
+  var n = 0.0;
+  for (var i = 0; i < 12; i++) {
+    // Two rings at 2 and 4 voxels: the inner one separates a droplet from a
+    // small puddle, the outer one a puddle from something with real fetch.
+    let ring = select(2, 4, i >= 6);
+    let a = f32(i % 6) * 1.0472;   // 60 degrees apart
+    let o = vec3<i32>(i32(round(cos(a) * f32(ring))), 0,
+                      i32(round(sin(a) * f32(ring))));
+    // "Is there a liquid column here", which is exactly "is this cell
+    // liquid": liquidColumn adds the cells ABOVE only once this one is full,
+    // and a liquid cell holds at least an eighth -- so the walk up the column
+    // (two more voxel and material loads per tap on open water, 24 per pixel)
+    // could not change the answer.
+    if (liquidFullnessAt(cell + o) > 0.0) { n += 1.0; }
+  }
+  return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
+}
+
+// The cell's facts, computed from the voxels (the cache's bake and the
+// fragment shader's fallback both call exactly this).
+fn waterCellCompute(cell : vec3<i32>) -> WaterCellInfo {
+  var o : WaterCellInfo;
+  o.depthM = waterDepthM(cell);
+  o.open = waterOpenness(cell);
+  o.hx0 = 0.0;
+  o.hx1 = 0.0;
+  o.hz0 = 0.0;
+  o.hz1 = 0.0;
+  if ((R.flags & RFLAG_NO_SLOPE) == 0u) {
+    o.hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0));
+    o.hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
+    o.hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
+    o.hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
+  }
+  return o;
+}

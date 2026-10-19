@@ -123,6 +123,8 @@ namespace {
 #define PIPE_GAS_MASK        Pipe::GasMask
 #define PIPE_GI_PREPARE      Pipe::GiPrepare
 #define PIPE_GI_GATHER       Pipe::GiGather
+#define PIPE_WC_PREPARE      Pipe::WaterCellPrepare
+#define PIPE_WC_BAKE         Pipe::WaterCellBake
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLOWMEAS_FOLD   Pipe::FlowMeasFold
@@ -325,6 +327,7 @@ namespace {
 #define IND_HEATARGS      (uint32_t)DispatchSel::IndHeatArgs
 #define IND_ELECARGS      (uint32_t)DispatchSel::IndElecArgs
 #define IND_GIARGS        (uint32_t)DispatchSel::IndGiArgs
+#define IND_WCARGS        (uint32_t)DispatchSel::IndWaterCellArgs
 #define IND_CAARGS        (uint32_t)DispatchSel::IndCaArgs
 #define IND_FARDOWNARGS   (uint32_t)DispatchSel::IndFarDownArgs
 

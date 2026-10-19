@@ -901,9 +901,8 @@ const RFLAG_REFL_STEP_SHIFT : u32 = 12u;
 // Bits 14..19: the BASE water shade's per-pixel terms, each replaced by a
 // constant so its own cost shows (dev panel "base shade" probes). The picture
 // is wrong with these on, on purpose: they are a measurement, not a look.
-const RFLAG_NO_OPENNESS : u32 = 16384u;   // waterOpenness -> 1 (12-read ring)
-const RFLAG_NO_DEPTH : u32 = 32768u;      // waterDepthM -> 1 m (column walk)
-const RFLAG_NO_SLOPE : u32 = 65536u;      // waterNormal's 4 liquidColumn reads -> flat
+// RFLAG_NO_OPENNESS / RFLAG_NO_DEPTH / RFLAG_NO_SLOPE (bits 14..16) are in
+// water_cell.wgsli beside the functions that honour them.
 const RFLAG_NO_SOLUTE : u32 = 131072u;    // solPathLook -> body optics, no walk
 const RFLAG_NO_RIPPLE : u32 = 262144u;    // waterWaveNormal: no current/ripple bands
 const RFLAG_NO_VEIL : u32 = 524288u;      // writeWaterVeil: no 7-word store
@@ -912,7 +911,7 @@ const RFLAG_FULL_RISER : u32 = 2097152u;  // shadeWater: a riser takes the full 
 const RFLAG_LOOSE_REFL : u32 = 4194304u;  // reflections: the OLD gate (see reflTight)
 const RFLAG_NO_FLOWMARKS : u32 = 8388608u;   // waveSlope: no streaks / boils
 const RFLAG_NO_CURRENT : u32 = 16777216u;    // waterWaveNormal: no current lookup
-const RFLAG_WCACHE_ON : u32 = 33554432u;     // waterCellInfo: use the cache (OFF by default)
+const RFLAG_NO_WCACHE : u32 = 33554432u;     // waterCellInfo: bypass the cache (inline)
 // render.fallSheetStrength (0..1), the white-water cover's strength, rides
 // RenderParams' spare pad word _pwi1 (world.h pad_wi1, written as an f32 by
 // WriteRenderParams) so the F1 / F5 value is live with no shader recompile: a
@@ -10685,110 +10684,8 @@ fn rippleCurvature(cp : vec2f, t : f32, e : f32, footM : f32) -> f32 {
 // This is what makes a settling / flowing / wavy body of water read as a
 // surface with shape rather than as a staircase, and it costs 4 taps.
 //
-// ANY LIQUID IS THE SAME SURFACE (ticket 2026-10-13 20:56:51, "lye in a pool
-// has an outline like ice"). The SHAPE of a liquid's top is the interface
-// between liquid and whatever is not liquid; which liquid sits in the next
-// column over does not move that interface. This used to read "is this cell
-// MY material", so where lye met water each side saw the other as a cliff of
-// air at its own level: the column gradient across the seam was a whole
-// cell-height, the normal tilted ~55 degrees over it, the far rim of the patch
-// went grazing and its Fresnel to ~1, and a one-cell staircase of white sky
-// traced every boundary between two liquids -- lye in water, blood in water,
-// brine against fresh, a potion poured into a pond. Every surface-SHAPE probe
-// (this column, waterDepthM, waterOpenness, the viscous density field) now
-// reads any liquid; what each liquid LOOKS like is still its own material's
-// (optics, palette, the slick's sheen), so an immiscible pair such as oil on
-// water stays legible by colour, not by a fake crease at its edge.
-fn liquidFullnessAt(c : vec3<i32>) -> f32 {
-  if (!inBounds(c)) { return 0.0; }
-  let w = voxWordAt(c);
-  let m = voxMat(w);
-  if (m == MAT_AIR || materials[m].klass != CLASS_LIQUID) { return 0.0; }
-  return f32(voxState(w) + 1u) / 8.0;
-}
-
-// Surface height (in voxels, relative to the cell floor) of the liquid column
-// at XZ: full cells below stack, and the topmost partial cell adds its
-// fullness. Sampling the column rather than one cell is what lets the gradient
-// see a slope of more than one cell. Any liquid (liquidFullnessAt).
-fn liquidColumn(c : vec3<i32>) -> f32 {
-  // Walk up from the sample cell while cells stay full; the first non-full
-  // cell contributes its fraction and ends the column.
-  var h = 0.0;
-  for (var i = 0; i < 3; i++) {
-    let f = liquidFullnessAt(c + vec3<i32>(0, i, 0));
-    h += f;
-    if (f < 0.999) { break; }
-  }
-  return h;
-}
-
-// LOCAL DEPTH of the water under a surface cell, in METRES.
-//
-// Component 9's dispersion relation needs `h`, and `h` is what makes the same
-// tanh term pay twice — per-octave speed AND shoaling toward a bank. The plan
-// says "the descriptor provides both", and for a governed body it does; but the
-// renderer must also be right on the 95% of water that is not governed (a
-// puddle, a flooded cellar, the CA's own transient), so this measures it.
-//
-// A GEOMETRIC PROBE, not a linear one: 8 taps at increasing stride reach 26
-// voxels (2.6 m, exactly `pondDepth`) with 1-voxel resolution where it matters.
-// Resolution near the surface is what the shore fade and the shoaling gain are
-// sensitive to; resolution at 2 m is not, because tanh has already saturated.
-// A linear 26-tap probe would spend 18 extra taps buying nothing.
-fn waterDepthM(cell : vec3<i32>) -> f32 {
-  if ((R.flags & RFLAG_NO_DEPTH) != 0u) { return 1.0; }
-  var d = 0;
-  var step = 1;
-  for (var i = 0; i < 8; i++) {
-    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0)) <= 0.0) {
-      break;
-    }
-    d += step;
-    if (i >= 2) { step = step * 2; }
-  }
-  return f32(d + 1) * VOXEL_METERS;
-}
-
-// ---- how OPEN is this body of water? ----
-// Ripples are wind-driven gravity waves, and a gravity wave needs FETCH: an
-// open surface many wavelengths across for the wind to work on. The shortest
-// band in rippleSlope is 0.22 m — three and a half voxels — and the longest is
-// 2.6 m, or forty. A puddle one voxel wide cannot physically carry any of them.
-//
-// Running the field on one anyway is what made single droplets on the ground
-// look like a fast-moving current: the waves are defined in world XZ and
-// animate at 0.55-2.3 m/s regardless of what they are drawn on, so a 6 cm
-// splash shows a full-speed wavefront crossing it and reads as rushing water.
-// Scale is the giveaway — the same slope that looks like gentle chop on a lake
-// looks like whitewater when it crosses a droplet in a fraction of a second.
-//
-// So measure the surface's horizontal extent and fade the ripples out with it.
-// A horizontal probe, deliberately: fetch is a property of how far the surface
-// runs, and depth has nothing to do with it. Samples the COLUMN (not one cell)
-// so a shallow-but-wide pond still counts as open, which is the case that would
-// otherwise go glassy and dead.
-//
-// 12 taps on a 2-voxel spacing, primary up-facing water hits only.
-fn waterOpenness(cell : vec3<i32>) -> f32 {
-  if ((R.flags & RFLAG_NO_OPENNESS) != 0u) { return 1.0; }
-  var n = 0.0;
-  for (var i = 0; i < 12; i++) {
-    // Two rings at 2 and 4 voxels: the inner one separates a droplet from a
-    // small puddle, the outer one a puddle from something with real fetch.
-    let ring = select(2, 4, i >= 6);
-    let a = f32(i % 6) * 1.0472;   // 60 degrees apart
-    let o = vec3<i32>(i32(round(cos(a) * f32(ring))), 0,
-                      i32(round(sin(a) * f32(ring))));
-    // "Is there a liquid column here", which is exactly "is this cell
-    // liquid": liquidColumn adds the cells ABOVE only once this one is full,
-    // and a liquid cell holds at least an eighth -- so the walk up the column
-    // (two more voxel and material loads per tap on open water, 24 per pixel)
-    // could not change the answer.
-    if (liquidFullnessAt(cell + o) > 0.0) { n += 1.0; }
-  }
-  return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
-}
+// liquidFullnessAt / liquidColumn / waterDepthM / waterOpenness live in
+// water_cell.wgsli (appended to this shader and to water_cell.wgsl).
 
 // PER-WAVE DISTANCE DAMPING (the analytic stand-in for normal-map mipping).
 // One pixel far across a lake covers many wavelengths, so the ripples inside it
@@ -11288,104 +11185,48 @@ fn waterConvergeNear(p : vec3f) -> f32 {
   return -((tv.x - tv.y) + (tv.z - tv.w)) / (2.0 * e);
 }
 
-// ---- THE WATER CELL CACHE (2026-10-18) -------------------------------------
-// A top water pixel used to rebuild its CELL's facts from scratch: the depth
-// walk (waterDepthM, up to 8 voxel reads), the openness ring (waterOpenness,
-// 12) and the four neighbour column heights the slope comes from
-// (liquidColumn x4, up to 12) -- ~32 dependent page-table + word + material
-// loads, identical for every one of the tens to hundreds of pixels a near
-// water cell covers. Measured: those three were 0.7-1.4 ms of a water-heavy
-// frame (--render-budget wp_neigh, PLAN: the owner's water cost probes).
+// ---- THE WATER CELL CACHE (2026-10-18; water_cell.wgsli has the layout) ----
+// A top water pixel's CELL facts -- depth, openness and the four neighbour
+// column heights the slope comes from -- come from a per-frame bake
+// (water_cell.wgsl) instead of ~32 dependent loads per pixel. This shader's
+// half: read the slot if this frame's bake filled it for this cell, and list
+// the cell (one lane per slot per frame) for the next frame's bake. A miss
+// computes inline exactly as before the cache.
+// RFLAG_NO_WCACHE (F1 "no water cell cache") bypasses it: the A/B.
 //
-// The cache answers it once per cell per frame instead:
-//  * slot = hash of the cell; each slot holds an owner key, an ELECTION word
-//    and two data records, one per frame parity;
-//  * every pixel does atomicMax(election, F) (F = frameIdx + 1, never 0). The
-//    ONE pixel that raises it is elected: it computes the cell fresh and
-//    writes the record of THIS frame's parity;
-//  * every other pixel reads the OTHER parity's record, written by last
-//    frame's elected pixel and finished before this frame began (a new command
-//    buffer, the global barrier it opens with), so it cannot be torn. It is
-//    one frame stale: on water that moved this tick the slope is a frame
-//    behind, which no eye resolves;
-//  * a record is used only if its own stamp says frame F-1 and its own key is
-//    this cell's, so a collision or a cell nobody drew last frame just falls
-//    back to the inline compute. Correctness never depends on the cache.
-// Render-only derived data: not hashed, not saved; zeroed at creation.
-// OFF BY DEFAULT (RFLAG_WCACHE_ON, F1 "water cell cache (in-shader)"):
-// measured 2026-10-18 it saved 0.4 ms on the lake camera but COST 1.0 ms on
-// silverrun -- far, small cells put an elected pixel in nearly every warp, and
-// the warp waits for its slowest lane, so the compute is not saved and the
-// atomics are added. The fix is to compute in a pass before the raymarch.
+// NOT THE CURRENT. The bake also stored currentAt at the cell's corners for a
+// while, read here in place of waterCurrentAt (the ~1.1 ms the no-current
+// probe measured). Measured in one process, 4 interleaved repeats: having that
+// branch compiled into waterWaveNormal cost 1.7-3.0 ms on pour / lake /
+// silverrun -- far more than the lookup it replaced. Do not put it back
+// without a perfExp A/B of exactly that branch.
+//
+// PARKED (branch wip/water-cell-cache, 2026-10-18): even without the current,
+// the cache measured +0.3..0.4 ms saved on pour / lake and -0.2..0.35 ms on
+// silverrun (4 interleaved repeats, one process) -- inside the noise and not
+// worth three passes and a buffer. Main does not carry it.
 @group(0) @binding(51) var<storage, read_write> wcache : array<atomic<u32>>;
-const WC_SLOT_LOG2 : u32 = 18u;
-// [0] owner key, [1] election, [2..6] record A, [7..11] record B; a record is
-// stamp, key, pack(depthM, open), pack(hx0, hx1), pack(hz0, hz1).
-const WC_WORDS : u32 = 12u;
-struct WaterCellInfo {
-  depthM : f32,
-  open : f32,
-  hx0 : f32,
-  hx1 : f32,
-  hz0 : f32,
-  hz1 : f32,
-}
 // The pixel's own cell's openness, for the night reflection blur in
 // shadeWater (waterReflBlur): set by waterNormal, < 0 = not computed.
 var<private> gWcOpen : f32 = -1.0;
-fn waterCellCompute(cell : vec3<i32>) -> WaterCellInfo {
-  var o : WaterCellInfo;
-  o.depthM = waterDepthM(cell);
-  o.open = waterOpenness(cell);
-  o.hx0 = 0.0;
-  o.hx1 = 0.0;
-  o.hz0 = 0.0;
-  o.hz1 = 0.0;
-  if ((R.flags & RFLAG_NO_SLOPE) == 0u) {
-    o.hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0));
-    o.hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
-    o.hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
-    o.hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
-  }
-  return o;
-}
-// World coords mod 2048 (x, z) / 1024 (y): unique inside any residency window.
-fn wcKey(c : vec3<i32>) -> u32 {
-  return (bitcast<u32>(c.x) & 0x7FFu) | ((bitcast<u32>(c.z) & 0x7FFu) << 11u) |
-         ((bitcast<u32>(c.y) & 0x3FFu) << 22u);
-}
 fn waterCellInfo(cell : vec3<i32>) -> WaterCellInfo {
-  if ((R.flags & RFLAG_WCACHE_ON) == 0u ||
-      arrayLength(&wcache) < (1u << WC_SLOT_LOG2) * WC_WORDS) {
+  if ((R.flags & RFLAG_NO_WCACHE) != 0u || arrayLength(&wcache) < WC_TOTAL_WORDS) {
     return waterCellCompute(cell);
   }
   let key = wcKey(cell);
-  let base = ((key * 0x9E3779B1u) >> (32u - WC_SLOT_LOG2)) * WC_WORDS;
+  let base = wcSlotBase(key);
   let F = R.frameIdx + 1u;
-  let prevR = base + 2u + ((F - 1u) & 1u) * 5u;
-  let valid = atomicLoad(&wcache[prevR]) == F - 1u &&
-              atomicLoad(&wcache[prevR + 1u]) == key;
-  let old = atomicMax(&wcache[base + 1u], F);
-  if (old < F) {
-    // Elected. Claim the slot if it is ours or nobody used it last frame;
-    // a live collision keeps its owner and this cell computes inline.
-    let owner = atomicLoad(&wcache[base]);
-    if (owner == key || old + 1u < F) {
-      let o = waterCellCompute(cell);
-      atomicStore(&wcache[base], key);
-      let curR = base + 2u + (F & 1u) * 5u;
-      atomicStore(&wcache[curR + 1u], key);
-      atomicStore(&wcache[curR + 2u], pack2x16float(vec2f(o.depthM, o.open)));
-      atomicStore(&wcache[curR + 3u], pack2x16float(vec2f(o.hx0, o.hx1)));
-      atomicStore(&wcache[curR + 4u], pack2x16float(vec2f(o.hz0, o.hz1)));
-      atomicStore(&wcache[curR], F);
-      return o;
-    }
+  let valid = atomicLoad(&wcache[base + 1u]) == F &&
+              atomicLoad(&wcache[base + 2u]) == key;
+  // Ask for next frame: the lane that raises the election lists the cell.
+  if (atomicMax(&wcache[base], F) < F) {
+    let i = atomicAdd(&wcache[0], 1u);
+    if (i < WC_REQ_CAP) { atomicStore(&wcache[WC_HEADER + i], key); }
   }
   if (!valid) { return waterCellCompute(cell); }
-  let a = unpack2x16float(atomicLoad(&wcache[prevR + 2u]));
-  let x = unpack2x16float(atomicLoad(&wcache[prevR + 3u]));
-  let z = unpack2x16float(atomicLoad(&wcache[prevR + 4u]));
+  let a = unpack2x16float(atomicLoad(&wcache[base + 3u]));
+  let x = unpack2x16float(atomicLoad(&wcache[base + 4u]));
+  let z = unpack2x16float(atomicLoad(&wcache[base + 5u]));
   var o : WaterCellInfo;
   o.depthM = a.x;
   o.open = a.y;
