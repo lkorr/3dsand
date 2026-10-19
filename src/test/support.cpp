@@ -886,7 +886,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
              (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u) |
              (GasFarRenderActive() ? 32u : 0u) |
              (CurrentTuning().render.horizon ? 128u : 0u) |
-             // Bits 8..25: the dev panel's water cost probes (support.h).
+             // Bits 8..24: the dev panel's water cost probes (support.h).
              WaterFxProbe();
   // render.fallSheetStrength rides the spare pad word (world.h pad_wi1,
   // raymarch.wgsl fallSheetStrength): a value, live, no recompile.

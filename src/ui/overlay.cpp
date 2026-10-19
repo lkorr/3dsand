@@ -2864,10 +2864,6 @@ void Overlay::DrawDevView(UIState& s) {
     ImGui::Checkbox("no flow marks", &s.wfxNoFlowMarks);
     ImGui::SetItemTooltip("waveSlope: the current's streaks (24 noise taps) and\n"
                           "boils. The bands and advection stay.");
-    ImGui::Checkbox("water cell cache (in-shader, experimental)", &s.wfxWCache);
-    ImGui::SetItemTooltip("Computes each water cell's depth, openness and neighbour\n"
-                          "columns once per frame and shares it. Off by default:\n"
-                          "measured faster on near water, slower on far water.");
     ImGui::Checkbox("no veil write", &s.wfxNoVeil);
     ImGui::SetItemTooltip("writeWaterVeil: the 7-word per-pixel store that lets\n"
                           "mobs and items behind water be tinted. They will look\n"
@@ -2875,7 +2871,7 @@ void Overlay::DrawDevView(UIState& s) {
     if (ImGui::Button("all on (shipped look)")) {
       s.wfxNoMist = s.wfxNoRefl = s.wfxNoCaustic = false;
       s.wfxNoRisers = s.wfxNoWhite = s.wfxFullRiser = false;
-      s.wfxLooseRefl = s.wfxNoCurrent = s.wfxNoFlowMarks = s.wfxWCache = false;
+      s.wfxLooseRefl = s.wfxNoCurrent = s.wfxNoFlowMarks = false;
       s.wfxNoOpenness = s.wfxNoDepth = s.wfxNoSlope = false;
       s.wfxNoSolute = s.wfxNoRipple = s.wfxNoVeil = false;
       s.wfxReflShift = 0;

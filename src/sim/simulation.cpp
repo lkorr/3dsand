@@ -866,12 +866,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // FRAGMENT stage, covered by the global barrier every command buffer
         // opens with (flowMeas's standing). Render-only.
         entry(50, T::ReadOnlyStorage, S::Fragment),               // stillWater
-        // THE WATER CELL CACHE (raymarch.wgsl waterCellInfo): read-write in
-        // the fragment stage only. Each frame's writes are read by the NEXT
-        // frame's fragments (the other parity record), a new command buffer
-        // whose opening global barrier orders them; within a frame the slots
-        // are only touched through atomics. Render-only.
-        entry(51, T::Storage, S::Fragment),                       // waterCell
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1063,16 +1057,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
                                   "stillWater");
     const std::vector<uint32_t> zero(kStillWaterWords, 0u);
     device.GetQueue().WriteBuffer(stillWaterBuf_, 0, zero.data(), zero.size() * 4u);
-  }
-  // THE WATER CELL CACHE (raymarch.wgsl waterCellInfo; WC_SLOT_LOG2 / WC_WORDS
-  // there): 2^18 slots x 12 words = 12 MiB, zeroed so no stale stamp matches.
-  {
-    constexpr uint64_t kWaterCellWords = (1ull << 18) * 12ull;
-    waterCellBuf_ = CreateBuffer(device, kWaterCellWords * 4u,
-                                 rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
-                                 "waterCell");
-    const std::vector<uint32_t> zero(kWaterCellWords, 0u);
-    device.GetQueue().WriteBuffer(waterCellBuf_, 0, zero.data(), zero.size() * 4u);
   }
   // ...and its ambient wind cache (sim_step.wgsl caWind): 64 blocks x 3 words.
   caWindBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 64u * 3u * 4u,
@@ -4649,7 +4633,6 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(48, flowGridBuf_),          // the terrain flow field (flowfield.h)
         b(49, flowMeasBuf_),          // the measured flow (flowfield.h kFlowMeas*)
         b(50, stillWaterBuf_),        // the still-water table (held + adopted streams)
-        b(51, waterCellBuf_),         // the water cell cache (raymarch waterCellInfo)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

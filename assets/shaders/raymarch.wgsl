@@ -912,7 +912,6 @@ const RFLAG_FULL_RISER : u32 = 2097152u;  // shadeWater: a riser takes the full 
 const RFLAG_LOOSE_REFL : u32 = 4194304u;  // reflections: the OLD gate (see reflTight)
 const RFLAG_NO_FLOWMARKS : u32 = 8388608u;   // waveSlope: no streaks / boils
 const RFLAG_NO_CURRENT : u32 = 16777216u;    // waterWaveNormal: no current lookup
-const RFLAG_WCACHE_ON : u32 = 33554432u;     // waterCellInfo: use the cache (OFF by default)
 // render.fallSheetStrength (0..1), the white-water cover's strength, rides
 // RenderParams' spare pad word _pwi1 (world.h pad_wi1, written as an f32 by
 // WriteRenderParams) so the F1 / F5 value is live with no shader recompile: a
@@ -11288,40 +11287,12 @@ fn waterConvergeNear(p : vec3f) -> f32 {
   return -((tv.x - tv.y) + (tv.z - tv.w)) / (2.0 * e);
 }
 
-// ---- THE WATER CELL CACHE (2026-10-18) -------------------------------------
-// A top water pixel used to rebuild its CELL's facts from scratch: the depth
-// walk (waterDepthM, up to 8 voxel reads), the openness ring (waterOpenness,
-// 12) and the four neighbour column heights the slope comes from
-// (liquidColumn x4, up to 12) -- ~32 dependent page-table + word + material
-// loads, identical for every one of the tens to hundreds of pixels a near
-// water cell covers. Measured: those three were 0.7-1.4 ms of a water-heavy
-// frame (--render-budget wp_neigh, PLAN: the owner's water cost probes).
-//
-// The cache answers it once per cell per frame instead:
-//  * slot = hash of the cell; each slot holds an owner key, an ELECTION word
-//    and two data records, one per frame parity;
-//  * every pixel does atomicMax(election, F) (F = frameIdx + 1, never 0). The
-//    ONE pixel that raises it is elected: it computes the cell fresh and
-//    writes the record of THIS frame's parity;
-//  * every other pixel reads the OTHER parity's record, written by last
-//    frame's elected pixel and finished before this frame began (a new command
-//    buffer, the global barrier it opens with), so it cannot be torn. It is
-//    one frame stale: on water that moved this tick the slope is a frame
-//    behind, which no eye resolves;
-//  * a record is used only if its own stamp says frame F-1 and its own key is
-//    this cell's, so a collision or a cell nobody drew last frame just falls
-//    back to the inline compute. Correctness never depends on the cache.
-// Render-only derived data: not hashed, not saved; zeroed at creation.
-// OFF BY DEFAULT (RFLAG_WCACHE_ON, F1 "water cell cache (in-shader)"):
-// measured 2026-10-18 it saved 0.4 ms on the lake camera but COST 1.0 ms on
-// silverrun -- far, small cells put an elected pixel in nearly every warp, and
-// the warp waits for its slowest lane, so the compute is not saved and the
-// atomics are added. The fix is to compute in a pass before the raymarch.
-@group(0) @binding(51) var<storage, read_write> wcache : array<atomic<u32>>;
-const WC_SLOT_LOG2 : u32 = 18u;
-// [0] owner key, [1] election, [2..6] record A, [7..11] record B; a record is
-// stamp, key, pack(depthM, open), pack(hx0, hx1), pack(hz0, hz1).
-const WC_WORDS : u32 = 12u;
+// ---- THE WATER CELL'S FACTS (2026-10-18) -----------------------------------
+// Depth, openness and the four neighbour column heights the slope comes from,
+// gathered in one place. Two caches for these were built and measured the same
+// day and neither paid (branch wip/water-cell-cache): sharing them across a
+// cell's pixels saved 0.3-0.4 ms on near water and cost about as much on a far
+// fall. They stay per pixel.
 struct WaterCellInfo {
   depthM : f32,
   open : f32,
@@ -11333,7 +11304,7 @@ struct WaterCellInfo {
 // The pixel's own cell's openness, for the night reflection blur in
 // shadeWater (waterReflBlur): set by waterNormal, < 0 = not computed.
 var<private> gWcOpen : f32 = -1.0;
-fn waterCellCompute(cell : vec3<i32>) -> WaterCellInfo {
+fn waterCellInfo(cell : vec3<i32>) -> WaterCellInfo {
   var o : WaterCellInfo;
   o.depthM = waterDepthM(cell);
   o.open = waterOpenness(cell);
@@ -11347,52 +11318,6 @@ fn waterCellCompute(cell : vec3<i32>) -> WaterCellInfo {
     o.hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
     o.hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   }
-  return o;
-}
-// World coords mod 2048 (x, z) / 1024 (y): unique inside any residency window.
-fn wcKey(c : vec3<i32>) -> u32 {
-  return (bitcast<u32>(c.x) & 0x7FFu) | ((bitcast<u32>(c.z) & 0x7FFu) << 11u) |
-         ((bitcast<u32>(c.y) & 0x3FFu) << 22u);
-}
-fn waterCellInfo(cell : vec3<i32>) -> WaterCellInfo {
-  if ((R.flags & RFLAG_WCACHE_ON) == 0u ||
-      arrayLength(&wcache) < (1u << WC_SLOT_LOG2) * WC_WORDS) {
-    return waterCellCompute(cell);
-  }
-  let key = wcKey(cell);
-  let base = ((key * 0x9E3779B1u) >> (32u - WC_SLOT_LOG2)) * WC_WORDS;
-  let F = R.frameIdx + 1u;
-  let prevR = base + 2u + ((F - 1u) & 1u) * 5u;
-  let valid = atomicLoad(&wcache[prevR]) == F - 1u &&
-              atomicLoad(&wcache[prevR + 1u]) == key;
-  let old = atomicMax(&wcache[base + 1u], F);
-  if (old < F) {
-    // Elected. Claim the slot if it is ours or nobody used it last frame;
-    // a live collision keeps its owner and this cell computes inline.
-    let owner = atomicLoad(&wcache[base]);
-    if (owner == key || old + 1u < F) {
-      let o = waterCellCompute(cell);
-      atomicStore(&wcache[base], key);
-      let curR = base + 2u + (F & 1u) * 5u;
-      atomicStore(&wcache[curR + 1u], key);
-      atomicStore(&wcache[curR + 2u], pack2x16float(vec2f(o.depthM, o.open)));
-      atomicStore(&wcache[curR + 3u], pack2x16float(vec2f(o.hx0, o.hx1)));
-      atomicStore(&wcache[curR + 4u], pack2x16float(vec2f(o.hz0, o.hz1)));
-      atomicStore(&wcache[curR], F);
-      return o;
-    }
-  }
-  if (!valid) { return waterCellCompute(cell); }
-  let a = unpack2x16float(atomicLoad(&wcache[prevR + 2u]));
-  let x = unpack2x16float(atomicLoad(&wcache[prevR + 3u]));
-  let z = unpack2x16float(atomicLoad(&wcache[prevR + 4u]));
-  var o : WaterCellInfo;
-  o.depthM = a.x;
-  o.open = a.y;
-  o.hx0 = x.x;
-  o.hx1 = x.y;
-  o.hz0 = z.x;
-  o.hz1 = z.y;
   return o;
 }
 
@@ -11411,7 +11336,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 
   // Central differences of the column height across X and Z. dh/dx in voxels
   // per voxel is already a slope, so the normal is (-dh/dx, 1, -dh/dz).
-  // The cell's depth, openness and neighbour columns: THE WATER CELL CACHE.
+  // The cell's depth, openness and neighbour columns (waterCellInfo).
   let ci = waterCellInfo(cell);
   gWcOpen = ci.open;
   let hx0 = ci.hx0;

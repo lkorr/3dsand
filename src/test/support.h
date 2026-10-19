@@ -95,7 +95,7 @@ void SetShortRangeNear(bool on);
 // ---- water cost probes (dev panel View page, "water render cost") ----------
 // Bits that switch one liquid-shading effect OFF in the raymarch, so its look
 // and its ms can be compared live (raymarch.wgsl RFLAG_NO_*). WriteRenderParams
-// ORs them into RenderParams.flags bits 8..25. 0 = the shipped look.
+// ORs them into RenderParams.flags bits 8..24. 0 = the shipped look.
 // Render-only: no sim input, cannot reach the world hash.
 constexpr uint32_t kWaterProbeNoMist    = 1u << 8;
 constexpr uint32_t kWaterProbeNoRefl    = 1u << 9;
@@ -115,8 +115,7 @@ constexpr uint32_t kWaterProbeFullRiser  = 1u << 21;   // riser takes the full t
 constexpr uint32_t kWaterProbeLooseRefl  = 1u << 22;   // reflections: the OLD gate
 constexpr uint32_t kWaterProbeNoFlowMarks = 1u << 23;  // no streaks / boils
 constexpr uint32_t kWaterProbeNoCurrent  = 1u << 24;   // no current lookup (no advection)
-constexpr uint32_t kWaterProbeWCacheOn   = 1u << 25;   // use the in-shader water cell cache (off by default)
-constexpr uint32_t kWaterProbeMask      = 0x3FFFF00u;
+constexpr uint32_t kWaterProbeMask      = 0x1FFFF00u;
 uint32_t WaterFxProbe();
 void SetWaterFxProbe(uint32_t bits);
 

@@ -1037,8 +1037,6 @@ class Simulation {
   // pass::Buf::StillWater (worldgen.wgsl's still-water table, binding 58):
   // per window column, the authored surface of a map lake / river / the sea.
   rhi::Buffer stillWaterBuf_;
-  // The water cell cache (raymarch.wgsl waterCellInfo), render binding 51.
-  rhi::Buffer waterCellBuf_;
   // pass::Buf::RenderUBOTick (docs/PLAN_async_compute.md).
   rhi::Buffer renderUBOTickBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true;
