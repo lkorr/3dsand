@@ -1924,6 +1924,24 @@ reproducible (killing lockstep networking and replay debugging).
   Chunk-level dirty early-out still applies inside every pass. Within a pass,
   each cell's decisions use only the stateless RNG (hash of seed/tick/coords) —
   never thread or dispatch order.
+- **The pass order is REFLECTED per substep (2026-10-18, `sim_step.wgsl` `caFlip`
+  / `caPhase`).** The 27 passes are a SEQUENTIAL update: a cell sees the
+  neighbours of earlier colours after they moved this substep and those of later
+  colours before. With colour k = px + 3 py + 9 pz run in fixed order and a
+  cell's phase equal to its world residue, the -z neighbour was the earlier one
+  for two residues of three, so in any DRAINING water (a crater in a lake bed, a
+  hole, a fall) the partly emptied cells a descent can pour into lay on the -z
+  side twice as often: every diagonal partial descent ran -z, the deficit climbed
+  a staircase toward +z, and the measured current round an underwater blast was
+  one world-fixed direction (-88 deg) whichever side you stood on or way you
+  threw (ticket 2026-10-18_15-21-34 shot 2). Now the residue -> phase map is
+  reflected (p = 2 - r) on x and z by a pure function of (tick, substep), so each
+  direction is the earlier one as often as the other over four ticks. The colour
+  classes are the same sets of cells (disjointness untouched); only which class
+  runs first changes. y is not reflected. `flow-measure` XS asserts it: the real
+  `explosive projectile` thrown both ways at a deep pool's floor reads 8/8
+  inward, uniformity 0.04 / 0.17 (the old order: 4 inward, 0.99 toward -87 deg
+  both ways).
 - Alternative where more parallelism is needed: **two-phase propose/resolve** —
   pass 1 writes movement proposals, pass 2 resolves conflicts by a fixed priority
   rule (e.g., lowest source-cell index wins). Deterministic, full-width dispatch,
@@ -26792,13 +26810,21 @@ any height:
   needed: over the gate's 6 x 6 floor hole vy -2.4 cells/s, every ring point
   round it pulled down (it read sideways, the top ring 1 of 8 down, before).
   Bodies feel it through the same `y`.
-  KNOWN, NOT FIXED: the horizontal at a drain is the NET flux of an 8-column
-  bin, and a CA drain is not symmetric -- the diagonal falls into and inside
-  the hole drift one way for many ticks, so the hole's node reads a through-
-  flow (7.7 cells/s at the gate's floor hole, 1.5 with diagonal falls' lateral
-  part left out -- which in turn halves a breach's measured gap speed, so it
-  is not done) and the tent spreads it to the ring: early in a drain some
-  arrows on one side point away. The vertical now dominates next to the hole.
+  The horizontal at a drain is the NET flux of an 8-column bin. Until
+  2026-10-18 a CA drain was not symmetric -- the diagonal falls into and inside
+  the hole drifted one way (-z) for many ticks, so the hole's node read a
+  through-flow (7.7 cells/s at the gate's floor hole) and the tent spread it to
+  the ring. That drift was the CA's fixed colour ORDER, not the record (§4 Race
+  safety, "The pass order is REFLECTED"), and it is gone with the reflected
+  order; the same drift made the whole field round an underwater blast one
+  world-fixed direction (ticket 2026-10-18_15-21-34 shot 2). The writers'
+  attribution that found it stays: `flowfield.h` `kFlowMeasDiag*`, a
+  cumulative per-KIND region after GRID (transferLiquid lateral / with a
+  vertical part, tryMove lateral / with a vertical part, MPM, gross), written
+  only when `FLOWM_DIAG` is true in `sim_step.wgsl` and `sim_fluid.wgsl`
+  (false as shipped), read by `main.cpp`'s `SANDVOX_FLOW_PROBE` under `--at`
+  (with `SANDVOX_AT_CAST=<glyph words>[;frame[;dx,dy,dz]]`, the real cast
+  path, and `SANDVOX_AT_TUNE=group.name=value;...`).
   The same lattice reads a ONE-CELL dam's two sides as one where the dam is
   in a bin's middle: the CA flood fanning out at the dam's foot is that bin's
   current too (`flow-measure` W reads at sideDx 7.5 for that reason; the
@@ -26891,9 +26917,15 @@ beside the gap along the dam's face run toward it. A SECOND box 96 cells
 south has a SUBMERGED gap (rows 4..6 under 10 of water): S, upstream of it a
 point in the top row is pulled down and one in the bottom row up at >=
 vertMin, and it relaxes after; Cv, a body over it feels the downward pull. The
-vertical plane's words at four node columns are printed beside S. Thresholds
-`flowMeasure.*` in baseline.json; a trace every 15 ticks prints gap / ring /
-box max and the fold's tick.
+vertical plane's words at four node columns are printed beside S. XS (box 5,
+built after the timeline, a pool `spellDeep` 32 deep): the REAL spell, a page
+of `explosive projectile` cast through the harness session's SpellSystem from
+under the surface at the floor, once from +x+z and once from -x-z; spellAt
+ticks after each blast the ring 12 cells round it, 2 under the surface (a deep
+pool refills a floor cavity by its column falling straight down; what flows in
+sideways is the drawn-down surface) runs INWARD (>= blastMin of 8) and not one
+way (uniform <= blastUniform). Thresholds `flowMeasure.*` in baseline.json; a
+trace every 15 ticks prints gap / ring / box max and the fold's tick.
 
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)
 

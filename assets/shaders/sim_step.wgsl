@@ -3,7 +3,8 @@
 // one workgroup per dirty chunk, threads map to that chunk's cells of the
 // current color (local = colorPhase + lid*3). Any two acting cells are >=3
 // apart on every axis while writes reach <=1 cell: destination writes are
-// provably disjoint. No atomics on voxel data, fixed pass order =>
+// provably disjoint. No atomics on voxel data, a pass order that is a pure
+// function of (tick, substep) (THE PASS ORDER IS REFLECTED, below) =>
 // bit-deterministic (DESIGN.md §4). The dirty-list ORDER is scheduling-
 // dependent, but each dirty chunk appears exactly once and writes are
 // disjoint, so processing order cannot affect sim state.
