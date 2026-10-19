@@ -27,6 +27,49 @@
 // THE SUBSTEP, routed through one private so an entry point can fix it
 // at compile time (main1). Every entry point sets it before anything else.
 var<private> gCaSub : u32 = 0u;
+
+// ---- THE PASS ORDER IS REFLECTED, PER SUBSTEP (2026-10-18) -----------------
+// Ticket 2026-10-18_15-21-34 shot 2: "an explosion under water ... every
+// current vector points in one particular direction ... the same whichever
+// side of the explosion you are on". The colour rows run the 27 colours in a
+// fixed order, k = 0..26 with k = px + 3 py + 9 pz (simulation.cpp's passUBO
+// slices), and the CA is a SEQUENTIAL update across them: a cell sees its
+// neighbours of earlier colours AFTER they moved this substep and those of
+// later colours BEFORE. With a cell's phase equal to its world residue mod 3,
+// the -z neighbour (z digit, the most significant) was the earlier one for
+// two residues of three and the +z one for one -- so wherever water DRAINS
+// (a crater in a lake floor, a hole, a fall) the partly emptied cells a
+// descent can pour into lay on the -z side twice as often, every diagonal
+// partial descent ran -z, and the deficit climbed a staircase toward +z. The
+// measured flow recorded it faithfully: on the ticket's lake, 10 ticks after
+// a real `explosive projectile` on the floor, the writers' attribution
+// (flowfield.h kFlowMeasDiag*) read transferLiquid descents net (+2.9k,
+// -143k) eighths x cells over the blast's 9 x 9 nodes, every arrow -88 deg
+// whichever side of the crater, fired either way. (x was neutral for those
+// descents -- an x diagonal is one row down, so the y digit decides which is
+// earlier, the same for +x and -x -- but the same argument biases every
+// LATERAL x move toward -x.)
+// THE FIX IS THE SCHEDULE, NOT A RULE: per substep the mapping from a cell's
+// residue r to its phase p is reflected (p = 2 - r) on x and z by a pure
+// function of (tick, substep), so each direction is the earlier one exactly
+// as often as the other over four ticks, and the drift cancels instead of
+// accumulating. The colour CLASSES are the same sets of cells (a residue
+// class keeps its members), so the lattice's disjointness argument is
+// untouched; only which class runs first changes. y is not reflected: the
+// vertical order is not a lateral bias, and leaving it alone keeps a fall's
+// per-tick reach what it was. Rule 1: tick and substep are on the tick
+// stream. Every place that turns a residue into a phase or back goes through
+// caPhase: camask (the colour words, counts and pools) and caRow (where in
+// the chunk a colour's sites start); `main` keeps reading P.colorPhase as the
+// phase it is running.
+fn caFlip() -> vec3<u32> {
+  return vec3<u32>(gCaSub ^ ((T.tick >> 1u) & 1u), 0u, gCaSub ^ (T.tick & 1u));
+}
+// A residue's phase under the flip -- and, being an involution, a phase's
+// residue.
+fn caPhase(r : vec3<u32>, f : vec3<u32>) -> vec3<u32> {
+  return select(r, vec3<u32>(2u) - r, f != vec3<u32>(0u));
+}
 @group(0) @binding(11) var<storage, read>      reactions : array<Reaction>;
 // ---- MLS-MPM excited-fluid coupling (sim_fluid_seam.wgsl; DESIGN.md §5) ----
 // The solver's block map + node grid (LAST tick's final substep) and the
@@ -6018,9 +6061,15 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // coordinate mod 3 per axis (the global lattice, caRow's `start`),
   // k = cx + 3 cy + 9 cz -- the passUBO slice order (simulation.cpp:
   // colorPhase = (k % 3, k / 3 % 3, k / 9)). So only cz varies down the loop.
+  // The colour is the residue's PHASE (caPhase, THE PASS ORDER IS
+  // REFLECTED): cxy is a phase already; cz counts RESIDUES down the loop (the
+  // per-cz buckets below are by residue) and is turned into a phase where a
+  // colour index is formed.
   let wb = slotWorldChunk(ci, T.origin) * i32(CHUNK);
   let bm = ((wb % vec3<i32>(3)) + vec3<i32>(3)) % vec3<i32>(3);
-  let cxy = u32((bm.x + i32(li & 15u)) % 3) + 3u * u32((bm.y + i32(li >> 4u)) % 3);
+  let cfl = caFlip();
+  let cph = caPhase(vec3<u32>(u32((bm.x + i32(li & 15u)) % 3), u32((bm.y + i32(li >> 4u)) % 3), 0u), cfl);
+  let cxy = cph.x + 3u * cph.y;
   let cz0 = u32(bm.z);
   if (!sentinel) {
     let base = e * CHUNK_VOL;
@@ -6090,7 +6139,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     for (var z = 0u; z < 3u; z++) {
       let c = select(select(cnt2, cnt1, z == 1u), cnt0, z == 0u);
       if (c == 0u) { continue; }
-      let k3 = (cxy + 9u * z) * 3u;
+      let k3 = (cxy + 9u * select(z, 2u - z, cfl.z != 0u)) * 3u;
       if ((c & 0xFFu) != 0u) { atomicAdd(&wgColCnt[k3], c & 0xFFu); }
       if (((c >> 8u) & 0xFFu) != 0u) { atomicAdd(&wgColCnt[k3 + 1u], (c >> 8u) & 0xFFu); }
       if ((c >> 16u) != 0u) { atomicAdd(&wgColCnt[k3 + 2u], c >> 16u); }
@@ -6237,7 +6286,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     for (var i = li; i < CHUNK_VOL; i += 256u) {
       let w5 = i >> 5u;
       let bit = 1u << (i & 31u);
-      let k = cxy + 9u * cz;
+      let k = cxy + 9u * select(cz, 2u - cz, cfl.z != 0u);
       cz = select(cz + 1u, 0u, cz == 2u);
       if (((sparse >> k) & 1u) == 0u || (atomicLoad(&wgCaMask[w5]) & bit) == 0u) { continue; }
       let kind = select(1u, 0u, (atomicLoad(&wgCaMask[CA_MASK_WORDS + w5]) & bit) != 0u);
@@ -6482,7 +6531,8 @@ fn caRow(first : u32, total : u32, t : u32) -> CaRow {
   // cells whose slots are WORLD_N apart would share a color); world coords
   // keep same-color cells >=3 apart in the space movement happens in.
   let bmod = ((base % vec3<i32>(3)) + vec3<i32>(3)) % vec3<i32>(3);
-  let start = (vec3<i32>(P.colorPhase) + vec3<i32>(3) - bmod) % vec3<i32>(3);
+  // The residue this pass's phase runs (caPhase: THE PASS ORDER IS REFLECTED).
+  let start = (vec3<i32>(caPhase(P.colorPhase, caFlip())) + vec3<i32>(3) - bmod) % vec3<i32>(3);
   let y = start.y + 3 * i32(r % 6u);
   let z = start.z + 3 * i32(r / 6u);
   if (y >= i32(CHUNK) || z >= i32(CHUNK)) { return o; }
