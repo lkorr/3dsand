@@ -1024,10 +1024,14 @@ def check_flow_measure():
         "FLOWM_ACC_Q": int(mq.group(1)),
         "FLOWM_STATE": slots * 8,
         "FLOWM_GRID": slots * 16,
+        # THE WRITERS' ATTRIBUTION region (flowfield.h kFlowMeasDiagBase):
+        # after GRID's header and its four node planes.
+        "FLOWM_DIAG_BASE": slots * 16 + int(mh.group(1)) + slots * 4,
+        "FLOWM_SLOTS": slots,
     }
     sources = {
-        "sim_step.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS"],
-        "sim_fluid.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS"],
+        "sim_step.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS", "FLOWM_DIAG_BASE", "FLOWM_SLOTS"],
+        "sim_fluid.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS", "FLOWM_DIAG_BASE", "FLOWM_SLOTS"],
         "flow_measure.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS", "FLOWM_STATE"],
         "common.wgsl": ["FLOWM_GRID", "FLOW_MEAS_TAKEOVER"],
     }

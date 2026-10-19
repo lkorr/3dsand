@@ -138,7 +138,22 @@ const FLOWM_ACC_STRIDE : u32 = 8u;
 // Bounded: while the summed weight stays <= 32767 (the fold's trust test)
 // w y^2 <= 64 x 65536 sums inside i32; past it the bin overflows harmlessly
 // and the fold ignores its moments.
-fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
+// THE WRITERS' ATTRIBUTION (flowfield.h kFlowMeasDiag*, ticket 2026-10-18_
+// 15-21-34 shot 2): with FLOWM_DIAG true every record also adds its lateral
+// flux to a cumulative per-KIND region after GRID (never zeroed by the
+// tick's fill), so a probe (main.cpp SANDVOX_FLOW_PROBE) can say which writer
+// moved the water an arrow points along. False as shipped: the branch
+// const-folds away. Kind = via (0 transferLiquid, 2 tryMove) + 1 if the move
+// has a vertical part; kind 5 sums every move's |dx|, |dz| (gross flux).
+const FLOWM_DIAG : bool = false;
+const FLOWM_DIAG_BASE : u32 = 89784u;    // flowfield.h kFlowMeasDiagBase
+const FLOWM_SLOTS : u32 = 4489u;         // FLOWM_N x FLOWM_N
+fn flowMeasDiag(slot : u32, kind : u32, dx : i32, dz : i32) {
+  let b = FLOWM_DIAG_BASE + 4u + (kind * FLOWM_SLOTS + slot) * 2u;
+  if (dx != 0) { atomicAdd(&flowMeasAcc[b], dx); }
+  if (dz != 0) { atomicAdd(&flowMeasAcc[b + 1u], dz); }
+}
+fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32, via : u32) {
   if (TUNE_CURRENT_MEASURED <= 0.0 && TUNE_CURRENT_MEASURED_CARRY <= 0.0) { return; }
   let d = dst - src;
   if (d.x == 0 && d.y == 0 && d.z == 0) { return; }
@@ -146,6 +161,11 @@ fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
   let kz = ((((src.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let s = u32(kz * FLOWM_N + kx) * FLOWM_ACC_STRIDE;
   let q = i32(eighths) * FLOWM_ACC_Q;
+  if (FLOWM_DIAG && (d.x != 0 || d.z != 0)) {
+    let slot = u32(kz * FLOWM_N + kx);
+    flowMeasDiag(slot, via + select(0u, 1u, d.y != 0), d.x * q, d.z * q);
+    flowMeasDiag(slot, 5u, abs(d.x) * q, abs(d.z) * q);
+  }
   if (d.x != 0) { atomicAdd(&flowMeasAcc[s], d.x * q); }
   if (d.z != 0) { atomicAdd(&flowMeasAcc[s + 1u], d.z * q); }
   if (d.y != 0) { atomicAdd(&flowMeasAcc[s + 7u], d.y * q); }
@@ -1729,7 +1749,7 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   if (myKlass == CLASS_POWDER) { flagSupportLoss(src, myKlass, voxMat(tw)); }
   // A whole liquid cell moved (a film step, a diagonal fall into air, a
   // lateral displace): the measured flow's record. Render-only.
-  if (myKlass == CLASS_LIQUID) { flowMeasNote(src, dst, voxState(myWord) + 1u); }
+  if (myKlass == CLASS_LIQUID) { flowMeasNote(src, dst, voxState(myWord) + 1u, 2u); }
   return true;
 }
 
@@ -2406,7 +2426,7 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   solTransfer(src, dst, sf, df, t);
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
-  flowMeasNote(src, dst, t);   // the measured flow's record (render-only)
+  flowMeasNote(src, dst, t, 0u);   // the measured flow's record
 }
 
 // faceDir and faceDirBit (the six face directions with their RDIR_* bits)

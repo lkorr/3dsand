@@ -110,6 +110,7 @@
 #include "sim/boltfx.h"   // the bolt you see (render-only; package D)
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
+#include "sim/flowfield.h"
 #include "sim/world.h"
 #include "sim/dungeon.h"
 #include "sim/worldedit.h"
@@ -948,6 +949,150 @@ int g_fellSiteX = 0, g_fellSiteZ = 0;
 // (ui/bugreport.h), so "where was this" is one paste. Voxel units, degrees.
 bool g_atSet = false;
 float g_atEye[3] = {0, 0, 0}, g_atYawDeg = 0, g_atPitchDeg = 0;
+
+// ---- SANDVOX_FLOW_PROBE: what the current round a blast is MADE of ----------
+// Ticket 2026-10-18_15-21-34 shot 2 ("every arrow round an underwater
+// explosion points one way"), CLAUDE.md rule 6. Under --at, from the tick the
+// first blast goes off (a cast's or SANDVOX_AT_BLAST's) for
+// SANDVOX_FLOW_PROBE_SPAN ticks (default 240), every SANDVOX_FLOW_PROBE ticks
+// (default 5): a BLOCKING readback of the measured flow (a debug harness, never
+// the game's frame path) and one block of lines --
+//  * rings of 8 points round the blast at three radii and two heights: per
+//    point the composed arrow (primitives + solved blended under measured,
+//    horizontal) as heading deg (0 = +x, 90 = +z) @ cells/s, and per ring how
+//    many move inward / outward and how UNIFORM they are (1 = one direction);
+//    then the same ring split by SOURCE: solved, measured, primitives;
+//  * the published measured node map round the blast;
+//  * THE WRITERS (flowfield.h kFlowMeasDiag*, only when the shaders' FLOWM_DIAG
+//    is true): per kind of move, over the 9 x 9 nodes round the blast, since
+//    the last probe, the NET flux (x, z), its inward part, and the gross flux,
+//    so a uniform field names the writer that moved the water that way.
+// SANDVOX_AT_CAST's parse (the --at block) and its one pending cast (the tick
+// loop, just before TickAuthority).
+std::string g_atCastWords;
+int g_atCastFrame = -1;
+bool g_atCastPending = false, g_atCastDirSet = false;
+Vec3 g_atCastDir{0, 0, 0};
+struct FlowProbe {
+  int every = 0;
+  int span = 240;
+  bool have = false;
+  Vec3 c{};
+  uint32_t t0 = 0;
+  std::vector<int32_t> prevDiag;
+};
+FlowProbe g_flowProbe;
+
+static void FlowProbeSample(GpuContext& ctx, Simulation& sim, uint32_t tick) {
+  using namespace sandvox;
+  FlowProbe& fp = g_flowProbe;
+  ctx.WaitIdle();
+  std::vector<uint32_t> grid(kFlowMeasGridWords, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.FlowMeasureBuffer(), (uint64_t)kFlowMeasGridBase * 4,
+                        grid.data(), grid.size() * 4, "flowProbeGrid");
+  std::vector<int32_t> diag(kFlowMeasDiagWords, 0);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.FlowMeasureBuffer(), (uint64_t)kFlowMeasDiagBase * 4,
+                        diag.data(), diag.size() * 4, "flowProbeDiag");
+  const float gain = CurrentTuning().render.currentMeasured;
+  const Vec3 c = fp.c;
+  std::printf("flowprobe +%d (tick %u) blast (%.0f, %.0f, %.0f), fold tick %u, grid n %u\n",
+              (int)(tick - fp.t0), tick, c.x, c.y, c.z, grid[3], grid[2]);
+  auto ringLine = [&](const char* what, float r, float y, int src) {
+    std::string s;
+    int moving = 0, in = 0, out = 0;
+    float ux = 0, uz = 0, sum = 0;
+    for (int k = 0; k < 8; k++) {
+      const double a = 6.28318530717959 * (k + 0.5) / 8.0;
+      const Vec3 p{c.x + (float)(r * std::cos(a)), y, c.z + (float)(r * std::sin(a))};
+      const Vec3 solved = WaterFlow().Sample(p);
+      const Vec3 meas = flowfield::SampleMeasured(grid.data(), p) * gain;
+      const Vec3 prim = CurrentAtCpu(p) - solved;
+      Vec3 v = prim + flowfield::BlendMeasured(solved, meas);
+      if (src == 1) v = solved;
+      if (src == 2) v = meas;
+      if (src == 3) v = prim;
+      const float sp = std::sqrt(v.x * v.x + v.z * v.z);
+      sum += sp / 8.0f;
+      if (sp >= 0.5f) {
+        moving++;
+        const float ix = c.x - p.x, iz = c.z - p.z, il = std::sqrt(ix * ix + iz * iz);
+        const float cs = (v.x * ix + v.z * iz) / (sp * il);
+        if (cs >= 0.5f) in++;
+        if (cs <= -0.5f) out++;
+        ux += v.x / sp;
+        uz += v.z / sp;
+      }
+      char b[48];
+      std::snprintf(b, sizeof b, " %.0f@%.1f", std::atan2(v.z, v.x) * 57.2957795f, sp);
+      s += b;
+    }
+    const float uni = moving ? std::sqrt(ux * ux + uz * uz) / (float)moving : 0.0f;
+    std::printf("  %-8s r%-2.0f y%+.0f: in %d out %d of %d moving, uniform %.2f toward %.0f deg, mean %.2f |%s\n",
+                what, r, y - c.y, in, out, moving, uni, std::atan2(uz, ux) * 57.2957795f, sum, s.c_str());
+  };
+  for (float dy : {0.0f, 6.0f})
+    for (float r : {8.0f, 16.0f, 28.0f}) {
+      ringLine("ARROW", r, c.y + dy, 0);
+      ringLine(" solved", r, c.y + dy, 1);
+      ringLine(" meas", r, c.y + dy, 2);
+      ringLine(" prims", r, c.y + dy, 3);
+    }
+  // The published measured nodes, 9 x 9 round the blast: heading@speed.
+  const int n = (int)grid[2];
+  if (n > 0) {
+    const int ci = (int)std::lround((c.x - (float)(int32_t)grid[0]) / (float)kFlowStep);
+    const int cj = (int)std::lround((c.z - (float)(int32_t)grid[1]) / (float)kFlowStep);
+    for (int dj = -4; dj <= 4; dj++) {
+      std::string row;
+      for (int di = -4; di <= 4; di++) {
+        const int i = ci + di, j = cj + dj;
+        if (i < 0 || j < 0 || i >= n || j >= n) { row += "      off"; continue; }
+        const size_t node = (size_t)j * n + i;
+        const uint32_t w = grid[kFlowHeaderWords + 2 * node];
+        const uint32_t b = grid[kFlowHeaderWords + 2 * node + 1];
+        const float vx = (float)(int16_t)(w & 0xFFFFu) / (float)kFlowVelQ;
+        const float vz = (float)(int16_t)(w >> 16) / (float)kFlowVelQ;
+        const float vy = (float)(int16_t)(grid[kFlowMeasVyOffset + node] & 0xFFFFu) / (float)kFlowVelQ;
+        char cell[48];
+        if ((int16_t)(b & 0xFFFFu) == kFlowDry) std::snprintf(cell, sizeof cell, " %8s", "dry");
+        else std::snprintf(cell, sizeof cell, " %4.0f@%-3.1f%s", std::atan2(vz, vx) * 57.2957795f,
+                           std::sqrt(vx * vx + vz * vz), vy < -0.5f ? "v" : vy > 0.5f ? "^" : " ");
+        row += cell;
+      }
+      std::printf("  nodes z%+d:%s\n", dj * (int)kFlowStep, row.c_str());
+    }
+    // THE WRITERS, since the last probe, over the same 9 x 9 nodes.
+    static const char* kKind[kFlowMeasDiagKinds] = {"xfer-lat", "xfer-fall", "move-lat", "move-fall",
+                                                     "mpm", "gross"};
+    if (fp.prevDiag.size() != diag.size()) fp.prevDiag.assign(diag.size(), 0);
+    const int node0x = (int)(int32_t)grid[0] / (int)kFlowStep, node0z = (int)(int32_t)grid[1] / (int)kFlowStep;
+    for (uint32_t k = 0; k < kFlowMeasDiagKinds; k++) {
+      double nx = 0, nz = 0, inward = 0, cross = 0;
+      for (int dj = -4; dj <= 4; dj++)
+        for (int di = -4; di <= 4; di++) {
+          const int i = ci + di, j = cj + dj;
+          if (i < 0 || j < 0 || i >= n || j >= n) continue;
+          const int wx = node0x + i, wz = node0z + j;
+          const int sx = ((wx % kFlowMeasN) + kFlowMeasN) % kFlowMeasN;
+          const int sz = ((wz % kFlowMeasN) + kFlowMeasN) % kFlowMeasN;
+          const size_t w = kFlowMeasDiagHeader + ((size_t)k * kFlowMeasSlots + (size_t)sz * kFlowMeasN + sx) * 2;
+          const double fx = (double)(diag[w] - fp.prevDiag[w]) / kFlowMeasAccQ;
+          const double fz = (double)(diag[w + 1] - fp.prevDiag[w + 1]) / kFlowMeasAccQ;
+          nx += fx;
+          nz += fz;
+          const double ix = -(double)di, iz = -(double)dj, il = std::sqrt(ix * ix + iz * iz);
+          if (il > 0) {
+            inward += (fx * ix + fz * iz) / il;
+            cross += (fx * -iz + fz * ix) / il;
+          }
+        }
+      std::printf("  writer %-9s net (%+.0f, %+.0f) eighths*cells, inward %+.0f, swirl %+.0f\n", kKind[k], nx, nz,
+                  inward, cross);
+    }
+    fp.prevDiag = diag;
+  }
+  std::fflush(stdout);
+}
 // --forest-fire [tick]: the "whole forest is burning around me" frame-rate
 // repro, in the live loop so debris, mobs, audio and the render all pay what
 // the game pays (--perf treeburn is ONE tree, headless, with no debris).
@@ -13085,6 +13230,57 @@ int main(int argc, char** argv) {
         std::printf("SANDVOX_AT_BLAST: blast r%d p%d at (%d, %d, %d), frame %d\n", (int)atBlast.radius,
                     (int)atBlast.power, (int)atBlast.x, (int)atBlast.y, (int)atBlast.z, atBlastFrame);
       }
+      // SANDVOX_AT_TUNE=group.name=value[;group.name=value...]: tuning rows set
+      // on frame 1 (SetTuningField, --sweep's door) -- e.g. sim.fluidEnabled=0,
+      // the game as it ships, which a --frames harness otherwise runs with on.
+      // SANDVOX_AT_CAST=<glyph words>[;frame[;dx,dy,dz]]: the REAL spell path
+      // (ticket 2026-10-18_15-21-34: "explosive projectile" at a lake floor).
+      // The words are compiled against the game's glyph library and cast on
+      // that frame's first tick (default frame 60) by the player's SpellSystem
+      // from one cell in front of the eye along the view (or dx,dy,dz), with a
+      // throwaway full mana pool; the bolt then flies, hits and resolves in
+      // TickAuthority exactly as a thrown one does.
+      // SANDVOX_FLOW_PROBE=N[;span] (with either): FlowProbeSample every N
+      // ticks from the blast for `span` ticks.
+      if (frameCounter == 1) {
+        if (const char* at = std::getenv("SANDVOX_AT_TUNE")) {
+          Tuning t = CurrentTuning();
+          std::string all = at;
+          size_t p0 = 0;
+          while (p0 < all.size()) {
+            size_t p1 = all.find(';', p0);
+            if (p1 == std::string::npos) p1 = all.size();
+            const std::string item = all.substr(p0, p1 - p0);
+            const size_t dot = item.find('.'), eq = item.find('=');
+            if (dot != std::string::npos && eq != std::string::npos && dot < eq) {
+              const bool ok = SetTuningField(t, item.substr(0, dot), item.substr(dot + 1, eq - dot - 1),
+                                             std::strtof(item.c_str() + eq + 1, nullptr));
+              std::printf("SANDVOX_AT_TUNE: %s %s\n", item.c_str(), ok ? "set" : "UNKNOWN");
+            }
+            p0 = p1 + 1;
+          }
+          SetCurrentTuning(t);
+        }
+        if (const char* fpe = std::getenv("SANDVOX_FLOW_PROBE")) {
+          std::sscanf(fpe, "%d;%d", &g_flowProbe.every, &g_flowProbe.span);
+          g_flowProbe.every = std::max(g_flowProbe.every, 1);
+        }
+        if (const char* ac = std::getenv("SANDVOX_AT_CAST")) {
+          std::string s = ac;
+          const size_t semi = s.find(';');
+          g_atCastWords = s.substr(0, semi);
+          g_atCastFrame = 60;
+          if (semi != std::string::npos) {
+            float d[3] = {0, 0, 0};
+            const int got = std::sscanf(s.c_str() + semi + 1, "%d;%f,%f,%f", &g_atCastFrame, &d[0], &d[1], &d[2]);
+            if (got == 4) {
+              g_atCastDirSet = true;
+              g_atCastDir = Vec3{d[0], d[1], d[2]};
+            }
+          }
+        }
+      }
+      if (!g_atCastWords.empty() && (int64_t)frameCounter == (int64_t)g_atCastFrame) g_atCastPending = true;
       const float flyVox = (float)std::max<int64_t>((int64_t)frameCounter - atFlyAfter, 0) *
                            (1.0f / 60.0f) / kVoxelMeters;
       player.pos = Vec3{g_atEye[0] + atFly[0] * flyVox, g_atEye[1] + atFly[1] * flyVox,
@@ -16949,10 +17145,60 @@ int main(int argc, char** argv) {
                         &parkGround);
       }
 
+      // SANDVOX_AT_CAST (the --at block): the page, cast through the
+      // player's own SpellSystem on this tick; TickAuthority flies it.
+      if (g_atCastPending) {
+        g_atCastPending = false;
+        std::vector<std::string> words;
+        {
+          std::string w;
+          for (char ch : g_atCastWords + " ") {
+            if (ch == ' ' || ch == ',') { if (!w.empty()) words.push_back(w); w.clear(); }
+            else w += ch;
+          }
+        }
+        SpellStack st;
+        for (const std::string& w : words) {
+          const int gi = glyphs.Find(w);
+          if (gi >= 0) st.spoken.push_back(gi);
+          else std::printf("SANDVOX_AT_CAST: no glyph '%s'\n", w.c_str());
+        }
+        const CastList cl = CompileSpell(glyphs, st);
+        Vec3 dir = g_atCastDirSet ? g_atCastDir : cam.Forward();
+        const float dl = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+        if (dl > 0.0f) dir = dir * (1.0f / dl);
+        const Vec3 o = Vec3{g_atEye[0], g_atEye[1], g_atEye[2]} + dir * 2.0f;
+        CasterState cs;
+        cs.mana = cs.manaMax = 1 << 24;
+        SpellEmission emit;
+        const SpellProbe probe = WorldSpellProbe(world);
+        const CastResult res = spells.Cast(
+            cl, cs, playerHealth, kPlayerCasterId,
+            {SpellFxFromFloat(o.x), SpellFxFromFloat(o.y), SpellFxFromFloat(o.z)},
+            {SpellFxFromFloat(dir.x), SpellFxFromFloat(dir.y), SpellFxFromFloat(dir.z)}, tick, emit, &probe);
+        std::printf("SANDVOX_AT_CAST: '%s' (%zu glyphs, cost %d) from (%.1f, %.1f, %.1f) dir (%.3f, %.3f, %.3f) "
+                    "tick %u: outcome %d, %u live, %zu immediate explosions\n",
+                    g_atCastWords.c_str(), st.spoken.size(), (int)cl.manaCost, o.x, o.y, o.z, dir.x, dir.y,
+                    dir.z, tick, (int)res.outcome, (unsigned)spells.LiveCount(), emit.explosions.size());
+      }
       TickAuthority(tickCtx, session,
                     FrameIntent{brushActive, handsUp, pourAimValid, pourAim,
                                 ui.pourRadius, pourFromValid, pourFrom},
                     ti, tick, opBatch);
+      // SANDVOX_FLOW_PROBE: the first blast this run names the centre.
+      if (g_flowProbe.every > 0) {
+        if (!g_flowProbe.have && !opBatch.exps.empty()) {
+          const ExplosionOp& e = opBatch.exps.front();
+          g_flowProbe.have = true;
+          g_flowProbe.c = Vec3{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
+          g_flowProbe.t0 = tick;
+          std::printf("flowprobe: blast r%d p%d at (%d, %d, %d) on tick %u\n", (int)e.radius, (int)e.power,
+                      (int)e.x, (int)e.y, (int)e.z, tick);
+        }
+        if (g_flowProbe.have && tick - g_flowProbe.t0 <= (uint32_t)g_flowProbe.span &&
+            (tick - g_flowProbe.t0) % (uint32_t)g_flowProbe.every == 0)
+          FlowProbeSample(ctx, sim, tick);
+      }
 
       // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
       //

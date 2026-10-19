@@ -109,6 +109,9 @@ const FLOWM_ACC_STRIDE : u32 = 8u;
 // thousand barely-moving, zero-mean particles summed to a steady pull toward
 // -x/-z that nothing in it was doing (found 2026-10-15, when bodies began to
 // read the field).
+const FLOWM_DIAG : bool = false;         // sim_step.wgsl's (both or neither)
+const FLOWM_DIAG_BASE : u32 = 89784u;    // flowfield.h kFlowMeasDiagBase
+const FLOWM_SLOTS : u32 = 4489u;
 fn flowMeasParticle(cell : vec3<i32>, vx : i32, vz : i32) {
   if (TUNE_CURRENT_MEASURED <= 0.0 && TUNE_CURRENT_MEASURED_CARRY <= 0.0) { return; }
   let fx = vx / 4096;
@@ -117,6 +120,13 @@ fn flowMeasParticle(cell : vec3<i32>, vx : i32, vz : i32) {
   let kx = ((((cell.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let kz = ((((cell.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
   let s = u32(kz * FLOWM_N + kx) * FLOWM_ACC_STRIDE;
+  // THE WRITERS' ATTRIBUTION (sim_step.wgsl FLOWM_DIAG; flowfield.h
+  // kFlowMeasDiagMpm): false as shipped.
+  if (FLOWM_DIAG) {
+    let b = FLOWM_DIAG_BASE + 4u + (4u * FLOWM_SLOTS + u32(kz * FLOWM_N + kx)) * 2u;
+    if (fx != 0) { atomicAdd(&flowMeasAcc[b], fx); }
+    if (fz != 0) { atomicAdd(&flowMeasAcc[b + 1u], fz); }
+  }
   if (fx != 0) { atomicAdd(&flowMeasAcc[s], fx); }
   if (fz != 0) { atomicAdd(&flowMeasAcc[s + 1u], fz); }
   atomicMax(&flowMeasAcc[s + 2u], cell.y + FLOWM_Y_BIAS);

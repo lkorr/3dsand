@@ -182,6 +182,31 @@ constexpr uint32_t kFlowMeasVertOffset = kFlowHeaderWords + kFlowMeasSlots * 2u;
 constexpr uint32_t kFlowMeasVyOffset = kFlowMeasVertOffset + kFlowMeasSlots;
 constexpr uint32_t kFlowMeasGridWords = kFlowMeasVyOffset + kFlowMeasSlots;
 constexpr uint32_t kFlowMeasWords = kFlowMeasGridBase + kFlowMeasGridWords;
+// THE WRITERS' ATTRIBUTION (2026-10-18, ticket 2026-10-18_15-21-34 shot 2:
+// "every arrow round an underwater explosion points one way"; CLAUDE.md rule
+// 6). A DIAGNOSTIC region after GRID, written only when the writers' own
+// FLOWM_DIAG const is true (sim_step.wgsl, sim_fluid.wgsl; false as shipped,
+// so the region costs 216 KiB of memory and nothing else): per KIND of move,
+// per slot, the CUMULATIVE net horizontal flux (x, z; the ACC's units), never
+// zeroed by the tick's ACC fill -- so a probe reads WHICH writer moved the
+// water a node's arrow says, over any span of ticks, by differencing two
+// reads. Kinds: kFlowMeasDiag* below. Nothing reads it but a probe
+// (main.cpp SANDVOX_FLOW_PROBE).
+enum : uint32_t {
+  kFlowMeasDiagXferLat = 0,   // transferLiquid, a lateral move (equalize, split, bridge)
+  kFlowMeasDiagXferFall = 1,  // transferLiquid with a vertical part (partial descents)
+  kFlowMeasDiagMoveLat = 2,   // tryMove of a whole liquid cell, lateral (film step, displace)
+  kFlowMeasDiagMoveFall = 3,  // tryMove with a vertical part (diagonal falls)
+  kFlowMeasDiagMpm = 4,       // an MPM particle's record (sim_fluid.wgsl mark)
+  kFlowMeasDiagGross = 5,     // every CA move's |dx|, |dz| (the gross flux, for net / gross)
+  kFlowMeasDiagKinds = 6,
+};
+constexpr uint32_t kFlowMeasDiagBase = kFlowMeasWords;
+constexpr uint32_t kFlowMeasDiagHeader = 4;
+constexpr uint32_t kFlowMeasDiagWords =
+    kFlowMeasDiagHeader + kFlowMeasDiagKinds * kFlowMeasSlots * 2u;
+// The buffer: the three regions the field uses, then the attribution.
+constexpr uint32_t kFlowMeasBufWords = kFlowMeasDiagBase + kFlowMeasDiagWords;
 constexpr int kFlowMeasAccQ = 16;
 // The fold's dispatch: 8 x 8 threads a group, one thread per grid node.
 constexpr uint32_t kFlowMeasGroups = (uint32_t)(kFlowMeasN + 7) / 8u;

@@ -979,7 +979,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // `flow-measure` gate's readback; CopyDst for the Fill rows. NO ZERO UPLOAD:
   // CreateBuffer already queues a GPU zero fill (rhi_vulkan.cpp, "Zero-init,
   // queued"), and the worldgen / load-reset Fill rows zero it again.
-  flowMeasBuf_ = CreateBuffer(device, (uint64_t)sandvox::kFlowMeasWords * 4,
+  flowMeasBuf_ = CreateBuffer(device, (uint64_t)sandvox::kFlowMeasBufWords * 4,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc |
                                   rhi::BufferUsage::CopyDst,
                               "flowMeasure");
