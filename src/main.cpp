@@ -17772,7 +17772,15 @@ int main(int argc, char** argv) {
       SetWaterFxProbe((ui.wfxNoMist ? kWaterProbeNoMist : 0u) |
                       (ui.wfxNoRefl ? kWaterProbeNoRefl : 0u) |
                       (ui.wfxNoCaustic ? kWaterProbeNoCaustic : 0u) |
-                      (ui.wfxNoSheets ? kWaterProbeNoSheets : 0u) |
+                      (ui.wfxNoRisers ? kWaterProbeNoRisers : 0u) |
+                      (ui.wfxNoWhite ? kWaterProbeNoWhite : 0u) |
+                      (ui.wfxFullRiser ? kWaterProbeFullRiser : 0u) |
+                      (ui.wfxNoOpenness ? kWaterProbeNoOpenness : 0u) |
+                      (ui.wfxNoDepth ? kWaterProbeNoDepth : 0u) |
+                      (ui.wfxNoSlope ? kWaterProbeNoSlope : 0u) |
+                      (ui.wfxNoSolute ? kWaterProbeNoSolute : 0u) |
+                      (ui.wfxNoRipple ? kWaterProbeNoRipple : 0u) |
+                      (ui.wfxNoVeil ? kWaterProbeNoVeil : 0u) |
                       ((uint32_t)std::clamp(ui.wfxReflShift, 0, 3)
                        << kWaterProbeReflShift));
       // The panel's draw-distance readout, and the evidence that ticking the

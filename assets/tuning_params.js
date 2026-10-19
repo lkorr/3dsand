@@ -198,6 +198,7 @@ const TUNING_PARAMS = {
   'render.siltDrift':{t:'f',def:0.05,min:0,max:1,wgsl:'TUNE_SILT_DRIFT'},
   'render.mistDensity':{t:'f',def:1,min:0,max:4,wgsl:'TUNE_MIST_DENSITY'},
   'render.mistBrightness':{t:'f',def:0.9,min:0,max:4,wgsl:'TUNE_MIST_BRIGHTNESS'},
+  'render.fallSheetStrength':{t:'f',def:1,min:0,max:1},
   'render.mistRadius':{t:'f',def:10,min:0.5,max:48,wgsl:'TUNE_MIST_RADIUS'},
   'render.mistFallSpeed':{t:'f',def:2.2,min:0,max:12,wgsl:'TUNE_MIST_FALL_SPEED'},
   'render.sprayDensity':{t:'f',def:1.3,min:0,max:4,wgsl:'TUNE_SPRAY_DENSITY'},

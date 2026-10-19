@@ -3094,7 +3094,18 @@ struct RenderArm {
   // camera. 1 = coarse march only, 3 = + thickness walk, 4 = the step heatmap
   // (a picture, not a cost: read it with SANDVOX_BUDGET_ARM_SHOTS=1).
   uint32_t fluidBits = 0;
+  // The F1 View page's water cost probes (support.h kWaterProbe*), set for
+  // this arm through SetWaterFxProbe: a runtime RenderParams flag, so no
+  // reload and the same world, camera and frame as `baseline`.
+  uint32_t waterProbe = 0;
 };
+
+// The water probe arms' rows (support.h kWaterProbe*), one helper so the
+// positional initializer below stays readable.
+#define WATER_PROBE_ARM(id, label, means, bits)                              \
+  {id, label, nullptr, true, 1, means, /*universalShader=*/false,            \
+   /*noRayStart=*/false, /*anyCamera=*/true, /*noRainMap=*/false,            \
+   /*fluidBits=*/0u, /*waterProbe=*/(bits)}
 
 const RenderArm kRenderArms[] = {
     {"baseline", "everything on", nullptr, true, 1,
@@ -3286,7 +3297,54 @@ const RenderArm kRenderArms[] = {
     // cheaper ones; if it does not, something fixed-cost dominates.
     {"halfres", "render 960x540 instead of 1920x1080", nullptr, true, 2,
      "pixel-linearity: a 4x pixel cut should be a ~4x time cut"},
+
+    // ---- water shade attribution (2026-10-18, the F1 water cost probes) ----
+    // Each removes ONE term at runtime (raymarch.wgsl RFLAG_NO_*), anyCamera
+    // so a --budget-arms list runs them on every water camera. wp_all is the
+    // ceiling; wp_neigh is the three neighbourhood terms a per-cell bake would
+    // replace together (its ceiling); wp_fullriser is NEGATIVE saved-ms = what
+    // the cheap riser saves.
+    WATER_PROBE_ARM("wp_all", "every water probe on (refl steps >> 3)",
+                    "the whole optional water shade at once",
+                    kWaterProbeNoMist | kWaterProbeNoRefl | kWaterProbeNoCaustic |
+                    kWaterProbeNoRisers | kWaterProbeNoWhite |
+                    kWaterProbeNoOpenness | kWaterProbeNoDepth |
+                    kWaterProbeNoSlope | kWaterProbeNoSolute |
+                    kWaterProbeNoRipple | kWaterProbeNoVeil |
+                    (3u << kWaterProbeReflShift)),
+    WATER_PROBE_ARM("wp_fullriser", "risers take the OLD full top shade",
+                    "negative = what the cheap riser saves", kWaterProbeFullRiser),
+    WATER_PROBE_ARM("wp_norisers", "risers drawn as plain walls",
+                    "the (cheap) riser shade", kWaterProbeNoRisers),
+    WATER_PROBE_ARM("wp_nowhite", "no white water cover",
+                    "fallingSheet on sheets and water in flight", kWaterProbeNoWhite),
+    WATER_PROBE_ARM("wp_nomist", "no mist / spray (runtime)",
+                    "waterfallMist incl. its sun ray", kWaterProbeNoMist),
+    WATER_PROBE_ARM("wp_norefl", "traced reflections return the sky",
+                    "the reflection ray", kWaterProbeNoRefl),
+    WATER_PROBE_ARM("wp_nocaustic", "no caustics", "waterCausticCurv + bedCaustic",
+                    kWaterProbeNoCaustic),
+    WATER_PROBE_ARM("wp_noopen", "openness = 1", "waterOpenness's 12-cell ring",
+                    kWaterProbeNoOpenness),
+    WATER_PROBE_ARM("wp_nodepth", "depth = 1 m", "waterDepthM's column walk",
+                    kWaterProbeNoDepth),
+    WATER_PROBE_ARM("wp_noslope", "flat column slope",
+                    "waterNormal's four neighbour columns", kWaterProbeNoSlope),
+    WATER_PROBE_ARM("wp_neigh", "openness + depth + slope together",
+                    "the ceiling of a per-cell water bake",
+                    kWaterProbeNoOpenness | kWaterProbeNoDepth | kWaterProbeNoSlope),
+    WATER_PROBE_ARM("wp_nosolute", "no solute walk", "solPathLook's second march",
+                    kWaterProbeNoSolute),
+    WATER_PROBE_ARM("wp_noripple", "no ripples / current",
+                    "waterWaveNormal's flow lookup + ripple bands", kWaterProbeNoRipple),
+    WATER_PROBE_ARM("wp_noveil", "no veil write", "writeWaterVeil's 7-word store",
+                    kWaterProbeNoVeil),
+    // LAST, and identical to `baseline`: the run's own noise floor and drift
+    // (the first arm of a camera runs warm), read against baseline's row.
+    WATER_PROBE_ARM("wp_none", "no probe (baseline again, measured last)",
+                    "noise floor: should match baseline", 0u),
 };
+#undef WATER_PROBE_ARM
 constexpr int kRenderArmCount =
     (int)(sizeof(kRenderArms) / sizeof(kRenderArms[0]));
 // The Rm* block of PerfCounter is the shader's slot table, one enumerator per
@@ -4669,6 +4727,7 @@ class RenderBudgetRunner {
     sim_.SetForceUniversalRaymarch(arm.universalShader);
     sim_.SetRayStartOff(arm.noRayStart);
     sim_.SetRainMapOff(arm.noRainMap);
+    SetWaterFxProbe(arm.waterProbe);
 
     const uint32_t d = arm.widthDiv;
     const uint32_t W = opt_.width / d, H = opt_.height / d;

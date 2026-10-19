@@ -618,6 +618,7 @@ const TUNING_SCHEMA = [
       {k:'siltDensity', n:'silt density', d:'Drifting motes suspended in the water. They are most of why footage reads as underwater — the shafts need something to catch.', step:0.02},
       {k:'siltBrightness', n:'silt brightness', d:'How brightly those motes catch the light.', step:0.02},
       {k:'siltDrift', n:'silt drift', d:'How fast the particulate drifts. Very slow is correct; fast reads as snow.', step:0.005},
+      {k:'fallSheetStrength', n:'falling water whiteness', d:'How white falling water goes: the streaked white-water cover on falling sheets and on water in flight, near and far. 1 = the full cover, 0 = clear water (and the term costs nothing). Live: rides the per-frame render flags, no shader recompile.', step:0.05},
       {k:'mistDensity', n:'waterfall mist density', d:'Render-only vapour wrapped around a FALLING liquid column. The renderer finds the column by reading the cell under a liquid hit — no particle, no sim state. 0 removes the whole effect at shader-compile time.', step:0.02},
       {k:'mistBrightness', n:'waterfall mist brightness', d:'How brightly that vapour catches the sun. Mist is white because it is aerated, so this is most of what makes falling water read as falling water.', step:0.02},
       {k:'mistRadius', n:'waterfall mist radius', d:'Voxels the mist veil wraps around the column, along the view ray.', step:0.5},
